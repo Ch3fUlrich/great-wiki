@@ -8,6 +8,19 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- The proxy shared secret is now an enforced per-request check rather than a startup
+  assertion. Requests without it, or with a wrong value, are refused before routing — so an
+  unknown path returns 403 rather than 404 and cannot be used to probe what exists.
+  Comparison is constant-time; an empty configured secret returns 503 rather than allowing
+  through, because an unconfigured secret must never silently disable the boundary.
+- Enforcement is derived from the bind address: loopback disables it, so local development
+  needs no proxy in front, and anything public requires it.
+- `gw-auth`: the permission engine as its own crate. One `can()` decides every
+  authorisation in the system and checks authentication *before* group or team membership,
+  so a forged group on an anonymous request cannot pass. Local account credentials use
+  argon2id with Authelia's exact parameters, and a malformed stored hash denies access
+  rather than panicking.
+
 - `great-wiki seed --content <dir>` loads a folder of markdown files with YAML frontmatter
   into the database, so there is real content to develop against before the editor exists.
   The markdown-to-block conversion it needs is also half of the export round-trip, so this

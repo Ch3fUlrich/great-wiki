@@ -2,6 +2,7 @@ pub mod docs;
 pub mod tree;
 
 use crate::identity::Identity;
+use crate::proxy_guard::{self, ProxyGuard};
 use axum::routing::get;
 use axum::{Json, Router};
 use gw_store::Store;
@@ -13,13 +14,28 @@ pub struct AppState {
     /// When present, every request is treated as this identity. Only reachable on a
     /// loopback bind — `config::validate` refuses to start otherwise.
     pub dev_identity: Option<Identity>,
+    /// Proxy attestation policy, resolved from the bind address once at startup. It lives
+    /// in the state rather than being read from the environment inside the layer, so a
+    /// test constructs an enforcing server directly instead of mutating process globals.
+    pub proxy_guard: ProxyGuard,
 }
 
 impl AppState {
+    /// Unenforced, matching the loopback bind a test implies. Tests that are about the
+    /// boundary itself use `for_test_with_guard`.
     pub fn for_test(store: Arc<Store>, dev_identity: Option<Identity>) -> Self {
+        Self::for_test_with_guard(store, dev_identity, ProxyGuard::disabled())
+    }
+
+    pub fn for_test_with_guard(
+        store: Arc<Store>,
+        dev_identity: Option<Identity>,
+        proxy_guard: ProxyGuard,
+    ) -> Self {
         Self {
             store,
             dev_identity,
+            proxy_guard,
         }
     }
 
@@ -52,5 +68,12 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/tree", get(tree::get_tree))
         .route("/api/documents/{*path}", get(docs::get_document))
+        // Last, so it wraps every route registered above *and* the 404 fallback: the guard
+        // has to run before routing, or an unattested request would learn which paths
+        // exist. Handlers read `AppState::identity` inside this layer, never outside it.
+        .layer(axum::middleware::from_fn_with_state(
+            state.proxy_guard.clone(),
+            proxy_guard::enforce,
+        ))
         .with_state(state)
 }

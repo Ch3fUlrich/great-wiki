@@ -1,0 +1,16 @@
+[package]
+name = "gw-auth"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gw-core = { path = "../gw-core" }
+anyhow = { workspace = true }
+argon2 = "0.5"
+password-hash = { version = "0.5", features = ["rand_core"] }
+rand = "0.8"
+serde = { workspace = true }
+thiserror = { workspace = true }

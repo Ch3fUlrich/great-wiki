@@ -72,6 +72,7 @@ async fn main() -> Result<()> {
             let state = gw_api::AppState {
                 store,
                 dev_identity: cfg.dev_identity.clone(),
+                proxy_guard: gw_api::ProxyGuard::from_config(&cfg),
             };
             let app = gw_api::build_router(state).layer(
                 tower_http::limit::RequestBodyLimitLayer::new(2 * 1024 * 1024),

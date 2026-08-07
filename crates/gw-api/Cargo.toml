@@ -25,6 +25,9 @@ serde_json = { workspace = true }
 # sqlx is a DIRECT dependency because handlers query. The predecessor plan omitted it
 # from this crate's manifest while calling sqlx from four of its modules.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+# Constant-time byte comparison for the proxy secret. `==` short-circuits on the first
+# differing byte, which times how much of a guess was right; `subtle` does not.
+subtle = "2"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tower = "0.5"
