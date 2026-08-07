@@ -1,10 +1,12 @@
 use serde::Serialize;
 
-/// Who is making a request.
+/// What `GW_DEV_IDENTITY` says: a username and the Authelia groups to arrive with.
 ///
-/// Deliberately independent of how it was established. OIDC produces one; the development
-/// shim produces one; M2's local accounts will produce one. Handlers consume only this, so
-/// adding an authentication method never touches a handler.
+/// **Not an authorisation input.** M1 let handlers decide from this directly; M2 does not.
+/// It is configuration for the development shim and nothing else — a name to look up. The
+/// principal a request actually runs as is `gw_auth::Principal`, read from the store by
+/// [`crate::routes::AppState::principal`], so the shim goes through the same permission
+/// engine as a real sign-in instead of standing in for one.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Identity {
     pub user: Option<String>,

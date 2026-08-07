@@ -254,7 +254,7 @@ impl Store {
         path: &str,
         action: Action,
     ) -> Result<Option<StoredDocument>> {
-        let Some(doc) = self.document_by_path(path).await? else {
+        let Some(doc) = self.document_by_path_unchecked(path).await? else {
             return Ok(None);
         };
         let visibility = Visibility::from_str(&doc.visibility).unwrap_or_default();

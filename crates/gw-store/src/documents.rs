@@ -106,7 +106,17 @@ impl Store {
         Ok(id)
     }
 
-    pub async fn document_by_path(&self, path: &str) -> Result<Option<StoredDocument>> {
+    /// A document with NO permission check whatsoever.
+    ///
+    /// Crate-private, and named so the danger is unmissable at every call site. The one
+    /// public way to obtain a document is [`Store::document_for`], which takes a principal;
+    /// that is the invariant M2 exists to establish — no code outside `gw-store` can hold
+    /// an unfiltered document — and a `pub` spelling of this method is precisely how a
+    /// later handler would leak one by forgetting to filter.
+    pub(crate) async fn document_by_path_unchecked(
+        &self,
+        path: &str,
+    ) -> Result<Option<StoredDocument>> {
         let row = sqlx::query_as::<_, StoredDocument>(
             r#"
             SELECT id, path, parent_path, slug, doc_type, title, language, visibility, body, sort_key
@@ -120,30 +130,34 @@ impl Store {
         Ok(row)
     }
 
+    /// Whether anything lives at `path`. Public because it is the *only* thing a caller
+    /// outside this crate is allowed to learn without a principal.
+    ///
+    /// The HTTP layer needs it to tell 404 from 403: [`Store::document_for`] returns `None`
+    /// both for a path that is absent and for one the caller may not have, and collapsing
+    /// the two either hides configuration mistakes or confirms the existence of every path
+    /// somebody guesses. The seeder needs it too, to refuse to invent a parent and to name
+    /// a collision. A boolean is the whole answer, so this discloses strictly less than the
+    /// response it is used to choose.
+    pub async fn document_exists(&self, path: &str) -> Result<bool> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM documents WHERE path = ?1 AND deleted_at IS NULL")
+                .bind(path)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.is_some())
+    }
+
     /// The whole tree, nested.
     ///
     /// Fetched flat in one query and assembled in memory rather than issuing a query per
     /// level: a wiki's tree is small enough that one round trip beats N, and the ordering
     /// is then unambiguous.
     ///
-    /// UNFILTERED. Use [`Store::tree_for`], which takes a principal and is the only tree
-    /// accessor any caller should ever reach for.
-    ///
-    /// STILL BLOCKED, and this is the one thing M2 is not yet finished with: this method
-    /// must become `pub(crate)`, so that no caller outside this crate can obtain an
-    /// unfiltered tree and no later handler can leak one by forgetting to filter. The
-    /// change is one word, but it does not compile until the three remaining callers are
-    /// gone, and all three live in `gw-api`:
-    ///
-    /// - `gw-api/src/routes/tree.rs` — the M1 handler, which post-filters with `may_read`
-    ///   (M2 Task 4 deletes both, routing the handler through `tree_for` instead);
-    /// - `gw-api/tests/seed.rs`, two assertions that only need "is the tree empty".
-    ///
-    /// `gw-api` does not depend on `gw-auth`, so it cannot construct a `Principal` to call
-    /// `tree_for` with until Task 4 adds that dependency. Flipping this word is therefore
-    /// the FIRST step of Task 4, not the last step of Task 3.
-    #[doc(hidden)]
-    pub async fn tree(&self) -> Result<Vec<TreeNode>> {
+    /// UNFILTERED, and crate-private for exactly that reason. [`Store::tree_for`] takes a
+    /// principal and is the only tree accessor reachable from outside this crate: a
+    /// restricted title in the navigation is a disclosure even when the body is protected.
+    pub(crate) async fn tree(&self) -> Result<Vec<TreeNode>> {
         #[derive(FromRow)]
         struct Row {
             path: String,

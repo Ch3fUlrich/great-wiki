@@ -3,9 +3,27 @@
 //! so a rule enforced only in `main` would not pass this suite.
 
 use gw_api::seed::{self, SeedReport};
-use gw_store::Store;
+use gw_auth::{Action, Principal};
+use gw_store::{Store, StoredDocument};
 use std::path::Path;
 use tempfile::TempDir;
+
+/// A principal in `admins`, which D-M2-1 gives read reach over everything.
+///
+/// These tests are about what reached the database, not about who may see it — but they
+/// still read through the permission-scoped accessor, because no code outside `gw-store`
+/// can obtain an unfiltered document or tree. Asserting on seeded content is not a reason
+/// to make an exception; it is a reason to name a principal.
+fn admin() -> Principal {
+    Principal::test("seed-test", &["admins"], &[])
+}
+
+async fn fetch(store: &Store, path: &str) -> Option<StoredDocument> {
+    store
+        .document_for(&admin(), path, Action::Read)
+        .await
+        .unwrap()
+}
 
 /// Write `files` into a fresh temporary directory, creating parents as needed.
 fn corpus(files: &[(&str, &str)]) -> TempDir {
@@ -46,10 +64,8 @@ async fn a_document_lands_at_the_path_its_title_slugifies_to() {
     assert_eq!(report.inserted.len(), 1);
 
     // German end to end: umlauts in the title, an ASCII path in the database.
-    let doc = store
-        .document_by_path("/groesse-und-mass")
+    let doc = fetch(&store, "/groesse-und-mass")
         .await
-        .unwrap()
         .expect("a German title must produce a transliterated path");
     assert_eq!(doc.title, "Größe und Maß");
     assert_eq!(doc.visibility, "public");
@@ -73,10 +89,8 @@ async fn a_child_is_nested_under_the_document_its_directory_names() {
     assert_eq!(report.inserted[0].path, "/handbuch", "shallowest first");
     assert_eq!(report.inserted[1].path, "/handbuch/erste-schritte");
 
-    let child = store
-        .document_by_path("/handbuch/erste-schritte")
+    let child = fetch(&store, "/handbuch/erste-schritte")
         .await
-        .unwrap()
         .expect("the child must exist");
     assert_eq!(child.parent_path.as_deref(), Some("/handbuch"));
 }
@@ -93,11 +107,7 @@ async fn a_missing_title_is_reported_with_the_filename_never_guessed() {
     assert!(reason.contains("ohne-titel.md"), "{reason}");
     assert!(reason.contains("title"), "{reason}");
     // The filename must not have become the title.
-    assert!(store
-        .document_by_path("/ohne-titel")
-        .await
-        .unwrap()
-        .is_none());
+    assert!(!store.document_exists("/ohne-titel").await.unwrap());
 }
 
 #[tokio::test]
@@ -107,7 +117,7 @@ async fn a_file_with_no_visibility_is_restricted_not_public() {
     let (store, report) = seed(dir.path()).await;
 
     assert!(report.is_complete(), "{report}");
-    let doc = store.document_by_path("/notiz").await.unwrap().unwrap();
+    let doc = fetch(&store, "/notiz").await.unwrap();
     assert_eq!(
         doc.visibility, "restricted",
         "a document with no stated visibility must not be world-readable"
@@ -136,7 +146,7 @@ async fn two_files_claiming_one_path_name_both_sides() {
     );
 
     // The winner is untouched: a collision must never overwrite.
-    let doc = store.document_by_path("/notiz").await.unwrap().unwrap();
+    let doc = fetch(&store, "/notiz").await.unwrap();
     assert!(doc.body.contains("Eins."));
 }
 
@@ -171,8 +181,8 @@ async fn a_child_without_a_parent_document_is_skipped_not_given_an_invented_one(
     assert!(reason.contains("parent"), "{reason}");
 
     // No placeholder parent was created.
-    assert!(store.document_by_path("/handbuch").await.unwrap().is_none());
-    assert!(store.tree().await.unwrap().is_empty());
+    assert!(!store.document_exists("/handbuch").await.unwrap());
+    assert!(store.tree_for(&admin()).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -184,7 +194,7 @@ async fn table_text_reaches_the_database_and_the_flattening_is_reported() {
     let (store, report) = seed(dir.path()).await;
 
     assert!(report.is_complete(), "{report}");
-    let doc = store.document_by_path("/tabelle").await.unwrap().unwrap();
+    let doc = fetch(&store, "/tabelle").await.unwrap();
     let body: gw_core::Block = serde_json::from_str(&doc.body).unwrap();
     // Exact, not `contains`: a substring check passes on the fused token "FeldWert" too,
     // and a fused token is in the index matching nothing anyone would search for.
@@ -205,7 +215,7 @@ async fn headings_lists_quotes_and_code_all_survive() {
     let (store, report) = seed(dir.path()).await;
 
     assert!(report.is_complete(), "{report}");
-    let doc = store.document_by_path("/reich").await.unwrap().unwrap();
+    let doc = fetch(&store, "/reich").await.unwrap();
     let body: gw_core::Block = serde_json::from_str(&doc.body).unwrap();
 
     let kinds: Vec<gw_core::BlockKind> = body.content.iter().map(|b| b.kind).collect();
@@ -240,7 +250,7 @@ async fn an_unread_frontmatter_key_is_reported_rather_than_silently_ignored() {
         report.notes.iter().any(|n| n.detail.contains("visibilty")),
         "{report}"
     );
-    let doc = store.document_by_path("/notiz").await.unwrap().unwrap();
+    let doc = fetch(&store, "/notiz").await.unwrap();
     assert_eq!(doc.visibility, "restricted");
 }
 
@@ -298,7 +308,7 @@ async fn the_shipped_example_corpus_seeds_cleanly() {
     assert!(report.is_complete(), "{report}");
     assert!(report.inserted.len() >= 4, "{report}");
     assert!(
-        !store.tree().await.unwrap().is_empty(),
+        !store.tree_for(&admin()).await.unwrap().is_empty(),
         "the example corpus must produce a navigable tree"
     );
 }

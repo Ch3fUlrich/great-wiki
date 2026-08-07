@@ -98,7 +98,7 @@ mod tests {
             .unwrap();
 
         let got = store
-            .document_by_path("/groesse-und-mass")
+            .document_by_path_unchecked("/groesse-und-mass")
             .await
             .unwrap()
             .expect("document should exist");
@@ -124,7 +124,7 @@ mod tests {
             .unwrap();
 
         let child = store
-            .document_by_path("/handbuch/erste-schritte")
+            .document_by_path_unchecked("/handbuch/erste-schritte")
             .await
             .unwrap();
         assert!(child.is_some(), "child path must nest under its parent");
@@ -171,7 +171,7 @@ mod tests {
         store.insert_document(&doc).await.unwrap();
         assert_eq!(doc.resolved_path().unwrap(), "/handbuch/groesse-und-mass");
         assert!(store
-            .document_by_path(&doc.resolved_path().unwrap())
+            .document_by_path_unchecked(&doc.resolved_path().unwrap())
             .await
             .unwrap()
             .is_some());
@@ -180,7 +180,7 @@ mod tests {
     #[tokio::test]
     async fn missing_document_is_none_not_an_error() {
         let store = Store::open("sqlite::memory:").await.unwrap();
-        assert!(store.document_by_path("/nope").await.unwrap().is_none());
+        assert!(store.document_by_path_unchecked("/nope").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -851,10 +851,25 @@ mod tests {
             .unwrap();
 
         assert!(store
-            .document_by_path("/temporaer")
+            .document_by_path_unchecked("/temporaer")
             .await
             .unwrap()
             .is_none());
         assert!(store.tree().await.unwrap().is_empty());
+        assert!(
+            !store.document_exists("/temporaer").await.unwrap(),
+            "a deleted document must not keep answering the existence check that picks \
+             404 over 403"
+        );
+    }
+
+    #[tokio::test]
+    async fn document_exists_answers_only_the_question_the_status_code_needs() {
+        // What separates 404 from 403 at the HTTP layer, and the only thing a caller may
+        // learn about a path without presenting a principal.
+        let store = seeded().await;
+        assert!(store.document_exists("/handbuch").await.unwrap());
+        assert!(store.document_exists("/oeffentlich").await.unwrap());
+        assert!(!store.document_exists("/gibt-es-nicht").await.unwrap());
     }
 }

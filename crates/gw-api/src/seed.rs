@@ -151,7 +151,7 @@ async fn load_one(
     // `handbuch/` is `handbuch.md` beside it, and if nobody wrote it, inventing one would
     // put an untitled, restricted page in the tree that nobody asked for.
     if let Some(parent) = &parent_path {
-        if store.document_by_path(parent).await?.is_none() {
+        if !store.document_exists(parent).await? {
             return skip(format!(
                 "parent document `{parent}` does not exist — create the file that owns it \
                  (`{}.md`, beside the directory); seeding never invents a parent",
@@ -179,7 +179,7 @@ async fn load_one(
 
     // Checked before the insert so the message can say *what* collided. The UNIQUE
     // constraint is still the authority — see the fallback below.
-    if store.document_by_path(&path).await?.is_some() {
+    if store.document_exists(&path).await? {
         return skip(collision_reason(&path, claimed));
     }
 
