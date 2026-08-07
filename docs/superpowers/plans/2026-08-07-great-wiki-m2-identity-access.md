@@ -23,6 +23,53 @@ that bite in M2:
   accounts are great-wiki's own principals, not homelab SSO accounts.
 - **Every task ends green** on `just ci`.
 
+## Decisions locked after M1 (2026-08-07)
+
+**D-M2-1 — Default access follows the Authelia group.** A first sign-in does not grant
+anything by itself; what the person can see is derived from the verified `groups` claim:
+
+| Authelia group | Default reach |
+|---|---|
+| `admins` | Everything, including instance administration |
+| `users` | Public plus `internal` |
+| anything else, or none | Public only |
+
+This is better than a flat default in both directions: access follows the homelab account
+rather than being maintained twice, and "I gave someone an account" never silently becomes
+"I gave them the internal wiki". The mapping is **configuration, not code** — a table, so a
+new group does not need a release. Local guest accounts have no Authelia groups and
+therefore land in the third row until granted explicitly.
+
+**D-M2-2 — Space admins may invite guests, scoped to their own spaces.** Account creation
+decentralises to whoever administers an area. The scope restriction is load-bearing: without
+it, a space admin could mint a credential reaching the whole instance's public surface and
+any `internal` content. An invite may therefore grant **only into spaces the inviter
+administers**, and the resulting principal starts with nothing else.
+
+**D-M2-3 — Invites are one-time links, not passwords handed over.** The recipient sets their
+own password, so no credential ever passes through chat or email. Links expire and are
+single-use.
+
+**D-M2-4 — The admin console ships all four capabilities**, including the hard one:
+
+1. **Who can see what** — for any page or space, every principal and team with read,
+   comment, write or admin, showing what is inherited and from where.
+2. **Fast grant and revoke**, with confirmation on anything destructive.
+3. **A readable audit trail**, written in the same transaction as the change it records, so
+   an action cannot succeed unrecorded.
+4. **"What can this person see?"** — the whole wiki rendered as another principal would see
+   it. This is the one that catches a mistake *before* it matters, and it is genuinely
+   harder than the other three: it means running the entire permission engine under a
+   substituted principal, on every retrieval path, without ever letting the substitution
+   leak into a write. Read-only, explicitly labelled in the interface, and audited.
+
+**D-M2-5 — The OIDC login flow moves into M2.** M1 registered the client in Authelia but
+never wrote the application side, so both wiki hostnames currently sit behind a *temporary*
+`import authelia` edge gate. That gate blocks four things this milestone must deliver:
+public pages readable without signing in, per-person rather than blanket access, real
+attribution on revisions and comments, and guest accounts that bypass Authelia entirely.
+**Removing the edge gate is an exit criterion of M2**, not a follow-up.
+
 ## What M2 replaces
 
 M1 left two deliberate stubs, both commented as such. M2 must **replace** them, not sit
@@ -1448,9 +1495,77 @@ git commit -m "feat(admin): principal, team and access management with audited m
 
 ---
 
+---
+
+## Task 6: OIDC login, and removing the edge gate
+
+**Files:** `crates/gw-api/src/auth/{mod,oidc,session}.rs`, `crates/gw-store/migrations/0004_sessions.sql`,
+`web/src/routes/auth/`, and `Server/server/network/opnsense/caddy.d/10-services.conf`.
+
+**Produces:** `GET /auth/login`, `GET /auth/callback`, `POST /auth/logout`, `GET /api/me`;
+sessions persisted in SQLite; `AppState::principal` reading the session cookie.
+
+Authorization-code flow with PKCE against Authelia. The client `great-wiki` is already
+registered with both redirect URIs, `two_factor`, and the `groups` scope. The client secret
+is in the Server repo's secret store as `server__coding__great-wiki__.env`.
+
+**On callback:** verify the id token, read `preferred_username` and the `groups` claim,
+`upsert_oidc_principal`, and apply the D-M2-1 mapping. **Groups are replaced on every login,
+never merged** — losing a group in Authelia must take effect here at the next sign-in, and
+merging would make removal impossible.
+
+**Sessions go in SQLite, not memory** — M1's plan deferred this, but attribution (D-M2-5)
+means a restart must not silently reattribute in-flight work to nobody.
+
+**The last step is deleting the two `import authelia` lines** from the wiki site blocks and
+reloading Caddy. Before doing so, prove in this order: a published page is readable
+anonymously; a restricted page is not; signing in yields the right groups at `/api/me`; a
+local guest account signs in *without* Authelia. If any fails, the gate stays.
+
+---
+
+## Task 7: Invites and space-scoped account creation
+
+**Produces:** `invite` table (token hash, scope, inviter, expiry, single-use),
+`POST /api/admin/invites`, `GET /auth/invite/{token}`, `POST /auth/invite/{token}/accept`.
+
+An invite may grant **only into spaces the inviter administers** (D-M2-2) — enforced
+server-side against the permission engine, not by hiding options in the interface. Tokens
+are stored hashed, single-use, and expiring; accepting one creates a local principal whose
+password the recipient chooses (D-M2-3).
+
+Tests: an invite scoped to a space the inviter does *not* administer is rejected; a used
+token cannot be reused; an expired token is refused; the created principal can reach the
+invited space and nothing else.
+
+---
+
+## Task 8: "What can this person see?"
+
+**Produces:** `GET /api/admin/view-as/{principal}/tree` and a console view.
+
+Runs the real permission engine under a substituted principal. Three properties, each
+tested:
+
+- **Read-only.** The substitution must be impossible to carry into a write — a mutating
+  request while viewing-as is refused outright, not silently performed as the real user.
+- **No escalation.** Viewing as someone must never reveal more than they can see, even to
+  an admin who could see it anyway by other means; the output is exactly their view.
+- **Audited.** Every activation is written to the audit log with both identities.
+
+The interface must state whose view is shown, persistently and unmissably.
+
 ## Milestone exit criteria
 
 - [ ] `just ci` passes.
+- [ ] A first-time Authelia sign-in gets exactly the reach its group implies — `admins`
+      everything, `users` public plus internal, anyone else public only.
+- [ ] A space admin can invite a guest into their own space and **cannot** scope an invite
+      to a space they do not administer.
+- [ ] A guest signs in **without Authelia** and reaches only what they were granted.
+- [ ] Viewing-as another principal shows exactly their view, refuses writes, and is audited.
+- [ ] **The `import authelia` lines are gone from both wiki site blocks**, a published page
+      is readable anonymously, and a restricted one is not.
 - [ ] A local guest account can be created in the admin console, added to a team, granted
       read on one subtree, and signs in.
 - [ ] That guest sees **only** the granted subtree plus public pages, in the tree and by
