@@ -116,7 +116,11 @@ impl AppState {
     /// the shim would appear to be ignored, and the obvious next move is to weaken
     /// something until content shows up again.
     async fn principal_from_dev_shim(&self, dev: &Identity) -> Option<Principal> {
-        let username = dev.user.as_deref().map(str::trim).filter(|u| !u.is_empty())?;
+        let username = dev
+            .user
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())?;
 
         match self.store.principal_by_username(username).await {
             Ok(Some((principal, _))) => Some(principal),

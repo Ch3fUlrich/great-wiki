@@ -8,6 +8,21 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- API authorisation now runs through the permission engine. `may_read` is deleted rather
+  than deprecated, and `Store::tree`, `Store::document_by_path` and `Store::pool` are all
+  crate-private — so no code outside the storage layer can obtain an unfiltered document,
+  an unfiltered tree, or raw database access to go around either.
+- Principals are re-read from the store on every request, so revoking a grant or
+  deactivating an account takes effect on the next click rather than at the next sign-in.
+- The development identity now drives the real engine rather than bypassing it: its groups
+  determine its reach, so local work exercises the same rules production does.
+
+### Changed
+
+- An authenticated account no longer reaches restricted content by virtue of being signed
+  in. Reach follows the Authelia group, so an account by itself confers nothing beyond
+  public.
+
 - Identity storage: principals (from OpenID Connect or local accounts), teams and
   memberships, path-scoped access grants that inherit down the document tree, and an audit
   log.

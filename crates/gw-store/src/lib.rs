@@ -11,7 +11,12 @@ use sqlx::SqlitePool;
 use std::str::FromStr;
 
 pub struct Store {
-    pub pool: SqlitePool,
+    /// Crate-private, for the same reason [`Store::tree`] is. A caller holding the pool can
+    /// `SELECT * FROM documents` and has bypassed every check in this crate, which would
+    /// leave the invariant true only of the methods and not of the type. Nothing outside
+    /// `gw-store` needs it: a query that does not exist here yet should become a method
+    /// here, where the permission engine is already in scope.
+    pub(crate) pool: SqlitePool,
 }
 
 impl Store {
@@ -180,7 +185,11 @@ mod tests {
     #[tokio::test]
     async fn missing_document_is_none_not_an_error() {
         let store = Store::open("sqlite::memory:").await.unwrap();
-        assert!(store.document_by_path_unchecked("/nope").await.unwrap().is_none());
+        assert!(store
+            .document_by_path_unchecked("/nope")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

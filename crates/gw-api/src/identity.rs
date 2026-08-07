@@ -14,23 +14,16 @@ pub struct Identity {
 }
 
 impl Identity {
-    pub fn anonymous() -> Self {
-        Self::default()
-    }
-
     pub fn dev(user: &str, groups: &[&str]) -> Self {
         Self {
             user: Some(user.to_string()),
             groups: groups.iter().map(|g| g.to_string()).collect(),
         }
     }
-
-    /// A blank username is anonymous, not "a user called empty string".
-    pub fn is_authenticated(&self) -> bool {
-        self.user.as_deref().is_some_and(|u| !u.trim().is_empty())
-    }
-
-    pub fn in_group(&self, group: &str) -> bool {
-        self.groups.iter().any(|g| g == group)
-    }
 }
+
+// `anonymous()`, `is_authenticated()` and `in_group()` are gone with the visibility stub
+// that used them. They were a second way to ask an authorisation question, and a second
+// way is how the two answers eventually disagree: `Principal::is_authenticated` and
+// `gw_auth::can` are now the only ones. There is no anonymous *shim* either — the absence
+// of a shim is spelled `None`, and it resolves to `Principal::anonymous()`.
