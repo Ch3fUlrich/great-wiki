@@ -126,9 +126,23 @@ impl Store {
     /// level: a wiki's tree is small enough that one round trip beats N, and the ordering
     /// is then unambiguous.
     ///
-    /// NOTE: this returns every document. Permission filtering is added in M2 by taking a
-    /// principal and joining the ACL — it is NOT a caller's responsibility to filter, and
-    /// M2 must change this signature rather than leaving an unfiltered variant available.
+    /// UNFILTERED. Use [`Store::tree_for`], which takes a principal and is the only tree
+    /// accessor any caller should ever reach for.
+    ///
+    /// STILL BLOCKED, and this is the one thing M2 is not yet finished with: this method
+    /// must become `pub(crate)`, so that no caller outside this crate can obtain an
+    /// unfiltered tree and no later handler can leak one by forgetting to filter. The
+    /// change is one word, but it does not compile until the three remaining callers are
+    /// gone, and all three live in `gw-api`:
+    ///
+    /// - `gw-api/src/routes/tree.rs` — the M1 handler, which post-filters with `may_read`
+    ///   (M2 Task 4 deletes both, routing the handler through `tree_for` instead);
+    /// - `gw-api/tests/seed.rs`, two assertions that only need "is the tree empty".
+    ///
+    /// `gw-api` does not depend on `gw-auth`, so it cannot construct a `Principal` to call
+    /// `tree_for` with until Task 4 adds that dependency. Flipping this word is therefore
+    /// the FIRST step of Task 4, not the last step of Task 3.
+    #[doc(hidden)]
     pub async fn tree(&self) -> Result<Vec<TreeNode>> {
         #[derive(FromRow)]
         struct Row {

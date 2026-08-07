@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+gw-auth = { path = "../gw-auth" }
 gw-core = { path = "../gw-core" }
 anyhow = { workspace = true }
 serde = { workspace = true }

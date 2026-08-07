@@ -8,6 +8,17 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- Identity storage: principals (from OpenID Connect or local accounts), teams and
+  memberships, path-scoped access grants that inherit down the document tree, and an audit
+  log.
+- Default reach follows the verified Authelia group, held in a `group_roles` table rather
+  than in code, so mapping a new group is a row and not a release. `admins` reach
+  restricted content, `users` reach internal, anything unmapped reaches public only —
+  expressed as the *absence* of a row, so a forgotten configuration can never widen access.
+  The admin baseline confers reads only; writing still needs an explicit grant.
+- Grants do not union up the tree: the nearest ancestor holding any grants wins outright,
+  which is what makes it possible to narrow access on a subtree rather than only widen it.
+
 - The proxy shared secret is now an enforced per-request check rather than a startup
   assertion. Requests without it, or with a wrong value, are refused before routing — so an
   unknown path returns 403 rather than 404 and cannot be used to probe what exists.

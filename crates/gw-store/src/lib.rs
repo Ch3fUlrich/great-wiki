@@ -1,5 +1,8 @@
+pub mod acl;
 pub mod documents;
+pub mod principals;
 
+pub use acl::Baseline;
 pub use documents::{NewDocument, StoredDocument, TreeNode};
 
 use anyhow::Result;
@@ -204,6 +207,634 @@ mod tests {
             vec!["alpha", "beta"],
             "children must respect sort_key"
         );
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Identity, ACLs and effective permissions (M2 Task 3, including D-M2-1).
+    // ---------------------------------------------------------------------------------
+
+    use gw_auth::{Action, Permission, Principal, Subject};
+
+    async fn seeded() -> Store {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        store
+            .insert_document(&new_doc(None, "Handbuch", Visibility::Restricted))
+            .await
+            .unwrap();
+        store
+            .insert_document(&new_doc(
+                Some("/handbuch"),
+                "Onboarding",
+                Visibility::Restricted,
+            ))
+            .await
+            .unwrap();
+        store
+            .insert_document(&new_doc(None, "Öffentlich", Visibility::Public))
+            .await
+            .unwrap();
+        store
+            .insert_document(&new_doc(None, "Intern", Visibility::Internal))
+            .await
+            .unwrap();
+        store
+    }
+
+    fn titles(nodes: &[TreeNode]) -> Vec<&str> {
+        nodes.iter().map(|n| n.title.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn an_oidc_principal_is_created_on_first_login_and_updated_after() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let first = store
+            .upsert_oidc_principal("sergej", "Sergej", None, &["users".into()])
+            .await
+            .unwrap();
+        let second = store
+            .upsert_oidc_principal(
+                "sergej",
+                "Sergej Maul",
+                None,
+                &["users".into(), "admins".into()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first.id, second.id,
+            "the same user must not create a second principal"
+        );
+        assert_eq!(second.display_name, "Sergej Maul");
+        // Groups are refreshed from the verified claim: losing a group must take effect.
+        assert_eq!(second.groups, vec!["users", "admins"]);
+    }
+
+    #[tokio::test]
+    async fn oidc_groups_are_replaced_on_upsert_never_merged() {
+        // Merging would make removal impossible: someone dropped from `admins` in
+        // Authelia would keep the reach forever.
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        store
+            .upsert_oidc_principal("sergej", "Sergej", None, &["users".into(), "admins".into()])
+            .await
+            .unwrap();
+        let after = store
+            .upsert_oidc_principal("sergej", "Sergej", None, &["users".into()])
+            .await
+            .unwrap();
+        assert_eq!(after.groups, vec!["users"]);
+        assert_eq!(
+            store.baseline_for(&after).await.unwrap(),
+            Baseline::Internal,
+            "losing `admins` must lose the admin baseline"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_principal_carries_its_credential_and_no_groups() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let guest = store
+            .create_local_principal("gast", "Gast", None, "$argon2id$fake")
+            .await
+            .unwrap();
+        assert_eq!(guest.kind, gw_auth::PrincipalKind::Local);
+        assert!(guest.groups.is_empty());
+
+        let (_, hash) = store.principal_by_username("gast").await.unwrap().unwrap();
+        assert_eq!(hash.as_deref(), Some("$argon2id$fake"));
+
+        // An OIDC principal has no credential row at all, rather than a NULL to compare.
+        store
+            .upsert_oidc_principal("sergej", "Sergej", None, &[])
+            .await
+            .unwrap();
+        let (_, none) = store
+            .principal_by_username("sergej")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(none.is_none());
+    }
+
+    #[tokio::test]
+    async fn team_membership_loads_onto_the_principal() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let guest = store
+            .create_local_principal("gast", "Gast", None, "x")
+            .await
+            .unwrap();
+        store.create_team("editors", "Redaktion").await.unwrap();
+        store.add_team_member("editors", &guest.id).await.unwrap();
+
+        let (loaded, _) = store.principal_by_username("gast").await.unwrap().unwrap();
+        assert_eq!(loaded.teams, vec!["editors"]);
+    }
+
+    #[tokio::test]
+    async fn deactivating_a_principal_is_visible_on_the_next_load() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let guest = store
+            .create_local_principal("gast", "Gast", None, "x")
+            .await
+            .unwrap();
+        assert!(guest.active);
+        store.set_principal_active(&guest.id, false).await.unwrap();
+        let (loaded, _) = store.principal_by_username("gast").await.unwrap().unwrap();
+        assert!(!loaded.active);
+    }
+
+    #[tokio::test]
+    async fn grants_inherit_down_the_tree() {
+        let store = seeded().await;
+        store
+            .add_grant(
+                "/handbuch",
+                Subject::Team("editors".into()),
+                Permission::Read,
+            )
+            .await
+            .unwrap();
+
+        let grants = store.grants_for_path("/handbuch/onboarding").await.unwrap();
+        assert_eq!(grants.len(), 1, "a child must inherit its parent's grants");
+        assert_eq!(grants[0].permission, Permission::Read);
+    }
+
+    #[tokio::test]
+    async fn a_descendant_grant_overrides_rather_than_adds() {
+        let store = seeded().await;
+        store
+            .add_grant(
+                "/handbuch",
+                Subject::Team("editors".into()),
+                Permission::Admin,
+            )
+            .await
+            .unwrap();
+        store
+            .add_grant(
+                "/handbuch/onboarding",
+                Subject::Team("editors".into()),
+                Permission::Read,
+            )
+            .await
+            .unwrap();
+
+        let grants = store.grants_for_path("/handbuch/onboarding").await.unwrap();
+        assert_eq!(
+            grants.len(),
+            1,
+            "the nearest ancestor with grants wins outright"
+        );
+        assert_eq!(grants[0].permission, Permission::Read);
+    }
+
+    #[tokio::test]
+    async fn a_descendant_grant_can_narrow_access_a_parent_grant_gave() {
+        // The reason grants do not union upward: narrowing a subtree must be possible.
+        let store = seeded().await;
+        store
+            .add_grant(
+                "/handbuch",
+                Subject::Team("editors".into()),
+                Permission::Admin,
+            )
+            .await
+            .unwrap();
+        store
+            .add_grant(
+                "/handbuch/onboarding",
+                Subject::Team("leitung".into()),
+                Permission::Read,
+            )
+            .await
+            .unwrap();
+        let editor = Principal::test("ed", &[], &["editors"]);
+
+        assert!(store
+            .document_for(&editor, "/handbuch", Action::Read)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            store
+                .document_for(&editor, "/handbuch/onboarding", Action::Read)
+                .await
+                .unwrap()
+                .is_none(),
+            "a nearer grant that does not name the caller must take the subtree away"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_tree_hides_documents_the_principal_cannot_read() {
+        let store = seeded().await;
+        let guest = Principal::test("guest", &[], &[]);
+
+        let tree = store.tree_for(&guest).await.unwrap();
+        assert_eq!(
+            titles(&tree),
+            vec!["Öffentlich"],
+            "restricted branches must not appear at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_granted_team_member_sees_the_restricted_branch() {
+        let store = seeded().await;
+        store
+            .add_grant(
+                "/handbuch",
+                Subject::Team("editors".into()),
+                Permission::Read,
+            )
+            .await
+            .unwrap();
+        let editor = Principal::test("ed", &[], &["editors"]);
+
+        let tree = store.tree_for(&editor).await.unwrap();
+        let handbuch = tree
+            .iter()
+            .find(|n| n.path == "/handbuch")
+            .expect("branch should appear");
+        assert_eq!(
+            handbuch.children.len(),
+            1,
+            "the granted subtree comes with it"
+        );
+    }
+
+    #[tokio::test]
+    async fn document_for_enforces_the_action_not_just_readability() {
+        let store = seeded().await;
+        store
+            .add_grant(
+                "/handbuch",
+                Subject::Team("editors".into()),
+                Permission::Read,
+            )
+            .await
+            .unwrap();
+        let editor = Principal::test("ed", &[], &["editors"]);
+
+        assert!(store
+            .document_for(&editor, "/handbuch", Action::Read)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .document_for(&editor, "/handbuch", Action::Write)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn document_for_is_none_for_an_absent_path() {
+        // Absent and forbidden are both `None` here on purpose; the HTTP layer decides
+        // which to reveal.
+        let store = seeded().await;
+        let editor = Principal::test("ed", &[], &["editors"]);
+        assert!(store
+            .document_for(&editor, "/gibt-es-nicht", Action::Read)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_deactivated_principal_loses_granted_access_immediately() {
+        let store = seeded().await;
+        store
+            .add_grant(
+                "/handbuch",
+                Subject::Team("editors".into()),
+                Permission::Admin,
+            )
+            .await
+            .unwrap();
+        let mut editor = Principal::test("ed", &[], &["editors"]);
+        editor.active = false;
+
+        assert!(store
+            .document_for(&editor, "/handbuch", Action::Read)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .tree_for(&editor)
+            .await
+            .unwrap()
+            .iter()
+            .all(|n| n.path != "/handbuch"));
+    }
+
+    // --- D-M2-1: default reach follows the verified Authelia group ---------------------
+
+    #[tokio::test]
+    async fn a_local_principal_with_no_groups_reaches_only_public_content() {
+        // The row that matters most: "I gave someone an account" must never silently
+        // become "I gave them the internal wiki". Local guests have no Authelia groups.
+        let store = seeded().await;
+        let guest = store
+            .create_local_principal("gast", "Gast", None, "x")
+            .await
+            .unwrap();
+
+        assert_eq!(store.baseline_for(&guest).await.unwrap(), Baseline::Public);
+        assert!(store
+            .document_for(&guest, "/oeffentlich", Action::Read)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            store
+                .document_for(&guest, "/intern", Action::Read)
+                .await
+                .unwrap()
+                .is_none(),
+            "an account by itself must not confer the internal wiki"
+        );
+        assert!(store
+            .document_for(&guest, "/handbuch", Action::Read)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            titles(&store.tree_for(&guest).await.unwrap()),
+            ["Öffentlich"]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_users_group_reaches_internal_but_not_restricted() {
+        let store = seeded().await;
+        let member = store
+            .upsert_oidc_principal("sergej", "Sergej", None, &["users".into()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.baseline_for(&member).await.unwrap(),
+            Baseline::Internal
+        );
+        assert!(store
+            .document_for(&member, "/intern", Action::Read)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            store
+                .document_for(&member, "/handbuch", Action::Read)
+                .await
+                .unwrap()
+                .is_none(),
+            "`users` is public plus internal, never restricted without a grant"
+        );
+        assert_eq!(
+            titles(&store.tree_for(&member).await.unwrap()),
+            ["Intern", "Öffentlich"]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_admins_group_reaches_restricted_content_without_a_grant() {
+        let store = seeded().await;
+        let admin = store
+            .upsert_oidc_principal("sergej", "Sergej", None, &["admins".into()])
+            .await
+            .unwrap();
+
+        assert_eq!(store.baseline_for(&admin).await.unwrap(), Baseline::Admin);
+        assert!(store
+            .document_for(&admin, "/handbuch", Action::Read)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            titles(&store.tree_for(&admin).await.unwrap()),
+            ["Handbuch", "Intern", "Öffentlich"]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_admin_baseline_does_not_confer_writing() {
+        // Reach is about reading. Writing still needs a grant, so a stray `admins`
+        // membership cannot silently become edit rights on every page.
+        let store = seeded().await;
+        let admin = store
+            .upsert_oidc_principal("sergej", "Sergej", None, &["admins".into()])
+            .await
+            .unwrap();
+        assert!(store
+            .document_for(&admin, "/handbuch", Action::Write)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unmapped_group_confers_public_only() {
+        let store = seeded().await;
+        let outsider = store
+            .upsert_oidc_principal("extern", "Extern", None, &["lieferanten".into()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.baseline_for(&outsider).await.unwrap(),
+            Baseline::Public,
+            "a group with no row confers nothing beyond public"
+        );
+        assert_eq!(
+            titles(&store.tree_for(&outsider).await.unwrap()),
+            ["Öffentlich"]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_strongest_baseline_across_the_groups_wins() {
+        let store = seeded().await;
+        let both = store
+            .upsert_oidc_principal(
+                "sergej",
+                "Sergej",
+                None,
+                &["lieferanten".into(), "users".into(), "admins".into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.baseline_for(&both).await.unwrap(), Baseline::Admin);
+    }
+
+    #[tokio::test]
+    async fn mapping_a_new_group_is_a_row_not_a_release() {
+        let store = seeded().await;
+        let outsider = store
+            .upsert_oidc_principal("extern", "Extern", None, &["lieferanten".into()])
+            .await
+            .unwrap();
+        assert!(store
+            .document_for(&outsider, "/intern", Action::Read)
+            .await
+            .unwrap()
+            .is_none());
+
+        store
+            .set_group_role("lieferanten", Baseline::Internal)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.baseline_for(&outsider).await.unwrap(),
+            Baseline::Internal
+        );
+        assert!(store
+            .document_for(&outsider, "/intern", Action::Read)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn the_seeded_mapping_is_admins_and_users_only() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let mut roles = store.group_roles().await.unwrap();
+        roles.sort();
+        assert_eq!(
+            roles,
+            vec![
+                ("admins".to_string(), Baseline::Admin),
+                ("users".to_string(), Baseline::Internal),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_caller_carrying_a_forged_group_gets_no_baseline() {
+        // Authentication before groups, always. A `groups` list on a request that is not
+        // signed in is not evidence of anything.
+        let store = seeded().await;
+        let mut forged = Principal::anonymous();
+        forged.groups = vec!["admins".into()];
+
+        assert_eq!(store.baseline_for(&forged).await.unwrap(), Baseline::Public);
+        assert!(store
+            .document_for(&forged, "/handbuch", Action::Read)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .document_for(&forged, "/intern", Action::Read)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            titles(&store.tree_for(&forged).await.unwrap()),
+            ["Öffentlich"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deactivated_admin_loses_the_baseline_but_keeps_public_reads() {
+        let store = seeded().await;
+        let mut admin = store
+            .upsert_oidc_principal("sergej", "Sergej", None, &["admins".into()])
+            .await
+            .unwrap();
+        store.set_principal_active(&admin.id, false).await.unwrap();
+        admin.active = false;
+
+        assert_eq!(store.baseline_for(&admin).await.unwrap(), Baseline::Public);
+        assert!(store
+            .document_for(&admin, "/handbuch", Action::Read)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            store
+                .document_for(&admin, "/oeffentlich", Action::Read)
+                .await
+                .unwrap()
+                .is_some(),
+            "suspending an account must not make the public site disappear"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_grant_still_reaches_a_principal_with_no_baseline() {
+        // The baseline narrows the DEFAULT. An explicit grant is unaffected by it.
+        let store = seeded().await;
+        let guest = store
+            .create_local_principal("gast", "Gast", None, "x")
+            .await
+            .unwrap();
+        store
+            .add_grant(
+                "/handbuch",
+                Subject::Principal(guest.id.clone()),
+                Permission::Read,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.baseline_for(&guest).await.unwrap(), Baseline::Public);
+        assert!(store
+            .document_for(&guest, "/handbuch", Action::Read)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            titles(&store.tree_for(&guest).await.unwrap()),
+            ["Handbuch", "Öffentlich"],
+            "the granted subtree plus public pages, and nothing else"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_anyone_grant_reaches_an_anonymous_caller_at_that_permission_only() {
+        let store = seeded().await;
+        store
+            .add_grant("/handbuch", Subject::Anyone, Permission::Read)
+            .await
+            .unwrap();
+        let anon = Principal::anonymous();
+
+        assert!(store
+            .document_for(&anon, "/handbuch", Action::Read)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .document_for(&anon, "/handbuch", Action::Write)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unrecognised_subject_kind_confers_nothing() {
+        // A row written by a future version, or by hand, must never be guessed at. The
+        // CHECK constraint is suspended for the length of the insert so the test can
+        // produce the row a CHECK is meant to prevent, and prove the code refuses it too.
+        let store = seeded().await;
+        for statement in [
+            "PRAGMA ignore_check_constraints = ON",
+            "INSERT INTO acl (id, path, subject_kind, subject_id, permission) \
+             VALUES ('x', '/handbuch', 'zukunft', NULL, 'read')",
+            "PRAGMA ignore_check_constraints = OFF",
+        ] {
+            sqlx::query(statement).execute(&store.pool).await.unwrap();
+        }
+
+        assert!(store.grants_for_path("/handbuch").await.unwrap().is_empty());
+        let anon = Principal::anonymous();
+        assert!(store
+            .document_for(&anon, "/handbuch", Action::Read)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

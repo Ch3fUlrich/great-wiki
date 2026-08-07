@@ -610,6 +610,7 @@ name = "gw-store"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "gw-auth",
  "gw-core",
  "serde",
  "serde_json",
