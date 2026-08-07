@@ -1,0 +1,37 @@
+[package]
+name = "gw-api"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "gw_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "great-wiki"
+path = "src/main.rs"
+
+[dependencies]
+gw-core = { path = "../gw-core" }
+gw-store = { path = "../gw-store" }
+anyhow = { workspace = true }
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# sqlx is a DIRECT dependency because handlers query. The predecessor plan omitted it
+# from this crate's manifest while calling sqlx from four of its modules.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "limit"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tower = { version = "0.5", features = ["util"] }

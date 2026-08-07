@@ -4,6 +4,10 @@
 //! a filesystem or a network. Round-trip fidelity of the export format is proven in
 //! this crate.
 
+pub mod block;
+pub mod document;
 pub mod slug;
 
+pub use block::{Block, BlockKind, Heading};
+pub use document::{DocumentType, Visibility};
 pub use slug::slugify;

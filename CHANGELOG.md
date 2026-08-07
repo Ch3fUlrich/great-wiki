@@ -8,6 +8,22 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- Document content model: a ProseMirror-shaped `Block` tree with plain-text extraction and
+  a heading outline whose anchor ids are transliterated to ASCII. `Visibility` defaults to
+  `Restricted`, so a document arriving with no stated visibility is never world-readable.
+- SQLite store with the initial schema: documents keyed by a materialised path, with
+  sibling ordering, soft delete, and a UNIQUE path so a slug collision fails loudly instead
+  of silently overwriting a page.
+- `great-wiki` binary with `serve` and `check`, and fail-closed startup validation: a
+  synthesised development identity cannot be combined with a non-loopback bind, a public
+  bind without a proxy secret is refused, and port 8090 is rejected outright because
+  `omnigraph-viewer` already owns it.
+- Read API — `/api/health`, `/api/tree`, `/api/documents/{*path}` — with visibility enforced
+  in the retriever. Restricted documents return 403 rather than a misleading 404, and
+  restricted titles are filtered out of the navigation tree entirely.
+- Integration tests that exercise the real router rather than calling handlers directly, so
+  a route registered without its permission check cannot pass the suite.
+
 - Rust workspace with `gw-core`, the pure-domain crate, and the `cargo test` /
   `clippy -D warnings` / `fmt --check` gate that every later task must pass.
 - `slugify` with German transliteration (ä→ae, ö→oe, ü→ue, ß→ss), so German titles produce
