@@ -974,7 +974,7 @@ git commit -m "feat(documents): move, duplicate, templates and recoverable trash
 
 ## Self-Review
 
-**Spec coverage.** Implements spec §1.1 criteria 1–3 (edit the rendered page, concurrent
+**Spec coverage.** Implements spec §1.2 criteria 1–3 (edit the rendered page, concurrent
 edits both survive, agents merge rather than overwrite), §9 in full (timeline, three diff
 modes, view source, non-destructive restore, compare arbitrary pairs), and the editing
 portion of §10.

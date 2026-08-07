@@ -14,7 +14,39 @@ truth. That premise is incompatible with the central requirement here — that p
 images, video, tables and graphs are all editable through the rendered page — so the
 storage model is inverted and the plan is superseded rather than amended.
 
-### 1.1 Success criteria
+### 1.1 The shape of the thing
+
+**Timeline-based development of knowledge, toward publication. Research-level precision,
+designer-level formatting, easy to use.**
+
+That sentence governs every trade-off below, so it is worth unpacking:
+
+- **Timeline-based development.** A page is not a document that gets edited; it is an idea
+  that matures. The system treats that maturation as first-class — a note becomes research,
+  research acquires evidence, evidence supports a claim, a claim gets published. The
+  timeline shows how the knowledge got to where it is, not merely that bytes changed.
+- **Toward publication.** There is a difference between the working state and the published
+  state, and the system knows it. Publishing is a deliberate act producing a designed
+  artefact, not just "the latest revision made visible".
+- **Research-level precision.** Claims carry provenance. Sources are cited, not merely
+  linked. A figure knows which dataset produced it. "Where did this come from" always has
+  an answer.
+- **Designer-level formatting.** The published output should look like someone designed it,
+  without the author having to be a designer. Typography, spacing, hierarchy and colour are
+  the system's responsibility.
+- **Easy to use.** Everything above must be reachable by someone who just wants to write a
+  page. Precision that requires ceremony gets skipped, and skipped precision is worse than
+  none because it looks present.
+
+Three consequences bind the design. Document **status** is a first-class axis independent
+of visibility (§4) — `draft`, `developing`, `review`, `published` — so "not finished" and
+"not permitted" never get conflated. Every claim-supporting artefact — a citation, a
+dataset, a figure — is a **first-class entity with its own identity**, not text inside a
+paragraph, which is what makes provenance queryable rather than merely written down. And
+the design system is applied, not authored: the editor offers semantic choices ("this is a
+callout", "this is a figure caption") rather than typographic ones.
+
+### 1.2 Success criteria
 
 1. A person with no technical knowledge can open a page, click into it, change a sentence,
    paste an image, and see the result — without learning markdown.
@@ -120,6 +152,18 @@ overrides. Three visibility levels: `public`, `internal` (any authenticated), `r
 **Structured data** — `dataset`, `dataset_field` (typed: text, number, bool, date, select,
 multi_select, tags, url, relation, rollup, formula, person, file), `dataset_row`,
 `dataset_view` (kind + saved config), `ingestion_recipe`.
+
+**Status** is a first-class axis on `document`, independent of `visibility`:
+`draft` → `developing` → `review` → `published`, plus `archived`. Conflating "not finished"
+with "not permitted" is a common wiki failure — it makes every unfinished page look secret
+and every secret page look unfinished. They are separate columns and separate filters.
+
+**Knowledge intelligence** — `entity` (a concept, term, dataset, figure or citation with its
+own identity, so a reference to it is resolvable and renameable), `entity_mention` (where an
+entity is referenced, with position), `claim` (an assertion a document makes), `evidence`
+(what supports or contradicts a claim, pointing at a reference, dataset or another
+document), and `claim_edge` (`supports`, `contradicts`, `supersedes`, `cites`) with a
+`confidence` grade of `stated`, `inferred` or `uncertain`. See §11.5.
 
 **Knowledge** — `tag`, `document_tag`, `doc_link` (authored references), `edge` (derived:
 from, to, kind, weight, reason), `embedding` (chunk-level), `reference` (citations: DOI,
@@ -384,6 +428,48 @@ discoverable.
 `graphify export wiki` already renders roughly this as markdown. It must not be shipped —
 it would violate §1's storage model — but its implementation is a working reference for the
 layout and is worth reading before designing the panels.
+
+### 11.5 Content intelligence — the same three capabilities, turned inward
+
+Serena, Graphify and Omnigraph solve, for code, exactly the three problems this platform
+has for prose. great-wiki does **not** call those servers to serve its own users — they are
+loopback-only developer tooling, single-project, and unavailable during maintenance (§11.1).
+It reimplements the three *capabilities* over its own content, reusing their approaches and,
+where licensing allows, their code.
+
+| Their tool | Its question | great-wiki's equivalent |
+|---|---|---|
+| **Serena** | "Where is this symbol defined, and what references it?" | **Entity resolution.** Concepts, datasets, citations, figures and terms are addressable entities. Jump to definition; list every page that references a term; rename an entity and update every reference |
+| **Graphify** | "What connects X to Y, and what does this change reach?" | **Corpus structure.** Whole-corpus graph with Louvain communities, hub ("god") nodes, cohesion scores, surprising connections, and blast radius — "changing this claim reaches N pages" |
+| **Omnigraph** | "What did we decide, and why?" | **Typed knowledge.** Claims, evidence, decisions and open questions as typed nodes with typed edges (`supports`, `contradicts`, `supersedes`, `cites`), so the reasoning behind a page is queryable, not buried in prose |
+
+**What is reused rather than reinvented:**
+
+- **Graphify is MIT-licensed Python**, and its analysis layer is directly portable:
+  `cluster()` (Louvain with a hub-exclusion percentile), `god_nodes()`, `cohesion_score()`,
+  `surprising_connections()`, `graph_diff()` and `compute_pr_impact()` — the last being
+  exactly the blast-radius computation, generalised from changed files to changed entities.
+  Its node/edge schema is also worth adopting wholesale: a `confidence` grade
+  (`EXTRACTED` / `INFERRED` / `AMBIGUOUS`) on every edge, and a `rationale` node type edged
+  to what it explains. Both map onto prose better than they map onto code.
+- **Omnigraph's discipline, not its storage** (ADR 0004): typed nodes and typed edges with
+  no generic `relates-to`; key-based idempotent upsert; and the lint that a node whose only
+  edge is to its hub is under-linked.
+- **Serena's model**: a language server resolves symbols precisely on demand rather than
+  maintaining a whole-corpus index. The prose equivalent resolves an entity reference at
+  authoring time and validates it on change — the same "precise oracle, not bulk index"
+  split that keeps the render path fast.
+
+**Semantic extraction** — turning prose into entities, claims and typed edges — runs through
+**LiteLLM (`deepseek-v4-flash`)**, the same route graphify's own document extraction uses.
+It is a background job, never in the request path, and its output is **proposed** for human
+confirmation rather than applied: an extractor silently asserting that one page contradicts
+another is how a knowledge base acquires confident nonsense.
+
+This is what makes the "development of knowledge" in §1.1 tractable. Without typed claims
+and evidence, a timeline can only show that text changed. With them, it can show that a
+claim gained support, lost it, or was superseded — which is the thing actually worth
+watching.
 
 ## 12. Interface requirements
 
