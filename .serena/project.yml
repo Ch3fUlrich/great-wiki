@@ -1,23 +1,30 @@
 # Serena project configuration for great-wiki.
 #
-# WHY THE LANGUAGE LIST IS SHORT AND CONSERVATIVE:
-# A language whose server is not present in the running serena-mcp image does NOT
-# degrade to "no symbols for that language". Its `initialize` fails, the language
-# server MANAGER fails with it, and EVERY symbol tool then errors with
-# "The language server manager is not initialized" -- naming neither the language
-# nor the cause. The repo goes dark. `markdown` is the classic offender (its
-# marksman LSP crashes the image) and is deliberately absent below.
+# WHY THIS LIST IS EXACTLY THIS LIST:
+# A language whose server fails to start does NOT degrade to "no symbols for that
+# language". Its `initialize` fails, the language server MANAGER fails with it, and
+# EVERY symbol tool then errors with "The language server manager is not
+# initialized" -- naming neither the language nor the cause. The repo goes dark.
 #
-# Proven working in the current image: bash, json, python, rust, toml, yaml.
+# VERIFIED against the running serena-mcp container (2026-08-07), not assumed.
+# Staged servers include typescript-language-server 5.1.3,
+# vscode-html-language-server and some-sass-language-server 2.3.8. The container's
+# own log from the 2026-07-20 incident shows typescript, html, scss, toml and rust
+# ALL starting successfully -- only `markdown` failed. The widely-repeated
+# "proven working: bash, json, python, rust, toml, yaml" list is therefore too
+# conservative, and semantic navigation of web/ is available.
 #
-# TYPESCRIPT/SVELTE ARE NOT LISTED YET -- ON PURPOSE.
-# This project has a large TypeScript + Svelte frontend under web/, so semantic
-# navigation there would be valuable. But adding an unsupported language takes the
-# WHOLE server down, so it must be verified against the running image first:
-#   docker exec serena-mcp ls <language-servers-dir>   # confirm ts server present
-# Add "typescript" here only after that check passes, then RESTART serena-mcp.
-# Until then, use the built-in Read/Grep tools for web/.
-languages: ["rust", "toml", "yaml", "json", "bash", "python"]
+# `markdown` stays out. marksman IS in the image (21 MB) -- the usual claim that it
+# is missing is wrong -- but it is a .NET binary and the image has no libicu, so it
+# aborts with "Couldn't find a valid ICU package installed on the system".
+#
+# `javascript` and `css` are not separate enum members. Use typescript and scss.
+#
+# `svelte` is deliberately absent: the module exists but has NEVER been started in
+# this container (no staged directory, no log line), and it npm-installs
+# typescript@6.0.3 -- a different major than the staged 5.9.3. Add it ALONE,
+# restart serena-mcp, and read the container log before trusting it.
+languages: ["rust", "toml", "yaml", "json", "bash", "python", "typescript", "html", "scss"]
 
 encoding: "utf-8"
 

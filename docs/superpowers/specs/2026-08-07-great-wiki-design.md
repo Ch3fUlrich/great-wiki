@@ -273,7 +273,119 @@ port), and a browser web clipper.
 **Platform** — installable PWA with offline *reading*, multi-language documents as linked
 translation siblings, soft delete, and hygiene analytics (stale, orphaned, broken links).
 
-## 11. Interface requirements
+## 11. Knowledge graph, code integration and the MCP stack
+
+Three servers already exist in this estate — Serena, Graphify and Omnigraph. They are
+complements, not alternatives, and the design uses each for the one thing it is good at.
+
+### 11.1 Graph storage lives in SQLite, not Omnigraph
+
+Omnigraph is agent *memory*, not this product's storage layer. Four reasons, in weight order:
+
+1. **Availability.** `structured-memory` states plainly that there is no fallback and that
+   memory is "an accelerator, not a correctness dependency". That is right for memory and
+   wrong for a product's primary read path. Applying any schema change stops the server for
+   *every* graph — `apply-cluster.sh` does `docker stop` to release the state lock. A wiki
+   whose pages stop rendering during an unrelated graph's migration is not acceptable.
+2. **Permission filtering.** `.gq` has no row-level security. §6.1 requires filtering inside
+   the retriever on every path; that can be made structural in SQLite (a permission-joined
+   view, a builder that cannot emit an unfiltered read) and can only be a convention in `.gq`.
+3. **Expressiveness.** `.gq` has no variable-length traversal — multi-hop must be written
+   hop by hop. SQLite's `WITH RECURSIVE` does exactly this, and FTS5 and vector scanning sit
+   in the same store.
+4. **Maturity for this role.** The live cluster holds 621 nodes total across five graphs,
+   with 253 of 256 `Decision` vectors null — semantic search is currently dead cluster-wide
+   — four unfixed embedding defects, no API to delete an individual edge, and an hourly cron
+   job whose purpose is removing duplicate edges. An acceptable risk profile for memory; not
+   for storage.
+
+**What Omnigraph keeps doing:** holding this project's memory (Decisions, Rules,
+Conventions, Components, Tasks) exactly as the skill prescribes. Optionally, a *one-way,
+best-effort* projection of the document graph is pushed to it (`load`, `mode: merge`) so
+great-wiki's structure is queryable alongside the other repos' graphs. Export, never store —
+if it is down, the wiki does not notice.
+
+**What is worth stealing from it:** typed nodes and typed edges with no generic
+`relates-to`; `@key`-based idempotent upsert; the "a node whose only edge is to the hub is
+under-linked" lint, which is a genuinely good invariant for a wiki; and the viewer's
+server-side-token proxy pattern, where the browser never sees a credential and the page
+loads zero external assets.
+
+> **Prerequisite, currently unmet:** the `great-wiki` graph does not exist —
+> `GET /graphs/great-wiki/schema` returns 404. `add-project-graph.sh great-wiki &&
+> apply-cluster.sh` must run first, and `apply-cluster.sh` refuses while any non-`main`
+> branch exists (there are currently 12 stale `mem/homelab-server/*` branches to merge and
+> delete). Until then the `.mcp.json` bridge points at a graph that is not there.
+
+### 11.2 Graphify supplies the code graph
+
+Graphify produces a complete code-structure graph as a static `graph.json`: roughly 2.5
+seconds for a mid-size repository, no API key, no network, no LLM for the code path.
+great-wiki ingests that file directly — a serde struct and a loop — with **no graphify
+dependency at all**.
+
+What it yields: file and symbol nodes with line numbers; `calls`, `imports_from`, `contains`,
+`implements`, `references`, `method` edges each carrying a confidence grade; precomputed
+Louvain communities with names; god-node degree rankings; and `rationale` nodes, which are
+docstrings already extracted and already edged to the function they describe.
+
+Imported nodes go into **the same graph tables as document nodes**, so one traversal spans
+prose and code.
+
+Two gotchas that must be designed around, both verified:
+
+- **Svelte is parsed shallowly and its import edges are broken.** A `.svelte` file produces
+  one node; functions inside `<script>` are not extracted, and its imports resolve to
+  duplicate stub nodes with a `repo_`-prefixed id that never unify with the real module.
+  Normalise or drop those on ingest, or the graph fills with phantom modules. TypeScript,
+  by contrast, is parsed fully — interfaces, classes, methods, calls and imports.
+- **Graphify node ids are not stable across versions.** Persistent document→code links must
+  be keyed on `(repo, source_file, label)`, never on graphify's `id`.
+
+Graphify also has an HTTP transport (`--transport http`, with a per-call `project_path`),
+despite local documentation claiming stdio-only — so one long-running instance can serve
+every repository's graph if direct file ingestion ever becomes inconvenient.
+
+### 11.3 Serena is a precision oracle, used narrowly
+
+Serena answers point questions exactly: a symbol's real signature, its true LSP references
+with surrounding code, its implementations. It has no bulk export — synthesising a graph
+from it would mean one LSP round-trip per symbol through a single-threaded manager.
+
+Use it for **authoring-time enrichment only**: resolving a symbol as an author types a
+reference, and validating that a linked symbol still exists. Never on the page-render path.
+It is loopback-only, speaks MCP JSON-RPC over SSE rather than REST, holds one activated
+project at a time, and one failing language server takes the whole manager down. Every call
+sits behind a short timeout with a cached fallback.
+
+### 11.4 Documents linked to code — the actual feature
+
+Everything above is plumbing; this is the product idea. An author writes a symbol reference
+in a page, and the page gains a live view of the code it documents:
+
+| Panel | Source |
+|---|---|
+| **In the code** | symbol, file, line, degree, community |
+| **Calls** | one hop out on `calls` |
+| **Called by** | one hop in — the backlink a wiki cannot compute for itself |
+| **Blast radius** | reverse traversal: "changing this reaches N symbols across M modules", intersected with document→symbol links to add "…and 3 other pages document symbols in that radius" |
+| **Related modules** | the symbol's community, each member linkable to its own page |
+| **Why** | the `rationale` node edged to the function, rendered as an epigraph |
+
+Edge kinds for authored links: `documents` (page → symbol), `example_of`, `supersedes`,
+`decided_by` (symbol → ADR).
+
+**Staleness is a first-class state.** Store the commit the graph was built at. When
+re-ingestion finds a linked symbol gone, mark the link *broken* and surface it in the
+maintenance report — the same shape as a broken wiki link, a concept users already
+understand. This is the payoff: a code change and a documentation change become mutually
+discoverable.
+
+`graphify export wiki` already renders roughly this as markdown. It must not be shipped —
+it would violate §1's storage model — but its implementation is a working reference for the
+layout and is worth reading before designing the panels.
+
+## 12. Interface requirements
 
 Dark and light themes with system detection and a manual override. **Accessibility is
 tested, not assumed**: `aria-sort` on sortable columns, labelled controls, table captions
@@ -282,7 +394,7 @@ widths including tables. Syntax highlighting and sane print output. German and E
 content throughout, which means transliterating umlauts in slugs (`ä→ae`, `ö→oe`, `ü→ue`,
 `ß→ss`), diacritic-folding search, and locale-aware sorting and formatting.
 
-## 12. Non-goals
+## 13. Non-goals
 
 - **Video transcoding.** Uploads are stored and served as-is with range requests.
 - **Offline editing.** The PWA is read-only offline in v1; the CRDT makes this extensible.
@@ -292,7 +404,7 @@ content throughout, which means transliterating umlauts in slugs (`ä→ae`, `ö
 - **Managing homelab accounts.** See D7.
 - **Multi-tenancy.** One instance, one organisation.
 
-## 13. Risks
+## 14. Risks
 
 | Risk | Mitigation |
 |---|---|
@@ -303,7 +415,7 @@ content throughout, which means transliterating umlauts in slugs (`ä→ae`, `ö
 | Serena has no verified TypeScript server | Frontend uses built-in tools until the image is checked; do not add the language speculatively |
 | Per-user cloud credentials for backup | Encrypted at rest with a key held outside the database |
 
-## 14. Milestones
+## 15. Milestones
 
 M0 Foundations · M1 Vertical slice on a real URL · M2 Identity & access · M3 Editing core ·
 M4 Block registry · M5 Media & attachments · M6 Comments & notifications · M7 Search & AI ·
