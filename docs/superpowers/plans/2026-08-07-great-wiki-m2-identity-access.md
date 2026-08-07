@@ -70,6 +70,40 @@ public pages readable without signing in, per-person rather than blanket access,
 attribution on revisions and comments, and guest accounts that bypass Authelia entirely.
 **Removing the edge gate is an exit criterion of M2**, not a follow-up.
 
+**D-M2-6 — View-as is instance admins only.** Someone who can already see everything reveals
+nothing new by using it, so no disclosure is possible. Space-scoped view-as was considered
+and rejected: a space admin would see the subject's view of *other* spaces unless the output
+were scoped, and that scoping is an easy place to get wrong for a feature whose whole job is
+to be trustworthy.
+
+**D-M2-7 — Revocation is immediate, and deactivation ends the session.** Permissions are
+read fresh on every request, so removing a grant takes effect on the person's next click
+rather than at their next sign-in. Deactivating an account additionally invalidates its
+sessions everywhere. The per-request read costs a single indexed query — negligible at this
+scale, and the alternative means someone you just removed keeps their access for days.
+
+**D-M2-8 — Write is always an explicit grant.** Being able to read something never implies
+being able to change it, for any group including `users`. Consistent with the fail-closed
+posture everywhere else, and it means "I gave them access to read the handbook" cannot
+become "they can rewrite it".
+
+**D-M2-9 — History visibility is configurable, and defaults to open.** Anyone who can read a
+page can, by default, read its full history and timeline — that is what makes "development
+of knowledge" visible to readers rather than only to editors. It is a setting, not a
+constant, and **spaces carry defaults their documents inherit**, so a space can be created
+"history visible to editors only" without setting it per page.
+
+> **The consequence, stated plainly because it will surprise someone eventually.** With
+> history open by default, *removing something from a page does not hide it*. An earlier
+> revision still holds it, and anyone who can read the page can read that revision. Deleting
+> a paragraph is an edit, not a redaction.
+>
+> Two things follow, and both are M3 requirements rather than nice-to-haves. There must be a
+> **purge** operation that removes content from the history itself — audited, admin-only,
+> and explicitly distinct from editing. And the interface must **say so at the point of
+> editing**: someone pasting a credential and then deleting it needs to learn immediately
+> that it is still there, not months later.
+
 ## What M2 replaces
 
 M1 left two deliberate stubs, both commented as such. M2 must **replace** them, not sit

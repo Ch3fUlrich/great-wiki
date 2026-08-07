@@ -33,6 +33,34 @@ last-write-wins that is unsolvable without locking, and locking makes agent edit
 useless. With a CRDT both are transactions against one document and merge deterministically
 — which is also what retires ADR 0001's stated concern about a second write path.
 
+
+## Decisions locked after M1/M2 review (2026-08-07)
+
+**Write is always an explicit grant** (D-M2-8). Read never implies write, for any group.
+The collaboration socket authorises `Action::Write` before accepting a single update, and a
+read-only connection rejects updates and closes rather than silently discarding them.
+
+**History defaults to open, and is configurable** (D-M2-9). Anyone who can read a page can
+read its full history and timeline by default — that is what makes the development of an
+idea visible to readers, not only to editors. Spaces carry defaults their documents inherit,
+so a space can be created "history visible to editors only" without setting it per page.
+
+**Two requirements follow from that default, and they are not optional.**
+
+*Purge.* With history open, removing content from a page does **not** hide it — the earlier
+revision still holds it and anyone who can read the page can read that revision. Deleting a
+paragraph is an edit, not a redaction. So there must be a `purge` operation that removes
+content from the history itself: admin-only, audited with what was purged and why, and
+presented as clearly distinct from editing. It is the only operation in this system that
+destroys history, which is exactly why it must be deliberate, rare and recorded.
+
+*Warning at the point of editing.* The interface must say that history is visible **while
+someone is editing**, not in documentation they will not read. Someone who pastes a
+credential and then deletes it needs to learn in that moment that it is still there — not
+months later when someone else finds it.
+
+---
+
 ## File Structure
 
 ```
