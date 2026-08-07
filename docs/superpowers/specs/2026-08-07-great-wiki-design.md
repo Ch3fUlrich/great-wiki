@@ -78,6 +78,11 @@ Recorded with rationale so they are not re-litigated. Non-obvious ones also get 
 | D12 | Runs on **cloud.vm**; developed on coding.vm | Only cloud.vm has both bulk storage (`/mnt/cloud`, 2.1 TB) and the embedding model |
 | D13 | Docker is the **last** milestone | Packaging over something already proven, not the only environment it has ever run in |
 | D14 | Content types: `page`, `research`, `project`, `dataset` | Carried from kbase; they differ in listing, default template and URL prefix |
+| D15 | **Multiple spaces**, not one flat tree | Separate areas (Research, Homelab, Personal) each with their own permissions, navigation and theme. Makes "share this whole area" natural; cross-space links still resolve |
+| D16 | **Styling-only plugins**, no third-party code | A plugin ships design tokens, CSS, templates and declarative behaviour configuration — never JavaScript. Anyone can install any plugin without trusting its author. See §12.1 |
+| D17 | Plugin theming is **CSS custom properties**, not a build-time config | Plugins install at runtime from a folder or Git URL. Anything compiled at build time — Tailwind config, SCSS tokens — cannot be swapped without rebuilding, so it cannot be the contract |
+| D18 | Citation lookup by **DOI, PubMed, arXiv and URL** | Covers published literature, biomedical sources, preprints, and the general web. URL citations archive a snapshot so they survive the page changing |
+| D19 | Timeline has **three views** over one dataset | Per-page idea development (the signature view), corpus-wide activity, and a subject timeline of dates in the content itself. Built in that order |
 
 ## 3. Architecture
 
@@ -479,6 +484,44 @@ and scopes, skip links, managed focus, full keyboard navigation. Responsive down
 widths including tables. Syntax highlighting and sane print output. German and English
 content throughout, which means transliterating umlauts in slugs (`ä→ae`, `ö→oe`, `ü→ue`,
 `ß→ss`), diacritic-folding search, and locale-aware sorting and formatting.
+
+### 12.1 The plugin system
+
+Designers extend the look without writing code that runs in the page. A plugin is a folder —
+uploaded, or pointed at by a Git URL — installed at runtime with no rebuild.
+
+**What a plugin may contain:**
+
+| | |
+|---|---|
+| **Design tokens** | Colour, typography scale, spacing, radii, shadows — as CSS custom properties |
+| **Stylesheets** | Plain CSS overriding documented, stable class names |
+| **Page templates** | Complete starting layouts, versioned and shared with the design they belong to |
+| **Behaviour configuration** | Declarative only: which columns a table shows, default sort, grouping, which filters appear. The core interprets it; the plugin does not execute it |
+
+**What a plugin may never contain: JavaScript.** That is the whole security model. A
+third-party component running in the page could read every document the viewer can see, so
+allowing one would mean trusting each plugin author with the corpus. Refusing code entirely
+means any plugin is safe to install from anyone, and no sandboxing is needed.
+
+**Why CSS custom properties are the contract** (D17): plugins arrive *after* the application
+is built. A build-time system — a Tailwind config, SCSS token overrides — has already been
+compiled by then, so classes a plugin invents simply do not exist in the stylesheet.
+Custom properties are read by the browser at runtime and can therefore be swapped. This
+constrains the component-library choice: whatever sits underneath must expose a rich, stable
+CSS-variable surface, and the core must theme through it rather than through hard-coded
+values.
+
+**Distribution** grows with demand: install from a file or Git URL first, an in-app gallery
+once there are plugins worth browsing, and a public registry only if other people actually
+start making them — that last step means running and moderating a public service, which is
+its own project.
+
+**The honest limit:** a designer can restyle a table beautifully and change what it shows by
+configuration, but cannot invent a new *kind* of interaction. New behaviour belongs in the
+core, where it is reviewed. Configuration-driven behaviour is what stretches that boundary
+as far as it goes safely, and it costs a defined configuration vocabulary per component —
+real design work, done once per component.
 
 ## 13. Non-goals
 
