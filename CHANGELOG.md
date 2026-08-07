@@ -8,6 +8,19 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- A real design system: tokens for type, space and colour as CSS custom properties, and
+  content typography for headings, lists, quotes, code, tables and figures. The reader
+  previously styled only the page chrome, so documents rendered as unstyled browser
+  defaults on a dark background.
+- Application styles live in named cascade layers and plugin CSS will load unlayered, so a
+  theme overrides anything by construction — no `!important`, no specificity contest.
+- A three-way theme control in the header: light, dark, or follow the system. The choice
+  is applied before first paint by a blocking inline script, so there is no flash of the
+  wrong theme, and it is a radio group rather than a toggle because "follow the system" is
+  a genuinely different choice from picking one.
+- Print styles: the document without the application around it, link targets spelled out,
+  and no page breaks inside code blocks or immediately after a heading.
+
 - API authorisation now runs through the permission engine. `may_read` is deleted rather
   than deprecated, and `Store::tree`, `Store::document_by_path` and `Store::pool` are all
   crate-private — so no code outside the storage layer can obtain an unfiltered document,

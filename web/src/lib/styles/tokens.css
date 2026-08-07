@@ -1,0 +1,139 @@
+/* great-wiki design tokens.
+ *
+ * EVERY visual value in the application resolves through a custom property declared
+ * here. That is not tidiness — it is the plugin contract (ADR 0005). A theme installs
+ * at runtime as plain CSS overriding these names, with no rebuild, so anything
+ * hard-coded elsewhere is a value a designer can never reach.
+ *
+ * Two themes are declared twice each, and both times deliberately:
+ *   :root                        the light values, and the fallback when nothing is known
+ *   @media (prefers-color-scheme) the system preference, for a visitor who has not chosen
+ *   [data-theme="…"]             an explicit choice, which must beat the system preference
+ * The explicit selector comes last so a person who picks a theme keeps it even when it
+ * disagrees with their operating system.
+ */
+
+:root {
+	color-scheme: light dark;
+
+	/* --- Type ---------------------------------------------------------------
+	 * A 1.2 (minor third) scale. Modest on purpose: a knowledge base is read, not
+	 * skimmed, and dramatic scales make long documents tiring.
+	 */
+	--font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+	--font-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace;
+
+	--text-xs: 0.79rem;
+	--text-sm: 0.889rem;
+	--text-base: 1rem;
+	--text-lg: 1.125rem;
+	--text-xl: 1.266rem;
+	--text-2xl: 1.424rem;
+	--text-3xl: 1.602rem;
+	--text-4xl: 1.802rem;
+
+	--leading-tight: 1.25;
+	--leading-normal: 1.65;
+
+	/* 68 characters. Below ~45 the eye jumps too often, above ~75 it loses the line. */
+	--measure: 68ch;
+
+	/* --- Space --------------------------------------------------------------
+	 * A 4px base. Every margin and padding is a multiple, so vertical rhythm holds
+	 * without anyone thinking about it.
+	 */
+	--space-1: 0.25rem;
+	--space-2: 0.5rem;
+	--space-3: 0.75rem;
+	--space-4: 1rem;
+	--space-6: 1.5rem;
+	--space-8: 2rem;
+	--space-12: 3rem;
+
+	--radius-sm: 4px;
+	--radius: 8px;
+
+	/* --- Colour: light ------------------------------------------------------ */
+	--bg: #fdfdfc;
+	--bg-raised: #ffffff;
+	--bg-sunken: #f4f4f2;
+	--border: #e3e2df;
+	--border-strong: #c9c8c3;
+
+	--ink: #1a1a18;
+	--ink-muted: #5c5b56;
+	--ink-faint: #8a8983;
+
+	--accent: #2f5fd0;
+	--accent-ink: #ffffff;
+	--accent-soft: #e8eefb;
+
+	--focus: #2f5fd0;
+
+	/* Meaning, not decoration: these carry status and must stay distinguishable
+	 * without relying on hue alone. */
+	--ok: #2b6e4f;
+	--warn: #8a6100;
+	--danger: #a32a2a;
+
+	--shadow-sm: 0 1px 2px rgb(0 0 0 / 6%);
+	--shadow: 0 2px 8px rgb(0 0 0 / 8%);
+}
+
+/* --- Colour: dark, by system preference --------------------------------- */
+@media (prefers-color-scheme: dark) {
+	:root:not([data-theme='light']) {
+		--bg: #14161a;
+		--bg-raised: #1b1e24;
+		--bg-sunken: #101216;
+		--border: #2b2f38;
+		--border-strong: #3d424d;
+
+		--ink: #e8e9ec;
+		--ink-muted: #a5a9b3;
+		--ink-faint: #757a85;
+
+		--accent: #8ab4ff;
+		--accent-ink: #101216;
+		--accent-soft: #1c2740;
+
+		--focus: #8ab4ff;
+
+		--ok: #6ecfa0;
+		--warn: #e3b341;
+		--danger: #f08a86;
+
+		--shadow-sm: 0 1px 2px rgb(0 0 0 / 40%);
+		--shadow: 0 2px 12px rgb(0 0 0 / 45%);
+	}
+}
+
+/* --- Colour: dark, chosen explicitly ------------------------------------
+ * Duplicated rather than shared, because a media query and an attribute selector
+ * cannot be combined into one rule that means "either". The alternative — a
+ * `:root` variable indirection — costs more clarity than this costs bytes.
+ */
+:root[data-theme='dark'] {
+	--bg: #14161a;
+	--bg-raised: #1b1e24;
+	--bg-sunken: #101216;
+	--border: #2b2f38;
+	--border-strong: #3d424d;
+
+	--ink: #e8e9ec;
+	--ink-muted: #a5a9b3;
+	--ink-faint: #757a85;
+
+	--accent: #8ab4ff;
+	--accent-ink: #101216;
+	--accent-soft: #1c2740;
+
+	--focus: #8ab4ff;
+
+	--ok: #6ecfa0;
+	--warn: #e3b341;
+	--danger: #f08a86;
+
+	--shadow-sm: 0 1px 2px rgb(0 0 0 / 40%);
+	--shadow: 0 2px 12px rgb(0 0 0 / 45%);
+}

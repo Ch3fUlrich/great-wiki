@@ -1,0 +1,246 @@
+/* Application styles, in named cascade layers.
+ *
+ * The layer order is the plugin contract (ADR 0005). Plugin CSS is loaded UNLAYERED,
+ * and an unlayered normal declaration beats every layered one regardless of
+ * specificity — so a theme overrides anything here by construction, with no
+ * `!important` and no specificity arms race. Never move application styles out of a
+ * layer: doing so would put them in the same tier as plugins and start exactly the
+ * fight this avoids.
+ */
+@import './tokens.css';
+
+@layer reset, base, content, components;
+
+@layer reset {
+	*,
+	*::before,
+	*::after {
+		box-sizing: border-box;
+	}
+
+	body,
+	h1,
+	h2,
+	h3,
+	h4,
+	h5,
+	h6,
+	p,
+	figure,
+	blockquote,
+	dl,
+	dd,
+	ul,
+	ol {
+		margin: 0;
+	}
+
+	/* Respect a stated preference for less motion. Not decoration — vestibular
+	 * disorders make unrequested animation genuinely unpleasant. */
+	@media (prefers-reduced-motion: reduce) {
+		*,
+		*::before,
+		*::after {
+			animation-duration: 0.01ms !important;
+			animation-iteration-count: 1 !important;
+			transition-duration: 0.01ms !important;
+			scroll-behavior: auto !important;
+		}
+	}
+}
+
+@layer base {
+	html {
+		/* Anchor links land below the sticky header rather than under it. */
+		scroll-padding-top: calc(var(--space-12) + var(--space-4));
+	}
+
+	body {
+		background: var(--bg);
+		color: var(--ink);
+		font-family: var(--font-sans);
+		font-size: var(--text-base);
+		line-height: var(--leading-normal);
+		-webkit-font-smoothing: antialiased;
+		text-rendering: optimizeLegibility;
+	}
+
+	a {
+		color: var(--accent);
+		text-decoration-thickness: 1px;
+		text-underline-offset: 0.15em;
+	}
+
+	a:hover {
+		text-decoration-thickness: 2px;
+	}
+
+	/* A visible focus ring on keyboard navigation only. Removing focus styles
+	 * outright makes an application unusable without a mouse. */
+	:focus-visible {
+		outline: 2px solid var(--focus);
+		outline-offset: 2px;
+		border-radius: var(--radius-sm);
+	}
+
+	::selection {
+		background: var(--accent-soft);
+		color: var(--ink);
+	}
+}
+
+/* --- Rendered document content ------------------------------------------
+ * Scoped to `.prose` so these rules never reach the interface chrome. Everything
+ * here is spacing and rhythm; the colours all come from tokens.
+ */
+@layer content {
+	.prose {
+		max-width: var(--measure);
+	}
+
+	.prose > * + * {
+		margin-block-start: var(--space-4);
+	}
+
+	.prose h1,
+	.prose h2,
+	.prose h3,
+	.prose h4 {
+		line-height: var(--leading-tight);
+		font-weight: 650;
+		letter-spacing: -0.015em;
+		text-wrap: balance;
+	}
+
+	/* More space above a heading than below it, so a heading binds to the text it
+	 * introduces rather than floating between two blocks. */
+	.prose > h2 {
+		margin-block-start: var(--space-12);
+		font-size: var(--text-2xl);
+	}
+
+	.prose > h3 {
+		margin-block-start: var(--space-8);
+		font-size: var(--text-xl);
+	}
+
+	.prose > h4 {
+		margin-block-start: var(--space-6);
+		font-size: var(--text-lg);
+	}
+
+	.prose > h2 + *,
+	.prose > h3 + *,
+	.prose > h4 + * {
+		margin-block-start: var(--space-3);
+	}
+
+	.prose ul,
+	.prose ol {
+		padding-inline-start: var(--space-6);
+	}
+
+	.prose li + li {
+		margin-block-start: var(--space-2);
+	}
+
+	.prose blockquote {
+		border-inline-start: 3px solid var(--accent);
+		padding: var(--space-1) 0 var(--space-1) var(--space-4);
+		color: var(--ink-muted);
+		font-style: italic;
+	}
+
+	.prose code {
+		font-family: var(--font-mono);
+		font-size: 0.9em;
+		background: var(--bg-sunken);
+		padding: 0.15em 0.35em;
+		border-radius: var(--radius-sm);
+	}
+
+	.prose pre {
+		background: var(--bg-sunken);
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		padding: var(--space-4);
+		/* Wide code scrolls inside its own box. The page body must never scroll
+		 * sideways — that is what makes a document unreadable on a phone. */
+		overflow-x: auto;
+		font-size: var(--text-sm);
+		line-height: 1.5;
+	}
+
+	.prose pre code {
+		background: none;
+		padding: 0;
+		font-size: inherit;
+	}
+
+	.prose table {
+		width: 100%;
+		border-collapse: collapse;
+		font-size: var(--text-sm);
+	}
+
+	.prose th,
+	.prose td {
+		text-align: start;
+		padding: var(--space-2) var(--space-3);
+		border-block-end: 1px solid var(--border);
+	}
+
+	.prose th {
+		font-weight: 650;
+		color: var(--ink-muted);
+	}
+
+	.prose img,
+	.prose video {
+		max-width: 100%;
+		height: auto;
+		border-radius: var(--radius);
+	}
+
+	.prose hr {
+		border: 0;
+		border-block-start: 1px solid var(--border);
+		margin-block: var(--space-8);
+	}
+}
+
+/* --- Print ---------------------------------------------------------------
+ * A page someone prints or saves as PDF should be the document, not the
+ * application around it.
+ */
+@media print {
+	:root {
+		--bg: #fff;
+		--ink: #000;
+		--ink-muted: #333;
+	}
+
+	.no-print {
+		display: none !important;
+	}
+
+	.prose {
+		max-width: none;
+	}
+
+	.prose a::after {
+		content: ' (' attr(href) ')';
+		font-size: 0.85em;
+		color: #555;
+	}
+
+	.prose pre,
+	.prose blockquote {
+		break-inside: avoid;
+	}
+
+	.prose h2,
+	.prose h3 {
+		break-after: avoid;
+	}
+}

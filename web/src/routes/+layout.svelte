@@ -1,5 +1,7 @@
 <script lang="ts">
+  import '$lib/styles/app.css';
   import favicon from '$lib/assets/favicon.svg';
+  import ThemeToggle from '$lib/components/ThemeToggle.svelte';
 
   let { children } = $props();
 </script>
@@ -8,38 +10,53 @@
   <link rel="icon" href={favicon} />
 </svelte:head>
 
-<!-- Skip link first in the DOM: keyboard users must be able to bypass navigation. -->
-<a class="skip" href="#content">Skip to content</a>
-<header>
-  <a class="brand" href="/">great-wiki</a>
+<!-- Skip link first in the DOM: a keyboard user must be able to bypass the navigation
+     without tabbing through every tree entry on every page. -->
+<a class="skip" href="#content">Zum Inhalt springen</a>
+
+<header class="no-print">
+  <a class="brand" href="/">great&#8209;wiki</a>
+  <ThemeToggle />
 </header>
+
 {@render children()}
 
 <style>
-  /* Theme via custom properties, dark by system preference with a light override.
-     Both directions are styled; neither is an afterthought. */
-  :global(:root) {
-    --bg: #0f1115; --panel: #161a21; --line: #2a3140;
-    --ink: #e6e9ef; --ink-dim: #a9b2c3; --accent: #6ea8fe;
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-4);
+    padding: var(--space-3) var(--space-6);
+    border-block-end: 1px solid var(--border);
+    /* Slightly translucent so content scrolling underneath is felt rather than hidden. */
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(8px);
   }
-  @media (prefers-color-scheme: light) {
-    :global(:root) {
-      --bg: #ffffff; --panel: #f6f7f9; --line: #d9dee7;
-      --ink: #16191f; --ink-dim: #5b6473; --accent: #1a5fd0;
-    }
+
+  .brand {
+    font-weight: 650;
+    letter-spacing: -0.01em;
+    color: var(--ink);
+    text-decoration: none;
   }
-  :global(body) {
-    margin: 0; background: var(--bg); color: var(--ink);
-    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
-  }
-  :global(a) { color: var(--accent); }
+
   .skip {
-    position: absolute; left: -9999px;
+    position: absolute;
+    inset-inline-start: -9999px;
   }
+
   .skip:focus {
-    left: 1rem; top: 1rem; z-index: 10;
-    background: var(--panel); padding: .5rem 1rem; border-radius: 6px;
+    inset-inline-start: var(--space-4);
+    inset-block-start: var(--space-4);
+    z-index: 20;
+    padding: var(--space-2) var(--space-4);
+    background: var(--bg-raised);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
   }
-  header { border-bottom: 1px solid var(--line); padding: 1rem; }
-  .brand { font-weight: 600; text-decoration: none; }
 </style>

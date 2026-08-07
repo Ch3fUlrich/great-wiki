@@ -1,10 +1,28 @@
 <!doctype html>
-<html lang="en">
+<html lang="de">
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
-		<meta name="text-scale" content="scale" />
+		<meta name="color-scheme" content="light dark" />
 		%sveltekit.head%
+		<script>
+			// Resolve the theme BEFORE first paint. Doing this in a component would mean
+			// rendering once in the default theme and again in the chosen one — the flash
+			// of wrong theme that makes an application feel unfinished. Deliberately
+			// inline and blocking: it is three lines, and a deferred script would defeat
+			// the entire point.
+			(() => {
+				try {
+					const stored = localStorage.getItem('gw-theme');
+					if (stored === 'light' || stored === 'dark') {
+						document.documentElement.dataset.theme = stored;
+					}
+				} catch {
+					// Private browsing can throw on localStorage. Falling through leaves the
+					// system preference in charge, which is the right default anyway.
+				}
+			})();
+		</script>
 	</head>
 	<body data-sveltekit-preload-data="hover">
 		<div style="display: contents">%sveltekit.body%</div>
