@@ -229,8 +229,14 @@ Expected: `test result: ok. 5 passed; 0 failed`
 
 - [ ] **Step 6: Run the lint gate**
 
-Run: `cargo fmt --check && cargo clippy --all-targets -- -D warnings`
+Run: `cargo fmt && cargo fmt --check && cargo clippy --all-targets -- -D warnings`
 Expected: no output, exit 0.
+
+Note the `cargo fmt` before `--check`. The test snippets above are written for readability,
+and rustfmt disagrees with some of them: its default `fn_call_width` is 60 columns, so a
+93-column `assert_eq!` wrapping a nested call gets split across three lines even though it
+is well under the 100-column limit. Let rustfmt win — that is what the gate is for. From
+here on the committed code is rustfmt-canonical and `--check` alone is enough.
 
 - [ ] **Step 7: Update the changelog and commit**
 
@@ -314,20 +320,23 @@ others `sv create` added):
 }
 ```
 
-In `web/svelte.config.js`, replace the adapter import and usage with the Node adapter — the
-application is served by its own process, not a static host:
-```js
-import adapter from '@sveltejs/adapter-node';
-import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
+Switch to the Node adapter — the application is served by its own process, not a static host.
 
-/** @type {import('@sveltejs/kit').Config} */
-const config = {
-  preprocess: vitePreprocess(),
-  kit: { adapter: adapter() }
-};
+**Where this lives depends on the scaffold generation, so check before editing.** The `sv`
+CLI ≥ 0.17 with SvelteKit ≥ 2.70 generates **no `svelte.config.js` at all**; the adapter and
+compiler options live inside the `sveltekit({...})` plugin call in `web/vite.config.ts`. In
+that case change only the import:
 
-export default config;
+```ts
+import adapter from '@sveltejs/adapter-node';   // was: @sveltejs/adapter-auto
 ```
+
+Do **not** create a `svelte.config.js` when the scaffold did not — this generation does not
+read one, so the file would look like configuration while having no effect. If your scaffold
+*did* produce one, set `kit: { adapter: adapter() }` there instead.
+
+`@sveltejs/adapter-auto` remains an unused devDependency either way; harmless, and removing
+it is not worth a separate step.
 
 - [ ] **Step 4: Write the failing test**
 

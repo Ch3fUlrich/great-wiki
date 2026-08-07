@@ -1,0 +1,5 @@
+# Pinned so CI and every developer machine agree. 1.97 is what is installed on the
+# development host; bumping it is a deliberate change, not a drift.
+[toolchain]
+channel = "1.97"
+components = ["rustfmt", "clippy"]

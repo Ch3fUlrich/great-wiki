@@ -8,6 +8,15 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- Rust workspace with `gw-core`, the pure-domain crate, and the `cargo test` /
+  `clippy -D warnings` / `fmt --check` gate that every later task must pass.
+- `slugify` with German transliteration (ä→ae, ö→oe, ü→ue, ß→ss), so German titles produce
+  readable, collision-free slugs. `Präbiotika` becomes `praebiotika`, not `pr-biotika`.
+- SvelteKit 2 / Svelte 5 application skeleton with the Node adapter, Vitest, and the
+  `npm run check` type gate. Node 24.19.0 pinned in `.nvmrc`.
+- `slugify` in TypeScript, mirroring the Rust implementation, with a test corpus shared
+  verbatim between the two so they cannot drift apart.
+
 - Repository foundations: MIT licence, public-repo-safe `.gitignore`, `.gitattributes`
   enforcing LF on scripts and configs, and `.graphifyignore`.
 - Agent instruction files — `AGENTS.md` (hub: skills, memory, architecture rules,

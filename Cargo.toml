@@ -1,0 +1,20 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.97"
+license = "MIT"
+repository = "https://github.com/Ch3fUlrich/great-wiki"
+
+# Versions live here so a crate never pins its own and they cannot drift apart.
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
