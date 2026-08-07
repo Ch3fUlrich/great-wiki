@@ -524,12 +524,42 @@ lint:
 # The full gate. Every task must end with this passing.
 ci: lint test
 
-# Rebuild the Graphify code graph. --user is REQUIRED: without it the container writes
-# root-owned files that the next rebuild cannot overwrite.
+# Rebuild the Graphify CODE graph. Seconds, no key, no network.
+# --user is REQUIRED: without it the container writes root-owned files that the next
+# rebuild cannot overwrite.
 graph:
     docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo" -w /repo \
       --entrypoint python graphify-mcp:latest -m graphify update .
+
+# Rebuild the FULL graph including prose. Minutes, and it costs a few cents through
+# LiteLLM. Most of this repository is documentation, so the code-only pass above misses
+# nearly all of it -- the semantic pass is what turns specs and ADRs into concept nodes
+# with typed edges.
+#
+# Never run two of these at once: they race on graphify-out/. A timed-out foreground
+# `docker run` leaves its container alive, so check `docker ps` first.
+graph-full:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    key=$(grep -m1 '^LITELLM_MASTER_KEY=' ../Server/secrets-generated/server__cloud__ai__.env | cut -d= -f2-)
+    run() {
+      docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo" -w /repo \
+        -e OPENAI_API_KEY="$key" \
+        -e OPENAI_BASE_URL=http://192.168.178.159:4000/v1 \
+        -e OPENAI_MODEL=deepseek-v4-flash \
+        --entrypoint python graphify-mcp:latest "$@"
+    }
+    run -m graphify extract . --backend openai --model deepseek-v4-flash
+    run -m graphify cluster-only . --backend=openai --model=deepseek-v4-flash
+    run -m graphify label . --backend=openai --model=deepseek-v4-flash
 ```
+
+> **The image must carry the `openai` extra.** Without it the semantic pass fails at call
+> time — *after* the AST pass has already succeeded — leaving a graph that looks built while
+> every prose file is silently absent from it. Fixed upstream in
+> `agent-skills/infra/mcp-servers/servers/graphify-mcp/Dockerfile`, which now installs
+> `graphifyy[mcp,openai]==0.9.20`. The pin matters: the AST cache is namespaced by version,
+> so an unpinned rebuild invalidates every repository's cache at once.
 
 - [ ] **Step 3: Verify the gate runs**
 
@@ -741,13 +771,24 @@ Verify with `commits_list` that the head advanced. A 504 does **not** mean failu
 server may have committed after the proxy dropped the response, so re-check rather than
 retrying blindly.
 
-- [ ] **Step 6: Build the Graphify code graph**
+- [ ] **Step 6: Build the Graphify graph**
 
 ```bash
-just graph
+just graph        # code only: seconds, no key, no network
+just graph-full   # including prose: minutes, a few cents through LiteLLM
 ```
-Expected: `[graphify watch] Rebuilt: N nodes, M edges, K communities` in a few seconds. No
-API key and no network are needed for the code path.
+Expected from `graph`: `[graphify watch] Rebuilt: N nodes, M edges, K communities`.
+Expected from `graph-full`: `wrote graphify-out/graph.json: N nodes, M edges`, then named
+communities rather than `Community 0`, `Community 1`.
+
+Verify through the MCP tools, not by reading the file — and **omit `project_path` or pass
+`/repo`**. The parameter is resolved *inside* the container, so a host path like
+`/home/s/code/great-wiki` fails with a confusing "graph.json not found" naming a path that
+plainly exists:
+```
+graph_stats  -> Nodes: …, Edges: …, Communities: …
+god_nodes    -> the specification and the milestone plans, most-connected first
+```
 
 Then confirm the wiring is correct — Graphify must be a single cwd-relative entry in **user**
 scope, never in this repository's `.mcp.json`:
