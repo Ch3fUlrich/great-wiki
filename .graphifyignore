@@ -1,0 +1,30 @@
+# Files graphify should not walk when building graphify-out/graph.json.
+# Same shape as .gitignore. Keeping generated and vendored trees out keeps the
+# graph about THIS codebase rather than its dependencies.
+
+/target
+**/target
+node_modules/
+/web/build
+/web/.svelte-kit
+/extension/dist
+
+# Graphify's own output — including it would make the graph describe itself.
+graphify-out/
+GRAPH_TREE.html
+GRAPH_*.html
+
+# Derived runtime state, never source.
+/data
+/media
+*.db
+*.db-wal
+*.db-shm
+
+# Fixtures and sample content are data, not architecture.
+/fixtures
+/content-example
+
+.git/
+.serena/
+.claude/

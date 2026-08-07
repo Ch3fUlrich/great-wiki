@@ -1,0 +1,49 @@
+# --- Secrets ------------------------------------------------------------
+# This repository is PUBLIC. Nothing here may ever contain a real credential.
+# Real values live outside the repo; only .example files are tracked.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!**/testdata/**/*.key
+secrets/
+secrets-generated/
+
+# --- Build artefacts ----------------------------------------------------
+/target
+**/target
+/web/build
+/web/.svelte-kit
+/web/node_modules
+node_modules/
+/extension/dist
+*.tsbuildinfo
+
+# --- Runtime / derived state -------------------------------------------
+# The database, search index, vectors and blobs are DERIVED. They are
+# rebuildable from the content export and must never be committed.
+/data
+/media
+*.db
+*.db-wal
+*.db-shm
+
+# --- Agent tooling ------------------------------------------------------
+# .serena/project.yml IS tracked (it is config); the cache under it is not.
+.serena/cache/
+.serena/memories/
+graphify-out/
+GRAPH_TREE.html
+GRAPH_*.html
+.playwright-mcp/
+.claude/settings.local.json
+.claude/worktrees/
+
+# --- OS / editor --------------------------------------------------------
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+!.vscode/extensions.json

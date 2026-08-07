@@ -1,0 +1,62 @@
+{
+  "$comment": [
+    "Project-scoped MCP servers for THIS repo. Pins `omnigraph` to the `great-wiki` graph.",
+    "",
+    "ONE omnigraph server per repo: a bridge serves exactly one graph, chosen by",
+    "OMNIGRAPH_GRAPH_ID, and no tool takes a graph argument. Never write this repo's data",
+    "to the shared `memory` graph -- that one holds global Preferences only.",
+    "",
+    "APPROVAL GATE: a tracked .mcp.json cannot approve itself. Without",
+    "`.claude/settings.local.json` -> {\"enabledMcpjsonServers\": [\"omnigraph\"]} the tool is",
+    "ABSENT ENTIRELY -- no prompt, no error. That file is untracked by design.",
+    "",
+    "PRECEDENCE: keep repo-bound servers OUT of user scope (~/.claude.json). A same-named",
+    "user-scope server silently overrides this file and answers about the WRONG graph.",
+    "Inspect both scopes:",
+    "  python -c \"import json,pathlib;d=json.loads((pathlib.Path.home()/'.claude.json').read_text());print('user:',sorted(d.get('mcpServers') or {}))\"",
+    "",
+    "SERVER-SIDE PREREQUISITE: the graph does not exist just because this file names it.",
+    "  cd ~/code/agent-skills/infra/mcp-servers",
+    "  ./scripts/add-project-graph.sh great-wiki && ./scripts/apply-cluster.sh",
+    "",
+    "GRAPHIFY is deliberately NOT declared here. graphify.serve is stdio and inherits its",
+    "launch directory, so ONE cwd-relative entry in USER scope serves every repo. A per-repo",
+    "entry is the old bug (one repo's graph answering for all). What opts this repo in is",
+    "having built `graphify-out/graph.json`, not an entry here. Verify:",
+    "  bash ~/code/agent-skills/infra/mcp-servers/scripts/linux/check-graphify-scope.sh --fix",
+    "",
+    "SERENA is configured by .serena/project.yml, not here.",
+    "",
+    "ENV (never hardcode -- this file is tracked and the repo is PUBLIC):",
+    "  OMNIGRAPH_TOKEN unset -> empty bearer -> 'missing bearer token' (memory silently dead)",
+    "  OMNIGRAPH_NET wrong   -> 'fetch failed' (a network can EXIST but be EMPTY). Differs per",
+    "                           host: mcp-server_mcp-net local, mcp-servers_default central.",
+    "  image not built       -> 'pull access denied':",
+    "     docker build -t omnigraph-mcp:latest ~/code/agent-skills/infra/mcp-servers/servers/omnigraph-mcp",
+    "  Diagnose all four: ~/code/agent-skills/infra/mcp-servers/omnigraph-setup/setup-agent-memory.sh --check",
+    "",
+    "Transport is docker, not npx: node/npx is absent on coding.vm.",
+    "",
+    "Router: ~/code/agent-skills/skills/repository-index/SKILL.md",
+    "Memory: ~/code/agent-skills/skills/structured-memory/SKILL.md"
+  ],
+  "mcpServers": {
+    "omnigraph": {
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "--network",
+        "${OMNIGRAPH_NET:-mcp-servers_default}",
+        "-e",
+        "OMNIGRAPH_BASE_URL=http://omnigraph-server:8080",
+        "-e",
+        "OMNIGRAPH_GRAPH_ID=great-wiki",
+        "-e",
+        "OMNIGRAPH_TOKEN=${OMNIGRAPH_TOKEN}",
+        "omnigraph-mcp:latest"
+      ]
+    }
+  }
+}
