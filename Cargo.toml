@@ -15,6 +15,10 @@ thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
+# CommonMark parsing for the importer and the export round-trip. `default-features = false`
+# drops the HTML renderer and its `getopts`/`bitflags` CLI baggage: we build a Block tree
+# from the event stream and must never grow a second, HTML-shaped rendering path.
+pulldown-cmark = { version = "0.12", default-features = false }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

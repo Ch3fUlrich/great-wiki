@@ -1,9 +1,10 @@
 // The modules live in the library (`src/lib.rs`) and are used from there rather than
 // re-declared here: declaring them again would compile a second, incompatible copy, so
 // the integration tests would exercise a different `Identity` than the binary runs.
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use gw_api::config;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
@@ -21,6 +22,16 @@ enum Command {
     Serve,
     /// Validate configuration and exit. Non-zero on any problem.
     Check,
+    /// Load a directory of markdown files into the database.
+    ///
+    /// Nothing is invented: a file with no title, or whose parent document does not
+    /// exist, is skipped and named. Exits non-zero if anything was skipped, so a
+    /// half-loaded corpus cannot pass for a loaded one in a script.
+    Seed {
+        /// Directory of `.md` files with YAML frontmatter.
+        #[arg(long)]
+        content: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -39,6 +50,22 @@ async fn main() -> Result<()> {
                 cfg.bind, cfg.database_url
             );
             Ok(())
+        }
+        Command::Seed { content } => {
+            let store = gw_store::Store::open(&cfg.database_url).await?;
+            let report = gw_api::seed::run(&store, &content).await?;
+            println!("seeding from {}", content.display());
+            println!("{report}");
+            if report.is_complete() {
+                Ok(())
+            } else {
+                // Non-zero so `just seed && just serve` cannot start against a corpus that
+                // is missing pages nobody noticed scrolling past.
+                bail!(
+                    "{} file(s) skipped — none of them were guessed at; fix them and run again",
+                    report.skipped.len()
+                )
+            }
         }
         Command::Serve => {
             let store = std::sync::Arc::new(gw_store::Store::open(&cfg.database_url).await?);

@@ -18,6 +18,8 @@ export default defineConfig({
 		})
 	],
 	server: {
+		host: true, // bind 0.0.0.0 — Caddy is on another host
+		allowedHosts: ['wiki-dev.ohje.ooguy.com'], // Vite rejects unknown Host headers by default
 		// Without this, /api/* 404s in `npm run dev` — in production Caddy routes it.
 		proxy: {
 			'/api': { target: 'http://127.0.0.1:8092', changeOrigin: true }

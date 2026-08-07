@@ -18,6 +18,8 @@ impl Store {
     /// database is private per connection, so a larger pool silently gives some queries an
     /// empty database. Production is a single-writer workload anyway.
     pub async fn open(url: &str) -> Result<Self> {
+        ensure_parent_dir(url)?;
+
         let opts = SqliteConnectOptions::from_str(url)?
             .create_if_missing(true)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
@@ -31,6 +33,32 @@ impl Store {
         sqlx::migrate!("./migrations").run(&pool).await?;
         Ok(Self { pool })
     }
+}
+
+/// Create the directory the database file lives in.
+///
+/// `create_if_missing` creates the *file* and never its directory, and the default
+/// configuration points at `./data/great-wiki.db` — a path a fresh clone does not have.
+/// Without this, the first command anyone runs after cloning fails on a directory the
+/// application itself chose.
+fn ensure_parent_dir(url: &str) -> Result<()> {
+    // In-memory databases have no path. `mode=memory` is the URI spelling of the same.
+    if url.contains(":memory:") || url.contains("mode=memory") {
+        return Ok(());
+    }
+    let path = url
+        .strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"))
+        .unwrap_or(url);
+    // Query parameters are part of the URL, not of the filename.
+    let path = path.split('?').next().unwrap_or(path);
+
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -111,6 +139,39 @@ mod tests {
             .insert_document(&new_doc(None, "Notes", Visibility::Public))
             .await;
         assert!(second.is_err(), "a colliding path must fail loudly");
+    }
+
+    #[tokio::test]
+    async fn opening_a_database_creates_the_directory_it_lives_in() {
+        // The default configuration points at ./data/great-wiki.db, which a fresh clone
+        // does not have. `create_if_missing` creates the file, never the directory.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("nested/great-wiki.db");
+        let store = Store::open(&format!("sqlite://{}", db.display()))
+            .await
+            .unwrap();
+        assert!(db.exists());
+        drop(store);
+    }
+
+    #[tokio::test]
+    async fn resolved_path_matches_the_path_the_insert_actually_uses() {
+        // The seeder pre-checks collisions with `resolved_path`. If it could disagree
+        // with the insert, the error message would name a path that is not the one that
+        // collided.
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let doc = new_doc(Some("/handbuch"), "Größe und Maß", Visibility::Public);
+        store
+            .insert_document(&new_doc(None, "Handbuch", Visibility::Public))
+            .await
+            .unwrap();
+        store.insert_document(&doc).await.unwrap();
+        assert_eq!(doc.resolved_path().unwrap(), "/handbuch/groesse-und-mass");
+        assert!(store
+            .document_by_path(&doc.resolved_path().unwrap())
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

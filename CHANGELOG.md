@@ -8,6 +8,19 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- `great-wiki seed --content <dir>` loads a folder of markdown files with YAML frontmatter
+  into the database, so there is real content to develop against before the editor exists.
+  The markdown-to-block conversion it needs is also half of the export round-trip, so this
+  is foundation rather than scaffolding.
+- Seeding refuses to guess. A missing title, absent frontmatter, a colliding path or a
+  parent document that does not exist are each reported by name with the reason, and the
+  command exits non-zero — deriving a title from a filename would silently publish a page
+  at a path nobody chose.
+- Markdown constructs the block model cannot yet represent are reported and their text
+  kept, never dropped: table cells become one paragraph per row, and emphasis is flattened.
+- `content-example/` makes the repository runnable straight after cloning, and gives CI
+  something real to validate.
+
 - Reader interface: layout with a skip link, dark and light themes following system
   preference, recursive tree navigation, document pages with an on-this-page outline, and
   error pages. Blocks render through a component that emits only the kinds it knows, so no

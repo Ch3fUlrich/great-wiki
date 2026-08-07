@@ -18,6 +18,36 @@ pub struct NewDocument {
     pub sort_key: i64,
 }
 
+impl NewDocument {
+    /// The slug this document will occupy: an explicit one wins, otherwise the title.
+    ///
+    /// Public because a caller that inserts many documents — the seeder, the M13 importer
+    /// — has to know the resulting path *before* the insert in order to report a
+    /// collision usefully. Re-deriving it at the call site would put two copies of this
+    /// rule in the tree, and the day they disagree the error message points at the wrong
+    /// path.
+    pub fn resolved_slug(&self) -> Result<String> {
+        let slug = self
+            .slug
+            .as_deref()
+            .map(slugify)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| slugify(&self.title));
+        anyhow::ensure!(
+            !slug.is_empty(),
+            "title `{}` produced an empty slug",
+            self.title
+        );
+        Ok(slug)
+    }
+
+    /// The materialised path this document will occupy.
+    pub fn resolved_path(&self) -> Result<String> {
+        let parent = self.parent_path.as_deref().unwrap_or("");
+        Ok(format!("{parent}/{}", self.resolved_slug()?))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct StoredDocument {
     pub id: String,
@@ -46,20 +76,8 @@ pub struct TreeNode {
 
 impl Store {
     pub async fn insert_document(&self, doc: &NewDocument) -> Result<String> {
-        let slug = doc
-            .slug
-            .as_deref()
-            .map(slugify)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| slugify(&doc.title));
-        anyhow::ensure!(
-            !slug.is_empty(),
-            "title `{}` produced an empty slug",
-            doc.title
-        );
-
-        let parent = doc.parent_path.as_deref().unwrap_or("");
-        let path = format!("{parent}/{slug}");
+        let slug = doc.resolved_slug()?;
+        let path = doc.resolved_path()?;
         let id = uuid::Uuid::now_v7().to_string();
         let body = serde_json::to_string(&doc.body)?;
 

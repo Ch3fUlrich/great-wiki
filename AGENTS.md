@@ -70,7 +70,7 @@ nonexistent and every write using them failed *silently*.
 ```bash
 cargo test --workspace && cargo clippy --all-targets -- -D warnings && cargo fmt --check
 cd web && npm run check && npx vitest run && npm run build
-cargo run -p gw-api -- check --content content-example   # content validation, exits non-zero
+cargo run -p gw-api -- seed --content content-example    # loads content; exits non-zero if any file was skipped
 ```
 
 Every task ends green on all of the above before it is committed. A task that cannot end
