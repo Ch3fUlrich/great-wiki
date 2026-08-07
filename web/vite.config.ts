@@ -16,5 +16,11 @@ export default defineConfig({
 			// See https://svelte.dev/docs/kit/adapters for more information about adapters.
 			adapter: adapter()
 		})
-	]
+	],
+	server: {
+		// Without this, /api/* 404s in `npm run dev` — in production Caddy routes it.
+		proxy: {
+			'/api': { target: 'http://127.0.0.1:8092', changeOrigin: true }
+		}
+	}
 });

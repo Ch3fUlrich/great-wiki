@@ -8,6 +8,11 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- Reader interface: layout with a skip link, dark and light themes following system
+  preference, recursive tree navigation, document pages with an on-this-page outline, and
+  error pages. Blocks render through a component that emits only the kinds it knows, so no
+  untrusted HTML is ever constructed and there is no sanitisation step to get wrong.
+
 - Document content model: a ProseMirror-shaped `Block` tree with plain-text extraction and
   a heading outline whose anchor ids are transliterated to ASCII. `Visibility` defaults to
   `Restricted`, so a document arriving with no stated visibility is never world-readable.
