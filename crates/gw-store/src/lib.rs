@@ -1,9 +1,11 @@
 pub mod acl;
 pub mod documents;
 pub mod principals;
+pub mod sessions;
 
 pub use acl::Baseline;
 pub use documents::{NewDocument, StoredDocument, TreeNode};
+pub use sessions::SESSION_TTL_SECONDS;
 
 use anyhow::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -870,6 +872,244 @@ mod tests {
             "a deleted document must not keep answering the existence check that picks \
              404 over 403"
         );
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Sessions (M2 Task 6). Persisted, hashed, expiring, and re-read on every lookup.
+    // ---------------------------------------------------------------------------------
+
+    /// Sessions are stored by digest, so the tests speak in digests too. The real one is
+    /// SHA-256 and lives in `gw_api::auth::session`, next to the generator; the store
+    /// treats the value as opaque, and a test that pretended otherwise would be asserting
+    /// against a layer that does not hash anything.
+    fn digest(token: &str) -> String {
+        format!("digest-of-{token}")
+    }
+
+    #[tokio::test]
+    async fn a_session_resolves_to_the_principal_that_owns_it() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let guest = store
+            .create_local_principal("gast", "Gast", None, "x")
+            .await
+            .unwrap();
+        store
+            .create_session(&guest.id, &digest("t"), SESSION_TTL_SECONDS)
+            .await
+            .unwrap();
+
+        let resolved = store
+            .principal_for_session(&digest("t"))
+            .await
+            .unwrap()
+            .expect("a live session must resolve");
+        assert_eq!(resolved.id, guest.id);
+        assert_eq!(resolved.username, "gast");
+    }
+
+    #[tokio::test]
+    async fn an_expired_session_resolves_to_nobody() {
+        // Expiry is enforced in the lookup, not by a sweeper: the row is still there.
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let guest = store
+            .create_local_principal("gast", "Gast", None, "x")
+            .await
+            .unwrap();
+        store
+            .create_session(&guest.id, &digest("abgelaufen"), -60)
+            .await
+            .unwrap();
+
+        assert_eq!(store.session_count_for(&guest.id).await.unwrap(), 1);
+        assert!(store
+            .principal_for_session(&digest("abgelaufen"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_session_token_resolves_to_nobody() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        assert!(store
+            .principal_for_session(&digest("erfunden"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn only_the_digest_is_stored_never_the_token() {
+        // A database disclosure must not hand over live sessions. The row holds what the
+        // caller hashed and nothing that resembles the token itself.
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let guest = store
+            .create_local_principal("gast", "Gast", None, "x")
+            .await
+            .unwrap();
+        store
+            .create_session(&guest.id, &digest("geheim"), SESSION_TTL_SECONDS)
+            .await
+            .unwrap();
+
+        let (stored,): (String,) = sqlx::query_as("SELECT token_hash FROM sessions")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, digest("geheim"));
+        assert!(
+            !stored.contains("geheim") || stored != "geheim",
+            "the plaintext token must never be the stored value"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_session_stops_it_resolving() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let guest = store
+            .create_local_principal("gast", "Gast", None, "x")
+            .await
+            .unwrap();
+        store
+            .create_session(&guest.id, &digest("t"), SESSION_TTL_SECONDS)
+            .await
+            .unwrap();
+
+        assert!(store.delete_session(&digest("t")).await.unwrap());
+        assert!(store
+            .principal_for_session(&digest("t"))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(store.session_count_for(&guest.id).await.unwrap(), 0);
+        // Deleting twice is not an error, it is simply no longer there.
+        assert!(!store.delete_session(&digest("t")).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn deactivating_a_principal_deletes_its_sessions() {
+        // D-M2-7, the half that a per-request permission read cannot deliver on its own:
+        // the cookie must stop resolving, not merely stop conferring anything.
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let guest = store
+            .create_local_principal("gast", "Gast", None, "x")
+            .await
+            .unwrap();
+        for token in ["laptop", "telefon"] {
+            store
+                .create_session(&guest.id, &digest(token), SESSION_TTL_SECONDS)
+                .await
+                .unwrap();
+        }
+
+        store.set_principal_active(&guest.id, false).await.unwrap();
+
+        assert_eq!(
+            store.session_count_for(&guest.id).await.unwrap(),
+            0,
+            "every session, on every device, not just the one that made the request"
+        );
+        assert!(store
+            .principal_for_session(&digest("laptop"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn reactivating_a_principal_does_not_bring_its_sessions_back() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let guest = store
+            .create_local_principal("gast", "Gast", None, "x")
+            .await
+            .unwrap();
+        store
+            .create_session(&guest.id, &digest("t"), SESSION_TTL_SECONDS)
+            .await
+            .unwrap();
+
+        store.set_principal_active(&guest.id, false).await.unwrap();
+        store.set_principal_active(&guest.id, true).await.unwrap();
+
+        assert!(
+            store
+                .principal_for_session(&digest("t"))
+                .await
+                .unwrap()
+                .is_none(),
+            "invalidated means gone; they sign in again"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_principal_behind_a_session_is_read_fresh_not_captured_at_sign_in() {
+        // D-M2-7: a change made after the session existed must be visible through it.
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let member = store
+            .upsert_oidc_principal("sergej", "Sergej", None, &["admins".into()])
+            .await
+            .unwrap();
+        store
+            .create_session(&member.id, &digest("t"), SESSION_TTL_SECONDS)
+            .await
+            .unwrap();
+
+        store.create_team("editors", "Redaktion").await.unwrap();
+        store.add_team_member("editors", &member.id).await.unwrap();
+        store
+            .upsert_oidc_principal("sergej", "Sergej Maul", None, &["users".into()])
+            .await
+            .unwrap();
+
+        let resolved = store
+            .principal_for_session(&digest("t"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.teams, vec!["editors"], "a team added afterwards");
+        assert_eq!(resolved.groups, vec!["users"], "groups as they are now");
+        assert_eq!(resolved.display_name, "Sergej Maul");
+    }
+
+    #[tokio::test]
+    async fn creating_a_session_clears_out_expired_rows() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let guest = store
+            .create_local_principal("gast", "Gast", None, "x")
+            .await
+            .unwrap();
+        store
+            .create_session(&guest.id, &digest("alt"), -60)
+            .await
+            .unwrap();
+        store
+            .create_session(&guest.id, &digest("neu"), SESSION_TTL_SECONDS)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.session_count_for(&guest.id).await.unwrap(),
+            1,
+            "the expired row is not kept for ever"
+        );
+    }
+
+    #[tokio::test]
+    async fn principal_by_id_matches_principal_by_username() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let guest = store
+            .create_local_principal("gast", "Gast", None, "$argon2id$fake")
+            .await
+            .unwrap();
+        store.create_team("gaeste", "Gäste").await.unwrap();
+        store.add_team_member("gaeste", &guest.id).await.unwrap();
+
+        let (by_id, hash_by_id) = store.principal_by_id(&guest.id).await.unwrap().unwrap();
+        let (by_name, hash_by_name) = store.principal_by_username("gast").await.unwrap().unwrap();
+        assert_eq!(by_id.id, by_name.id);
+        assert_eq!(by_id.teams, by_name.teams);
+        assert_eq!(by_id.teams, vec!["gaeste"]);
+        assert_eq!(hash_by_id, hash_by_name);
     }
 
     #[tokio::test]

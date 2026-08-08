@@ -1,3 +1,4 @@
+use crate::auth::OidcConfig;
 use crate::identity::Identity;
 use anyhow::{bail, Context, Result};
 use std::net::SocketAddr;
@@ -13,6 +14,74 @@ pub struct Config {
     pub bind: SocketAddr,
     pub dev_identity: Option<Identity>,
     pub proxy_secret: Option<String>,
+    /// `None` means no identity provider is configured, which is a legitimate deployment
+    /// — local accounts only. A *partly* configured one is not, and is refused at startup.
+    pub oidc: Option<OidcConfig>,
+}
+
+/// The four variables that make up an OIDC client, all or nothing.
+///
+/// All four or none. Three out of four is not "OIDC with a default for the fourth", it is
+/// a deployment that will redirect somebody to a login it cannot finish — and it would
+/// only be discovered by a person trying to sign in.
+fn read_oidc() -> Result<Option<OidcConfig>> {
+    let read = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    oidc_from(
+        read("GW_OIDC_ISSUER"),
+        read("GW_OIDC_CLIENT_ID"),
+        read("GW_OIDC_CLIENT_SECRET"),
+        read("GW_OIDC_REDIRECT_URI"),
+    )
+}
+
+/// The rule, separated from the environment so it can be tested without mutating process
+/// globals that every other test in the binary shares.
+pub fn oidc_from(
+    issuer: Option<String>,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    redirect_uri: Option<String>,
+) -> Result<Option<OidcConfig>> {
+    let present: Vec<&str> = [
+        ("GW_OIDC_ISSUER", &issuer),
+        ("GW_OIDC_CLIENT_ID", &client_id),
+        ("GW_OIDC_CLIENT_SECRET", &client_secret),
+        ("GW_OIDC_REDIRECT_URI", &redirect_uri),
+    ]
+    .iter()
+    .filter(|(_, value)| value.is_some())
+    .map(|(name, _)| *name)
+    .collect();
+
+    match (issuer, client_id, client_secret, redirect_uri) {
+        (None, None, None, None) => Ok(None),
+        (Some(issuer), Some(client_id), Some(client_secret), Some(redirect_uri)) => {
+            if !redirect_uri.ends_with("/auth/callback") {
+                bail!(
+                    "GW_OIDC_REDIRECT_URI must end in /auth/callback (got `{redirect_uri}`) and \
+                     must be one of the URIs registered with the provider — a mismatch is \
+                     rejected by the provider, not by us."
+                );
+            }
+            Ok(Some(OidcConfig {
+                issuer,
+                client_id,
+                client_secret,
+                redirect_uri,
+            }))
+        }
+        _ => bail!(
+            "OpenID Connect is half configured: {} set, the rest missing. All four of \
+             GW_OIDC_ISSUER, GW_OIDC_CLIENT_ID, GW_OIDC_CLIENT_SECRET and \
+             GW_OIDC_REDIRECT_URI are required, or none of them.",
+            present.join(", ")
+        ),
+    }
 }
 
 pub fn parse_dev_identity(raw: &str) -> Result<Identity> {
@@ -91,15 +160,70 @@ impl Config {
             bind,
             dev_identity,
             proxy_secret,
+            oidc: read_oidc()?,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{parse_dev_identity, validate};
+    use crate::config::{oidc_from, parse_dev_identity, validate};
     use crate::identity::Identity;
     use std::net::SocketAddr;
+
+    fn some(value: &str) -> Option<String> {
+        Some(value.to_string())
+    }
+
+    #[test]
+    fn no_oidc_variables_at_all_means_local_accounts_only() {
+        assert!(oidc_from(None, None, None, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_complete_oidc_configuration_is_accepted() {
+        let config = oidc_from(
+            some("https://auth.ohje.ooguy.com"),
+            some("great-wiki"),
+            some("nicht-das-echte-geheimnis"),
+            some("https://wiki.ohje.ooguy.com/auth/callback"),
+        )
+        .unwrap()
+        .expect("all four present");
+        assert_eq!(config.client_id, "great-wiki");
+    }
+
+    #[test]
+    fn a_half_configured_provider_refuses_to_start() {
+        // Otherwise the first person to click "sign in" discovers it, in production.
+        let error = oidc_from(
+            some("https://auth.ohje.ooguy.com"),
+            some("great-wiki"),
+            None,
+            some("https://wiki.ohje.ooguy.com/auth/callback"),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("half configured"), "{message}");
+        assert!(
+            message.contains("GW_OIDC_ISSUER") && message.contains("GW_OIDC_CLIENT_ID"),
+            "the message must name what IS set, so the gap is obvious: {message}"
+        );
+    }
+
+    #[test]
+    fn a_redirect_uri_that_is_not_the_callback_path_refuses_to_start() {
+        // The provider matches the redirect URI exactly. Getting it wrong here produces an
+        // opaque `invalid_request` from Authelia at sign-in time instead of a message here.
+        let error = oidc_from(
+            some("https://auth.ohje.ooguy.com"),
+            some("great-wiki"),
+            some("nicht-das-echte-geheimnis"),
+            some("https://wiki.ohje.ooguy.com/"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("/auth/callback"), "{error}");
+    }
 
     #[test]
     fn dev_identity_parses_user_and_groups() {

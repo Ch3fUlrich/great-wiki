@@ -135,6 +135,36 @@ impl Store {
         .fetch_optional(&self.pool)
         .await?;
 
+        self.hydrate(row).await
+    }
+
+    /// The same, by primary key. What a session resolves through: a session names an id,
+    /// and the principal behind it is read fresh on every request (D-M2-7).
+    ///
+    /// Keyed by id rather than by username on purpose — a username is a display handle and
+    /// could in principle be changed, whereas the id is what every grant and membership
+    /// already points at.
+    pub async fn principal_by_id(&self, id: &str) -> Result<Option<(Principal, Option<String>)>> {
+        let row: Option<PrincipalRow> = sqlx::query_as(
+            "SELECT id, kind, username, display_name, email, groups, active \
+             FROM principals WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        self.hydrate(row).await
+    }
+
+    /// Attach the credential and the team memberships a bare row does not carry.
+    ///
+    /// One implementation for both lookups, so `principal_by_id` cannot drift into
+    /// returning a principal with no teams while `principal_by_username` returns one with
+    /// them — a difference that would show up as a permission bug, not as a data bug.
+    async fn hydrate(
+        &self,
+        row: Option<PrincipalRow>,
+    ) -> Result<Option<(Principal, Option<String>)>> {
         let Some(row) = row else { return Ok(None) };
         let hash: Option<(String,)> =
             sqlx::query_as("SELECT password_hash FROM credentials WHERE principal_id = ?1")
@@ -145,12 +175,32 @@ impl Store {
         Ok(Some((row.into_principal(teams), hash.map(|(h,)| h))))
     }
 
+    /// Activate or deactivate an account.
+    ///
+    /// Deactivating additionally **deletes every session that principal holds**, in the
+    /// SAME transaction as the flag (D-M2-7). Two statements would leave a window in which
+    /// the account is inactive but its cookies still resolve; one transaction leaves none.
+    ///
+    /// Reactivating deliberately does not restore anything — sessions are not recoverable,
+    /// and the person signs in again. Restoring them would mean keeping deleted rows,
+    /// which is the opposite of what "invalidate everywhere" promises.
     pub async fn set_principal_active(&self, id: &str, active: bool) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+
         sqlx::query("UPDATE principals SET active = ?2 WHERE id = ?1")
             .bind(id)
             .bind(i64::from(active))
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+
+        if !active {
+            sqlx::query("DELETE FROM sessions WHERE principal_id = ?1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
         Ok(())
     }
 

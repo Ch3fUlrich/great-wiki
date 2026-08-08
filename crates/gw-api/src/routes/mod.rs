@@ -1,6 +1,7 @@
 pub mod docs;
 pub mod tree;
 
+use crate::auth::{OidcClient, OidcConfig};
 use crate::identity::Identity;
 use crate::proxy_guard::{self, ProxyGuard};
 use axum::routing::get;
@@ -10,10 +11,24 @@ use gw_auth::Principal;
 use gw_store::Store;
 use std::sync::Arc;
 
-/// The cookie a signed-in browser presents. Task 6 issues and validates it; the name is
-/// here because [`AppState::principal`] already looks for it, and the order in which the
-/// three sources are consulted is the part that matters.
-pub const SESSION_COOKIE: &str = "gw_session";
+/// The cookie a signed-in browser presents. Defined next to the code that issues it; this
+/// re-export exists because [`AppState::principal`] is the other end of the same contract.
+pub use crate::auth::SESSION_COOKIE;
+
+/// Which of the three sources established the caller's identity.
+///
+/// Reported by `/api/me`, never consulted by the permission engine: an identity is an
+/// identity whatever produced it, and a rule that treated one source as more trustworthy
+/// than another would be a second place where access is decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrincipalSource {
+    /// A session cookie, resolved against the session table.
+    Session,
+    /// `GW_DEV_IDENTITY`. Only reachable on a loopback bind.
+    DevShim,
+    Anonymous,
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -29,6 +44,13 @@ pub struct AppState {
     /// in the state rather than being read from the environment inside the layer, so a
     /// test constructs an enforcing server directly instead of mutating process globals.
     pub proxy_guard: ProxyGuard,
+    /// The identity provider, when one is configured.
+    ///
+    /// `None` is a legitimate deployment — a wiki with only local accounts — so
+    /// `/auth/login` answers 503 rather than the process refusing to start. What must
+    /// never happen is a *half*-configured provider, and `Config::from_env` refuses that
+    /// at startup instead of leaving it to fail at the first sign-in.
+    pub oidc: Option<Arc<OidcClient>>,
 }
 
 impl AppState {
@@ -47,7 +69,17 @@ impl AppState {
             store,
             dev_identity,
             proxy_guard,
+            oidc: None,
         }
+    }
+
+    /// A state that talks OIDC to `config`'s issuer, with no development shim — the login
+    /// tests must exercise the session branch and nothing else.
+    pub fn for_test_oidc(store: Arc<Store>, config: OidcConfig) -> anyhow::Result<Self> {
+        Ok(Self {
+            oidc: Some(Arc::new(OidcClient::new(config)?)),
+            ..Self::for_test(store, None)
+        })
     }
 
     /// A state whose requests arrive as `principal`.
@@ -73,33 +105,54 @@ impl AppState {
     /// fall-through for every failure along the way, never an error: a request that cannot
     /// establish who it is has established that it is nobody.
     pub async fn principal(&self, jar: &CookieJar) -> Principal {
+        self.principal_with_source(jar).await.0
+    }
+
+    /// The same, and where it came from.
+    ///
+    /// Nothing about authorisation depends on the source — `can()` sees a principal and
+    /// only a principal, which is what keeps the shim honest. The interface needs it for
+    /// one thing: a development shim has no session to end, so offering "sign out" there
+    /// would be offering a button that quietly does nothing.
+    pub async fn principal_with_source(&self, jar: &CookieJar) -> (Principal, PrincipalSource) {
         if let Some(cookie) = jar.get(SESSION_COOKIE) {
             if let Some(principal) = self.principal_from_session(cookie.value()).await {
-                return principal;
+                return (principal, PrincipalSource::Session);
             }
         }
         if let Some(dev) = &self.dev_identity {
             if let Some(principal) = self.principal_from_dev_shim(dev).await {
-                return principal;
+                return (principal, PrincipalSource::DevShim);
             }
         }
-        Principal::anonymous()
+        (Principal::anonymous(), PrincipalSource::Anonymous)
     }
 
     /// Resolve a session cookie to the principal that owns it.
     ///
-    /// **Stub until Task 6**, which adds the session store. Until then there is nothing to
-    /// resolve a cookie against, and the fail-closed answer is the only correct one: a
-    /// presented cookie confers *nothing*, rather than being believed for whatever it
-    /// claims. Returning `None` here drops the request through to the shim and then to
-    /// anonymous.
+    /// The cookie carries the token; the database holds only its SHA-256, so what is
+    /// looked up is the digest of what was presented. An unknown or expired session is
+    /// `None` — indistinguishable from no cookie at all, which is the correct answer to
+    /// both.
     ///
-    /// When the session store lands, this looks the session up and then RE-READS the
-    /// principal from the database by username (D-M2-7) instead of trusting whatever was
-    /// captured at sign-in, so revoking a grant or deactivating an account takes effect on
-    /// the next click.
-    async fn principal_from_session(&self, _session_id: &str) -> Option<Principal> {
-        None
+    /// The principal is RE-READ from the store here (D-M2-7) rather than being captured at
+    /// sign-in. That is what makes revocation immediate: a removed grant, a changed team
+    /// or a deactivated account takes effect on this request, not at the next sign-in.
+    ///
+    /// A store error is `None`, not a propagated failure. A store that cannot answer who
+    /// this is has not authenticated anybody, and the request continues as nobody.
+    async fn principal_from_session(&self, token: &str) -> Option<Principal> {
+        match self
+            .store
+            .principal_for_session(&crate::auth::session::hash_token(token))
+            .await
+        {
+            Ok(principal) => principal,
+            Err(error) => {
+                tracing::error!(%error, "could not resolve the session cookie");
+                None
+            }
+        }
     }
 
     /// The development shim, resolved into a real principal.
@@ -154,6 +207,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/tree", get(tree::get_tree))
         .route("/api/documents/{*path}", get(docs::get_document))
+        .merge(crate::auth::routes())
         // Last, so it wraps every route registered above *and* the 404 fallback: the guard
         // has to run before routing, or an unattested request would learn which paths
         // exist. Handlers read `AppState::principal` inside this layer, never outside it.

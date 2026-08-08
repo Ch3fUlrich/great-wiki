@@ -69,10 +69,25 @@ async fn main() -> Result<()> {
         }
         Command::Serve => {
             let store = std::sync::Arc::new(gw_store::Store::open(&cfg.database_url).await?);
+            let oidc = match cfg.oidc.clone() {
+                Some(config) => {
+                    tracing::info!(issuer = %config.issuer, client_id = %config.client_id,
+                        "OpenID Connect login enabled");
+                    Some(std::sync::Arc::new(gw_api::OidcClient::new(config)?))
+                }
+                None => {
+                    tracing::warn!(
+                        "no OpenID Connect provider configured — /auth/login will answer 503 \
+                         and only local accounts can sign in"
+                    );
+                    None
+                }
+            };
             let state = gw_api::AppState {
                 store,
                 dev_identity: cfg.dev_identity.clone(),
                 proxy_guard: gw_api::ProxyGuard::from_config(&cfg),
+                oidc,
             };
             let app = gw_api::build_router(state).layer(
                 tower_http::limit::RequestBodyLimitLayer::new(2 * 1024 * 1024),

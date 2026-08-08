@@ -24,9 +24,26 @@ axum = "0.8"
 # `Cookie:` header by hand is a small thing to get subtly wrong for something that decides
 # who somebody is.
 axum-extra = { version = "0.10", default-features = false, features = ["cookie"] }
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
+# ID-token verification. Pure-Rust backend (`rust_crypto`) rather than `aws_lc_rs`: no C
+# toolchain in the build, and `rsa` is already in the tree.
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
+# `OsRng` for session tokens and PKCE secrets. Never a seeded or thread-local PRNG for
+# anything an attacker may guess.
+rand = "0.8"
+# Discovery, the token endpoint, JWKS and userinfo. rustls so the build needs no system
+# OpenSSL, and the bundled Mozilla roots rather than the OS trust store so a container
+# with an empty `/etc/ssl/certs` fails at build time rather than at first login. No
+# cookie store and no redirect following: a token exchange follows nothing.
+reqwest = { version = "0.13", default-features = false, features = ["charset", "form", "http2", "json", "rustls-no-provider", "webpki-roots"] }
+# rustls' default provider is `aws-lc-rs`, which needs CMake and a C toolchain to build.
+# `ring` needs neither, so the provider is chosen here and installed explicitly in
+# `OidcClient::new` rather than left to whatever happens to be linked in.
+rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 # sqlx is a DIRECT dependency because handlers query. The predecessor plan omitted it
 # from this crate's manifest while calling sqlx from four of its modules.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
@@ -34,13 +51,20 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 # differing byte, which times how much of a guess was right; `subtle` does not.
 subtle = "2"
 thiserror = { workspace = true }
+# Cookie lifetimes. `axum-extra`'s cookie support is the `cookie` crate, which expresses
+# `Max-Age` as a `time::Duration`; this is that crate, not a second time library.
+time = "0.3"
 tokio = { workspace = true }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "limit"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+url = "2.5"
 
 [dev-dependencies]
+# A stand-in identity provider for the login tests: a real RSA key, generated per test
+# run rather than committed, so no private key ever lives in this public repository.
+rsa = "0.9"
 tempfile = "3"
 tokio = { workspace = true }
 tower = { version = "0.5", features = ["util"] }

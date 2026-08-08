@@ -8,6 +8,18 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- OpenID Connect sign-in against Authelia: authorization-code flow with PKCE, verified
+  `state` and `nonce`, and id-token signature, issuer and audience all checked. Groups are
+  read from the id token, falling back to userinfo with a mandatory subject match.
+- Sessions are stored in SQLite with only a hash of the token, so a database disclosure
+  does not hand over live sessions. Tokens carry at least 256 bits; the cookie is
+  `__Host-` prefixed, HttpOnly, Secure and SameSite=Lax.
+- Signing out deletes the server-side session rather than merely clearing the cookie, and
+  deactivating an account ends its sessions everywhere in the same transaction.
+- Three typefaces the reader chooses between — IBM Plex, Literata with JetBrains Mono, or
+  the platform's own — applied before first paint like the theme, with each family's
+  licence shipped beside its files.
+
 - Real tables. Markdown tables become `table`, `row`, `header` and `cell` blocks and render
   as an actual table with `scope="col"` on headers and per-column alignment carried through,
   inside a focusable horizontally scrolling container — so a wide table scrolls in its own

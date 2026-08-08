@@ -323,16 +323,17 @@ async fn an_admins_member_reaches_the_whole_tree() {
 }
 
 #[tokio::test]
-async fn a_session_cookie_confers_nothing_until_there_is_a_session_store() {
-    // Task 6 adds the session store. Until then a presented cookie must resolve to nobody
-    // rather than to whatever it claims — the branch has to fail closed while it is a stub,
-    // not merely once it is finished.
+async fn a_session_cookie_naming_a_real_user_confers_nothing_on_its_own() {
+    // The session table is keyed by the digest of a random token, so a cookie whose value
+    // is simply somebody's username resolves to nobody. Worth pinning: "the cookie says
+    // sergej, so this is sergej" is the shape of the bug this design exists to prevent,
+    // and `sergej` is an `admins` member in this fixture.
     let store = seed_with_acl().await;
     let response = gw_api::build_router(gw_api::AppState::for_test(Arc::clone(&store), None))
         .oneshot(
             Request::builder()
                 .uri("/api/documents/geheim")
-                .header("cookie", "gw_session=sergej")
+                .header("cookie", "__Host-gw_session=sergej")
                 .body(Body::empty())
                 .unwrap(),
         )

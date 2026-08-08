@@ -22,3 +22,13 @@ pulldown-cmark = { version = "0.12", default-features = false }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# The login tests generate a real RSA key rather than committing one to a public
+# repository, and unoptimised primality testing takes tens of seconds. Optimising these
+# two packages only keeps `cargo test` quick without optimising the code under test,
+# which would make a debugger and a backtrace worse for everything else.
+[profile.dev.package.rsa]
+opt-level = 3
+
+[profile.dev.package.num-bigint-dig]
+opt-level = 3

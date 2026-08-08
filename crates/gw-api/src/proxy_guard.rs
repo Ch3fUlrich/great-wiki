@@ -172,6 +172,7 @@ mod tests {
             bind: bind.parse().unwrap(),
             dev_identity: None,
             proxy_secret: secret.map(str::to_string),
+            oidc: None,
         }
     }
 
