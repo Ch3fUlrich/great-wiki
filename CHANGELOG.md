@@ -8,6 +8,10 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- The temporary edge gate is gone. Both wiki hosts now rely on the application's own
+  sign-in, so published pages are readable without a homelab account and guest accounts
+  will be able to sign in without Authelia at all.
+
 - OpenID Connect sign-in against Authelia: authorization-code flow with PKCE, verified
   `state` and `nonce`, and id-token signature, issuer and audience all checked. Groups are
   read from the id token, falling back to userinfo with a mandatory subject match.
