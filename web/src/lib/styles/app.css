@@ -61,9 +61,17 @@
 		font-family: var(--font-sans);
 		font-size: var(--text-base);
 		line-height: var(--leading-normal);
-		-webkit-font-smoothing: antialiased;
-		text-rendering: optimizeLegibility;
 	}
+
+	/* Deliberately NOT set here: `-webkit-font-smoothing: antialiased` and
+	 * `text-rendering: optimizeLegibility`.
+	 *
+	 * Both are cargo-cult. The first is macOS-only and actively degrades light-mode
+	 * rendering by disabling subpixel antialiasing; MDN recommends against it and points
+	 * at `font-weight` for the dark-mode over-boldness it is usually reached for. The
+	 * second enables ligature and kerning behaviour that is already on by default in
+	 * every current engine, and has historically caused rendering bugs.
+	 */
 
 	a {
 		color: var(--accent);

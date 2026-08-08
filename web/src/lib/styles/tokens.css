@@ -23,9 +23,12 @@
 	--font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
 	--font-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace;
 
+	/* 17px base, not 16. Rello et al. (CHI 2016, n=104) found readability improving
+	 * continuously up to 18pt for long-form text, and this is a platform for reading
+	 * rather than for glancing. It costs nothing. */
 	--text-xs: 0.79rem;
 	--text-sm: 0.889rem;
-	--text-base: 1rem;
+	--text-base: 1.0625rem;
 	--text-lg: 1.125rem;
 	--text-xl: 1.266rem;
 	--text-2xl: 1.424rem;
@@ -35,8 +38,20 @@
 	--leading-tight: 1.25;
 	--leading-normal: 1.65;
 
-	/* 68 characters. Below ~45 the eye jumps too often, above ~75 it loses the line. */
-	--measure: 68ch;
+	/* ~66 GERMAN characters, which is not 66ch.
+	 *
+	 * The `ch` unit is the advance width of `0`, and digits are wider than average
+	 * lowercase — measured at 1.14× for the body face. So `68ch` was landing near 78
+	 * characters, not 68. This is the corrected figure.
+	 *
+	 * Honesty about what this number is: the "45–75 characters" rule is a style-manual
+	 * convention, not a finding. Bringhurst writes "widely regarded as", uncited. The
+	 * actual evidence shows a dissociation — longer lines are read FASTER (Dyson &
+	 * Kipping 1998: 100 characters beat 25, comprehension unchanged) and readers
+	 * dislike them. Choosing ~66 optimises for satisfaction, not speed. That is a
+	 * legitimate preference, but it is a preference.
+	 */
+	--measure: 58ch;
 
 	/* --- Space --------------------------------------------------------------
 	 * A 4px base. Every margin and padding is a multiple, so vertical rhythm holds
