@@ -4,7 +4,12 @@ import { slugify } from '$lib/slug';
 // rather than rendered raw — that is what makes an unknown block safe.
 export type BlockKind =
   | 'doc' | 'paragraph' | 'heading' | 'bulletList' | 'orderedList'
-  | 'listItem' | 'blockquote' | 'codeBlock' | 'text';
+  | 'listItem' | 'blockquote' | 'codeBlock'
+  // `tableHeader` is a header *cell* (`th`), not a header row — a row is a `tableRow`
+  // whichever kind of cell it holds. That is how ProseMirror models it, and it is what
+  // lets the renderer choose `th` over `td` from the cell alone.
+  | 'table' | 'tableRow' | 'tableHeader' | 'tableCell'
+  | 'text';
 
 export interface Block {
   kind: BlockKind;

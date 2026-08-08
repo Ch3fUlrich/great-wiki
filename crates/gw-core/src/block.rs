@@ -15,6 +15,19 @@ pub enum BlockKind {
     ListItem,
     Blockquote,
     CodeBlock,
+    /// A table: `TableRow` children and nothing else.
+    Table,
+    /// A row: `TableCell` or `TableHeader` children and nothing else.
+    TableRow,
+    /// A header cell (`th`). ProseMirror models the header as a *cell* kind rather than a
+    /// row kind, and so does this: a renderer can then choose `th` over `td` from the cell
+    /// alone, without having to know what its ancestors were.
+    ///
+    /// Cells hold block content — a paragraph, not bare text — so a cell can hold a list
+    /// or a second paragraph the day the editor allows one.
+    TableHeader,
+    /// A body cell (`td`).
+    TableCell,
     Text,
 }
 
@@ -153,6 +166,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(doc.headings()[0].level, 1);
+    }
+
+    #[test]
+    fn table_cells_are_separated_in_plain_text() {
+        // Written as JSON rather than built in Rust so the camelCase wire names are pinned
+        // here too: `web/src/lib/blocks/render.ts` mirrors this enum and cannot see it.
+        let doc: Block = serde_json::from_str(
+            r#"{"kind":"doc","content":[{"kind":"table","content":[
+                 {"kind":"tableRow","content":[
+                   {"kind":"tableHeader","attrs":{"align":"right"},
+                    "content":[{"kind":"paragraph","content":[{"kind":"text","text":"Länge"}]}]},
+                   {"kind":"tableCell",
+                    "content":[{"kind":"paragraph","content":[{"kind":"text","text":"Meter"}]}]}]}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(doc.content[0].kind, BlockKind::Table);
+        assert_eq!(doc.content[0].content[0].kind, BlockKind::TableRow);
+        assert_eq!(
+            doc.content[0].content[0].content[0].kind,
+            BlockKind::TableHeader
+        );
+        // Exact, not `contains`: a substring check passes on the fused token "LängeMeter",
+        // which is the failure this separation exists to prevent.
+        assert_eq!(doc.plain_text(), "Länge Meter");
+    }
+
+    #[test]
+    fn a_table_contributes_no_headings_to_the_outline() {
+        let doc: Block = serde_json::from_str(
+            r#"{"kind":"doc","content":[{"kind":"table","content":[
+                 {"kind":"tableRow","content":[
+                   {"kind":"tableHeader",
+                    "content":[{"kind":"paragraph","content":[{"kind":"text","text":"Feld"}]}]}]}]}]}"#,
+        )
+        .unwrap();
+        assert!(
+            doc.headings().is_empty(),
+            "a column title is not a section of the document"
+        );
     }
 
     #[test]

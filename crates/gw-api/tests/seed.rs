@@ -186,23 +186,77 @@ async fn a_child_without_a_parent_document_is_skipped_not_given_an_invented_one(
 }
 
 #[tokio::test]
-async fn table_text_reaches_the_database_and_the_flattening_is_reported() {
+async fn a_table_reaches_the_database_as_a_table_not_as_paragraphs() {
     let dir = corpus(&[(
         "tabelle.md",
-        "---\ntitle: Tabelle\n---\n\n| Feld | Wert |\n| --- | --- |\n| Größe | 42 |\n",
+        "---\ntitle: Tabelle\n---\n\n| Feld | Wert |\n| ---: | --- |\n| Größe | 42 |\n",
     )]);
     let (store, report) = seed(dir.path()).await;
 
     assert!(report.is_complete(), "{report}");
     let doc = fetch(&store, "/tabelle").await.unwrap();
     let body: gw_core::Block = serde_json::from_str(&doc.body).unwrap();
+
+    let table = &body.content[0];
+    assert_eq!(table.kind, gw_core::BlockKind::Table);
+    assert_eq!(table.content.len(), 2, "a header row and one body row");
+    assert_eq!(
+        table.content[0].content[0].kind,
+        gw_core::BlockKind::TableHeader
+    );
+    assert_eq!(
+        table.content[1].content[0]
+            .attrs
+            .get("align")
+            .and_then(|v| v.as_str()),
+        Some("right"),
+        "alignment must survive the store, or a numeric column arrives ragged"
+    );
+
     // Exact, not `contains`: a substring check passes on the fused token "FeldWert" too,
     // and a fused token is in the index matching nothing anyone would search for.
     assert_eq!(body.plain_text(), "Feld Wert Größe 42");
     assert!(
-        report.notes.iter().any(|n| n.detail.contains("table")),
-        "a lossy conversion must be reported: {report}"
+        report.notes.is_empty(),
+        "a table is no longer a lossy conversion: {report}"
     );
+}
+
+#[tokio::test]
+async fn a_body_heading_that_only_repeats_the_title_does_not_reach_the_database() {
+    // The reader renders the frontmatter title as the page's `h1`. A file that also opens
+    // with `# Title` would show it twice — on the page and in the outline.
+    let dir = corpus(&[(
+        "notiz.md",
+        "---\ntitle: Größe und Maß\n---\n\n# Größe und Maß\n\nEin Satz.\n",
+    )]);
+    let (store, report) = seed(dir.path()).await;
+
+    assert!(report.is_complete(), "{report}");
+    let doc = fetch(&store, "/groesse-und-mass").await.unwrap();
+    let body: gw_core::Block = serde_json::from_str(&doc.body).unwrap();
+
+    assert_eq!(doc.title, "Größe und Maß", "the title itself is untouched");
+    assert!(
+        body.headings().is_empty(),
+        "the duplicate heading must be gone from the outline too: {:?}",
+        body.headings()
+    );
+    assert_eq!(body.plain_text(), "Ein Satz.");
+}
+
+#[tokio::test]
+async fn a_body_heading_that_differs_from_the_title_is_kept() {
+    let dir = corpus(&[(
+        "notiz.md",
+        "---\ntitle: Handbuch\n---\n\n# Erste Schritte\n\nEin Satz.\n",
+    )]);
+    let (store, report) = seed(dir.path()).await;
+
+    assert!(report.is_complete(), "{report}");
+    let doc = fetch(&store, "/handbuch").await.unwrap();
+    let body: gw_core::Block = serde_json::from_str(&doc.body).unwrap();
+    assert_eq!(body.headings()[0].text, "Erste Schritte");
 }
 
 #[tokio::test]
@@ -307,6 +361,11 @@ async fn the_shipped_example_corpus_seeds_cleanly() {
 
     assert!(report.is_complete(), "{report}");
     assert!(report.inserted.len() >= 4, "{report}");
+    assert!(
+        !report.notes.iter().any(|n| n.detail.contains("table")),
+        "the corpus contains a table and tables are modelled now; a note here means the \
+         converter went back to flattening one: {report}"
+    );
     assert!(
         !store.tree_for(&admin()).await.unwrap().is_empty(),
         "the example corpus must produce a navigable tree"

@@ -36,10 +36,18 @@
 <style>
   .shell {
     display: grid;
-    gap: var(--space-12);
+    gap: var(--space-8) var(--space-12);
     padding: var(--space-8) var(--space-6);
-    grid-template-columns: minmax(11rem, 15rem) minmax(0, 1fr) minmax(9rem, 13rem);
-    max-width: 92rem;
+    /* The centre column is sized to the measure rather than to leftover space.
+       With `1fr` the column stretched to the viewport while the text inside stayed
+       capped at 68 characters, so on a wide screen the prose hugged the left edge
+       with a band of dead space beside it — which reads as a bug, because it is one. */
+    grid-template-columns:
+      minmax(11rem, 15rem)
+      minmax(0, var(--measure))
+      minmax(9rem, 13rem);
+    justify-content: center;
+    max-width: 100rem;
     margin-inline: auto;
     align-items: start;
   }
@@ -82,7 +90,15 @@
     border-inline-start: 2px solid transparent;
     color: var(--ink-muted);
     text-decoration: none;
-    line-height: 1.4;
+    line-height: 1.35;
+    /* A wrapped entry keeps its indent on the second line. Without this the
+       continuation returns to the left rail and the nesting stops reading. */
+    text-indent: 0;
+    hanging-punctuation: none;
+  }
+
+  .outline a:focus-visible {
+    color: var(--ink);
   }
 
   .outline a:hover {
@@ -98,12 +114,16 @@
     text-wrap: balance;
   }
 
-  /* One column below 64rem. The outline moves above the text rather than
-     disappearing — on a phone it is the fastest way through a long document. */
+  /* One column below 64rem.
+     Ordering matters more than it looks. Putting both navigations above the text
+     means scrolling past two blocks of links to reach the article — on a phone that
+     is most of a screen of nothing you came for. So: the outline first, because it
+     is short and is the fastest way through a long document; then the article; then
+     the site tree, which you only want when you are leaving this page anyway. */
   @media (max-width: 64rem) {
     .shell {
       grid-template-columns: minmax(0, 1fr);
-      gap: var(--space-8);
+      gap: var(--space-6);
       padding: var(--space-6) var(--space-4);
     }
 
@@ -111,13 +131,18 @@
     .outline {
       position: static;
       max-block-size: none;
-      padding-block: var(--space-4);
-      border-block-end: 1px solid var(--border);
     }
 
     .outline {
       order: -1;
-      border-block: 1px solid var(--border);
+      padding-block-end: var(--space-4);
+      border-block-end: 1px solid var(--border);
+    }
+
+    .sidebar {
+      order: 1;
+      padding-block-start: var(--space-6);
+      border-block-start: 1px solid var(--border);
     }
   }
 </style>

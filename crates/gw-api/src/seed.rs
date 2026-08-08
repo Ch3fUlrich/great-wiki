@@ -14,7 +14,7 @@
 //!   script and a half-loaded corpus cannot pass for a loaded one.
 
 use anyhow::{Context, Result};
-use gw_core::{markdown, slugify, split_frontmatter, SeedMeta};
+use gw_core::{markdown, slugify, split_frontmatter, Block, BlockKind, SeedMeta};
 use gw_store::{NewDocument, Store};
 use std::collections::HashMap;
 use std::fmt;
@@ -160,7 +160,8 @@ async fn load_one(
         }
     }
 
-    let conversion = markdown::convert(body);
+    let mut conversion = markdown::convert(body);
+    drop_duplicate_title_heading(&mut conversion.doc, &meta.title);
     let new = NewDocument {
         parent_path,
         doc_type: meta.doc_type,
@@ -203,6 +204,35 @@ async fn load_one(
     }
 
     Ok(Loaded::Inserted { path, notes })
+}
+
+/// Drop a leading `# Title` that only repeats the frontmatter title.
+///
+/// A content file states its title twice — once in frontmatter, once as the first line of
+/// the body — and the reader renders the frontmatter title as the page's `h1`. Keeping
+/// both puts the same heading on the page twice and in the outline twice.
+///
+/// The comparison is **exact** (trimmed): not case-insensitive, not by prefix. A page
+/// whose first heading genuinely differs from its title keeps both, because only the
+/// author knows whether "Größe" under a page titled "Größe und Maß" is a repetition or a
+/// section. Guessing wrong here deletes writing, which is worse than a duplicated line.
+fn drop_duplicate_title_heading(doc: &mut Block, title: &str) {
+    let Some(first) = doc.content.first() else {
+        return;
+    };
+    if first.kind != BlockKind::Heading {
+        return;
+    }
+    // An absent level means 1, as `Block::headings` reads it.
+    let level = first
+        .attrs
+        .get("level")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
+    if level != 1 || first.plain_text().trim() != title.trim() {
+        return;
+    }
+    doc.content.remove(0);
 }
 
 fn collision_reason(path: &str, claimed: &HashMap<String, PathBuf>) -> String {
@@ -298,8 +328,92 @@ fn walk(root: &Path, rel: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_markdown, parent_path_of};
+    use super::{collect_markdown, drop_duplicate_title_heading, parent_path_of};
+    use gw_core::markdown;
     use std::path::{Path, PathBuf};
+
+    /// Convert `body` and apply the rule, then describe what is left — one
+    /// `kind: text` line per top-level block, so a test asserts the whole document
+    /// rather than only the part it expected to change.
+    fn after(title: &str, body: &str) -> Vec<String> {
+        let mut doc = markdown::convert(body).doc;
+        drop_duplicate_title_heading(&mut doc, title);
+        doc.content
+            .iter()
+            .map(|b| format!("{:?}: {}", b.kind, b.plain_text()))
+            .collect()
+    }
+
+    #[test]
+    fn a_leading_h1_that_repeats_the_title_is_dropped() {
+        // The reader renders the frontmatter title as the page's `h1`. Keeping the body's
+        // copy puts the same heading on screen twice, and in the outline twice.
+        assert_eq!(
+            after("Größe und Maß", "# Größe und Maß\n\nEin Satz.\n"),
+            vec!["Paragraph: Ein Satz."]
+        );
+    }
+
+    #[test]
+    fn a_leading_h1_that_differs_from_the_title_is_kept() {
+        // Only the author knows the difference is meaningful, so it is never guessed away.
+        assert_eq!(
+            after("Handbuch", "# Erste Schritte\n\nEin Satz.\n"),
+            vec!["Heading: Erste Schritte", "Paragraph: Ein Satz."]
+        );
+    }
+
+    #[test]
+    fn a_heading_matching_only_in_case_or_as_a_prefix_is_kept() {
+        // The comparison is exact. A case-insensitive or prefix match would delete a
+        // heading the author wrote deliberately — "Größe" under a page titled "Größe und
+        // Maß" is a section, not a repetition.
+        assert_eq!(
+            after("Größe und Maß", "# größe und maß\n\nText.\n").len(),
+            2
+        );
+        assert_eq!(after("Größe und Maß", "# Größe\n\nText.\n").len(), 2);
+        assert_eq!(after("Größe", "# Größe und Maß\n\nText.\n").len(), 2);
+    }
+
+    #[test]
+    fn surrounding_whitespace_does_not_decide_it() {
+        assert_eq!(after("  Notiz  ", "#   Notiz  \n\nText.\n").len(), 1);
+    }
+
+    #[test]
+    fn a_deeper_heading_that_repeats_the_title_is_kept() {
+        // Only an `h1` collides with the title the reader renders; an `h2` of the same
+        // name is a section that happens to share the page's name.
+        assert_eq!(
+            after("Tabellen", "## Tabellen\n\nText.\n"),
+            vec!["Heading: Tabellen", "Paragraph: Text."]
+        );
+    }
+
+    #[test]
+    fn only_the_first_block_is_considered() {
+        // A repetition further down is prose the author placed there, not the artefact of
+        // writing the title twice at the top of the file.
+        assert_eq!(
+            after("Notiz", "Ein Satz.\n\n# Notiz\n\nMehr.\n"),
+            vec!["Paragraph: Ein Satz.", "Heading: Notiz", "Paragraph: Mehr."]
+        );
+    }
+
+    #[test]
+    fn a_document_with_no_leading_heading_is_untouched() {
+        assert_eq!(after("Notiz", "Ein Satz.\n"), vec!["Paragraph: Ein Satz."]);
+        assert!(after("Notiz", "").is_empty(), "an empty body stays empty");
+    }
+
+    #[test]
+    fn the_document_is_not_emptied_when_the_title_is_all_it_holds() {
+        // A page whose body is only its own title becomes an empty document, not a
+        // document with a heading nobody wanted. The reader still shows the title.
+        let doc = after("Notiz", "# Notiz\n");
+        assert!(doc.is_empty(), "{doc:?}");
+    }
 
     #[test]
     fn a_root_file_has_no_parent() {

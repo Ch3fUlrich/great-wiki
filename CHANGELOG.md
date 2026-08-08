@@ -8,6 +8,23 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- Real tables. Markdown tables become `table`, `row`, `header` and `cell` blocks and render
+  as an actual table with `scope="col"` on headers and per-column alignment carried through,
+  inside a focusable horizontally scrolling container — so a wide table scrolls in its own
+  box and the page never scrolls sideways.
+- Screenshot tooling: the reader is captured at desktop and phone widths in both themes, so
+  a layout can be looked at rather than inferred from a status code.
+
+### Fixed
+
+- Every page rendered its title twice — once from frontmatter and once from the body's own
+  leading heading. The seeder now drops a leading level-1 heading when it exactly matches
+  the title, and keeps it when it does not.
+- The prose column stretched to the viewport while the text inside stayed capped at the
+  measure, so on a wide screen the text hugged the left edge with dead space beside it.
+- On a phone you scrolled past two navigation blocks before reaching the article. The short
+  outline now comes first, then the article, then the site tree.
+
 - A real design system: tokens for type, space and colour as CSS custom properties, and
   content typography for headings, lists, quotes, code, tables and figures. The reader
   previously styled only the page chrome, so documents rendered as unstyled browser
@@ -69,7 +86,7 @@ Entries describe the *effect* of a change, not the diff.
   command exits non-zero — deriving a title from a filename would silently publish a page
   at a path nobody chose.
 - Markdown constructs the block model cannot yet represent are reported and their text
-  kept, never dropped: table cells become one paragraph per row, and emphasis is flattened.
+  kept, never dropped. Emphasis is currently flattened.
 - `content-example/` makes the repository runnable straight after cloning, and gives CI
   something real to validate.
 

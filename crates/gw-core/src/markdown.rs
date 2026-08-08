@@ -7,7 +7,7 @@
 //! `Conversion::notes` — a silent loss is the one outcome that cannot be detected later.
 
 use crate::block::{Block, BlockKind};
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -19,8 +19,6 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum Unsupported {
-    /// A GFM table. Cell text is flattened into one paragraph per row.
-    Table,
     /// An image. The alt text survives as text; the source URL does not.
     Image,
     /// A link. The link text survives; the destination does not.
@@ -42,7 +40,6 @@ impl Unsupported {
     /// which is free to change.
     pub fn key(self) -> &'static str {
         match self {
-            Unsupported::Table => "table",
             Unsupported::Image => "image",
             Unsupported::LinkTarget => "link",
             Unsupported::InlineMarks => "inline-marks",
@@ -56,9 +53,6 @@ impl Unsupported {
     /// What happened to the construct's content, and which milestone closes the gap.
     pub fn disposition(self) -> &'static str {
         match self {
-            Unsupported::Table => {
-                "cell text flattened into one paragraph per row — M8 adds table blocks"
-            }
             Unsupported::Image => "alt text kept, source URL dropped — M6 adds image blocks",
             Unsupported::LinkTarget => "link text kept, destination dropped — M4 adds inline marks",
             Unsupported::InlineMarks => "text kept, emphasis dropped — M4 adds inline marks",
@@ -119,10 +113,10 @@ pub fn convert(md: &str) -> Conversion {
     builder.finish()
 }
 
-/// Tables and strikethrough are enabled deliberately even though no block kind matches
-/// them: parsing them means their text is *seen* and can be preserved, whereas leaving
-/// the extensions off makes a table parse as a paragraph of pipes and a `~~word~~` keep
-/// its tildes. Seeing more than we can model is recoverable; not seeing it is not.
+/// Tables and strikethrough are enabled deliberately. Tables have block kinds of their
+/// own; strikethrough does not, but parsing it means its text is *seen* and can be
+/// preserved, whereas leaving the extension off makes a `~~word~~` keep its tildes.
+/// Seeing more than we can model is recoverable; not seeing it is not.
 fn options() -> Options {
     Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH
 }
@@ -136,12 +130,27 @@ struct Frame {
     implicit: bool,
 }
 
+/// The table currently open: what the delimiter row said, and where in the row we are.
+///
+/// One is enough because GFM tables cannot nest — a cell's content is inline, so no table
+/// can begin inside one.
+struct Table {
+    /// Column alignments, in column order. `Tag::Table` carries them once, but they belong
+    /// on the cells, which are the only thing a renderer can act on.
+    alignments: Vec<Alignment>,
+    /// The column the next `TableCell` opens. Reset at every row.
+    column: usize,
+    /// Whether the open row is the header row, which decides `TableHeader` over `TableCell`.
+    in_head: bool,
+}
+
 struct Builder {
     stack: Vec<Frame>,
     /// Fenced and indented code arrives as one `Text` event per line. They are joined here
     /// rather than becoming one text leaf each, because separate leaves lose the newlines
     /// and a code block without its line breaks is not the same code block.
     code: Option<String>,
+    table: Option<Table>,
     losses: BTreeMap<Unsupported, usize>,
 }
 
@@ -153,6 +162,7 @@ impl Builder {
                 implicit: false,
             }],
             code: None,
+            table: None,
             losses: BTreeMap::new(),
         }
     }
@@ -246,6 +256,16 @@ impl Builder {
         }
     }
 
+    /// Open a table row, remembering whether its cells are header cells and restarting the
+    /// column count — alignment is per column, so a row that miscounts bends the table.
+    fn open_row(&mut self, in_head: bool) {
+        if let Some(table) = &mut self.table {
+            table.column = 0;
+            table.in_head = in_head;
+        }
+        self.open(block(BlockKind::TableRow));
+    }
+
     /// Every `Event` variant is matched by name, with no catch-all arm. That is
     /// deliberate: the day a pulldown-cmark upgrade adds an event, this fails to compile
     /// instead of quietly discarding whatever the new event carried.
@@ -321,20 +341,46 @@ impl Builder {
             }
             Tag::List(None) => self.open(block(BlockKind::BulletList)),
             Tag::Item => self.open(block(BlockKind::ListItem)),
-            // A table row becomes a paragraph and each cell a text leaf inside it, so
-            // every cell's text reaches the search index and the export. M8 introduces
-            // real table blocks and this branch becomes a structural mapping.
-            Tag::Table(_) => self.note(Unsupported::Table),
-            Tag::TableHead | Tag::TableRow => self.open(block(BlockKind::Paragraph)),
+            Tag::Table(alignments) => {
+                self.table = Some(Table {
+                    alignments,
+                    column: 0,
+                    in_head: false,
+                });
+                self.open(block(BlockKind::Table));
+            }
+            Tag::TableHead => self.open_row(true),
+            Tag::TableRow => self.open_row(false),
             Tag::TableCell => {
-                // A cell boundary carries no character of its own, so without this the
-                // last word of one cell fuses to the first word of the next — `| Länge |
-                // Meter |` becomes the token "LängeMeter", which lands in the search index
-                // and matches nothing anyone would ever type. Exactly the failure
-                // `Block::plain_text` guards against between blocks, one level down.
-                if !self.top().content.is_empty() {
-                    self.text(" ");
+                // Each cell is its own block, which is also what keeps `| Länge | Meter |`
+                // from becoming the token "LängeMeter" in the search index: `plain_text`
+                // separates blocks, and a cell boundary carries no character of its own.
+                let (kind, align) = match &mut self.table {
+                    Some(table) => {
+                        // A row with more cells than the delimiter row declared is legal
+                        // GFM; the surplus simply has no stated alignment.
+                        let align = table
+                            .alignments
+                            .get(table.column)
+                            .copied()
+                            .unwrap_or(Alignment::None);
+                        table.column += 1;
+                        let kind = if table.in_head {
+                            BlockKind::TableHeader
+                        } else {
+                            BlockKind::TableCell
+                        };
+                        (kind, align)
+                    }
+                    // Unreachable: a cell only ever arrives inside a table.
+                    None => (BlockKind::TableCell, Alignment::None),
+                };
+                let mut b = block(kind);
+                if let Some(name) = align_name(align) {
+                    b.attrs
+                        .insert("align".into(), serde_json::Value::from(name));
                 }
+                self.open(b);
             }
             Tag::Image { .. } => self.note(Unsupported::Image),
             Tag::Link { .. } => self.note(Unsupported::LinkTarget),
@@ -355,7 +401,12 @@ impl Builder {
             | TagEnd::List(_)
             | TagEnd::Item
             | TagEnd::TableHead
-            | TagEnd::TableRow => self.close(),
+            | TagEnd::TableRow
+            | TagEnd::TableCell => self.close(),
+            TagEnd::Table => {
+                self.table = None;
+                self.close();
+            }
             TagEnd::CodeBlock => {
                 if let Some(code) = self.code.take() {
                     // The fence supplies the final newline, so storing it would grow the
@@ -369,9 +420,23 @@ impl Builder {
                 }
                 self.close();
             }
-            // Marks, images, links, tables and cells open no frame, so they close none.
+            // Marks, images and links open no frame, so they close none.
             _ => {}
         }
+    }
+}
+
+/// The `align` attribute for a column, or `None` where the table states no alignment.
+///
+/// A column with no stated alignment writes no attribute at all, so the common case
+/// produces no attrs and the JSON stays comparable across importers — the same rule the
+/// list `start` attribute follows.
+fn align_name(align: Alignment) -> Option<&'static str> {
+    match align {
+        Alignment::Left => Some("left"),
+        Alignment::Center => Some("center"),
+        Alignment::Right => Some("right"),
+        Alignment::None => None,
     }
 }
 
@@ -386,7 +451,7 @@ fn block(kind: BlockKind) -> Block {
 
 #[cfg(test)]
 mod tests {
-    use crate::block::BlockKind;
+    use crate::block::{Block, BlockKind};
     use crate::markdown::{convert, markdown_to_blocks, Unsupported};
 
     fn keys(md: &str) -> Vec<&'static str> {
@@ -394,6 +459,19 @@ mod tests {
             .notes
             .iter()
             .map(|n| n.construct.key())
+            .collect()
+    }
+
+    /// The kind of each child, so a row's cells can be asserted in one line.
+    fn kinds_of(block: &Block) -> Vec<BlockKind> {
+        block.content.iter().map(|c| c.kind).collect()
+    }
+
+    /// The `align` attribute of each child, `None` where the column states none.
+    fn aligns_of(row: &Block) -> Vec<Option<&str>> {
+        row.content
+            .iter()
+            .map(|c| c.attrs.get("align").and_then(|v| v.as_str()))
             .collect()
     }
 
@@ -508,44 +586,103 @@ mod tests {
     }
 
     #[test]
-    fn table_cell_text_survives_as_paragraphs_and_is_reported() {
-        // Losing content silently is the one unacceptable outcome. Until M8 there is no
-        // table block, so the text must land somewhere a reader and the index can see it.
-        let md = "| Feld | Wert |\n| --- | --- |\n| Größe | 42 |\n";
+    fn a_table_becomes_a_table_block_with_a_header_row_and_body_rows() {
+        let md = "| Feld | Wert |\n| --- | --- |\n| Größe | 42 |\n| Breite | 7 |\n";
         let conversion = convert(md);
+
+        assert_eq!(
+            conversion.doc.content.len(),
+            1,
+            "one table, not one block per row"
+        );
+        let table = &conversion.doc.content[0];
+        assert_eq!(table.kind, BlockKind::Table);
+        assert_eq!(table.content.len(), 3, "a header row and two body rows");
+        assert!(table.content.iter().all(|r| r.kind == BlockKind::TableRow));
+
+        // The header row is a row like any other; what makes it a header is that its cells
+        // are `TableHeader`, exactly as ProseMirror models it. A renderer can therefore
+        // decide `th` versus `td` from the cell alone, without knowing its ancestry.
+        assert_eq!(
+            kinds_of(&table.content[0]),
+            vec![BlockKind::TableHeader, BlockKind::TableHeader]
+        );
+        assert_eq!(
+            kinds_of(&table.content[1]),
+            vec![BlockKind::TableCell, BlockKind::TableCell]
+        );
+
+        // A cell holds block content, not text: the text lives in a paragraph inside it,
+        // so a cell can hold a list or a second paragraph the day the editor allows one.
+        assert_eq!(
+            table.content[0].content[0].content[0].kind,
+            BlockKind::Paragraph
+        );
+
+        assert!(
+            conversion.notes.is_empty(),
+            "a table is no longer a lossy conversion: {:?}",
+            conversion.notes
+        );
+    }
+
+    #[test]
+    fn every_cell_reaches_plain_text_separated_rather_than_fused() {
         // Asserted as exact text, not `contains`: a `contains("Feld")` check passes just
         // as happily on the fused token "FeldWert", which is the actual failure mode.
-        assert_eq!(conversion.doc.plain_text(), "Feld Wert Größe 42");
+        let md = "| Feld | Wert |\n| --- | --- |\n| Größe | 42 |\n";
+        assert_eq!(markdown_to_blocks(md).plain_text(), "Feld Wert Größe 42");
+    }
+
+    #[test]
+    fn column_alignment_reaches_every_cell_and_a_default_column_carries_none() {
+        // Dropping alignment silently is how a numeric column ends up ragged, so it rides
+        // on the cells — the only place a renderer can act on it.
+        let md = "| l | c | r | d |\n|:---|:---:|---:|---|\n| 1 | 2 | 3 | 4 |\n";
+        let doc = markdown_to_blocks(md);
+        let table = &doc.content[0];
+
+        let expected = vec![Some("left"), Some("center"), Some("right"), None];
         assert_eq!(
-            conversion
-                .notes
-                .iter()
-                .map(|n| n.construct)
-                .collect::<Vec<_>>(),
-            vec![Unsupported::Table]
+            aligns_of(&table.content[0]),
+            expected,
+            "the header row is aligned too, or the column looks bent at its title"
         );
-        assert_eq!(conversion.doc.content.len(), 2, "one paragraph per row");
-        assert!(conversion
-            .doc
-            .content
-            .iter()
-            .all(|b| b.kind == BlockKind::Paragraph));
+        assert_eq!(aligns_of(&table.content[1]), expected);
     }
 
     #[test]
     fn a_three_column_row_does_not_fuse_its_cells() {
-        // Regression: cell boundaries carry no character, so merging adjacent text leaves
-        // produced "LängeMeterm" — a token in the search index that matches no query.
+        // Regression: a cell boundary carries no character of its own, so while cells
+        // shared one block `| Länge | Meter |` produced "LängeMeter" — a token in the
+        // search index that matches no query anyone would ever type.
         let md = "| Größe | Einheit | Symbol |\n| --- | --- | --- |\n| Länge | Meter | m |\n";
         let doc = markdown_to_blocks(md);
-        assert_eq!(doc.content[1].plain_text(), "Länge Meter m");
+        assert_eq!(doc.content[0].content[1].plain_text(), "Länge Meter m");
     }
 
     #[test]
-    fn an_empty_cell_neither_fuses_its_neighbours_nor_adds_a_block() {
+    fn an_empty_cell_neither_fuses_its_neighbours_nor_loses_its_column() {
         let md = "| a | b |\n| --- | --- |\n| x |  |\n";
         let doc = markdown_to_blocks(md);
         assert_eq!(doc.plain_text(), "a b x");
+        assert_eq!(
+            doc.content[0].content[1].content.len(),
+            2,
+            "an empty cell still holds its place, or every later cell shifts a column left"
+        );
+    }
+
+    #[test]
+    fn a_table_survives_a_json_round_trip_with_its_alignment() {
+        let doc = markdown_to_blocks("| a |\n| ---: |\n| 1 |\n");
+        let json = serde_json::to_string(&doc).unwrap();
+        assert!(json.contains("\"tableHeader\""), "{json}");
+        assert!(json.contains("\"align\":\"right\""), "{json}");
+
+        let again: crate::block::Block = serde_json::from_str(&json).unwrap();
+        assert_eq!(again.content[0].kind, BlockKind::Table);
+        assert_eq!(again.plain_text(), doc.plain_text());
     }
 
     #[test]
