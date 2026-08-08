@@ -4,13 +4,38 @@
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<meta name="color-scheme" content="light dark" />
+
+		<!--
+			The default reading face, and only that one. `crossorigin` is not optional even
+			though this is same-origin: fonts are always requested in CORS mode, so a preload
+			without it is a different request from the one the stylesheet makes and the file
+			is downloaded twice.
+
+			Not preloaded: the italic (most pages have none) and the mono (most pages have no
+			code). Preloading everything would push the byte cost of the exceptions onto every
+			reader. The cost of preloading unconditionally is that a reader who chose Literata
+			or System fetches this once — the preload scanner starts it before any script can
+			intervene, so it cannot be made conditional, and it is the right bet for the default.
+
+			The href is root-absolute because the app is served at the origin root. It has to
+			resolve to the same URL as the `url()` in fonts.css or the preload buys nothing and
+			the file is fetched twice; if a base path is ever configured, both move together.
+		-->
+		<link
+			rel="preload"
+			as="font"
+			type="font/woff2"
+			href="/fonts/ibm-plex-sans/IBMPlexSansVar-Roman.woff2"
+			crossorigin
+		/>
+
 		%sveltekit.head%
 		<script>
-			// Resolve the theme BEFORE first paint. Doing this in a component would mean
-			// rendering once in the default theme and again in the chosen one — the flash
-			// of wrong theme that makes an application feel unfinished. Deliberately
-			// inline and blocking: it is three lines, and a deferred script would defeat
-			// the entire point.
+			// Resolve the theme and the typeface BEFORE first paint. Doing this in a
+			// component would mean rendering once in the defaults and again in the chosen
+			// ones — the flash of wrong theme, and of wrong font, that makes an application
+			// feel unfinished. Deliberately inline and blocking: it is a handful of lines,
+			// and a deferred script would defeat the entire point.
 			(() => {
 				try {
 					const stored = localStorage.getItem('gw-theme');
@@ -20,6 +45,16 @@
 				} catch {
 					// Private browsing can throw on localStorage. Falling through leaves the
 					// system preference in charge, which is the right default anyway.
+				}
+				try {
+					// 'plex' is the default and is expressed by the ABSENCE of the attribute,
+					// so it is not written here even if it somehow got stored.
+					const stored = localStorage.getItem('gw-font');
+					if (stored === 'literata' || stored === 'system') {
+						document.documentElement.dataset.font = stored;
+					}
+				} catch {
+					// As above. The default typeface stays in charge.
 				}
 			})();
 		</script>

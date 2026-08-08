@@ -10,6 +10,34 @@ export interface TreeNode {
   children: TreeNode[];
 }
 
+/**
+ * `/api/me`. Every field is derived server-side from the principal the permission engine
+ * would use, so the header cannot show a name the API would not honour — and the reverse:
+ * nothing here decides anything, it only reports what was already decided.
+ */
+export interface Me {
+  authenticated: boolean;
+  username: string | null;
+  display_name: string | null;
+  email: string | null;
+  groups: string[];
+  teams: string[];
+  baseline: 'public' | 'internal' | 'admin';
+  login_available: boolean;
+}
+
+/** What the interface shows when the API cannot be reached: nobody, with nothing. */
+export const ANONYMOUS: Me = {
+  authenticated: false,
+  username: null,
+  display_name: null,
+  email: null,
+  groups: [],
+  teams: [],
+  baseline: 'public',
+  login_available: false
+};
+
 export interface StoredDocument {
   id: string;
   path: string;

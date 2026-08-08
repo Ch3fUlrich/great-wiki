@@ -67,4 +67,22 @@ issues privately rather than in a public issue.
 
 ## Licence
 
-MIT — see [LICENSE](LICENSE).
+The code is MIT — see [LICENSE](LICENSE).
+
+The bundled typefaces are not. **IBM Plex Sans**, **IBM Plex Mono**, **Literata** and
+**JetBrains Mono** are licensed under the SIL Open Font License 1.1, and OFL condition 5
+requires that they stay entirely under it — living in an MIT repository does not make a
+font MIT. Each family's `OFL.txt` sits beside its files in `web/static/fonts/<family>/`.
+
+They are self-hosted, and nothing on a page ever requests a font from a third party:
+a font fetched from a foreign host on every page load discloses the reader's IP address
+and the page they are on to that host. IBM's licence reserves the name *Plex*, which
+under the OFL means those files must not be subset — see the note at the top of
+[`web/src/lib/styles/fonts.css`](web/src/lib/styles/fonts.css).
+
+Two checks keep that honest. `cd web && npm test` verifies, with no extra tooling, that
+every shipped face contains a real ẞ (U+1E9E) rather than a faked SS, and that the three
+choices still map to the families the control promises.
+`python3 web/scripts/check-fonts.py` (needs `pip install 'fonttools[woff]'`) adds the
+licence checks — the notices inside each binary, and that the reserved-name files are
+byte-for-byte upstream.

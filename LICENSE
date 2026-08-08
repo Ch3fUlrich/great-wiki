@@ -1,3 +1,23 @@
+The MIT licence below covers the source code of great-wiki. It does NOT cover the
+typefaces bundled under web/static/fonts/, which are licensed separately.
+
+    IBM Plex Sans, IBM Plex Mono    Copyright (c) 2017 IBM Corp.,
+                                    with Reserved Font Name "Plex"
+    Literata                        Copyright (c) 2017 The Literata Project Authors
+    JetBrains Mono                  Copyright (c) 2020 The JetBrains Mono Project Authors
+
+Each is licensed under the SIL Open Font License, Version 1.1, and each family's
+OFL.txt sits beside its font files in web/static/fonts/<family>/. Condition 5 of the
+OFL requires that these files remain entirely under the OFL: they are not relicensed
+by being distributed here, and this MIT grant does not extend to them.
+
+IBM's licence reserves the name "Plex". Under the OFL, subsetting a font is
+Modification, and a Modified Version may not use a Reserved Font Name. The IBM Plex
+files here are therefore shipped exactly as IBM published them; see the note at the
+top of web/src/lib/styles/fonts.css before touching them.
+
+-------------------------------------------------------------------------------
+
 MIT License
 
 Copyright (c) 2026 Sergej Maul

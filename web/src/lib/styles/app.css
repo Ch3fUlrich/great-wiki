@@ -9,6 +9,11 @@
  */
 @import './tokens.css';
 
+/* Unlayered on purpose. `@font-face` is not a style rule and takes no part in the
+ * cascade, so putting it in a layer would say something about precedence that is not
+ * true; and the faces must be declared for any layer — or any plugin — that names one. */
+@import './fonts.css';
+
 @layer reset, base, content, components;
 
 @layer reset {
@@ -58,10 +63,17 @@
 	body {
 		background: var(--bg);
 		color: var(--ink);
-		font-family: var(--font-sans);
+		/* Not --font-sans: the reading face is whichever the reader chose, and under
+		 * "Literata" that is the serif. --font-body is the indirection that lets this
+		 * rule stay ignorant of the choice. */
+		font-family: var(--font-body);
 		font-size: var(--text-base);
 		line-height: var(--leading-normal);
 	}
+
+	/* Deliberately NOT set anywhere: `font-variant-ligatures: none`. The ligatures are
+	 * wanted — including JetBrains Mono's contextual ones in code, which is most of
+	 * why that face is paired with Literata. */
 
 	/* Deliberately NOT set here: `-webkit-font-smoothing: antialiased` and
 	 * `text-rendering: optimizeLegibility`.

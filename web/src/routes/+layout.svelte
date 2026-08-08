@@ -2,8 +2,10 @@
   import '$lib/styles/app.css';
   import favicon from '$lib/assets/favicon.svg';
   import ThemeToggle from '$lib/components/ThemeToggle.svelte';
+  import FontToggle from '$lib/components/FontToggle.svelte';
+  import AccountMenu from '$lib/components/AccountMenu.svelte';
 
-  let { children } = $props();
+  let { children, data } = $props();
 </script>
 
 <svelte:head>
@@ -16,7 +18,13 @@
 
 <header class="no-print">
   <a class="brand" href="/">great&#8209;wiki</a>
-  <ThemeToggle />
+  <!-- Two reading preferences, side by side, because they are the same kind of thing.
+       They wrap under the brand on a narrow screen rather than squeezing it. -->
+  <div class="prefs">
+    <AccountMenu me={data.me} />
+    <FontToggle />
+    <ThemeToggle />
+  </div>
 </header>
 
 {@render children()}
@@ -27,14 +35,22 @@
     top: 0;
     z-index: 10;
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
-    gap: var(--space-4);
+    gap: var(--space-2) var(--space-4);
     padding: var(--space-3) var(--space-6);
     border-block-end: 1px solid var(--border);
     /* Slightly translucent so content scrolling underneath is felt rather than hidden. */
     background: color-mix(in srgb, var(--bg) 88%, transparent);
     backdrop-filter: blur(8px);
+  }
+
+  .prefs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
   }
 
   .brand {

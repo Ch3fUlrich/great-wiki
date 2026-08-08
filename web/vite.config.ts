@@ -21,8 +21,12 @@ export default defineConfig({
 		host: true, // bind 0.0.0.0 — Caddy is on another host
 		allowedHosts: ['wiki-dev.ohje.ooguy.com'], // Vite rejects unknown Host headers by default
 		// Without this, /api/* 404s in `npm run dev` — in production Caddy routes it.
+		// `/auth/*` is the OIDC login flow and lives on the same API: the browser is
+		// redirected out to Authelia and back to /auth/callback, so the path has to reach
+		// the application rather than SvelteKit's router.
 		proxy: {
-			'/api': { target: 'http://127.0.0.1:8092', changeOrigin: true }
+			'/api': { target: 'http://127.0.0.1:8092', changeOrigin: true },
+			'/auth': { target: 'http://127.0.0.1:8092', changeOrigin: true }
 		}
 	}
 });

@@ -28,6 +28,9 @@ web/package-lock.json  linguist-generated=true -diff
 Cargo.lock             linguist-generated=true -diff
 
 # Binary fixtures — never try to merge or diff these.
+# woff2 is brotli-compressed already; there is nothing to gain by compressing it again,
+# and a text-mode checkout would corrupt it outright.
+*.woff2 binary
 *.png  binary
 *.jpg  binary
 *.webp binary

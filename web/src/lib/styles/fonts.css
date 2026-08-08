@@ -1,0 +1,239 @@
+/* Self-hosted typefaces.
+ *
+ * Everything here is served from this origin. That is not a latency decision. A font
+ * fetched from a third party on every page load hands that party the reader's IP
+ * address and the page they were reading, and this platform has no lawful basis for
+ * that transfer — so there is no `@import url(fonts.googleapis.com)`, no CDN, and
+ * nothing fetched from a foreign host at build time either.
+ *
+ * --- Provenance, and why two families are subset and two are not ---------------
+ *
+ * IBM Plex Sans Var, IBM Plex Mono — npm `@ibm/plex@6.4.1`, copied byte for byte:
+ *     IBM-Plex-Sans-Variable/fonts/complete/woff2/IBM Plex Sans Var-{Roman,Italic}.woff2
+ *     IBM-Plex-Mono/fonts/complete/woff2/IBMPlexMono-Regular.woff2
+ *   Only the filename changed, and a filename is not part of the font. These are NOT
+ *   subset, deliberately. IBM's OFL declares a Reserved Font Name (`OFL.txt` line 1:
+ *   `Copyright © 2017 IBM Corp. with Reserved Font Name "Plex"`), and OFL 1.1 counts
+ *   subsetting as Modification — which forfeits the right to the reserved name. The
+ *   choice is therefore "ship ~60 kB more" or "ship a font that may not call itself
+ *   IBM Plex", and a renamed face is a thing readers would actually notice. DO NOT
+ *   SUBSET THESE.
+ *
+ * Literata — googlefonts/literata v3.103, fonts/variable/Literata{,-Italic}[opsz,wght].ttf
+ * JetBrains Mono — JetBrains/JetBrainsMono v2.304, fonts/variable/JetBrainsMono[wght].ttf
+ *   Neither reserves a name. Checked BOTH ways, because the two sources disagree: name
+ *   IDs 0 and 13 inside the binary, and the OFL.txt beside it. Worth knowing before
+ *   trusting either one alone — IBM Plex's binaries say nothing about a reserved name
+ *   in any name record, and reserve "Plex" only in the licence file, so a nameID-13
+ *   check on its own would have cleared it for subsetting. The check has to be an OR.
+ *   No reserved name in either place means subsetting is allowed and the family keeps
+ *   its name:
+ *
+ *     pyftsubset "<source>.ttf" --flavor=woff2 --name-IDs='*' --output-file=<dest>.woff2 \
+ *       --unicodes="U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,\
+ *                   U+0304,U+0308,U+0329,U+1E9E,U+2000-206F,U+2074,U+20AC,U+2122,\
+ *                   U+2190-2193,U+2212,U+2215,U+FEFF,U+FFFD"
+ *
+ *   `--name-IDs='*'` is load-bearing: it keeps name IDs 0, 13 and 14, so the copyright
+ *   and licence survive inside the binary as OFL 1.1 §2 requires. pyftsubset's default
+ *   layout-feature set keeps `liga` and `calt`, which is why the ligatures still work.
+ *
+ * U+1E9E (ẞ, capital sharp s) is verified present AND real — not a fake built from two
+ * S at double the advance — in every file, by `web/scripts/check-fonts.py` and by
+ * `src/lib/styles/fonts.test.ts`. STRAẞE must not come out as STRASSE.
+ *
+ * woff2 is brotli-compressed internally. Do NOT add a gzip or brotli step for these
+ * files: it spends CPU re-compressing compressed data for the same byte count.
+ *
+ * The .woff2 files are OFL 1.1, not MIT. Each family's OFL.txt sits beside its
+ * binaries in `static/fonts/<family>/`; see the carve-out in the root LICENSE.
+ */
+
+/* --- The webfonts ---------------------------------------------------------
+ *
+ * `font-display: swap` throughout: a reader gets the text immediately in a fallback
+ * and the designed face replaces it. The reflow that would normally cause is what the
+ * metric-matched fallbacks further down are for.
+ *
+ * Variable fonts get a font-weight RANGE, so one file covers every weight the design
+ * uses instead of one file per weight. Two `src` entries pointing at the same URL is
+ * not a double download — a UA picks the first `format()` it recognises and fetches
+ * only that. The `woff2-variations` entry exists for older Safari, which understood
+ * variable woff2 only under that name.
+ */
+
+@font-face {
+	font-family: 'IBM Plex Sans Var';
+	src:
+		url('/fonts/ibm-plex-sans/IBMPlexSansVar-Roman.woff2') format('woff2-variations'),
+		url('/fonts/ibm-plex-sans/IBMPlexSansVar-Roman.woff2') format('woff2');
+	font-weight: 100 700;
+	font-stretch: 85% 100%;
+	font-style: normal;
+	font-display: swap;
+	/* No unicode-range: this is the unsubset upstream file and covers Latin, Greek,
+	   Cyrillic and more. Narrowing it here would only hide glyphs we already paid for. */
+}
+
+@font-face {
+	font-family: 'IBM Plex Sans Var';
+	src:
+		url('/fonts/ibm-plex-sans/IBMPlexSansVar-Italic.woff2') format('woff2-variations'),
+		url('/fonts/ibm-plex-sans/IBMPlexSansVar-Italic.woff2') format('woff2');
+	font-weight: 100 700;
+	font-stretch: 85% 100%;
+	font-style: italic;
+	font-display: swap;
+}
+
+/* IBM Plex Mono has no variable cut upstream, so this is the 400 static. Bold code is
+   left to the browser's synthetic bold rather than a second 45 kB unsubsettable file —
+   in a monospace face at `--text-sm` the difference is not worth the bytes. */
+@font-face {
+	font-family: 'IBM Plex Mono';
+	src: url('/fonts/ibm-plex-mono/IBMPlexMono-Regular.woff2') format('woff2');
+	font-weight: 400;
+	font-style: normal;
+	font-display: swap;
+}
+
+/* Literata and JetBrains Mono are subset, so they DO carry a unicode-range: it stops
+   the browser using these faces for a character they no longer contain, and lets it
+   fall through to the platform font instead of drawing tofu. */
+
+@font-face {
+	font-family: 'Literata';
+	src:
+		url('/fonts/literata/Literata-Roman-latin.woff2') format('woff2-variations'),
+		url('/fonts/literata/Literata-Roman-latin.woff2') format('woff2');
+	font-weight: 200 900;
+	font-style: normal;
+	font-display: swap;
+	unicode-range:
+		U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+		U+0308, U+0329, U+1E9E, U+2000-206F, U+2074, U+20AC, U+2122, U+2190-2193, U+2212,
+		U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+	font-family: 'Literata';
+	src:
+		url('/fonts/literata/Literata-Italic-latin.woff2') format('woff2-variations'),
+		url('/fonts/literata/Literata-Italic-latin.woff2') format('woff2');
+	font-weight: 200 900;
+	font-style: italic;
+	font-display: swap;
+	unicode-range:
+		U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+		U+0308, U+0329, U+1E9E, U+2000-206F, U+2074, U+20AC, U+2122, U+2190-2193, U+2212,
+		U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+	font-family: 'JetBrains Mono';
+	src:
+		url('/fonts/jetbrains-mono/JetBrainsMono-Roman-latin.woff2') format('woff2-variations'),
+		url('/fonts/jetbrains-mono/JetBrainsMono-Roman-latin.woff2') format('woff2');
+	font-weight: 100 800;
+	font-style: normal;
+	font-display: swap;
+	unicode-range:
+		U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+		U+0308, U+0329, U+1E9E, U+2000-206F, U+2074, U+20AC, U+2122, U+2190-2193, U+2212,
+		U+2215, U+FEFF, U+FFFD;
+}
+
+/* --- Metric-matched fallbacks ---------------------------------------------
+ *
+ * `font-display: swap` means the page is first painted in a platform font and then
+ * repainted in ours. Without help the two have different widths and vertical metrics,
+ * so every line rewraps and the whole document jumps — the layout shift that makes a
+ * site feel like it is still loading long after it is readable.
+ *
+ * These faces fix that. `src` is `local()` only, so they are pure metric descriptions:
+ * a font already on the machine, re-declared with our face's proportions. They never
+ * cause a network request, which is also why they are safe under the no-third-party
+ * rule above. If none of the named fonts exists the face simply fails and the stack
+ * falls through to the next family, un-adjusted — a worse match, never a broken page.
+ *
+ * How the numbers were derived (`ratio = webfont / fallback`, both normalised to their
+ * own units-per-em, averaged over a German prose sample — German letter frequencies,
+ * because this is a German platform and `ä ö ü ß` are not rare here):
+ *
+ *   size-adjust        = avgAdvance(web) / avgAdvance(fallback)
+ *   ascent-override    = ascent(web)  / size-adjust
+ *   descent-override   = descent(web) / size-adjust
+ *
+ * The division by size-adjust is not a mistake: the overrides are resolved against the
+ * unadjusted font size and then scaled by size-adjust, so dividing first makes the
+ * final metric land on the webfont's true one. Ascent and descent are taken from the
+ * face the browser itself would use — OS/2 sTypo* when USE_TYPO_METRICS is set,
+ * hhea otherwise.
+ *
+ * Safari does not implement ascent-override, descent-override or line-gap-override
+ * (it does implement size-adjust). There the widths still match, and the line box is
+ * held steady by the explicit `--leading-normal` / `--leading-tight` that every text
+ * element already sets — line-height in the tokens is what makes this degrade quietly
+ * rather than visibly.
+ */
+
+/* IBM Plex Sans against Arial's metrics — Liberation Sans and Arimo are Arial-metric
+   clones, Nimbus Sans is the Helvetica one, and Arial and Helvetica share advances. */
+@font-face {
+	font-family: 'IBM Plex Sans Fallback';
+	src:
+		local('Arial'),
+		local('Helvetica'),
+		local('Liberation Sans'),
+		local('Arimo'),
+		local('Nimbus Sans');
+	size-adjust: 100.39%;
+	ascent-override: 102.1%;
+	descent-override: 27.39%;
+	line-gap-override: 0%;
+}
+
+/* Literata against Times New Roman's metrics. Literata is a much wider, larger-on-the-
+   body face, hence the 118% — that is the correction doing its job, not a typo. */
+@font-face {
+	font-family: 'Literata Fallback';
+	src:
+		local('Times New Roman'),
+		local('Liberation Serif'),
+		local('Tinos'),
+		local('Nimbus Roman');
+	size-adjust: 118.07%;
+	ascent-override: 99.68%;
+	descent-override: 26.09%;
+	line-gap-override: 0%;
+}
+
+/* Both monospaces and every common fallback mono sit at 0.6 em per character, so
+   size-adjust is a true 100% here and only the vertical metrics need stating. */
+@font-face {
+	font-family: 'IBM Plex Mono Fallback';
+	src:
+		local('DejaVu Sans Mono'),
+		local('Menlo'),
+		local('Liberation Mono'),
+		local('Cousine'),
+		local('Courier New');
+	size-adjust: 100%;
+	ascent-override: 102.5%;
+	descent-override: 27.5%;
+	line-gap-override: 0%;
+}
+
+@font-face {
+	font-family: 'JetBrains Mono Fallback';
+	src:
+		local('DejaVu Sans Mono'),
+		local('Menlo'),
+		local('Liberation Mono'),
+		local('Cousine'),
+		local('Courier New');
+	size-adjust: 100%;
+	ascent-override: 102%;
+	descent-override: 30%;
+	line-gap-override: 0%;
+}
