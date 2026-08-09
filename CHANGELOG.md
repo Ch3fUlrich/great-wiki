@@ -8,6 +8,16 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- CI on Forgejo, which is now the primary forge. Every job runs in the Node image and
+  installs Rust through rustup, so `rust-toolchain.toml` stays the only place the
+  compiler version is written down, and the Node version comes from the image that
+  matches `.nvmrc` exactly. Dependency and build caching goes through the runner's own
+  cache service, and cargo is capped to two parallel jobs because the runner has 1.7 GiB
+  of memory and an out-of-memory kill there is indistinguishable from a compiler crash.
+- The GitHub workflow is now guarded on the forge it is running against. Forgejo executes
+  `.github/workflows` as well as its own, and those jobs target a runner label that no
+  longer exists — which does not fail, it queues forever.
+
 - The temporary edge gate is gone. Both wiki hosts now rely on the application's own
   sign-in, so published pages are readable without a homelab account and guest accounts
   will be able to sign in without Authelia at all.
