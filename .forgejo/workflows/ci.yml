@@ -22,6 +22,14 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # ci.vm reports 1736 MiB total and ~817 MiB available — the VM is documented as
+  # 8 GiB ballooned with a 2 GiB floor, but the balloon is currently sitting below
+  # its own minimum. rustc runs one process per codegen unit, so the default
+  # `-j $(nproc)` (6 here) is what turns a tight box into an OOM kill. That kill
+  # arrives as a bare `signal: 9` with no "out of memory" anywhere in the log and
+  # no readable dmesg for an unprivileged runner, so it reads exactly like a
+  # compiler crash. Capping the job count is far cheaper than diagnosing it twice.
+  CARGO_BUILD_JOBS: "2"
 
 jobs:
   rust:
@@ -50,6 +58,27 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # The runner ships its own cache service and injects ACTIONS_CACHE_URL into
+      # the job — verified live at http://192.168.178.165:<ephemeral>/… — so this
+      # is a LAN round trip, not an internet one. Without it every run recompiles
+      # the whole dependency graph on a 1.7 GiB box, which is the single largest
+      # cost in this pipeline.
+      #
+      # Keyed on Cargo.lock AND rust-toolchain.toml: artefacts compiled by one
+      # rustc are not reusable by another, and a toolchain bump that silently
+      # restored a stale target/ would produce failures with no plausible cause.
+      # If you ever suspect the cache, bump the `v1-` prefix rather than debugging
+      # it — a cold build here is minutes, not hours.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: v1-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: v1-cargo-
 
       - name: Show what rustup resolved
         # rust-toolchain.toml names the channel and its components, so this first
@@ -89,6 +118,12 @@ jobs:
             exit 1
           fi
           echo "Node $have matches .nvmrc."
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: v1-npm-${{ hashFiles('web/package-lock.json') }}
+          restore-keys: v1-npm-
 
       - run: npm ci
       - run: npm run check

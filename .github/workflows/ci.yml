@@ -1,5 +1,19 @@
 name: CI
 
+# This file is for GITHUB ONLY. Forgejo is the primary forge and has its own
+# pipeline at .forgejo/workflows/ci.yml, shaped around a runner that has no
+# preinstalled toolchain — see the comments there.
+#
+# Forgejo reads `.github/workflows` as well, so without the `if:` guard on every
+# job below, each push would also fire this file on the Forgejo runner, where
+# `ubuntu-latest` matches no label at all. That does not fail: it QUEUES, forever,
+# showing a run that is permanently in progress. The guard compares the server
+# URL, which is the one value that reliably differs between the two forges.
+#
+# Keep the two files in step. They deliberately assert the same things — the same
+# fmt, clippy, test, check and secret scan — and are allowed to differ only in how
+# they obtain a toolchain.
+
 on:
   push:
     branches: [main]
@@ -17,6 +31,7 @@ env:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    if: ${{ github.server_url == 'https://github.com' }}
     steps:
       - uses: actions/checkout@v4
       # No toolchain input: rust-toolchain.toml is authoritative, so CI and a laptop
@@ -26,11 +41,12 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
   web:
     runs-on: ubuntu-latest
+    if: ${{ github.server_url == 'https://github.com' }}
     defaults:
       run:
         working-directory: web
@@ -48,6 +64,7 @@ jobs:
 
   secrets:
     runs-on: ubuntu-latest
+    if: ${{ github.server_url == 'https://github.com' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -58,7 +75,7 @@ jobs:
         run: |
           if git grep -nEI \
               '(api[_-]?key|secret|password|token|bearer)[[:space:]]*[=:][[:space:]]*["'"'"']?[A-Za-z0-9/+_-]{16,}' \
-              -- ':!*.example' ':!docs/**' ':!.github/workflows/ci.yml'; then
+              -- ':!*.example' ':!docs/**' ':!.github/workflows/**' ':!.forgejo/workflows/**'; then
             echo "::error::A credential-shaped value is committed. Rotate it, then remove it."
             exit 1
           fi
