@@ -1,9 +1,11 @@
 pub mod acl;
+pub mod audit;
 pub mod documents;
 pub mod principals;
 pub mod sessions;
 
 pub use acl::Baseline;
+pub use audit::{AuditEntry, AuditPage};
 pub use documents::{NewDocument, StoredDocument, TreeNode};
 pub use sessions::SESSION_TTL_SECONDS;
 
