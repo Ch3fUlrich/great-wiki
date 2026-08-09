@@ -215,8 +215,15 @@ impl Store {
         Ok(id)
     }
 
-    pub async fn add_team_member(&self, team_slug: &str, principal_id: &str) -> Result<()> {
-        sqlx::query(
+    /// Put somebody in a team. Returns whether a row was actually written.
+    ///
+    /// The boolean matters because of how this is expressed: the insert selects the team
+    /// id by slug, so a slug that names no team inserts NO ROWS and reports success. An
+    /// administrator would see "added to team" and the person would have gained nothing —
+    /// the failure mode being that a typo in a team name silently withholds access
+    /// instead of announcing itself.
+    pub async fn add_team_member(&self, team_slug: &str, principal_id: &str) -> Result<bool> {
+        let result = sqlx::query(
             "INSERT OR IGNORE INTO team_members (team_id, principal_id) \
              SELECT id, ?2 FROM teams WHERE slug = ?1",
         )
@@ -224,6 +231,185 @@ impl Store {
         .bind(principal_id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
+    }
+}
+
+/// A team and who is in it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TeamSummary {
+    pub slug: String,
+    pub name: String,
+    /// Principal ids. Resolving them to names is the caller's job, so this stays one
+    /// query regardless of how many teams there are.
+    pub members: Vec<String>,
+}
+
+impl Store {
+    /// Everyone great-wiki knows about, active and deactivated alike.
+    ///
+    /// Deactivated accounts are included deliberately: an administrator needs to see that
+    /// an account exists and is suspended. Hiding it would make "this person cannot sign
+    /// in" indistinguishable from "this person was never here", and the second invites
+    /// creating a duplicate.
+    pub async fn list_principals(&self) -> Result<Vec<Principal>> {
+        let rows: Vec<PrincipalRow> = sqlx::query_as(
+            "SELECT id, kind, username, display_name, email, groups, active \
+             FROM principals ORDER BY username",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let teams = self.teams_of(&row.id).await?;
+            out.push(row.into_principal(teams));
+        }
+        Ok(out)
+    }
+
+    pub async fn list_teams(&self) -> Result<Vec<TeamSummary>> {
+        let teams: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT id, slug, name FROM teams ORDER BY slug")
+                .fetch_all(&self.pool)
+                .await?;
+
+        let mut out = Vec::with_capacity(teams.len());
+        for (id, slug, name) in teams {
+            let members: Vec<(String,)> =
+                sqlx::query_as("SELECT principal_id FROM team_members WHERE team_id = ?1")
+                    .bind(&id)
+                    .fetch_all(&self.pool)
+                    .await?;
+            out.push(TeamSummary {
+                slug,
+                name,
+                members: members.into_iter().map(|(m,)| m).collect(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Remove somebody from a team. Returns whether a row was actually removed.
+    ///
+    /// Same reason [`Store::remove_grant`] returns a boolean: a removal that matched
+    /// nothing must not report success to an administrator who is about to conclude that
+    /// access has been withdrawn.
+    pub async fn remove_team_member(&self, team_slug: &str, principal_id: &str) -> Result<bool> {
+        let result = sqlx::query(
+            "DELETE FROM team_members WHERE principal_id = ?2 \
+             AND team_id = (SELECT id FROM teams WHERE slug = ?1)",
+        )
+        .bind(team_slug)
+        .bind(principal_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+}
+
+#[cfg(test)]
+mod admin_tests {
+    use crate::Store;
+    use gw_auth::{Permission, Subject};
+
+    async fn store() -> Store {
+        Store::open("sqlite::memory:").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn adding_to_a_team_that_does_not_exist_reports_failure() {
+        // The insert selects the team id by slug, so a slug naming no team writes no
+        // rows. Before this returned a boolean it reported success, and a typo in a team
+        // name silently withheld access instead of announcing itself.
+        let store = store().await;
+        let p = store
+            .create_local_principal("gast", "Gast", None, "x")
+            .await
+            .unwrap()
+            .id;
+
+        assert!(
+            !store.add_team_member("tippfehler", &p).await.unwrap(),
+            "a nonexistent team reported a successful add"
+        );
+
+        store.create_team("redaktion", "Redaktion").await.unwrap();
+        assert!(store.add_team_member("redaktion", &p).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn removing_a_membership_that_is_not_there_reports_failure() {
+        let store = store().await;
+        let p = store
+            .create_local_principal("gast", "Gast", None, "x")
+            .await
+            .unwrap()
+            .id;
+        store.create_team("redaktion", "Redaktion").await.unwrap();
+
+        assert!(!store.remove_team_member("redaktion", &p).await.unwrap());
+        store.add_team_member("redaktion", &p).await.unwrap();
+        assert!(store.remove_team_member("redaktion", &p).await.unwrap());
+        assert!(!store.remove_team_member("redaktion", &p).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn revoking_an_inherited_grant_from_the_child_reports_failure() {
+        // The grant lives on the ancestor. A console offering a revoke control here would
+        // be claiming an effect it cannot have — the boolean is what lets it refuse.
+        let store = store().await;
+        store
+            .add_grant("/raum", Subject::Anyone, Permission::Read)
+            .await
+            .unwrap();
+
+        assert!(
+            !store
+                .remove_grant("/raum/unterseite", &Subject::Anyone, Permission::Read)
+                .await
+                .unwrap(),
+            "revoking an inherited grant from the child claimed success"
+        );
+        assert!(store
+            .remove_grant("/raum", &Subject::Anyone, Permission::Read)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn effective_grants_name_the_ancestor_they_come_from() {
+        let store = store().await;
+        store
+            .add_grant("/raum", Subject::Anyone, Permission::Read)
+            .await
+            .unwrap();
+
+        let (source, grants) = store.effective_grants("/raum/tief/tiefer").await.unwrap();
+        assert_eq!(source.as_deref(), Some("/raum"));
+        assert_eq!(grants.len(), 1);
+
+        // Nothing anywhere above: reach is whatever the baseline confers, and the console
+        // must say so rather than implying an empty grant list was configured here.
+        let (none, empty) = store.effective_grants("/woanders").await.unwrap();
+        assert_eq!(none, None);
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deactivated_accounts_are_still_listed() {
+        // Hiding them would make "cannot sign in" indistinguishable from "never existed",
+        // and the second invites creating a duplicate account.
+        let store = store().await;
+        let p = store
+            .create_local_principal("gesperrt", "Gesperrt", None, "x")
+            .await
+            .unwrap()
+            .id;
+        store.set_principal_active(&p, false).await.unwrap();
+
+        let all = store.list_principals().await.unwrap();
+        let found = all.iter().find(|x| x.id == p).expect("not listed");
+        assert!(!found.active);
     }
 }

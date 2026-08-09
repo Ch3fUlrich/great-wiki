@@ -298,6 +298,101 @@ impl Store {
     }
 }
 
+impl Store {
+    /// The grants that apply at `path`, together with the path they are defined on.
+    ///
+    /// The access-first console has to answer "why does this person reach this page?",
+    /// and "because /rundgang says so" is a different answer from "because this page
+    /// says so" — the first is changed somewhere else, and an administrator who edits
+    /// the wrong one has widened access to a whole subtree by accident.
+    ///
+    /// `None` for the source means no ancestor carries any grant, so reach here is
+    /// whatever the baseline confers and nothing more.
+    pub async fn effective_grants(&self, path: &str) -> Result<(Option<String>, Vec<Grant>)> {
+        for candidate in ancestors(path) {
+            let rows: Vec<GrantRow> = sqlx::query_as(
+                "SELECT subject_kind, subject_id, permission FROM acl WHERE path = ?1",
+            )
+            .bind(&candidate)
+            .fetch_all(&self.pool)
+            .await?;
+            if !rows.is_empty() {
+                let grants = rows.into_iter().filter_map(to_grant).collect();
+                return Ok((Some(candidate), grants));
+            }
+        }
+        Ok((None, Vec::new()))
+    }
+
+    /// The grants written on `path` itself, inherited ones excluded.
+    ///
+    /// This is what a revoke operates on: you cannot remove an inherited grant from
+    /// here, and offering a control that appears to would be a lie about what happened.
+    pub async fn grants_defined_at(&self, path: &str) -> Result<Vec<Grant>> {
+        let rows: Vec<GrantRow> =
+            sqlx::query_as("SELECT subject_kind, subject_id, permission FROM acl WHERE path = ?1")
+                .bind(path)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().filter_map(to_grant).collect())
+    }
+
+    /// Remove one grant defined at `path`. Returns whether a row was actually removed.
+    ///
+    /// The boolean is not decoration. A revoke that silently matched nothing — because
+    /// the grant was inherited, or already gone — must not report success to someone who
+    /// is about to conclude that access has been withdrawn.
+    pub async fn remove_grant(
+        &self,
+        path: &str,
+        subject: &Subject,
+        permission: Permission,
+    ) -> Result<bool> {
+        let (kind, id) = subject_columns(subject);
+        let result = sqlx::query(
+            "DELETE FROM acl WHERE path = ?1 AND subject_kind = ?2 \
+             AND subject_id IS ?3 AND permission = ?4",
+        )
+        .bind(path)
+        .bind(kind)
+        .bind(id)
+        .bind(permission_column(permission))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Every path that carries at least one grant, with how many. The console's index.
+    pub async fn paths_with_grants(&self) -> Result<Vec<(String, i64)>> {
+        Ok(
+            sqlx::query_as("SELECT path, COUNT(*) FROM acl GROUP BY path ORDER BY path")
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+}
+
+/// The stored spelling of a subject. One definition, so an insert and a delete cannot
+/// disagree about how `Anyone` is written and leave a grant that can never be revoked.
+fn subject_columns(subject: &Subject) -> (&'static str, Option<String>) {
+    match subject {
+        Subject::Principal(i) => ("principal", Some(i.clone())),
+        Subject::Team(i) => ("team", Some(i.clone())),
+        Subject::Group(i) => ("group", Some(i.clone())),
+        Subject::Anyone => ("anyone", None),
+        Subject::Authenticated => ("authenticated", None),
+    }
+}
+
+fn permission_column(permission: Permission) -> &'static str {
+    match permission {
+        Permission::Read => "read",
+        Permission::Comment => "comment",
+        Permission::Write => "write",
+        Permission::Admin => "admin",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ancestors, Baseline};
