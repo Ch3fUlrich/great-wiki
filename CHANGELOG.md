@@ -8,6 +8,18 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- The audit log is now scoped and readable. Instance admins see everything; anyone
+  holding `admin` on a subtree sees the entries concerning that subtree and nothing else.
+  Scope is an explicit column rather than a guess at what `target` means, and its absence
+  means instance-wide — so an action that forgets to state a scope becomes invisible to
+  space admins rather than visible to the wrong ones. Permission is evaluated per path,
+  not by prefix, because grants do not union up the tree: a prefix query would hand over
+  a subtree that had been deliberately narrowed.
+- Adding to a team, removing from a team and revoking a grant now report whether they
+  did anything. Each silent version was a lie an administrator would have believed — a
+  mistyped team name withheld access while reporting success, and revoking an inherited
+  grant from a child page matched nothing at all.
+
 - CI on Forgejo, which is now the primary forge. Every job runs in the Node image and
   installs Rust through rustup, so `rust-toolchain.toml` stays the only place the
   compiler version is written down, and the Node version comes from the image that

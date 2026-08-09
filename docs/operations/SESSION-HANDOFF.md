@@ -7,14 +7,21 @@ Written for the next Claude Code session. Read this, then
 
 **Live and working:** <https://wiki-dev.ohje.ooguy.com> — public pages readable with no
 login, sign-in through Authelia OIDC, restricted content gated by the real permission
-engine. **231 Rust tests, 31 web tests**, all gates green, everything pushed to
-`github.com/Ch3fUlrich/great-wiki`.
+engine. **243 Rust tests, 31 web tests**, all gates green.
+
+**Forgejo is the primary forge** — <https://forgejo.ohje.ooguy.com/Ch3fUlrich/great-wiki>
+(private). GitHub is a public mirror and both carry CI; push to both. The Forgejo
+pipeline is `.forgejo/workflows/ci.yml` and is shaped by one fact: the runner's only
+label is `docker` → `node:22-bookworm`, with nothing preinstalled. **`ubuntu-latest`
+matches no runner and queues forever rather than failing** — never use it there. Full
+detail, including the on-disk job-log path (there is no log API) and ci.vm's real 1.7 GiB
+memory ceiling, is in `Server/docs/operations/ci-runner-vm.md`.
 
 | Milestone | State |
 |---|---|
 | **M0** Foundations | Complete |
 | **M1** Vertical slice | Complete |
-| **M2** Identity & access | Tasks 1–4 and 6 done. **Remaining: Task 5 (admin console), Task 7 (invites), Task 8 (view-as)** |
+| **M2** Identity & access | Tasks 1–4 and 6 done. Task 5's store layer done (scoped audit log, team and grant operations). **Remaining: Task 5 API + console, Task 7 (invites), Task 8 (view-as)** |
 | **M3+** | Planned, not started |
 
 ## Start the dev servers
