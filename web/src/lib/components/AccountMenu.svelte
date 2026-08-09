@@ -35,9 +35,16 @@
       </span>
     {/if}
 
-    <form method="post" action="/auth/logout">
-      <button type="submit">Abmelden</button>
-    </form>
+    {#if me.source === 'session'}
+      <form method="post" action="/auth/logout">
+        <button type="submit">Abmelden</button>
+      </form>
+    {:else}
+      <!-- GW_DEV_IDENTITY. There is no session to end, so no button that would pretend
+           to end one — it would clear nothing and the next request would arrive as the
+           same person, which reads as a broken sign-out rather than as a shim. -->
+      <span class="shim" title="GW_DEV_IDENTITY">Entwicklungs&#8209;Identität</span>
+    {/if}
   {:else if me.login_available}
     <a class="signin" href="/auth/login" rel="nofollow">Anmelden</a>
   {:else}
@@ -66,6 +73,14 @@
 
   .reach,
   .groups {
+    color: var(--ink-faint);
+    font-size: var(--text-xs);
+  }
+
+  .shim {
+    padding: var(--space-1) var(--space-2);
+    border: 1px dashed var(--border-strong);
+    border-radius: var(--radius-sm);
     color: var(--ink-faint);
     font-size: var(--text-xs);
   }

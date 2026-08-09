@@ -15,7 +15,8 @@ const signedIn: Me = {
   groups: ['admins'],
   teams: [],
   baseline: 'admin',
-  login_available: true
+  login_available: true,
+  source: 'session'
 };
 
 describe('AccountMenu', () => {
@@ -40,6 +41,15 @@ describe('AccountMenu', () => {
     expect(out).toContain('Sergej Maul');
     expect(out).toContain('admins');
     expect(out).toContain('Alle Seiten');
+  });
+
+  it('offers no sign-out for the development shim, which has no session to end', () => {
+    // A button that clears nothing and leaves the next request signed in as the same
+    // person reads as a broken sign-out, not as a shim.
+    const out = html({ ...signedIn, source: 'dev-shim' });
+    expect(out).not.toContain('/auth/logout');
+    expect(out).toContain('Sergej Maul');
+    expect(out).toContain('Identität');
   });
 
   it('offers no sign-in link when no provider is configured', () => {

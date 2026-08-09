@@ -24,6 +24,11 @@ export interface Me {
   teams: string[];
   baseline: 'public' | 'internal' | 'admin';
   login_available: boolean;
+  /**
+   * What established this identity. `dev-shim` is `GW_DEV_IDENTITY` and has no session
+   * behind it, so there is nothing for a sign-out to end.
+   */
+  source: 'session' | 'dev-shim' | 'anonymous';
 }
 
 /** What the interface shows when the API cannot be reached: nobody, with nothing. */
@@ -35,7 +40,8 @@ export const ANONYMOUS: Me = {
   groups: [],
   teams: [],
   baseline: 'public',
-  login_available: false
+  login_available: false,
+  source: 'anonymous'
 };
 
 export interface StoredDocument {
