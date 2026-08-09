@@ -1,0 +1,35 @@
+name: probe
+on:
+  push:
+    branches: [ci-probe]
+
+jobs:
+  default-image:
+    runs-on: docker
+    steps:
+      - name: what is in the label image
+        run: |
+          echo "node:  $(command -v node || echo NONE) $(node --version 2>/dev/null)"
+          echo "bash:  $(command -v bash || echo NONE)"
+          echo "git:   $(git --version 2>/dev/null || echo NONE)"
+          echo "cache: ${ACTIONS_CACHE_URL:-UNSET}"
+          echo "resul: ${ACTIONS_RESULTS_URL:-UNSET}"
+          echo "toolc: ${RUNNER_TOOL_CACHE:-UNSET}"
+      - uses: actions/checkout@v4
+      - run: ls -la && echo "CHECKOUT_OK"
+
+  rust-container:
+    runs-on: docker
+    container:
+      image: rust:1.97-bookworm
+    steps:
+      - name: what is in the rust image
+        run: |
+          echo "node:  $(command -v node || echo NONE)"
+          echo "cargo: $(cargo --version)"
+          echo "cache: ${ACTIONS_CACHE_URL:-UNSET}"
+      - name: checkout inside a nodeless image
+        continue-on-error: true
+        id: co
+        uses: actions/checkout@v4
+      - run: echo "checkout outcome=${{ steps.co.outcome }}" && ls -la
