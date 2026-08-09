@@ -33,3 +33,16 @@ jobs:
         id: co
         uses: actions/checkout@v4
       - run: echo "checkout outcome=${{ steps.co.outcome }}" && ls -la
+
+  # The recipe ci.yml actually ships: node in the container, so the JS action has
+  # an interpreter. This is the one that must pass.
+  node24-container:
+    runs-on: docker
+    container:
+      image: node:24-bookworm
+    steps:
+      - run: |
+          echo "node:  $(node --version)"
+          echo "cache: ${ACTIONS_CACHE_URL:-UNSET}"
+      - uses: actions/checkout@v4
+      - run: test -f Cargo.toml && echo "CHECKOUT_OK_NODE24"

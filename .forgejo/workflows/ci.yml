@@ -1,0 +1,120 @@
+name: CI
+
+# Forgejo is the primary forge; GitHub is a downstream mirror. Forgejo reads
+# `.forgejo/workflows` in preference to `.github/workflows` — when this directory
+# exists the GitHub file is ignored here entirely, which is what keeps the two
+# from both running on this runner.
+#
+# Everything below is shaped by one fact about the runner (ci.vm, forgejo-runner
+# v13, rootless Docker): its only label is `docker`, mapped to a plain
+# `node:22-bookworm`. That is NOT a GitHub-hosted image — no cargo, no rustup, no
+# preinstalled toolchain of any kind. `runs-on: ubuntu-latest` matches no runner
+# at all and queues forever rather than failing, so it must never appear here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: docker
+    # One image for every job, and deliberately the Node one rather than the Rust
+    # one. Three reasons, each of which was a failure first:
+    #
+    #  1. `actions/checkout` is a JavaScript action and the runner executes it
+    #     with `node` INSIDE this container. `rust:1.97-bookworm` ships no node,
+    #     so the very first step dies with `exec: "node": not found`.
+    #  2. `rust:1.97-bookworm` also ships neither rustfmt nor clippy — the
+    #     official image installs the *minimal* profile. Verified, not assumed.
+    #  3. Pinning a `rust:1.97-*` tag would state the toolchain version in a
+    #     second place that can drift from rust-toolchain.toml. Installing
+    #     through rustup leaves that file the only pin.
+    #
+    # node:24-bookworm derives from buildpack-deps, so it carries cc and make for
+    # the -sys crates.
+    container:
+      image: node:24-bookworm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain, as pinned by rust-toolchain.toml
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Show what rustup resolved
+        # rust-toolchain.toml names the channel and its components, so this first
+        # cargo invocation is what installs them. Printing the versions makes a
+        # toolchain surprise visible in the log rather than as a confusing later
+        # failure.
+        run: |
+          rustc --version
+          cargo fmt --version
+          cargo clippy --version
+
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  web:
+    runs-on: docker
+    # node:24-bookworm is 24.19.0 — the exact version .nvmrc pins — so there is
+    # no setup-node step and no second place to bump. The guard below is what
+    # catches the two drifting apart.
+    container:
+      image: node:24-bookworm
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse to test on a different Node major than developers use
+        working-directory: .
+        run: |
+          want="$(cut -d. -f1 < .nvmrc)"
+          have="$(node --version | sed 's/^v//' | cut -d. -f1)"
+          if [ "$want" != "$have" ]; then
+            echo "::error::.nvmrc pins Node $want but this image is Node $have."
+            echo "Bump the container image in .forgejo/workflows/ci.yml to match."
+            exit 1
+          fi
+          echo "Node $have matches .nvmrc."
+
+      - run: npm ci
+      - run: npm run check
+      - run: npx vitest run
+      - run: npm run build
+
+  secrets:
+    runs-on: docker
+    container:
+      image: node:24-bookworm
+    steps:
+      # No fetch-depth: 0. The scan below is `git grep` with no revision, which
+      # reads the working tree and never touches history — so a full clone bought
+      # nothing but download time. History is a rotation problem; this job is the
+      # gate that stops a credential arriving in the first place.
+      - uses: actions/checkout@v4
+
+      # The GitHub mirror of this repository is public. A credential that reaches
+      # it is not recoverable by deleting the commit — it must be rotated.
+      # Catching it here is far cheaper.
+      - name: Fail if a credential-shaped value is committed
+        run: |
+          if git grep -nEI \
+              '(api[_-]?key|secret|password|token|bearer)[[:space:]]*[=:][[:space:]]*["'"'"']?[A-Za-z0-9/+_-]{16,}' \
+              -- ':!*.example' ':!docs/**' ':!.github/workflows/**' ':!.forgejo/workflows/**'; then
+            echo "::error::A credential-shaped value is committed. Rotate it, then remove it."
+            exit 1
+          fi
+          echo "No credential-shaped values found."
