@@ -66,17 +66,14 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ github.server_url == 'https://github.com' }}
     steps:
+      # No fetch-depth: 0. The scan is `git grep` with no revision — it reads the
+      # working tree and never touches history, so a full clone bought only
+      # download time.
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      # This repository is public. A credential reaching main is not recoverable by
-      # deleting it — it must be rotated. Catching it at the gate is far cheaper.
+      # Proving the gate can still fail is part of the gate. A scanner that has
+      # quietly stopped matching anything looks exactly like a clean repository.
+      - name: The scanner classifies known shapes correctly
+        run: ./scripts/scan-secrets.sh --self-test
+
       - name: Fail if a credential-shaped value is committed
-        run: |
-          if git grep -nEI \
-              '(api[_-]?key|secret|password|token|bearer)[[:space:]]*[=:][[:space:]]*["'"'"']?[A-Za-z0-9/+_-]{16,}' \
-              -- ':!*.example' ':!docs/**' ':!.github/workflows/**' ':!.forgejo/workflows/**'; then
-            echo "::error::A credential-shaped value is committed. Rotate it, then remove it."
-            exit 1
-          fi
-          echo "No credential-shaped values found."
+        run: ./scripts/scan-secrets.sh scan

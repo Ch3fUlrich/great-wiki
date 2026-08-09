@@ -1,5 +1,11 @@
-# One definition of every gate. CI calls these, so "green locally" and "green in CI"
-# cannot diverge into two different command lines.
+# One definition of every gate.
+#
+# CI does NOT invoke `just` — the Forgejo runner's image has no toolchain at all and
+# adding one more thing to install is one more thing to break. CI therefore MIRRORS
+# these command lines rather than calling them, which means they can drift, and have:
+# `clippy` here lacked `--workspace` while CI had it, so a warning in another crate
+# failed CI and passed locally. Change a gate here and change it in BOTH
+# `.forgejo/workflows/ci.yml` and `.github/workflows/ci.yml`.
 
 # nvm is user-local and not on a non-interactive PATH, so every web recipe sources it.
 node := "export NVM_DIR=\"$HOME/.nvm\" && . \"$NVM_DIR/nvm.sh\" && nvm use --silent &&"
@@ -22,11 +28,19 @@ test:
 
 lint:
     cargo fmt --check
-    cargo clippy --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
     {{node}} cd web && npm run check
+    ./scripts/scan-secrets.sh --self-test
+    ./scripts/scan-secrets.sh scan
+
+# A production build catches what neither the type check nor the tests do: an adapter
+# or SSR failure that only appears when the app is actually compiled. CI runs it, so
+# this must too.
+build:
+    {{node}} cd web && npm run build
 
 # The full gate. Every task must end with this passing.
-ci: lint test
+ci: lint test build
 
 # Rebuild the Graphify CODE graph. Seconds, no key, no network.
 # --user is REQUIRED: without it the container writes root-owned files that the next

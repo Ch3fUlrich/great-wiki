@@ -141,15 +141,10 @@ jobs:
       # gate that stops a credential arriving in the first place.
       - uses: actions/checkout@v4
 
-      # The GitHub mirror of this repository is public. A credential that reaches
-      # it is not recoverable by deleting the commit — it must be rotated.
-      # Catching it here is far cheaper.
+      # Proving the gate can still fail is part of the gate. A scanner that has
+      # quietly stopped matching anything looks exactly like a clean repository.
+      - name: The scanner classifies known shapes correctly
+        run: ./scripts/scan-secrets.sh --self-test
+
       - name: Fail if a credential-shaped value is committed
-        run: |
-          if git grep -nEI \
-              '(api[_-]?key|secret|password|token|bearer)[[:space:]]*[=:][[:space:]]*["'"'"']?[A-Za-z0-9/+_-]{16,}' \
-              -- ':!*.example' ':!docs/**' ':!.github/workflows/**' ':!.forgejo/workflows/**'; then
-            echo "::error::A credential-shaped value is committed. Rotate it, then remove it."
-            exit 1
-          fi
-          echo "No credential-shaped values found."
+        run: ./scripts/scan-secrets.sh scan
