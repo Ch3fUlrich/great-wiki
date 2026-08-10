@@ -142,6 +142,35 @@ thing that breaks if the answer is "no". Every Ark component is restyled through
 existing tokens — a component that cannot be reached by a theme is a component that breaks
 the plugin contract.
 
+**D-M2-15 — Ten failures, then five minutes, counted two ways.** Per account *and* per
+source address independently; either counter tripping refuses the attempt. Ten is forgiving
+enough that somebody fumbling a password manager is not locked out, and five minutes is
+long enough that guessing at scale stops being worthwhile. A successful sign-in clears that
+account's counter. State lives in SQLite, so a restart is not a reset — an attacker who can
+provoke a restart must not be able to clear the evidence with it.
+
+Throttling never applies to the Authelia path. Otherwise somebody guessing at guest
+passwords could block homelab sign-in, which turns a login form into a denial-of-service
+lever against the whole instance.
+
+**D-M2-16 — Twelve characters, no composition rules, plus a breach check.** Length only:
+current NIST guidance is that forced symbols and mixed case push people toward `Passwort1!`
+patterns that are shorter and more guessable than a passphrase. The breach check uses Have I
+Been Pwned's k-anonymity range API, which receives the first five hex characters of a SHA-1
+and never the password or its full hash.
+
+**If the breach service is unreachable the password is allowed, and the fact is written to
+the audit log.** That is a deliberate trade rather than an oversight: failing closed would
+mean a network outage prevents anyone from ever setting a password, and the length
+requirement still applies with the service down. The audit row is what stops the degraded
+mode from being invisible.
+
+**D-M2-17 — View-as is blocked at the router, not in each handler.** A persistent banner
+names whose view is being shown and offers an exit. Every non-GET request is refused while
+the mode is active, *before* reaching any handler — so an endpoint written next year cannot
+forget the check. Per-handler checks would be more flexible and would fail open for code
+that does not exist yet, which is precisely the class of bug this project keeps finding.
+
 ## What M2 replaces
 
 M1 left two deliberate stubs, both commented as such. M2 must **replace** them, not sit

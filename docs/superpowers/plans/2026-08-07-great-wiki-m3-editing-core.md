@@ -28,6 +28,11 @@ that bite in M3:
 
 ## Why the CRDT rather than last-write-wins
 
+> **Which CRDT is settled: Yjs, with `y-prosemirror`.** See
+> [ADR 0006](../../decisions/0006-yjs-for-collaborative-editing.md), including the cost it
+> carries — the server cannot read a document body without a JavaScript runtime, which
+> lands on M5, M7, M9 and M12.
+
 Requirement: an AI agent editing while a person types must not clobber them. With
 last-write-wins that is unsolvable without locking, and locking makes agent editing
 useless. With a CRDT both are transactions against one document and merge deterministically
@@ -60,6 +65,38 @@ credential and then deletes it needs to learn in that moment that it is still th
 months later when someone else finds it.
 
 ---
+
+## Decisions locked 2026-08-10 (owner)
+
+**D-M3-4 — Offboarding removes access and nothing else.** Deactivating an account, or
+revoking a grant, leaves every page that person wrote exactly as it is, still attributed to
+them. A wiki is institutional memory; withdrawing someone's contributions when they leave
+destroys the record of how the current state was arrived at, which is most of what the
+history is for. Deletion stays a separate, deliberate act with its own permission.
+
+Anonymising the byline was considered and rejected: the revision history would still name
+them, so it would be anonymity in exactly one place — which is more misleading than none.
+
+**D-M3-5 — Seeing history follows read; restoring follows write.** Anyone who can read a
+page can read how it got that way. Restoring an old revision *is* an edit — it changes what
+the page says — so it needs the same permission as any other edit, and produces a new
+revision rather than rewinding the chain.
+
+The consequence, which must be surfaced in the interface and not merely documented: **text
+removed from a page remains readable to anyone who can read the page.** Deleting a sentence
+is not how you unpublish it. The editor has to say so at the moment somebody removes
+something, because that is when the misunderstanding happens.
+
+**D-M3-6 — Trash and purge are two operations, not one control with two answers.** Delete
+moves a page to trash: recoverable, history intact, reversible by anyone who could delete
+it. Purge destroys the page and every revision permanently, is restricted to instance
+admins, and is audited.
+
+They stay separate because they answer different questions — "I do not want this here" and
+"this must not exist" — and because an irreversible action one click away from a routine one
+is how irreversible things happen by accident. Purge is what makes it possible to genuinely
+remove a password, a private detail, or somebody else's personal data posted in error; a
+system with only trash cannot do that at all, and eventually has to.
 
 ## File Structure
 
