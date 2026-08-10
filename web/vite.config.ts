@@ -17,6 +17,14 @@ export default defineConfig({
 			adapter: adapter()
 		})
 	],
+	ssr: {
+		// Ark UI ships uncompiled `.svelte` sources. Left externalised, Node tries to
+		// `require` them during server rendering and dies with
+		// `ERR_UNKNOWN_FILE_EXTENSION: Unknown file extension ".svelte"` — a 500 on any
+		// page using an Ark component, with nothing in the browser console to say why.
+		// `noExternal` puts the package through Vite's Svelte pipeline instead.
+		noExternal: ['@ark-ui/svelte']
+	},
 	server: {
 		host: true, // bind 0.0.0.0 — Caddy is on another host
 		allowedHosts: ['wiki-dev.ohje.ooguy.com'], // Vite rejects unknown Host headers by default
