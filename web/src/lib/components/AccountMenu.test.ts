@@ -52,10 +52,14 @@ describe('AccountMenu', () => {
     expect(out).toContain('Identität');
   });
 
-  it('offers no sign-in link when no provider is configured', () => {
-    // Sending somebody to a login that answers 503 is worse than not offering one.
-    const out = html(ANONYMOUS);
-    expect(out).not.toContain('/auth/login');
-    expect(out).toContain('Nicht angemeldet');
+  it('still offers the sign-in link when no provider is configured', () => {
+    // D-M2-11 replaced the old rule. `/auth/login` used to 302 straight to Authelia, so
+    // offering it without a provider meant offering a 503; it is now great-wiki's own
+    // page, and the guest username-and-password form on it works with no provider at
+    // all. A deployment with only local accounts must not lose its way in.
+    const out = html({ ...ANONYMOUS, login_available: false });
+    expect(out).toContain('href="/auth/login"');
+    expect(out).toContain('Anmelden');
+    expect(out).not.toContain('/auth/logout');
   });
 });

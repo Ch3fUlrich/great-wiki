@@ -820,7 +820,9 @@ dependencies = [
  "password-hash",
  "rand",
  "serde",
+ "sha1",
  "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]

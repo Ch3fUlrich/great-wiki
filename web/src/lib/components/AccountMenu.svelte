@@ -45,10 +45,20 @@
            same person, which reads as a broken sign-out rather than as a shim. -->
       <span class="shim" title="GW_DEV_IDENTITY">Entwicklungs&#8209;Identität</span>
     {/if}
-  {:else if me.login_available}
-    <a class="signin" href="/auth/login" rel="nofollow">Anmelden</a>
   {:else}
-    <span class="reach">Nicht angemeldet</span>
+    <!--
+      ONE control, unconditionally (D-M2-11). It no longer depends on `login_available`,
+      and that is the point of the decision rather than an oversight: `/auth/login` is now
+      great-wiki's own page offering the homelab account *and* a guest username and
+      password, and the second of those works with no identity provider configured at
+      all. Hiding this link when `login_available` is false would leave a deployment with
+      only local accounts — a legitimate one — with no way to sign in.
+
+      Which mechanism a person uses is decided on that page, not here. The homelab button
+      is the thing that disappears when no provider is configured, and the page decides
+      that server-side from the same fact `login_available` reports.
+    -->
+    <a class="signin" href="/auth/login" rel="nofollow">Anmelden</a>
   {/if}
 </nav>
 
