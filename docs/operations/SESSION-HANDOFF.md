@@ -50,10 +50,23 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && ca
 cd web && npm run check && npx vitest run
 ```
 
-**Screenshots are part of the loop, not a final check.** Three real defects shipped past
-green tests and 200 responses — a title duplicated on every page, tables rendering as flat
-paragraphs, and prose hugging the left edge of a too-wide column. None was visible to any
-check that was passing.
+**Two gates exist that `just ci` deliberately does NOT run**, because each needs something
+CI has not been given. Run both by hand after touching what they cover:
+
+```bash
+just mutate      # after any change to gw-auth or gw-store
+just behaviour   # after any change to the reader or a component; needs `just dev` running
+```
+
+`just mutate` breaks the security-critical code on purpose and checks the tests notice. It
+has found three vacuous tests so far, each of which looked completely reasonable. `just
+behaviour` asserts real browser behaviour — focus, computed colour, dialog visibility — and
+exits non-zero; it is not screenshots and needs no interpretation.
+
+**Screenshots are still part of the loop for anything visual.** Three real defects shipped
+past green tests and 200 responses — a title duplicated on every page, tables rendering as
+flat paragraphs, and prose hugging the left edge of a too-wide column. None was visible to
+any check that was passing.
 
 ```bash
 docker run --rm --network host --user "$(id -u):$(id -g)" \
@@ -81,6 +94,13 @@ mutation exposes that.
 
 **Do not `git add -A` while agents are running.** It swept an agent's in-flight work into
 an unrelated commit. Stage explicit paths.
+
+**Verify an agent against the repository, and break something it did NOT choose.** An agent
+asked to prove its own check can fail will pick the case it already had in mind. One
+reported 13/13 checks passing and demonstrated failure detection correctly — but breaking a
+*different* thing showed one check passed on the exact regression it was written to catch,
+because it asserted "link colour differs from body text" when the requirement was "reads as
+a link".
 
 **Substituting one placeholder in a file containing several is silently destructive.** Any
 deploy of `10-services.conf` must assert that *zero* value-carrying placeholders remain,
