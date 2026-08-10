@@ -39,6 +39,21 @@ lint:
 build:
     {{node}} cd web && npm run build
 
+# Deterministic Playwright behaviour checks against a running dev server: real assertions
+# (focus, colour, table markup, dialog visibility), not screenshots — exits 0 only if
+# every check passes. Requires `just dev` (or equivalent) already serving on SHOT_BASE.
+#
+# NOT part of `ci`, deliberately: it needs a running dev server, and wiring that into CI
+# is a separate decision the owner has not made. The container is required for the same
+# reason shots.mjs needs it — Playwright's own Chromium cannot start on this host because
+# libnspr4.so is missing and installing it needs root.
+behaviour:
+    docker run --rm --network host --user "$(id -u):$(id -g)" \
+      -v "$PWD/web/scripts:/scripts:ro" -e HOME=/tmp \
+      -e SHOT_BASE=http://127.0.0.1:5173 -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+      mcr.microsoft.com/playwright:v1.56.0-noble \
+      sh -c 'mkdir -p /tmp/pw && cd /tmp/pw && npm init -y >/dev/null && npm i playwright@1.56.0 >/dev/null && cp /scripts/behaviour.mjs . && node behaviour.mjs'
+
 # Break the security-critical code on purpose and check the tests notice.
 #
 # NOT part of `ci`: it rebuilds the workspace once per mutation, which is minutes on the
