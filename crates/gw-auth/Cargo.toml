@@ -13,4 +13,14 @@ argon2 = "0.5"
 password-hash = { version = "0.5", features = ["rand_core"] }
 rand = "0.8"
 serde = { workspace = true }
+# SHA-1, and ONLY for Have I Been Pwned's range API, whose corpus is keyed on it. Never
+# for anything this application chooses the algorithm of: SHA-1 is broken for collision
+# resistance, and the k-anonymity lookup is the one place where matching somebody else's
+# published index is the whole requirement.
+sha1 = "0.10"
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# The breach seam is async, so its tests need an executor. Nothing in the crate's own
+# dependency tree needs one.
+tokio = { workspace = true }

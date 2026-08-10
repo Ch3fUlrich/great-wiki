@@ -138,19 +138,8 @@ impl Store {
         subject: Subject,
         permission: Permission,
     ) -> Result<()> {
-        let (kind, id) = match &subject {
-            Subject::Principal(i) => ("principal", Some(i.clone())),
-            Subject::Team(i) => ("team", Some(i.clone())),
-            Subject::Group(i) => ("group", Some(i.clone())),
-            Subject::Anyone => ("anyone", None),
-            Subject::Authenticated => ("authenticated", None),
-        };
-        let perm = match permission {
-            Permission::Read => "read",
-            Permission::Comment => "comment",
-            Permission::Write => "write",
-            Permission::Admin => "admin",
-        };
+        let (kind, id) = subject_columns(&subject);
+        let perm = permission_column(permission);
         sqlx::query(
             "INSERT OR IGNORE INTO acl (id, path, subject_kind, subject_id, permission) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -374,7 +363,7 @@ impl Store {
 
 /// The stored spelling of a subject. One definition, so an insert and a delete cannot
 /// disagree about how `Anyone` is written and leave a grant that can never be revoked.
-fn subject_columns(subject: &Subject) -> (&'static str, Option<String>) {
+pub(crate) fn subject_columns(subject: &Subject) -> (&'static str, Option<String>) {
     match subject {
         Subject::Principal(i) => ("principal", Some(i.clone())),
         Subject::Team(i) => ("team", Some(i.clone())),
@@ -384,7 +373,7 @@ fn subject_columns(subject: &Subject) -> (&'static str, Option<String>) {
     }
 }
 
-fn permission_column(permission: Permission) -> &'static str {
+pub(crate) fn permission_column(permission: Permission) -> &'static str {
     match permission {
         Permission::Read => "read",
         Permission::Comment => "comment",

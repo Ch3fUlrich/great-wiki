@@ -370,10 +370,14 @@ fn query_of(url: &str) -> HashMap<String, String> {
         .collect()
 }
 
-/// Drive the whole flow: `/auth/login`, then `/auth/callback` with whatever the provider
+/// Drive the whole flow: `/auth/oidc`, then `/auth/callback` with whatever the provider
 /// was scripted to return. Returns the callback's response and the browser's cookies.
+///
+/// `/auth/oidc` and not `/auth/login`: D-M2-11 made the latter a rendered page offering
+/// both mechanisms, and moved this redirect behind its homelab button. The flow itself is
+/// unchanged — `tests/local_login.rs` covers the page and the guest form.
 async fn sign_in(app: &Router, idp: &Idp, jar: &mut Jar) -> Response {
-    let start = send(app, "GET", "/auth/login", jar).await;
+    let start = send(app, "GET", "/auth/oidc", jar).await;
     assert_eq!(start.status(), StatusCode::FOUND, "login must redirect");
 
     // The stand-in cannot know the nonce this browser was issued, so the test tells it —
@@ -399,13 +403,13 @@ async fn sign_in(app: &Router, idp: &Idp, jar: &mut Jar) -> Response {
 // -------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn login_redirects_to_the_provider_with_pkce_and_state() {
+async fn the_homelab_route_redirects_to_the_provider_with_pkce_and_state() {
     let idp = Idp::start().await;
     let store = seed().await;
     let app = app(&store, Some(&idp));
     let mut jar = Jar::default();
 
-    let response = send(&app, "GET", "/auth/login", &mut jar).await;
+    let response = send(&app, "GET", "/auth/oidc", &mut jar).await;
     assert_eq!(response.status(), StatusCode::FOUND);
 
     let target = location(&response);
@@ -439,7 +443,7 @@ async fn the_flow_cookies_are_host_prefixed_httponly_secure_and_lax() {
     let app = app(&store, Some(&idp));
     let mut jar = Jar::default();
 
-    let response = send(&app, "GET", "/auth/login", &mut jar).await;
+    let response = send(&app, "GET", "/auth/oidc", &mut jar).await;
     for name in [
         "__Host-gw_oidc_state",
         "__Host-gw_oidc_nonce",
@@ -459,10 +463,10 @@ async fn the_flow_cookies_are_host_prefixed_httponly_secure_and_lax() {
 }
 
 #[tokio::test]
-async fn login_without_a_configured_provider_is_unavailable_not_a_crash() {
+async fn the_homelab_route_without_a_configured_provider_is_unavailable_not_a_crash() {
     let store = seed().await;
     let app = app(&store, None);
-    let response = send(&app, "GET", "/auth/login", &mut Jar::default()).await;
+    let response = send(&app, "GET", "/auth/oidc", &mut Jar::default()).await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
@@ -485,7 +489,7 @@ async fn a_mismatched_state_is_refused() {
     let app = app(&store, Some(&idp));
     let mut jar = Jar::default();
 
-    send(&app, "GET", "/auth/login", &mut jar).await;
+    send(&app, "GET", "/auth/oidc", &mut jar).await;
     let nonce = jar.get("__Host-gw_oidc_nonce").unwrap().to_string();
     idp.script(|s| s.nonce = Some(nonce));
 
@@ -537,7 +541,7 @@ async fn a_callback_with_no_state_parameter_is_refused() {
     let app = app(&store, Some(&idp));
     let mut jar = Jar::default();
 
-    send(&app, "GET", "/auth/login", &mut jar).await;
+    send(&app, "GET", "/auth/oidc", &mut jar).await;
     let response = send(&app, "GET", "/auth/callback?code=abc", &mut jar).await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
@@ -549,7 +553,7 @@ async fn a_provider_error_response_is_refused_rather_than_reported_as_a_fault() 
     let app = app(&store, Some(&idp));
     let mut jar = Jar::default();
 
-    send(&app, "GET", "/auth/login", &mut jar).await;
+    send(&app, "GET", "/auth/oidc", &mut jar).await;
     let state = jar.get("__Host-gw_oidc_state").unwrap().to_string();
     let response = send(
         &app,
@@ -568,7 +572,7 @@ async fn an_id_token_carrying_another_browsers_nonce_is_refused() {
     let app = app(&store, Some(&idp));
     let mut jar = Jar::default();
 
-    send(&app, "GET", "/auth/login", &mut jar).await;
+    send(&app, "GET", "/auth/oidc", &mut jar).await;
     idp.script(|s| s.nonce = Some("der-nonce-von-jemand-anderem".into()));
     let state = jar.get("__Host-gw_oidc_state").unwrap().to_string();
 
@@ -590,7 +594,7 @@ async fn an_id_token_with_no_nonce_at_all_is_refused() {
     let app = app(&store, Some(&idp));
     let mut jar = Jar::default();
 
-    send(&app, "GET", "/auth/login", &mut jar).await;
+    send(&app, "GET", "/auth/oidc", &mut jar).await;
     idp.script(|s| s.nonce = None);
     let state = jar.get("__Host-gw_oidc_state").unwrap().to_string();
 
@@ -683,7 +687,7 @@ async fn the_verifier_the_provider_receives_is_the_preimage_of_the_challenge_it_
     let app = app(&store, Some(&idp));
     let mut jar = Jar::default();
 
-    let start = send(&app, "GET", "/auth/login", &mut jar).await;
+    let start = send(&app, "GET", "/auth/oidc", &mut jar).await;
     let challenge = query_of(&location(&start))
         .get("code_challenge")
         .expect("no challenge")

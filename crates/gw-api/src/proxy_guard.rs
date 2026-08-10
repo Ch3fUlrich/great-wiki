@@ -62,6 +62,21 @@ enum Verdict {
     Unconfigured,
 }
 
+/// Proof, carried on the request itself, that this particular request presented the shared
+/// secret — that is, that it came through Caddy.
+///
+/// Inserted by [`enforce`] and by nothing else. It exists so a handler can ask about THIS
+/// request rather than about the global configuration: "attestation is switched on" and
+/// "this request was attested" are the same thing only for as long as every route sits
+/// inside the layer, and a route mounted outside it one day would silently turn a
+/// configuration question into a wrong answer.
+///
+/// What it licenses is narrow and specific: `X-Forwarded-For` is a header any client can
+/// write, so it is worth reading only on a request that could not have come from a client
+/// directly. See `auth::client_address`.
+#[derive(Debug, Clone, Copy)]
+pub struct Attested;
+
 impl ProxyGuard {
     /// Nothing in front to add the header, so nothing to demand. This is `just dev`.
     pub fn disabled() -> Self {
@@ -121,12 +136,24 @@ impl ProxyGuard {
 ///
 /// Applied in `build_router` as the outermost layer, so it runs before routing, before any
 /// handler, and before `AppState::identity`.
-pub async fn enforce(State(guard): State<ProxyGuard>, request: Request, next: Next) -> Response {
+pub async fn enforce(
+    State(guard): State<ProxyGuard>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     // Bound in a `let` so the borrow of `request` ends before the `Pass` arm moves it.
     let verdict = guard.verdict(request.headers());
 
     match verdict {
-        Verdict::Pass => next.run(request).await,
+        Verdict::Pass => {
+            // Only when attestation was actually demanded and met. An unenforced pass is
+            // "there is nothing in front of this server", which proves nothing about where
+            // the request came from and must not be recorded as if it did.
+            if guard.enforced {
+                request.extensions_mut().insert(Attested);
+            }
+            next.run(request).await
+        }
         Verdict::Denied => {
             // Method and path only. The value that was presented is never logged, at any
             // level: a near-miss in a log file is a secret in a log file.

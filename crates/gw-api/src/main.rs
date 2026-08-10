@@ -88,6 +88,21 @@ async fn main() -> Result<()> {
                 dev_identity: cfg.dev_identity.clone(),
                 proxy_guard: gw_api::ProxyGuard::from_config(&cfg),
                 oidc,
+                // The real corpus. If it cannot even be constructed the process still
+                // starts: an unreachable corpus is already a handled, audited state
+                // (D-M2-16), and refusing to boot over it would make an outside service
+                // able to stop this one.
+                corpus: match gw_api::auth::breach::HibpCorpus::new() {
+                    Ok(corpus) => std::sync::Arc::new(corpus),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "could not build the breach-corpus client; passwords will be \
+                             accepted on length alone and each occurrence audited"
+                        );
+                        std::sync::Arc::new(gw_auth::breach::UnavailableCorpus)
+                    }
+                },
             };
             let app = gw_api::build_router(state).layer(
                 tower_http::limit::RequestBodyLimitLayer::new(2 * 1024 * 1024),

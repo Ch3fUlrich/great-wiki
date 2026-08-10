@@ -8,6 +8,21 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- An administration API: list and create principals, activate and deactivate accounts,
+  manage teams and memberships, read and change the grants on a path, and read the audit
+  log. Two gates, and the difference is the point — instance-wide operations need the
+  `admin` baseline that comes from the verified Authelia group, while anything scoped to a
+  path asks the permission engine for `admin` on *that* path. Somebody who administers one
+  space administers that space and its descendants, and is refused everything else,
+  including the list of who else has an account.
+- Every administrative change is written in the same transaction as its audit entry, so
+  an action cannot succeed while the record of it is rolled back. A change that turns out
+  to be a no-op is recorded as nothing at all rather than as an action that happened.
+- Both gates check authentication before consulting any grant. `can()` answers an `anyone`
+  grant before it looks at who is asking — that is how a public share link works — so on a
+  path carrying `anyone: admin` the engine on its own would have handed the access editor
+  to a request that had not said who it was.
+
 - The audit log is now scoped and readable. Instance admins see everything; anyone
   holding `admin` on a subtree sees the entries concerning that subtree and nothing else.
   Scope is an explicit column rather than a guess at what `target` means, and its absence
@@ -29,6 +44,44 @@ Entries describe the *effect* of a change, not the diff.
 - The GitHub workflow is now guarded on the forge it is running against. Forgejo executes
   `.github/workflows` as well as its own, and those jobs target a runner label that no
   longer exists — which does not fail, it queues forever.
+
+- One *Anmelden* control, with both ways in behind it (D-M2-11). `/auth/login` was a 302
+  straight to Authelia; it is now great-wiki's own page offering a homelab button and a
+  guest username and password. The redirect moved to `/auth/oidc`. Where no identity
+  provider is configured the homelab button is absent rather than present and answering
+  503, and the guest form still works — a deployment with only local accounts no longer
+  has no way in.
+- `POST /auth/local`: signing in with a great-wiki account. It issues the same session the
+  provider path issues — one token generator, one hash, one `__Host-` cookie, one table —
+  because a second kind of session is a second place to get expiry and revocation wrong.
+- Throttling for that form, which is the price of putting a password field on a public
+  hostname. Ten failures then a five-minute lockout, counted per account **and** per source
+  address independently, either one enough to refuse. Counting only per account would miss
+  a spray across many accounts from one place; counting only per address would miss a
+  distributed guess at one account. The counters are in SQLite, so a restart is not a way
+  out of a lockout, and a success clears that account's counter but deliberately not the
+  address's — otherwise one valid credential would buy an unlimited spray budget.
+  **The Authelia path never consults them**: somebody guessing at guest passwords cannot
+  stop a homelab sign-in.
+- A wrong password, an unknown username and a deactivated account produce the same status
+  and the same bytes, and take the same kind of time — an unknown username is verified
+  against a stand-in hash so it costs argon2's tens of milliseconds like everyone else.
+  Without that, the form is a list of who has an account here, readable off a stopwatch.
+- A password policy for accounts created by invite or by an administrator: twelve
+  characters, no composition rules, and a breach check against Have I Been Pwned by
+  k-anonymity — only the first five characters of the SHA-1 ever leave the machine. An
+  unreachable corpus **allows** the password and writes the gap to the audit log, because
+  failing closed would mean an outage stops everybody, including whoever is trying to fix
+  it, from setting a password at all.
+
+### Changed
+
+- `X-Forwarded-For` is now read, but only on a request the proxy boundary attested, and
+  only its rightmost entry — the one Caddy appended and no client can write. There was no
+  trustworthy client address in the application before this; the TCP peer is Caddy and a
+  raw header is whatever the caller typed.
+
+### Added
 
 - The temporary edge gate is gone. Both wiki hosts now rely on the application's own
   sign-in, so published pages are readable without a homelab account and guest accounts

@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod docs;
 pub mod tree;
 
@@ -7,6 +8,7 @@ use crate::proxy_guard::{self, ProxyGuard};
 use axum::routing::get;
 use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
+use gw_auth::breach::BreachRange;
 use gw_auth::Principal;
 use gw_store::Store;
 use std::sync::Arc;
@@ -51,6 +53,16 @@ pub struct AppState {
     /// never happen is a *half*-configured provider, and `Config::from_env` refuses that
     /// at startup instead of leaving it to fail at the first sign-in.
     pub oidc: Option<Arc<OidcClient>>,
+    /// The breach corpus consulted when somebody SETS a password (D-M2-16).
+    ///
+    /// In the state rather than constructed at the call site so a test can substitute one
+    /// and never touch the network — a test that reaches the internet is a test that fails
+    /// on a plane — and so that every password-setting path shares one instance rather
+    /// than each deciding for itself whether to check at all. That is not hypothetical:
+    /// the admin account-creation endpoint originally called the length-only validator
+    /// directly, so accounts created by an administrator skipped the corpus entirely while
+    /// the policy looked implemented.
+    pub corpus: Arc<dyn BreachRange>,
 }
 
 impl AppState {
@@ -70,6 +82,10 @@ impl AppState {
             dev_identity,
             proxy_guard,
             oidc: None,
+            // Never the real corpus in a test. A stub that reports every password unseen
+            // keeps the length rule under test without a network call deciding whether
+            // the suite passes.
+            corpus: Arc::new(gw_auth::breach::UnseenCorpus),
         }
     }
 
@@ -207,6 +223,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/tree", get(tree::get_tree))
         .route("/api/documents/{*path}", get(docs::get_document))
+        .merge(admin::routes())
         .merge(crate::auth::routes())
         // Last, so it wraps every route registered above *and* the 404 fallback: the guard
         // has to run before routing, or an unattested request would learn which paths

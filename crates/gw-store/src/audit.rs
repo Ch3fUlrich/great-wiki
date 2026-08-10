@@ -87,6 +87,28 @@ impl Store {
         Ok(())
     }
 
+    /// Record an action that is NOT itself a change to this database.
+    ///
+    /// [`Store::record_audit`] takes an executor so a mutation and its record stand or
+    /// fall together, and that is the right shape for every administrative change. It is
+    /// the wrong shape — and unreachable, since the pool is crate-private — for a fact
+    /// that has no row behind it: "the breach corpus could not be reached, so this
+    /// password was accepted unchecked" is such a fact, and losing it would leave the
+    /// question an auditor asks months later with no answer at all.
+    ///
+    /// Never use this for something that also writes: an entry committed separately from
+    /// the change it describes can outlive a rollback, which is worse than no entry.
+    pub async fn record_audit_entry(
+        &self,
+        actor: Option<&str>,
+        action: &str,
+        target: Option<&str>,
+        path: Option<&str>,
+        detail: &serde_json::Value,
+    ) -> Result<()> {
+        Self::record_audit(&self.pool, actor, action, target, path, detail).await
+    }
+
     /// The audit entries `principal` is entitled to read, newest first.
     ///
     /// An instance admin sees everything. Anyone else sees only entries carrying a path

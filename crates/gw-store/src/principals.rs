@@ -35,6 +35,68 @@ impl PrincipalRow {
     }
 }
 
+/// Write a local principal and its credential. Returns the new id.
+///
+/// Takes a connection rather than the pool so it can be part of a larger transaction —
+/// [`crate::admin`] creates an account and its audit row together. One implementation for
+/// both callers, because the credential row is the easy half to forget from a second one,
+/// and an account with no credential cannot sign in at all.
+pub(crate) async fn insert_local_principal(
+    conn: &mut sqlx::SqliteConnection,
+    username: &str,
+    display_name: &str,
+    email: Option<&str>,
+    password_hash: &str,
+) -> Result<String> {
+    let id = uuid::Uuid::now_v7().to_string();
+
+    sqlx::query(
+        "INSERT INTO principals (id, kind, username, display_name, email) \
+         VALUES (?1, 'local', ?2, ?3, ?4)",
+    )
+    .bind(&id)
+    .bind(username)
+    .bind(display_name)
+    .bind(email)
+    .execute(&mut *conn)
+    .await?;
+
+    sqlx::query("INSERT INTO credentials (principal_id, password_hash) VALUES (?1, ?2)")
+        .bind(&id)
+        .bind(password_hash)
+        .execute(&mut *conn)
+        .await?;
+
+    Ok(id)
+}
+
+/// Set the active flag, deleting every session the principal holds when deactivating
+/// (D-M2-7). Returns whether a principal row was actually matched.
+///
+/// Same reason as [`insert_local_principal`] for taking a connection: the flag, the
+/// sessions and the audit row belong to one transaction. Two statements would leave a
+/// window in which the account is inactive but its cookies still resolve.
+pub(crate) async fn apply_active(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+    active: bool,
+) -> Result<bool> {
+    let result = sqlx::query("UPDATE principals SET active = ?2 WHERE id = ?1")
+        .bind(id)
+        .bind(i64::from(active))
+        .execute(&mut *conn)
+        .await?;
+
+    if !active {
+        sqlx::query("DELETE FROM sessions WHERE principal_id = ?1")
+            .bind(id)
+            .execute(&mut *conn)
+            .await?;
+    }
+
+    Ok(result.rows_affected() > 0)
+}
+
 impl Store {
     async fn teams_of(&self, principal_id: &str) -> Result<Vec<String>> {
         let rows: Vec<(String,)> = sqlx::query_as(
@@ -95,27 +157,10 @@ impl Store {
         email: Option<&str>,
         password_hash: &str,
     ) -> Result<Principal> {
-        let id = uuid::Uuid::now_v7().to_string();
         let mut tx = self.pool.begin().await?;
-
-        sqlx::query(
-            "INSERT INTO principals (id, kind, username, display_name, email) \
-             VALUES (?1, 'local', ?2, ?3, ?4)",
-        )
-        .bind(&id)
-        .bind(username)
-        .bind(display_name)
-        .bind(email)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query("INSERT INTO credentials (principal_id, password_hash) VALUES (?1, ?2)")
-            .bind(&id)
-            .bind(password_hash)
-            .execute(&mut *tx)
-            .await?;
-
+        insert_local_principal(&mut tx, username, display_name, email, password_hash).await?;
         tx.commit().await?;
+
         self.principal_by_username(username)
             .await?
             .map(|(p, _)| p)
@@ -186,20 +231,7 @@ impl Store {
     /// which is the opposite of what "invalidate everywhere" promises.
     pub async fn set_principal_active(&self, id: &str, active: bool) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-
-        sqlx::query("UPDATE principals SET active = ?2 WHERE id = ?1")
-            .bind(id)
-            .bind(i64::from(active))
-            .execute(&mut *tx)
-            .await?;
-
-        if !active {
-            sqlx::query("DELETE FROM sessions WHERE principal_id = ?1")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-        }
-
+        apply_active(&mut tx, id, active).await?;
         tx.commit().await?;
         Ok(())
     }
