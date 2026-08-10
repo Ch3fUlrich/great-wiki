@@ -47,3 +47,4 @@ Thumbs.db
 .idea/
 .vscode/
 !.vscode/extensions.json
+.mutate-backups/
