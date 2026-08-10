@@ -81,7 +81,24 @@
    *
    * `:not([hidden])` rather than `!important`, deliberately: an important declaration in a
    * cascade layer outranks an unlayered one, so it would be the one thing in the
-   * application a plugin could not override. */
+   * application a plugin could not override.
+   *
+   * TWO THINGS THIS GUARD WILL DO TO YOU, both found the hard way while building the
+   * admin console on Ark:
+   *
+   * 1. IT RAISES SPECIFICITY. `:not()` takes the weight of its argument, so
+   *    `.btn:not([hidden])` is (0,2,0) and silently outranks `.btn--primary` at (0,1,0) —
+   *    every modifier stops applying, nothing is invalid, nothing is logged, and it looks
+   *    like a missing class. If a guarded rule has modifiers, the modifiers must repeat
+   *    the guard.
+   *
+   * 2. IT CANNOT BE APPLIED MECHANICALLY, because Ark is not consistent about how it
+   *    closes things. Tabs content, collapsible and tree branch content, and the content
+   *    of combobox, select, menu and tooltip all use the `hidden` attribute — those need
+   *    the guard. `Field.ErrorText` is simply not rendered when there is no error, and
+   *    guarding it produces a rule that never matches. Check which one you have before
+   *    adding the guard, or you get dead CSS in one direction and a control that will not
+   *    close in the other. */
   :global(.gw-dialog-backdrop:not([hidden])) {
     position: fixed;
     inset: 0;

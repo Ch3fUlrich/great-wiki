@@ -1,0 +1,794 @@
+/* Appearance for the administration console.
+ *
+ * One stylesheet rather than a `<style>` block per component, for a reason that is
+ * specific to Ark UI: Ark renders through its own `Ark` factory component and, for
+ * anything overlaid, through a `Portal` that `mount()`s a separate tree at the end of
+ * `<body>`. Svelte's scoping attribute is applied to elements the compiler can see in
+ * *this* component's markup — it never reaches either of those. So every rule here would
+ * have had to be `:global(...)` anyway, and a hundred `:global()` wrappers spread over
+ * eight components is harder to audit than one prefixed, flat sheet.
+ *
+ * `@layer components` because that is the plugin contract (ADR 0005): application CSS is
+ * layered, plugin CSS arrives unlayered, and an unlayered normal declaration beats every
+ * layered one regardless of specificity. That is also why there is no `!important`
+ * anywhere below — an important declaration inside a layer outranks an unlayered one and
+ * would be the single thing in the console a theme could not repaint.
+ *
+ * Every colour, space, radius and size resolves through a custom property. Where a value
+ * is needed that no token declares — a faint danger wash, for instance — it is mixed from
+ * a token with `color-mix()` rather than written as a hex, so a theme changing `--danger`
+ * changes the wash with it.
+ *
+ * === The `:not([hidden])` rule, which is not optional ===
+ *
+ * Ark closes things by setting the `hidden` attribute and leaning on the user-agent rule
+ * `[hidden] { display: none }`. That rule has almost no specificity, so ANY author
+ * `display` or `position` declaration silently beats it: the element stays laid out,
+ * visible and focusable while its `data-state` says "closed". This has already bitten
+ * this repository once (see the comment in `Dialog.svelte`).
+ *
+ * So: every rule below that sets `display` or `position` on an element Ark renders is
+ * written `:not([hidden])`. The parts that are actually toggled that way are marked
+ * individually; the rest carry it as well, because "which Ark parts can be hidden" is a
+ * fact about a dependency and not one worth re-deriving at each upgrade.
+ */
+
+@layer components {
+	/* --- Shell ------------------------------------------------------------ */
+
+	.gw-adm {
+		max-width: 90rem;
+		margin-inline: auto;
+		padding: var(--space-8) var(--space-6);
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-6);
+	}
+
+	.gw-adm-head {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: var(--space-3) var(--space-6);
+	}
+
+	.gw-adm-title {
+		font-size: var(--text-3xl);
+		font-weight: 650;
+		line-height: var(--leading-tight);
+		letter-spacing: -0.02em;
+	}
+
+	.gw-adm-lede {
+		color: var(--ink-muted);
+		font-size: var(--text-sm);
+		max-width: var(--measure);
+	}
+
+	/* --- Tabs (Ark) -------------------------------------------------------- */
+
+	.gw-adm-tablist:not([hidden]) {
+		position: relative;
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--space-1);
+		border-block-end: 1px solid var(--border);
+	}
+
+	.gw-adm-tab:not([hidden]) {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--space-2);
+		padding: var(--space-2) var(--space-4);
+		border: 0;
+		background: none;
+		color: var(--ink-muted);
+		font: inherit;
+		font-size: var(--text-sm);
+		font-weight: 650;
+		cursor: pointer;
+		border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+	}
+
+	.gw-adm-tab:hover {
+		background: var(--bg-sunken);
+		color: var(--ink);
+	}
+
+	/* The selected tab is marked by weight, colour AND the indicator bar — never by
+	   colour alone, which fails for anyone who cannot separate these two hues. */
+	.gw-adm-tab[data-selected] {
+		color: var(--ink);
+	}
+
+	.gw-adm-tabindicator:not([hidden]) {
+		position: absolute;
+		inset-block-end: -1px;
+		block-size: 2px;
+		background: var(--accent);
+	}
+
+	/* Ark keeps an unselected panel mounted and sets `hidden` on it. Without the
+	   `:not([hidden])` here, `display: flex` would win over the user-agent rule and all
+	   four panels would render at once, stacked, every one of them tabbable. */
+	.gw-adm-tabpanel:not([hidden]) {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-6);
+		padding-block-start: var(--space-2);
+	}
+
+	/* --- Notices ----------------------------------------------------------- */
+
+	.gw-adm-notice {
+		padding: var(--space-3) var(--space-4);
+		border: 1px solid var(--border);
+		border-inline-start-width: 3px;
+		border-radius: var(--radius-sm);
+		background: var(--bg-sunken);
+		color: var(--ink-muted);
+		font-size: var(--text-sm);
+	}
+
+	.gw-adm-notice--fail {
+		border-color: var(--danger);
+		background: color-mix(in srgb, var(--danger) 8%, transparent);
+		color: var(--ink);
+	}
+
+	.gw-adm-notice--ok {
+		border-color: var(--ok);
+		background: color-mix(in srgb, var(--ok) 8%, transparent);
+		color: var(--ink);
+	}
+
+	.gw-adm-notice-title {
+		font-weight: 650;
+	}
+
+	/* --- Buttons -----------------------------------------------------------
+	 *
+	 * Every modifier below repeats `:not([hidden])`, and that is not copy-paste: the
+	 * guard is a compound selector, so it RAISES specificity. `.gw-adm-btn:not([hidden])`
+	 * scores (0,2,0) and a bare `.gw-adm-btn--primary` scores (0,1,0), which means the
+	 * base rule wins and the primary button renders in the plain colours — silently,
+	 * because nothing is invalid and nothing is logged. It looked exactly like a missing
+	 * class until the computed styles were read back.
+	 *
+	 * Adding the guard to the modifier levels the score, and source order then decides,
+	 * which is what one expects of a modifier in the first place.
+	 */
+
+	.gw-adm-btn:not([hidden]) {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--space-2);
+		padding: var(--space-1) var(--space-3);
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		background: var(--bg-raised);
+		color: var(--ink);
+		font: inherit;
+		font-size: var(--text-sm);
+		text-decoration: none;
+		cursor: pointer;
+	}
+
+	.gw-adm-btn:hover {
+		border-color: var(--border-strong);
+		background: var(--bg-sunken);
+	}
+
+	.gw-adm-btn--primary:not([hidden]) {
+		border-color: var(--accent);
+		background: var(--accent);
+		color: var(--accent-ink);
+	}
+
+	.gw-adm-btn--primary:not([hidden]):hover {
+		border-color: var(--accent);
+		background: color-mix(in srgb, var(--accent) 85%, var(--ink));
+	}
+
+	.gw-adm-btn--danger:not([hidden]) {
+		border-color: var(--danger);
+		color: var(--danger);
+	}
+
+	.gw-adm-btn--danger:not([hidden]):hover {
+		background: color-mix(in srgb, var(--danger) 10%, transparent);
+		border-color: var(--danger);
+	}
+
+	/* A disabled primary or danger button must still read as disabled, so this comes
+	   after both and matches their score. */
+	.gw-adm-btn:not([hidden])[disabled],
+	.gw-adm-btn:not([hidden])[aria-disabled='true'] {
+		border-color: var(--border);
+		background: var(--bg-sunken);
+		color: var(--ink-faint);
+		cursor: not-allowed;
+	}
+
+	/* The shared `Dialog.svelte` renders its `trigger` snippet inside Ark's
+	   `Dialog.Trigger` and forwards no class to it, so the button it produces cannot be
+	   styled by passing a class in. It can be reached through Ark's own part attribute
+	   from a wrapper we do control, which is what this is: `<span class="gw-adm-trigger">`
+	   around the dialog, and the rules below paint the button inside it.
+
+	   Attribute selectors, not a tag name, because which element Ark renders for a part
+	   is Ark's decision and has changed between versions. */
+	.gw-adm-trigger > [data-part='trigger']:not([hidden]) {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--space-2);
+		padding: var(--space-1) var(--space-3);
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		background: var(--bg-raised);
+		color: var(--ink);
+		font: inherit;
+		font-size: var(--text-sm);
+		cursor: pointer;
+	}
+
+	.gw-adm-trigger > [data-part='trigger']:not([hidden]):hover {
+		border-color: var(--border-strong);
+		background: var(--bg-sunken);
+	}
+
+	/* `:not([hidden])` repeated on the modifiers for the specificity reason set out
+	   above the buttons. Without it these lose to the base rule and the primary and
+	   danger triggers render as plain ones. */
+	.gw-adm-trigger--primary > [data-part='trigger']:not([hidden]) {
+		border-color: var(--accent);
+		background: var(--accent);
+		color: var(--accent-ink);
+	}
+
+	.gw-adm-trigger--primary > [data-part='trigger']:not([hidden]):hover {
+		background: color-mix(in srgb, var(--accent) 85%, var(--ink));
+		border-color: var(--accent);
+	}
+
+	.gw-adm-trigger--danger > [data-part='trigger']:not([hidden]) {
+		border-color: var(--danger);
+		color: var(--danger);
+	}
+
+	.gw-adm-trigger--danger > [data-part='trigger']:not([hidden]):hover {
+		background: color-mix(in srgb, var(--danger) 10%, transparent);
+		border-color: var(--danger);
+	}
+
+	/* --- Sections and cards ------------------------------------------------ */
+
+	.gw-adm-section {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-3);
+	}
+
+	.gw-adm-section-head {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--space-2) var(--space-4);
+	}
+
+	.gw-adm-h2 {
+		font-size: var(--text-xl);
+		font-weight: 650;
+		line-height: var(--leading-tight);
+	}
+
+	.gw-adm-h3 {
+		font-size: var(--text-lg);
+		font-weight: 650;
+		line-height: var(--leading-tight);
+	}
+
+	.gw-adm-card {
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		background: var(--bg-raised);
+		padding: var(--space-4);
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-3);
+	}
+
+	.gw-adm-muted {
+		color: var(--ink-muted);
+		font-size: var(--text-sm);
+	}
+
+	.gw-adm-mono {
+		font-family: var(--font-mono);
+		font-size: 0.9em;
+	}
+
+	/* --- Tables ------------------------------------------------------------ */
+
+	/* A wide table scrolls inside its own box. The page must never scroll sideways —
+	   that is what makes a screen unusable on a narrow viewport. */
+	.gw-adm-scroll {
+		overflow-x: auto;
+	}
+
+	.gw-adm-table {
+		inline-size: 100%;
+		border-collapse: collapse;
+		font-size: var(--text-sm);
+	}
+
+	.gw-adm-table caption {
+		text-align: start;
+		color: var(--ink-muted);
+		font-size: var(--text-sm);
+		padding-block-end: var(--space-2);
+	}
+
+	.gw-adm-table th,
+	.gw-adm-table td {
+		text-align: start;
+		vertical-align: top;
+		padding: var(--space-2) var(--space-3);
+		border-block-end: 1px solid var(--border);
+	}
+
+	.gw-adm-table thead th {
+		color: var(--ink-muted);
+		font-weight: 650;
+		white-space: nowrap;
+	}
+
+	.gw-adm-table tbody tr:hover {
+		background: var(--bg-sunken);
+	}
+
+	/* --- Badges ------------------------------------------------------------ */
+
+	.gw-adm-badge {
+		display: inline-block;
+		padding: 0 var(--space-2);
+		border: 1px solid var(--border-strong);
+		border-radius: var(--radius-sm);
+		color: var(--ink-muted);
+		font-size: var(--text-xs);
+		line-height: 1.6;
+		white-space: nowrap;
+	}
+
+	.gw-adm-badge--ok {
+		border-color: var(--ok);
+		color: var(--ok);
+	}
+
+	.gw-adm-badge--off {
+		border-color: var(--danger);
+		color: var(--danger);
+	}
+
+	.gw-adm-badge--accent {
+		border-color: var(--accent);
+		color: var(--accent);
+	}
+
+	/* --- Access panel ------------------------------------------------------ */
+
+	.gw-adm-access {
+		display: grid;
+		gap: var(--space-6);
+		grid-template-columns: minmax(13rem, 20rem) minmax(0, 1fr);
+		align-items: start;
+	}
+
+	@media (max-width: 60rem) {
+		.gw-adm-access {
+			grid-template-columns: minmax(0, 1fr);
+		}
+	}
+
+	.gw-adm-pathbar {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--space-2) var(--space-3);
+	}
+
+	.gw-adm-path {
+		font-family: var(--font-mono);
+		font-size: var(--text-lg);
+		font-weight: 650;
+		overflow-wrap: anywhere;
+	}
+
+	/* --- Tree view (Ark) --------------------------------------------------- */
+
+	.gw-adm-tree:not([hidden]) {
+		display: block;
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		background: var(--bg-raised);
+		padding: var(--space-2);
+		max-block-size: 32rem;
+		overflow: auto;
+		font-size: var(--text-sm);
+	}
+
+	.gw-adm-tree-label {
+		color: var(--ink-faint);
+		font-size: var(--text-xs);
+		font-weight: 650;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+		padding: var(--space-1) var(--space-2);
+	}
+
+	.gw-adm-tree-list:not([hidden]) {
+		display: block;
+		list-style: none;
+		margin: 0;
+		padding: 0;
+	}
+
+	.gw-adm-tree-branch:not([hidden]) {
+		display: block;
+	}
+
+	/* The collapsed branch body. Ark's Collapsible sets `hidden` here, so this is the
+	   single most important `:not([hidden])` in the file: without it every branch of the
+	   document tree renders expanded and no amount of clicking closes one. */
+	.gw-adm-tree-content:not([hidden]) {
+		display: block;
+		margin-inline-start: var(--space-3);
+		padding-inline-start: var(--space-3);
+		border-inline-start: 1px solid var(--border);
+	}
+
+	.gw-adm-tree-row:not([hidden]) {
+		display: flex;
+		align-items: center;
+		gap: var(--space-1);
+		padding: var(--space-1) var(--space-2);
+		border-radius: var(--radius-sm);
+		color: var(--accent);
+		cursor: pointer;
+		line-height: 1.4;
+	}
+
+	.gw-adm-tree-row:hover {
+		background: var(--bg-sunken);
+	}
+
+	/* Selection is weight plus background, not hue alone. */
+	.gw-adm-tree-row[data-selected] {
+		background: var(--accent-soft);
+		color: var(--ink);
+		font-weight: 650;
+	}
+
+	.gw-adm-tree-twisty:not([hidden]) {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		inline-size: 1rem;
+		color: var(--ink-faint);
+		transition: rotate 120ms ease;
+	}
+
+	.gw-adm-tree-twisty[data-state='open'] {
+		rotate: 90deg;
+	}
+
+	/* Leaves sit where branch text sits, so the column of titles stays straight. */
+	.gw-adm-tree-indent {
+		display: inline-block;
+		inline-size: 1rem;
+		flex: none;
+	}
+
+	/* --- Switch (Ark) ------------------------------------------------------ */
+
+	.gw-adm-switch:not([hidden]) {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--space-2);
+		cursor: pointer;
+		font-size: var(--text-sm);
+	}
+
+	.gw-adm-switch-control:not([hidden]) {
+		display: inline-flex;
+		align-items: center;
+		flex: none;
+		inline-size: 2.25rem;
+		block-size: 1.25rem;
+		padding: 2px;
+		border: 1px solid var(--border-strong);
+		border-radius: 999px;
+		background: var(--bg-sunken);
+		transition: background 120ms ease;
+	}
+
+	.gw-adm-switch-control[data-state='checked'] {
+		background: var(--ok);
+		border-color: var(--ok);
+	}
+
+	.gw-adm-switch-thumb:not([hidden]) {
+		display: block;
+		inline-size: 1rem;
+		block-size: 1rem;
+		border-radius: 999px;
+		background: var(--bg-raised);
+		box-shadow: var(--shadow-sm);
+		transition: translate 120ms ease;
+	}
+
+	.gw-adm-switch-thumb[data-state='checked'] {
+		translate: 1rem 0;
+	}
+
+	.gw-adm-switch[data-disabled] {
+		cursor: not-allowed;
+		color: var(--ink-faint);
+	}
+
+	/* --- Field (Ark) ------------------------------------------------------- */
+
+	.gw-adm-field:not([hidden]) {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-1);
+	}
+
+	.gw-adm-field-label {
+		font-size: var(--text-sm);
+		font-weight: 650;
+	}
+
+	.gw-adm-input:not([hidden]) {
+		display: block;
+		inline-size: 100%;
+		padding: var(--space-2) var(--space-3);
+		border: 1px solid var(--border-strong);
+		border-radius: var(--radius-sm);
+		background: var(--bg);
+		color: var(--ink);
+		font: inherit;
+		font-size: var(--text-sm);
+	}
+
+	.gw-adm-help {
+		color: var(--ink-faint);
+		font-size: var(--text-xs);
+	}
+
+	/* `Field.ErrorText` is not hidden while the field is valid — it is not rendered at
+	   all, which is why there is no `:not([hidden])` guard to write here. Worth knowing:
+	   Ark is not consistent about which of the two it uses, so the guard belongs
+	   everywhere the attribute is actually the mechanism and nowhere else. */
+	.gw-adm-error {
+		display: block;
+		color: var(--danger);
+		font-size: var(--text-xs);
+	}
+
+	/* --- Combobox and Select (Ark, portalled) ------------------------------ */
+
+	.gw-adm-combo:not([hidden]),
+	.gw-adm-select:not([hidden]) {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-1);
+	}
+
+	.gw-adm-combo-control:not([hidden]) {
+		display: flex;
+		align-items: stretch;
+		gap: var(--space-1);
+	}
+
+	.gw-adm-combo-trigger:not([hidden]),
+	.gw-adm-select-trigger:not([hidden]) {
+		display: inline-flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--space-2);
+		padding: var(--space-2) var(--space-3);
+		border: 1px solid var(--border-strong);
+		border-radius: var(--radius-sm);
+		background: var(--bg-raised);
+		color: var(--ink);
+		font: inherit;
+		font-size: var(--text-sm);
+		cursor: pointer;
+	}
+
+	.gw-adm-select-trigger:not([hidden]) {
+		inline-size: 100%;
+	}
+
+	/* Both dropdowns are rendered into a portal at the end of <body>, outside every
+	   stacking context on the page, so they need an explicit z-index above the sticky
+	   header (z-index 10) and below the dialog layer (50–51). */
+	.gw-adm-popper:not([hidden]) {
+		position: relative;
+		z-index: 30;
+	}
+
+	.gw-adm-listbox:not([hidden]) {
+		display: block;
+		min-inline-size: 14rem;
+		max-block-size: 16rem;
+		overflow-y: auto;
+		padding: var(--space-1);
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		background: var(--bg-raised);
+		box-shadow: var(--shadow);
+	}
+
+	.gw-adm-option:not([hidden]) {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--space-3);
+		padding: var(--space-1) var(--space-2);
+		border-radius: var(--radius-sm);
+		font-size: var(--text-sm);
+		cursor: pointer;
+	}
+
+	.gw-adm-option[data-highlighted] {
+		background: var(--accent-soft);
+		color: var(--ink);
+	}
+
+	.gw-adm-option[data-state='checked'] {
+		font-weight: 650;
+	}
+
+	.gw-adm-empty:not([hidden]) {
+		display: block;
+		padding: var(--space-2);
+		color: var(--ink-muted);
+		font-size: var(--text-sm);
+	}
+
+	/* --- Menu (Ark, portalled) --------------------------------------------- */
+
+	.gw-adm-menu:not([hidden]) {
+		display: flex;
+		flex-direction: column;
+		min-inline-size: 14rem;
+		padding: var(--space-1);
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		background: var(--bg-raised);
+		box-shadow: var(--shadow);
+	}
+
+	.gw-adm-menu-item:not([hidden]) {
+		display: block;
+		padding: var(--space-1) var(--space-2);
+		border-radius: var(--radius-sm);
+		color: var(--ink);
+		font-size: var(--text-sm);
+		text-decoration: none;
+		cursor: pointer;
+	}
+
+	.gw-adm-menu-item[data-highlighted] {
+		background: var(--accent-soft);
+	}
+
+	/* --- Tooltip (Ark, portalled) ------------------------------------------ */
+
+	.gw-adm-tip:not([hidden]) {
+		display: block;
+		max-inline-size: 22rem;
+		padding: var(--space-2) var(--space-3);
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		background: var(--bg-raised);
+		color: var(--ink);
+		box-shadow: var(--shadow);
+		font-size: var(--text-xs);
+		line-height: var(--leading-normal);
+	}
+
+	.gw-adm-tip-trigger:not([hidden]) {
+		display: inline;
+		border: 0;
+		background: none;
+		padding: 0;
+		color: inherit;
+		font: inherit;
+		text-decoration: underline dotted;
+		text-underline-offset: 0.2em;
+		cursor: help;
+	}
+
+	/* --- Confirmation dialog (Ark, portalled) ------------------------------ */
+
+	/* Deliberately NOT the shared `Dialog.svelte`, and the reason is worth writing down:
+	   that wrapper renders `<Dialog.Root>` with no `open` prop, so it can only ever be
+	   opened by its own trigger. A confirmation raised by a switch being turned off has
+	   no trigger to hang on — the control that started it is the switch. So the console
+	   carries one controlled dialog of its own for that case and uses the shared wrapper
+	   everywhere a trigger exists. Same tokens, same `:not([hidden])` discipline. */
+	.gw-adm-dialog-backdrop:not([hidden]) {
+		position: fixed;
+		inset: 0;
+		background: rgb(0 0 0 / 45%);
+		z-index: 50;
+	}
+
+	.gw-adm-dialog-positioner:not([hidden]) {
+		position: fixed;
+		inset: 0;
+		z-index: 51;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: var(--space-4);
+	}
+
+	.gw-adm-dialog:not([hidden]) {
+		position: relative;
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-3);
+		inline-size: min(32rem, 100%);
+		max-block-size: calc(100vh - var(--space-8));
+		overflow-y: auto;
+		padding: var(--space-6);
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		background: var(--bg-raised);
+		color: var(--ink);
+		box-shadow: var(--shadow);
+	}
+
+	.gw-adm-dialog-title {
+		font-size: var(--text-xl);
+		font-weight: 650;
+		line-height: var(--leading-tight);
+	}
+
+	.gw-adm-dialog-footer {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--space-2);
+		justify-content: flex-end;
+		margin-block-start: var(--space-2);
+	}
+
+	/* --- Forms inside dialogs ---------------------------------------------- */
+
+	.gw-adm-form {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-4);
+	}
+
+	/* --- Visually hidden ---------------------------------------------------- */
+
+	/* Readable by a screen reader, invisible on screen. `display: none` would hide it
+	   from both, which defeats the point of a label. */
+	.gw-adm-sr {
+		position: absolute;
+		inline-size: 1px;
+		block-size: 1px;
+		padding: 0;
+		margin: -1px;
+		overflow: hidden;
+		clip-path: inset(50%);
+		white-space: nowrap;
+	}
+}
