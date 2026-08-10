@@ -104,6 +104,44 @@ constant, and **spaces carry defaults their documents inherit**, so a space can 
 > editing**: someone pasting a credential and then deleting it needs to learn immediately
 > that it is still there, not months later.
 
+## Decisions locked 2026-08-10 (owner)
+
+**D-M2-11 — One sign-in button, both mechanisms behind it.** There is a single *Anmelden*
+control. It does not go straight to Authelia; it opens great-wiki's own sign-in page, which
+offers the homelab account **and** a guest username/password form. Which mechanism a person
+uses is great-wiki's business, not something the reader has to understand before clicking.
+
+*Consequence, and it is not optional:* the guest password form is now reachable from a
+public hostname by anyone, where the previous plan had it hidden behind an invite link. **A
+publicly reachable password form must ship with rate limiting and a generic failure
+message** — per-account and per-IP throttling, and "Anmeldung fehlgeschlagen" whether the
+username exists or not, so the form cannot be used to enumerate who has an account. This is
+a prerequisite of Task 6b, not a later hardening pass.
+
+*Also:* `/auth/login` currently 302s straight to the identity provider. That becomes a
+rendered page, and the redirect moves behind the homelab button.
+
+**D-M2-12 — Invites are a link first, email later.** The console shows a single-use expiring
+invite URL once, and the owner sends it by whatever channel they like. No SMTP is wired and
+an invite that silently fails to deliver is worse than one you have to paste. Build the
+delivery seam so that sending it by mail is a later addition rather than a rewrite: the
+invite is created and stored the same way either way, and only the handing-over differs.
+
+**D-M2-13 — Audit entries are kept indefinitely.** The log is a row per administrative
+action, not per page view, so it does not grow the way a request log does, and the question
+it exists to answer ("when did this change, and who changed it?") is usually asked months
+later. Recorded as a deliberate choice rather than an omission: if it is ever revisited, the
+reason will be size, and the privacy question about retaining who-viewed-whom should be
+reopened at the same time.
+
+**D-M2-14 — The admin console is built entirely on Ark UI.** Not only the primitives that
+are hard to hand-write. ADR 0005 chose Ark on paper and nothing has ever used it; a partial
+adoption would test the parts that were never in doubt. The console is the right place to
+find out what living in it is actually like, because it is small, internal, and the only
+thing that breaks if the answer is "no". Every Ark component is restyled through the
+existing tokens — a component that cannot be reached by a theme is a component that breaks
+the plugin contract.
+
 ## What M2 replaces
 
 M1 left two deliberate stubs, both commented as such. M2 must **replace** them, not sit
@@ -1557,6 +1595,32 @@ anonymously; a restricted page is not; signing in yields the right groups at `/a
 local guest account signs in *without* Authelia. If any fails, the gate stays.
 
 ---
+
+## Task 6b: One sign-in page, and the rate limiting it now requires
+
+**Produces:** a rendered `GET /auth/login` offering both mechanisms, `POST /auth/local`,
+and per-account plus per-IP throttling.
+
+Follows from D-M2-11. `/auth/login` currently 302s straight to Authelia; it becomes a page
+with a homelab button (which performs today's redirect) and a guest username/password form.
+
+**This task exists because that form is publicly reachable.** The earlier plan hid guest
+login behind an invite link, so nothing advertised that password authentication existed.
+One visible button is better for the person signing in and strictly worse for exposure, and
+the throttling is the price of the trade rather than a later hardening pass.
+
+Tests, each of which must fail before it passes:
+
+- A wrong password and an unknown username produce the **same** response, in the same
+  time envelope — otherwise the form enumerates who has an account.
+- N failures for one username lock that account's attempts regardless of source address,
+  so a distributed attempt on one account is still throttled.
+- N failures from one address are throttled across usernames, so a spray across many
+  accounts is too.
+- Throttling never applies to the Authelia path: a homelab sign-in must not be blockable
+  by somebody else guessing at guest passwords.
+- A successful sign-in clears the counter for that account.
+
 
 ## Task 7: Invites and space-scoped account creation
 
