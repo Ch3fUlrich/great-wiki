@@ -104,9 +104,20 @@ grep_pass() {
   return 0
 }
 
-scan() {
+scan_only() {
   local -a findings=()
   local line value name_hits key_hits
+
+  # If the scan can see no files at all, something is wrong with the working
+  # directory or the exclude list, and "no credentials found" would be true only
+  # because nothing was looked at. That is the same false-clean failure as a broken
+  # pattern, arriving by a different route.
+  local visible
+  visible="$(git ls-files -- "${EXCLUDES[@]}" | wc -l)"
+  if [ "$visible" -eq 0 ]; then
+    echo "::error::the scan matched no files at all — refusing to report a clean repository" >&2
+    return 2
+  fi
 
   name_hits="$(grep_pass "$NAME_PATTERN")" || return 2
   # Key material needs no name in front of it, so it is its own pass.
@@ -115,7 +126,14 @@ scan() {
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     value="$(value_of "$line" || true)"
-    [ -n "$value" ] || continue
+    if [ -z "$value" ]; then
+      # The first pass matched but the value could not be extracted, so the shape
+      # test cannot be applied. Report it rather than dropping it: an unclassifiable
+      # hit is the one case where a human must look, and silently skipping it is how
+      # a scanner disagrees with itself and lets something through.
+      findings+=("$line   [value could not be extracted — classify by hand]")
+      continue
+    fi
     if looks_like_a_credential "$value"; then
       findings+=("$line")
     fi
@@ -190,7 +208,7 @@ self_test() {
   cd "$tmp"
   local output status
   set +e
-  output="$(scan 2>&1)"
+  output="$(scan_only 2>&1)"
   status=$?
   set -e
   cd "$original"
@@ -221,7 +239,7 @@ self_test() {
   outside="$(mktemp -d)"
   cd "$outside"
   set +e
-  scan >/dev/null 2>&1
+  scan_only >/dev/null 2>&1
   status=$?
   set -e
   cd "$original"
@@ -235,6 +253,20 @@ self_test() {
     return 1
   fi
   echo "self-test: classification and scanning both correct"
+}
+
+# A clean report is only trustworthy if the scanner could still have failed, so
+# proving that is part of producing it — not a separate step someone can drop from
+# a workflow, and not a step that can pass in one job while the real scan runs
+# broken in another. The self-test builds a throwaway repository and takes about a
+# tenth of a second, which is not a price worth optimising away.
+scan() {
+  if ! self_test >/dev/null 2>&1; then
+    echo "::error::the scanner failed its own self-test — its verdict means nothing" >&2
+    echo "Run '$0 --self-test' to see which check failed." >&2
+    return 2
+  fi
+  scan_only
 }
 
 case "${1:-scan}" in

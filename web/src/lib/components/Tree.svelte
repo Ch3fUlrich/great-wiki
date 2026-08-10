@@ -32,18 +32,27 @@
     border-inline-start: 1px solid var(--border);
   }
 
+  /* Navigation links carry the accent colour, not muted body ink.
+   *
+   * They were `--ink-muted`, which is the colour of de-emphasised TEXT — so a column of
+   * page titles read as a list of labels rather than as things you can click, and looked
+   * fainter than the prose beside it. Underlines are still off here, because in a dense
+   * vertical list they add more noise than affordance; the colour plus the hover
+   * background carries it, and the hover adds an underline for anyone who reads shape
+   * before hue. */
   a {
     display: block;
     padding: var(--space-1) var(--space-2);
     border-radius: var(--radius-sm);
-    color: var(--ink-muted);
+    color: var(--accent);
     text-decoration: none;
     line-height: 1.4;
   }
 
   a:hover {
     background: var(--bg-sunken);
-    color: var(--ink);
+    text-decoration: underline;
+    text-underline-offset: 0.15em;
   }
 
   /* The current page is marked by weight and a background, not by colour alone —

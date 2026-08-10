@@ -22,13 +22,22 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # ci.vm reports 1736 MiB total and ~817 MiB available — the VM is documented as
-  # 8 GiB ballooned with a 2 GiB floor, but the balloon is currently sitting below
-  # its own minimum. rustc runs one process per codegen unit, so the default
-  # `-j $(nproc)` (6 here) is what turns a tight box into an OOM kill. That kill
-  # arrives as a bare `signal: 9` with no "out of memory" anywhere in the log and
-  # no readable dmesg for an unprivileged runner, so it reads exactly like a
-  # compiler crash. Capping the job count is far cheaper than diagnosing it twice.
+  # ci.vm is memory-ballooned, so how much RAM a job gets depends on when it runs.
+  # `free -m` in that guest is the CURRENT balloon size, not a ceiling and not a
+  # floor: measured at 1736 MiB total / 817 available on one day and 4036 / 3367 on
+  # the next, against 8 GiB configured. Reading either number as "the memory this
+  # box has" is wrong in both directions.
+  #
+  # That variability is the argument for the cap, not scarcity. rustc runs one
+  # process per codegen unit and defaults to `-j $(nproc)` (6 here), so peak usage
+  # is set by the build while available memory is set by the host's mood — and a
+  # build that passes all week fails the first time it starts while the balloon is
+  # deflated. Capping makes the peak independent of when the job happens to run.
+  #
+  # It is worth being deliberate about because the failure is unrecognisable: an
+  # OOM kill arrives as a bare `signal: 9` with no "out of memory" anywhere in the
+  # log, and an unprivileged runner cannot read dmesg to find out otherwise. It
+  # reads exactly like a compiler crash, or like a cancelled job.
   CARGO_BUILD_JOBS: "2"
 
 jobs:

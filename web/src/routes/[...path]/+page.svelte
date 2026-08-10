@@ -88,7 +88,10 @@
     padding-inline-start: var(--space-3);
     margin-inline-start: -1px;
     border-inline-start: 2px solid transparent;
-    color: var(--ink-muted);
+    /* The accent, not muted body ink. These were --ink-muted, which is the colour of
+       de-emphasised TEXT, so the on-this-page list read as a set of labels rather than
+       as jumps you can take. */
+    color: var(--accent);
     text-decoration: none;
     line-height: 1.35;
     /* A wrapped entry keeps its indent on the second line. Without this the
@@ -97,13 +100,11 @@
     hanging-punctuation: none;
   }
 
+  .outline a:hover,
   .outline a:focus-visible {
-    color: var(--ink);
-  }
-
-  .outline a:hover {
-    color: var(--ink);
-    border-inline-start-color: var(--border-strong);
+    text-decoration: underline;
+    text-underline-offset: 0.15em;
+    border-inline-start-color: var(--accent);
   }
 
   .prose h1 {

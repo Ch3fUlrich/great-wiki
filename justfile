@@ -39,6 +39,14 @@ lint:
 build:
     {{node}} cd web && npm run build
 
+# Break the security-critical code on purpose and check the tests notice.
+#
+# NOT part of `ci`: it rebuilds the workspace once per mutation, which is minutes on the
+# runner. Run it by hand after touching gw-auth or gw-store — that is where a passing
+# suite has three times now failed to notice a defence being removed entirely.
+mutate:
+    ./scripts/mutate.sh
+
 # The full gate. Every task must end with this passing.
 ci: lint test build
 

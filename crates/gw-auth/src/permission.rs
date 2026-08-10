@@ -146,6 +146,36 @@ mod tests {
     #[test]
     fn restricted_documents_need_a_matching_grant() {
         assert!(!can(&guest(), Action::Read, Visibility::Restricted, &[]));
+    }
+
+    #[test]
+    fn internal_reach_confers_reading_and_nothing_else() {
+        // Being signed in with internal reach lets you READ an internal document. It must
+        // not let you change one: writing is only ever conferred by an explicit grant.
+        //
+        // Found by mutation testing, not by review. Deleting `action == Action::Read` from
+        // the internal branch — which hands write, comment AND admin on every internal
+        // document to everyone who can see it — failed no test in the suite.
+        for action in [Action::Comment, Action::Write, Action::Admin] {
+            assert!(
+                !can(&guest(), action, Visibility::Internal, &[]),
+                "internal reach conferred {action:?} with no grant"
+            );
+        }
+        assert!(can(&guest(), Action::Read, Visibility::Internal, &[]));
+    }
+
+    #[test]
+    fn a_public_document_is_readable_but_not_writable() {
+        // The same shape one visibility down, and the same failure if the read check is
+        // dropped: a public page would become world-writable.
+        for action in [Action::Comment, Action::Write, Action::Admin] {
+            assert!(
+                !can(&anon(), action, Visibility::Public, &[]),
+                "a public document accepted {action:?} from an anonymous caller"
+            );
+        }
+        assert!(can(&anon(), Action::Read, Visibility::Public, &[]));
         let grants = [Grant {
             subject: Subject::Principal("guest".into()),
             permission: Permission::Read,
