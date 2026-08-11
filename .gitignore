@@ -10,6 +10,18 @@
 secrets/
 secrets-generated/
 
+# --- Real content -------------------------------------------------------
+# This repository is PUBLIC, and a credential is not the only thing that must never
+# reach it. `content-darm/` is the owner's personal medical reference about a child;
+# committing it would publish health data about a named family to the world, and no
+# secret scanner would object, because health data is not credential-shaped.
+#
+# `content-example/` IS tracked, deliberately — it is invented demonstration text with
+# no real person in it. The distinction is the point: what makes content unpublishable
+# here is whose life it describes, not which directory it sits in. Anything imported
+# from the owner's notes belongs on this side of the line.
+content-darm/
+
 # --- Build artefacts ----------------------------------------------------
 /target
 **/target
