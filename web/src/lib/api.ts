@@ -87,7 +87,33 @@ export interface StoredDocument {
 
 // `$env/dynamic/private` is server-only, which is correct: this module is imported only
 // from `+page.server.ts` files and must never end up in a client bundle.
-const BASE = env.GW_API ?? 'http://127.0.0.1:8092';
+//
+// Read per call rather than once at import. `$env/dynamic/private` exists precisely to be
+// read at runtime — that is what separates it from `$env/static/private` — and a value
+// captured when the module first loads is a value that cannot be tested, because a test
+// cannot import the module twice with two environments. Both readers below are one
+// property lookup; nothing here is on a hot path.
+const base = () => env.GW_API ?? 'http://127.0.0.1:8092';
+
+/**
+ * The proxy attestation, for calls this server makes itself.
+ *
+ * The API refuses any request that arrives without it whenever it is bound to anything but
+ * loopback, because its port is reachable from the LAN and the shared secret is the only
+ * thing separating a request that came through the edge from one that did not. That guard
+ * applies to *this* server too: rendering a page is an ordinary HTTP call to the API, and
+ * nothing about running in the same compose project makes it attested.
+ *
+ * It was missing until 2026-08-11, and the way it failed is the reason this comment is
+ * long. Every server-side call would have been refused with 403, `+layout.server.ts` turns
+ * a failed `/api/me` into `ANONYMOUS` on purpose, and the result is a wiki that renders as
+ * "nobody signed in" for everybody — no crash, no error in any log the reader would see,
+ * just a site that quietly shows the public view to people who are signed in. It never
+ * reached production only because nothing had been deployed yet.
+ *
+ * Empty in development, where the API binds loopback and demands nothing.
+ */
+const proxySecret = () => env.GW_PROXY_SECRET ?? '';
 
 /**
  * Server-side fetch. Forwards the caller's cookie so the API sees the same session the
@@ -98,9 +124,12 @@ export async function apiGet<T>(
   path: string,
   cookie: string | null
 ): Promise<{ status: number; data: T | null }> {
-  const res = await fetchFn(`${BASE}${path}`, {
-    headers: cookie ? { cookie } : {}
-  });
+  const headers: Record<string, string> = {};
+  if (cookie) headers.cookie = cookie;
+  const secret = proxySecret();
+  if (secret) headers['X-GW-Proxy'] = secret;
+
+  const res = await fetchFn(`${base()}${path}`, { headers });
   if (!res.ok) return { status: res.status, data: null };
   return { status: res.status, data: (await res.json()) as T };
 }

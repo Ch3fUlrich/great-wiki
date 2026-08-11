@@ -6,6 +6,18 @@ Entries describe the *effect* of a change, not the diff.
 
 ## [Unreleased]
 
+### Fixed
+
+- The server-rendered pages now attest themselves to the API. They did not, and the way
+  that would have failed is worth recording: the API refuses any request without the
+  proxy secret whenever it is bound to anything but loopback — which is every deployment —
+  so every server-side call would have been refused. The layout deliberately turns a
+  failed identity lookup into "nobody signed in" rather than an error page, so the result
+  would have been a wiki that quietly showed the public view to people who were signed in,
+  with nothing in any log a reader would see. It never reached anybody only because
+  nothing had been deployed yet: every test ran against a loopback API that demands no
+  attestation, which is exactly the configuration that cannot notice.
+
 ### Added
 
 - Invitations: a single-use link that creates an account and gives it access in the same
