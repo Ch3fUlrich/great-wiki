@@ -16,7 +16,7 @@
   import { Switch } from '@ark-ui/svelte/switch';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import Notice from './Notice.svelte';
-  import { SOURCE_LABEL, type AdminPrincipal, type NewPrincipal } from '$lib/adminApi';
+  import { describeStatus, SOURCE_LABEL, type AdminPrincipal, type NewPrincipal } from '$lib/adminApi';
 
   interface Props {
     principals: AdminPrincipal[] | null;
@@ -119,6 +119,45 @@
     }
     const ok = await onSetActive(person, true);
     if (!ok) await rebuildSwitch(person.id);
+  }
+
+  // --- "Was sieht diese Person?" (D-M2-17) --------------------------------
+  //
+  // The request is made here rather than handed up as a prop, because there is nothing for
+  // the page to do with the result: on success this navigation LEAVES the console, and on
+  // failure the message belongs beside the row that was clicked.
+  //
+  // It is a `fetch` and not a `<form method="post">` because the endpoint answers JSON;
+  // a form would leave the administrator staring at it. The way OUT of the mode is a plain
+  // form and needs no script — that asymmetry is deliberate, and it is the direction that
+  // matters: this console already requires JavaScript, and being unable to leave would be
+  // a far worse failure than being unable to enter.
+  let starting = $state<string | null>(null);
+  let viewAsFailure = $state<string | null>(null);
+
+  async function viewAs(person: AdminPrincipal) {
+    starting = person.id;
+    viewAsFailure = null;
+    const clause = `Die Ansicht von »${person.display_name}« konnte nicht geöffnet werden`;
+    try {
+      const res = await fetch(`/api/admin/view-as/${encodeURIComponent(person.id)}`, {
+        method: 'POST'
+      });
+      if (!res.ok) {
+        viewAsFailure = describeStatus(res.status, clause);
+        starting = null;
+        return;
+      }
+    } catch {
+      viewAsFailure = describeStatus(0, clause);
+      starting = null;
+      return;
+    }
+    // Away from the console on purpose. Every mutating request is refused from here on,
+    // so a page whose every control would now fail is the wrong place to be left standing
+    // — and the question being answered is "what does this person see", which is answered
+    // by the wiki itself.
+    window.location.href = '/';
   }
 
   async function confirmDeactivate() {
@@ -246,6 +285,17 @@
     text="Homelab-Konten werden in der Konten-App verwaltet, nicht hier. great-wiki spiegelt sie nur und schreibt niemals in die Benutzerdatenbank von Authelia."
   />
 
+  <!-- Said before somebody tries it, because "ansehen als" reads like "anmelden als" and
+       is not that: no Sitzung wird übernommen, nichts wird geschrieben, und die eigene
+       Anmeldung bleibt bestehen. -->
+  <Notice
+    text="»Ansehen als« zeigt great-wiki genau so, wie diese Person es sieht — schreibgeschützt, jederzeit beendbar und im Protokoll vermerkt. Ihre eigene Anmeldung bleibt dabei bestehen."
+  />
+
+  {#if viewAsFailure}
+    <Notice tone="fail" title="Ansicht nicht geöffnet." text={viewAsFailure} />
+  {/if}
+
   {#if error}
     <Notice tone="fail" title="Personen nicht geladen." text={error} />
   {:else if !principals}
@@ -263,6 +313,7 @@
             <th scope="col">Gruppen</th>
             <th scope="col">Teams</th>
             <th scope="col">Status</th>
+            <th scope="col">Ansicht</th>
           </tr>
         </thead>
         <tbody>
@@ -295,6 +346,24 @@
                     <Switch.HiddenInput />
                   </Switch.Root>
                 {/key}
+              </td>
+              <td>
+                <!--
+                  Offered only for an account that can actually be viewed as. The API
+                  refuses a deactivated one with 409 — such a person sees what an
+                  anonymous visitor sees, so the answer would be true and useless — and an
+                  interface that offers a button whose only outcome is a refusal is worse
+                  than one that explains why it cannot.
+                -->
+                <button
+                  type="button"
+                  class="gw-adm-btn"
+                  disabled={busy || !person.active || starting !== null}
+                  aria-label="Ansehen als {person.display_name} ({person.username})"
+                  onclick={() => viewAs(person)}
+                >
+                  Ansehen als
+                </button>
               </td>
             </tr>
           {/each}

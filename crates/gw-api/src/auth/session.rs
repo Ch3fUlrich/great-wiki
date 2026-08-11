@@ -119,10 +119,19 @@ pub struct Me {
     /// What established this identity. `dev-shim` has no session to end, so the interface
     /// does not offer a sign-out that would do nothing.
     pub source: PrincipalSource,
+    /// Whose view is being shown, when an administrator is viewing as somebody else
+    /// (D-M2-17). `None` is the ordinary case.
+    ///
+    /// Every field above already describes the SUBSTITUTED person, because that is who the
+    /// permission engine ran as. This names both identities, which is what the persistent
+    /// banner is rendered from — the target alone would not say whose session this really
+    /// is, and the viewer alone would not say what is being shown.
+    pub view_as: Option<crate::view_as::ViewAsView>,
 }
 
 pub async fn me(State(state): State<AppState>, jar: CookieJar) -> Result<Json<Me>, ApiError> {
     let (principal, source) = state.principal_with_source(&jar).await;
+    let view_as = state.viewing_as(&jar).await;
     let baseline = state
         .store
         .baseline_for(&principal)
@@ -148,6 +157,7 @@ pub async fn me(State(state): State<AppState>, jar: CookieJar) -> Result<Json<Me
         baseline,
         login_available: state.oidc.is_some(),
         source,
+        view_as,
     }))
 }
 

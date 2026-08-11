@@ -5,6 +5,7 @@ pub mod identity;
 pub mod proxy_guard;
 pub mod routes;
 pub mod seed;
+pub mod view_as;
 
 pub use auth::{OidcClient, OidcConfig};
 pub use config::Config;

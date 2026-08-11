@@ -4,6 +4,7 @@
   import ThemeToggle from '$lib/components/ThemeToggle.svelte';
   import FontToggle from '$lib/components/FontToggle.svelte';
   import AccountMenu from '$lib/components/AccountMenu.svelte';
+  import ViewAsBanner from '$lib/components/ViewAsBanner.svelte';
 
   let { children, data } = $props();
 </script>
@@ -15,6 +16,12 @@
 <!-- Skip link first in the DOM: a keyboard user must be able to bypass the navigation
      without tabbing through every tree entry on every page. -->
 <a class="skip" href="#content">Zum Inhalt springen</a>
+
+<!-- Before the header, and outside it (D-M2-17). Above everything, on every page, because
+     the mode is entered in the console and then used everywhere else — and inside the
+     sticky header it would compete with the brand for the one row that never scrolls
+     away. It renders nothing at all when no substitution is active. -->
+<ViewAsBanner me={data.me} />
 
 <header class="no-print">
   <a class="brand" href="/">great&#8209;wiki</a>

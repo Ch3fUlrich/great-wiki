@@ -88,6 +88,13 @@ pub struct AppState {
     /// to ask first. A server has one state, so "once per state" and "once per process"
     /// are the same thing where it matters.
     pub placeholder: Arc<OnceLock<String>>,
+    /// Every live "view as somebody else" (D-M2-17).
+    ///
+    /// In the state rather than in a `static` for the same reason `placeholder` is: a test
+    /// builds a server and gets its own, and two servers in one process are two servers.
+    /// It is deliberately NOT in the database — see [`crate::view_as::Registry`]: losing
+    /// every session of it on restart is a property, not a cost.
+    pub view_as: Arc<crate::view_as::Registry>,
 }
 
 impl AppState {
@@ -110,6 +117,7 @@ impl AppState {
             corpus,
             hashing: HashingCost::PRODUCTION,
             placeholder: Arc::new(OnceLock::new()),
+            view_as: Arc::new(crate::view_as::Registry::default()),
         }
     }
 
@@ -138,6 +146,7 @@ impl AppState {
             // value here rather than a Cargo feature.
             hashing: HashingCost::CHEAP_FOR_TESTS,
             placeholder: Arc::new(OnceLock::new()),
+            view_as: Arc::new(crate::view_as::Registry::default()),
         }
     }
 
@@ -172,6 +181,12 @@ impl AppState {
     /// Session cookie first, then the development shim, then anonymous. Anonymous is the
     /// fall-through for every failure along the way, never an error: a request that cannot
     /// establish who it is has established that it is nobody.
+    ///
+    /// While an administrator is viewing as somebody else (D-M2-17) this is the
+    /// SUBSTITUTED principal — read from the store exactly as a real one is, so `can()`
+    /// and `baseline_for` run unchanged and nothing downstream has to know. That is the
+    /// only way the answer can be "what that person sees" rather than "what we believe
+    /// that person sees".
     pub async fn principal(&self, jar: &CookieJar) -> Principal {
         self.principal_with_source(jar).await.0
     }
@@ -182,7 +197,41 @@ impl AppState {
     /// only a principal, which is what keeps the shim honest. The interface needs it for
     /// one thing: a development shim has no session to end, so offering "sign out" there
     /// would be offering a button that quietly does nothing.
+    ///
+    /// The source is the REAL one even under a substitution: it describes how this request
+    /// authenticated, which view-as does not change. There is still a session to end, and
+    /// the banner — not the source field — is what says whose view is being shown.
     pub async fn principal_with_source(&self, jar: &CookieJar) -> (Principal, PrincipalSource) {
+        let (real, source) = self.real_principal_with_source(jar).await;
+        match crate::view_as::active_for(self, jar, &real).await {
+            Some(active) => (active.principal, source),
+            None => (real, source),
+        }
+    }
+
+    /// The caller as they actually authenticated, before any substitution.
+    ///
+    /// Used by the two places that must not be fooled by the mode: [`crate::view_as`],
+    /// which would otherwise be asking the cookie to vouch for itself, and the activation
+    /// endpoint, which has to know who is really asking. Everything else wants
+    /// [`AppState::principal`].
+    pub(crate) async fn real_principal(&self, jar: &CookieJar) -> Principal {
+        self.real_principal_with_source(jar).await.0
+    }
+
+    /// Whose view is being shown, when one is (D-M2-17). `None` is the ordinary case.
+    ///
+    /// Resolved through the same function every request uses, so `/api/me` cannot report a
+    /// mode the permission engine is not actually in — and cannot fail to report one it is
+    /// in, which is the direction that matters: a banner that does not appear is an
+    /// administrator who does not know whose view they are reading.
+    pub async fn viewing_as(&self, jar: &CookieJar) -> Option<crate::view_as::ViewAsView> {
+        crate::view_as::active(self, jar)
+            .await
+            .map(|active| active.view())
+    }
+
+    async fn real_principal_with_source(&self, jar: &CookieJar) -> (Principal, PrincipalSource) {
         if let Some(cookie) = jar.get(SESSION_COOKIE) {
             if let Some(principal) = self.principal_from_session(cookie.value()).await {
                 return (principal, PrincipalSource::Session);
@@ -268,6 +317,10 @@ impl AppState {
 }
 
 pub fn build_router(state: AppState) -> Router {
+    // The view-as layer needs the whole state (it reads the store); the proxy layer needs
+    // only its own policy. Cloned here because `with_state` consumes the original.
+    let view_as_state = state.clone();
+
     Router::new()
         .route(
             "/api/health",
@@ -277,6 +330,18 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/documents/{*path}", get(docs::get_document))
         .merge(admin::routes())
         .merge(crate::auth::routes())
+        .merge(crate::view_as::routes())
+        // D-M2-17, and it is applied HERE rather than in each handler for one reason: a
+        // layer added after every route wraps the 404 fallback too, so a path that does
+        // not exist yet is already covered. Per-handler checks fail open for code that has
+        // not been written, which is the class of bug this project keeps finding.
+        //
+        // Inside the proxy guard below, never outside it: this layer reads the store, and
+        // an unattested request must not reach anything that does.
+        .layer(axum::middleware::from_fn_with_state(
+            view_as_state,
+            crate::view_as::enforce,
+        ))
         // Last, so it wraps every route registered above *and* the 404 fallback: the guard
         // has to run before routing, or an unattested request would learn which paths
         // exist. Handlers read `AppState::principal` inside this layer, never outside it.

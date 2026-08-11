@@ -27,6 +27,10 @@
 
 use super::AppState;
 use crate::auth::password_policy::accept_new_password;
+// The invite token and the session cookie share one generator and one digest. A second
+// pair would be a second place for "random" to become "predictable" and for a plaintext
+// credential to reach a table.
+use crate::auth::session::{hash_token, new_session_token};
 use crate::error::ApiError;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -37,7 +41,10 @@ use gw_auth::{can, Action, Grant, Permission, Principal, Subject};
 use gw_core::Visibility;
 use gw_store::admin::{ActiveOutcome, InstanceAdminOutcome};
 use gw_store::principals::AdminCandidate;
-use gw_store::{AuditPage, Baseline, MembershipOutcome, TeamSummary};
+use gw_store::{
+    AuditPage, Baseline, CreateInviteOutcome, InviteSummary, MembershipOutcome, NewInvite,
+    RevokeInviteOutcome, TeamSummary, INVITE_TTL_SECONDS,
+};
 use serde::{Deserialize, Serialize};
 
 pub fn routes() -> Router<AppState> {
@@ -60,6 +67,8 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/admin/acl", get(read_acl).post(grant).delete(revoke))
         .route("/api/admin/audit", get(read_audit))
+        .route("/api/admin/invites", get(list_invites).post(create_invite))
+        .route("/api/admin/invites/{id}", delete(revoke_invite))
 }
 
 // -------------------------------------------------------------------------------------
@@ -72,7 +81,10 @@ pub fn routes() -> Router<AppState> {
 /// above it is defence in depth rather than the only thing standing here — but it is the
 /// one gate that does not depend on the `group_roles` table being right, and this is not
 /// a place to have exactly one.
-async fn instance_admin(state: &AppState, jar: &CookieJar) -> Result<Principal, ApiError> {
+pub(crate) async fn instance_admin(
+    state: &AppState,
+    jar: &CookieJar,
+) -> Result<Principal, ApiError> {
     let principal = state.principal(jar).await;
     if !principal.is_authenticated() || !principal.active {
         return Err(ApiError::Forbidden);
@@ -122,6 +134,23 @@ async fn path_admin(state: &AppState, jar: &CookieJar, path: &str) -> Result<Pri
         .await
         .map_err(ApiError::Internal)?;
     if can(&principal, Action::Admin, Visibility::Restricted, &grants) {
+        Ok(principal)
+    } else {
+        Err(ApiError::Forbidden)
+    }
+}
+
+/// The caller, if they have said who they are and the account is still active.
+///
+/// **Not an authorisation decision** — [`instance_admin`] and [`path_admin`] make those,
+/// and nothing may be handed over on the strength of this alone. It exists for endpoints
+/// whose authorisation depends on a stored row: the row has to be read before the right
+/// gate is even known, and reading it first would make "does this id exist?" answerable by
+/// somebody who has not signed in. Establishing that there is a caller closes that, and
+/// costs one session lookup that the gate below it would have done anyway.
+async fn signed_in(state: &AppState, jar: &CookieJar) -> Result<Principal, ApiError> {
+    let principal = state.principal(jar).await;
+    if principal.is_authenticated() && principal.active {
         Ok(principal)
     } else {
         Err(ApiError::Forbidden)
@@ -715,4 +744,278 @@ pub async fn read_audit(
         .await
         .map(Json)
         .map_err(ApiError::Internal)
+}
+
+// -------------------------------------------------------------------------------------
+// Invites.
+//
+// An invite is a CREDENTIAL: whoever holds the link can create an account and walk into
+// whatever the invite carries, with nobody watching. So these three endpoints are the ones
+// in this file where getting the gate wrong is not a leak of information but a way in.
+//
+// WHO MAY CREATE ONE, AND WHY IT IS TWO RULES RATHER THAN ONE
+//
+// D-M2-2: an invite may grant only into spaces the inviter administers. What that means
+// depends on what the invite carries, and the two halves are not the same question:
+//
+//   * A PATH GRANT is bounded by its path. Whoever holds `Action::Admin` there may write
+//     it, exactly as they may write the same grant through `POST /api/admin/acl` — this is
+//     the same act, arriving by a different door, and it is gated by the same function.
+//   * A TEAM is bounded by nothing. `redaktion` may read a space its own members chose,
+//     anywhere in the instance, and it may be granted more tomorrow by somebody else
+//     entirely. A space admin who could attach a team would be handing out reach they do
+//     not have and cannot see, which is precisely what D-M2-2 exists to stop — so a
+//     team-carrying invite is INSTANCE ADMINS ONLY.
+//
+// Written as a match on what the request carries rather than as a flag, so an invite that
+// grows a third kind of grant has to say which gate it belongs behind rather than
+// inheriting the weaker one by default.
+// -------------------------------------------------------------------------------------
+
+/// What a request asks for. Everything but the username is optional, and what is present
+/// decides both which gate applies and whether the invite is legal at all.
+#[derive(Deserialize)]
+pub struct InviteRequest {
+    /// The account the invite will create. Fixed here rather than chosen by the recipient:
+    /// the acceptance page asks for a display name and a password, and letting the link be
+    /// redeemed as any name at all would let it become a name an ACL already trusts.
+    username: String,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    /// Required when `path` is given and refused when it is not. Not defaulted to `read`:
+    /// a grant is a security decision, and an API that guesses at one is an API that
+    /// writes a grant nobody chose.
+    #[serde(default)]
+    permission: Option<Permission>,
+    /// A team slug.
+    #[serde(default)]
+    team: Option<String>,
+}
+
+/// How the link reached the person it is for (D-M2-12).
+///
+/// A tagged enum with one variant today, and that is the delivery seam rather than a
+/// placeholder for it: the console has to branch on `how` from the first version, so
+/// adding `Emailed { to }` when SMTP exists is an addition to a contract clients already
+/// read rather than a change to one they do not. Nothing about the invite itself differs
+/// between the two — it is created, hashed and stored identically — and only the handing
+/// over changes, which is exactly what D-M2-12 asks for.
+#[derive(Serialize)]
+#[serde(tag = "how", rename_all = "kebab-case")]
+pub enum Delivery {
+    /// Nobody sent it. The console shows the link once and the inviter passes it on by
+    /// whatever channel they like.
+    ShownOnce {
+        /// **Origin-relative**, and deliberately so. There is no configured public base
+        /// URL, and the one thing this process could derive an origin from is the `Host`
+        /// header — which any client can set, so a link built from it could be made to
+        /// point at somebody else's server and collect the token when the recipient
+        /// clicks. The console is already on the right origin and prepends it.
+        url: String,
+    },
+}
+
+/// An invite, plus the one and only copy of its link.
+#[derive(Serialize)]
+pub struct CreatedInvite {
+    /// Flattened so the created invite and a listed one are the same shape, and a console
+    /// can render either with one component.
+    #[serde(flatten)]
+    invite: InviteSummary,
+    delivery: Delivery,
+}
+
+/// Hand the link over.
+///
+/// The whole of the delivery decision, in one place, so that "send it by mail instead"
+/// is a branch here rather than a change to the endpoint, the store or the table.
+fn deliver(token: &str) -> Delivery {
+    Delivery::ShownOnce {
+        url: format!("/auth/invite/{token}"),
+    }
+}
+
+/// Refused for carrying nothing (D-M2-20), and what to do about it.
+const NOTHING_GRANTED: &str = "an invite must carry a path grant, a team, or both: one that \
+                               carries neither creates an account that can sign in and see \
+                               nothing";
+
+pub async fn create_invite(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(body): Json<InviteRequest>,
+) -> Result<(StatusCode, Json<CreatedInvite>), ApiError> {
+    let path = body
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    let team = body
+        .team
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+
+    // Authorisation first, validation second — the rule `grant` follows, for the same
+    // reason: a caller who may not do this learns 403 and nothing else, not even that
+    // their path was malformed.
+    let actor = match (path, team) {
+        // Bounded by the path, so gated by the path.
+        (Some(path), None) => path_admin(&state, &jar, path).await?,
+        // A team reaches wherever it has been granted, so nothing short of instance
+        // administration bounds it. This also covers path-AND-team: `instance_admin`
+        // already passes `path_admin` on every path, so asking again would decide nothing.
+        (_, Some(_)) => instance_admin(&state, &jar).await?,
+        // There is no scope to authorise against. Refused (see `NOTHING_GRANTED`), but
+        // only after establishing that the caller is somebody — otherwise this endpoint
+        // would describe its own request shape to anybody who asked.
+        (None, None) => {
+            signed_in(&state, &jar).await?;
+            return Err(ApiError::Invalid(NOTHING_GRANTED.into()));
+        }
+    };
+
+    let username = body.username.trim();
+    if username.is_empty() {
+        return Err(ApiError::Invalid("username is required".into()));
+    }
+    match (path, body.permission) {
+        (Some(path), Some(_)) => validate_grant_path(path)?,
+        (Some(_), None) => {
+            return Err(ApiError::Invalid(
+                "permission is required when a path is given".into(),
+            ))
+        }
+        (None, Some(_)) => {
+            return Err(ApiError::Invalid(
+                "a permission needs a path to apply to".into(),
+            ))
+        }
+        (None, None) => {}
+    }
+
+    // 256 bits from the operating system's CSPRNG — the SAME generator the session cookie
+    // uses, because there is no reason for a second one and every reason not to have two
+    // places where "random" could quietly become "predictable". The store is handed the
+    // SHA-256 and never the token, exactly as the session table is.
+    let token = new_session_token();
+    let outcome = state
+        .store
+        .create_invite_audited(
+            &actor.id,
+            &hash_token(&token),
+            &NewInvite {
+                username,
+                email: body
+                    .email
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty()),
+                path,
+                permission: body.permission,
+                team,
+                // D-M2-21. Thirty days, decided in the store next to the table it is
+                // written into rather than here.
+                ttl_seconds: INVITE_TTL_SECONDS,
+            },
+        )
+        .await
+        .map_err(ApiError::Internal)?;
+
+    match outcome {
+        CreateInviteOutcome::Created(invite) => Ok((
+            StatusCode::CREATED,
+            Json(CreatedInvite {
+                invite: *invite,
+                delivery: deliver(&token),
+            }),
+        )),
+        CreateInviteOutcome::UsernameTaken => {
+            Err(ApiError::Conflict("username already taken".into()))
+        }
+        // A field of the request names nothing, so this is a bad request rather than a
+        // missing resource: the invite is what was being created, and it does not exist
+        // either way.
+        CreateInviteOutcome::NoSuchTeam => Err(ApiError::Invalid("no such team".into())),
+        // Unreachable from here — the match above refuses it — and kept because the store
+        // is entitled to its own opinion about D-M2-20 and this must not become a 500 if
+        // the two ever disagree.
+        CreateInviteOutcome::NothingGranted => Err(ApiError::Invalid(NOTHING_GRANTED.into())),
+    }
+}
+
+/// Outstanding invites, filtered to the ones the caller is entitled to see.
+///
+/// The gate here establishes only that there IS a caller. **Which** invites they see is
+/// decided by [`gw_store::Store::invites_for`], in the retriever, where the architecture
+/// rule says it belongs — an instance admin sees everything, a space admin sees the
+/// invites into subtrees they administer, and nobody sees a token or its digest, because
+/// [`InviteSummary`] has no field to carry one.
+pub async fn list_invites(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<Vec<InviteSummary>>, ApiError> {
+    let principal = signed_in(&state, &jar).await?;
+    state
+        .store
+        .invites_for(&principal)
+        .await
+        .map(Json)
+        .map_err(ApiError::Internal)
+}
+
+/// Withdraw an invite that has not been redeemed.
+///
+/// Gated by the invite's own scope, which means the row has to be read before the gate is
+/// known. Two consequences, both deliberate:
+///
+/// - [`signed_in`] runs first, so "does this id exist?" is not a question an
+///   unauthenticated request can ask.
+/// - A caller who may not administer this invite's scope gets **404, not 403**. To a space
+///   admin, an invite into another space is not there; answering 403 would confirm the id
+///   and, with it, that somebody has been invited somewhere.
+pub async fn revoke_invite(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+) -> Result<Json<Changed>, ApiError> {
+    signed_in(&state, &jar).await?;
+
+    let Some(invite) = state
+        .store
+        .invite_by_id(&id)
+        .await
+        .map_err(ApiError::Internal)?
+    else {
+        return Err(ApiError::NotFound);
+    };
+
+    let gate = match invite.path.as_deref() {
+        Some(path) => path_admin(&state, &jar, path).await,
+        // No subtree, so the same rule that governs creating one: instance admins only.
+        None => instance_admin(&state, &jar).await,
+    };
+    let actor = match gate {
+        Ok(actor) => actor,
+        Err(ApiError::Forbidden) => return Err(ApiError::NotFound),
+        Err(other) => return Err(other),
+    };
+
+    match state
+        .store
+        .revoke_invite_audited(&actor.id, &id)
+        .await
+        .map_err(ApiError::Internal)?
+    {
+        RevokeInviteOutcome::Revoked => Ok(Json(Changed { changed: true })),
+        // A revoke that revoked nothing is NOT reported as done, for the reason every
+        // removal in this file gives: an administrator would conclude that a live link has
+        // been withdrawn. An already-spent invite in particular needs the ACCOUNT dealing
+        // with, and telling them the link is closed would answer the wrong question.
+        RevokeInviteOutcome::NotPending | RevokeInviteOutcome::NoSuchInvite => {
+            Err(ApiError::NotFound)
+        }
+    }
 }

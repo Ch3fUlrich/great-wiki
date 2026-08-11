@@ -8,6 +8,53 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- Invitations: a single-use link that creates an account and gives it access in the same
+  act. There is no moment where the account exists with nothing granted, which is the gap
+  the decision exists to close (D-M2-20) — an invite that would grant nothing is refused
+  outright, in the API, in the store's own outcome type, and as a database constraint.
+- An invite carries a grant on a path, membership of a team, or both, and who may issue
+  which differs on purpose: a path grant needs the same authority as granting it directly,
+  but attaching a **team** needs an instance admin, because a team's reach is bounded by no
+  path and may be widened tomorrow by somebody else. A space admin could otherwise hand out
+  reach they neither hold nor can see.
+- Only the link's SHA-256 is stored, exactly as for a session, so the database never holds
+  anything that could be presented. Unknown, expired, revoked and already-used links are
+  answered identically — the page cannot be used to discover which invitations exist. They
+  expire after 30 days (D-M2-21) and can be revoked before that.
+- Redeeming one is a single transaction that consumes the link first and refuses to consume
+  it twice, so two people opening the same link at the same moment produce one account, not
+  two. It writes the account, the grant, the team membership, the session and four audit
+  rows together, or none of them.
+- The password chosen on the invitation page goes through the same policy as every other:
+  a length floor **and** the breach corpus. That second half had never actually been proven
+  for accounts an administrator creates — the test meant to prove it submitted an
+  eight-character password, so the length floor refused it and the corpus was never
+  consulted. Both the test and its stub were wrong; both are fixed, and two tests now fail
+  if the corpus stops being asked.
+- "Was sieht diese Person?" — an instance admin can look at great-wiki exactly as somebody
+  else sees it, from a button beside that person in the console. The permission engine is
+  not simulated: the request runs as the substituted principal, read from the store the way
+  a real one is, so `can()` and the baseline decide unchanged and the answer is that
+  person's view rather than a filtered copy of the administrator's.
+- While that mode is active every non-GET request is refused **before routing**, so a path
+  that does not exist yet is already covered and an endpoint written next year cannot
+  forget the check (D-M2-17). A per-handler check would have failed open for code nobody
+  has written. The one exemption is the request that ends the mode, matched on exactly one
+  method and one path.
+- The mode cannot be entered by anything a caller can write down. The cookie carries a
+  256-bit token and nothing else; who is viewing, as whom and until when lives server-side,
+  is bound to the administrator who started it, and is re-checked against the caller on
+  every request — so a copied or invented cookie confers nothing, and a demoted or
+  deactivated viewer stops substituting on their next click rather than at their next
+  sign-in. Where the substitution cannot be completed the request continues as *nobody*,
+  never as the administrator.
+- A persistent banner above every page names both identities — whose view is shown and who
+  is really signed in — says that writing is refused, and offers the way out as a plain
+  form POST that needs no JavaScript. Being unable to leave is the one failure this mode
+  must not have.
+- Both ends are audited with both identities. The start row carries the mode's lifetime, so
+  a session with no matching stop row is bounded by the record itself rather than reading
+  as open-ended.
 - An administration API: list and create principals, activate and deactivate accounts,
   manage teams and memberships, read and change the grants on a path, and read the audit
   log. Two gates, and the difference is the point — instance-wide operations need the

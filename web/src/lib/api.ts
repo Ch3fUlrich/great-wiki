@@ -10,6 +10,28 @@ export interface TreeNode {
   children: TreeNode[];
 }
 
+/** One person, as `/api/me` names them. Mirrors `gw_api::view_as::PersonRef`. */
+export interface PersonRef {
+  id: string;
+  username: string;
+  display_name: string;
+}
+
+/**
+ * The view-as mode (D-M2-17), when it is active.
+ *
+ * Both identities, because either alone misleads: `target` without `viewer` does not say
+ * whose session this really is, and `viewer` without `target` does not say what is being
+ * shown. Every other field of `Me` already describes the TARGET — that is who the
+ * permission engine ran as — which is exactly why the banner has to be unmissable.
+ */
+export interface ViewAs {
+  /** The administrator who is really signed in. */
+  viewer: PersonRef;
+  /** Whose view is being shown. */
+  target: PersonRef;
+}
+
 /**
  * `/api/me`. Every field is derived server-side from the principal the permission engine
  * would use, so the header cannot show a name the API would not honour — and the reverse:
@@ -29,6 +51,11 @@ export interface Me {
    * behind it, so there is nothing for a sign-out to end.
    */
   source: 'session' | 'dev-shim' | 'anonymous';
+  /**
+   * Whose view is being shown, when an administrator is viewing as somebody else.
+   * `null` is the ordinary case.
+   */
+  view_as: ViewAs | null;
 }
 
 /** What the interface shows when the API cannot be reached: nobody, with nothing. */
@@ -41,7 +68,8 @@ export const ANONYMOUS: Me = {
   teams: [],
   baseline: 'public',
   login_available: false,
-  source: 'anonymous'
+  source: 'anonymous',
+  view_as: null
 };
 
 export interface StoredDocument {

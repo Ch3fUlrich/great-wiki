@@ -107,6 +107,16 @@ mutation crates/gw-store/src/admin.rs killed \
 mutation crates/gw-store/src/admin.rs killed \
   's/if !removed {/if false {/' \
   'admin store: a removal that removed nothing is not reported or recorded as done'
+# Revocation is the half of access control that is never exercised by using the system, so
+# it is the half that can be broken without anybody noticing: everything keeps working, and
+# what breaks is somebody keeping reach they were meant to lose. The M2 exit criterion rests
+# on it — "provably cannot reach anything else" is only proven if leaving the team takes the
+# reach with it. Killed by `milestone_m2`, which is in gw-api rather than gw-store, so the
+# probe misses it and the full suite is what catches it. That is the probe working as
+# designed, not a gap.
+mutation crates/gw-store/src/admin.rs killed \
+  's/            sqlx::query("DELETE FROM team_members WHERE team_id = ?1 AND principal_id = ?2")/            sqlx::query("SELECT 1 FROM team_members WHERE team_id = ?1 AND principal_id = ?2")/' \
+  'admin store: leaving a team actually deletes the membership, rather than reporting that it did'
 
 # --- the administrative interlock: the instance always keeps one administrator -------
 #
@@ -147,6 +157,157 @@ mutation crates/gw-store/src/principals.rs killed \
 mutation crates/gw-api/src/routes/admin.rs killed \
   's/^        instance_admin,$/        instance_admin: body.admin,/' \
   'admin interlock: "still an administrator" is asked of baseline_for, not assumed from the request'
+
+# --- invites: a link that creates an account -----------------------------------------
+#
+# An invite is a CREDENTIAL, and an unusual one: it is handed to somebody who has no
+# account yet, over a channel nobody controls, and redeeming it both creates a principal
+# and grants it access. Four things have to hold, and each is a mutation below.
+#
+#   1. SCOPE. D-M2-2 — only into spaces the inviter administers, and a team only for an
+#      instance admin, because a team's reach is bounded by no path at all.
+#   2. SINGLE USE. One link, one account, even when two accepts arrive together.
+#   3. ONE ANSWER FOR FOUR STATES. Unknown, expired, revoked and spent must be
+#      indistinguishable, or the endpoint reports which tokens exist. The three state
+#      mutations below each make one of them readable as live, which is what a
+#      distinguisher looks like from the outside.
+#   4. THE LINK IS NEVER STORED. Only its SHA-256, exactly as for a session.
+mutation crates/gw-api/src/routes/admin.rs killed \
+  's/        (Some(path), None) => path_admin(&state, &jar, path).await?,/        (Some(_path), None) => signed_in(\&state, \&jar).await?,/' \
+  'invites: a path invite may only be written by somebody who administers that path'
+mutation crates/gw-api/src/routes/admin.rs killed \
+  's/        (_, Some(_)) => instance_admin(&state, &jar).await?,/        (_, Some(_)) => signed_in(\&state, \&jar).await?,/' \
+  'invites: a team invite is instance admins only — a team reaches beyond any one space'
+mutation crates/gw-api/src/routes/admin.rs killed \
+  's/        Some(path) => path_admin(&state, &jar, path).await,/        Some(_path) => signed_in(\&state, \&jar).await,/' \
+  'invites: revoking one is gated by the scope of the invite itself'
+mutation crates/gw-api/src/routes/admin.rs killed \
+  's/    let principal = signed_in(&state, &jar).await?;/    let principal = state.principal(\&jar).await;/' \
+  'invites: listing them establishes there is a caller before the retriever filters'
+mutation crates/gw-api/src/routes/admin.rs killed \
+  's/            &hash_token(&token),/            \&token,/' \
+  'invites: the store is handed the digest, never the link'
+mutation crates/gw-store/src/invites.rs killed \
+  's/             WHERE id = ?1 AND accepted_at IS NULL AND revoked_at IS NULL/             WHERE id = ?1 AND revoked_at IS NULL/' \
+  'invites: consumption is single-use, and atomically so'
+mutation crates/gw-store/src/invites.rs killed \
+  's/        if self.accepted_at.is_some() {/        if false {/' \
+  'invites: a spent invite does not read as live'
+mutation crates/gw-store/src/invites.rs killed \
+  's/        } else if self.revoked_at.is_some() {/        } else if false {/' \
+  'invites: a revoked invite does not read as live'
+mutation crates/gw-store/src/invites.rs killed \
+  's/        } else if self.expired != 0 {/        } else if false {/' \
+  'invites: an expired invite does not read as live'
+mutation crates/gw-store/src/invites.rs killed \
+  's/        if row.state() != InviteState::Pending {/        if false {/' \
+  'invites: only a pending invite is offered to the person holding the link'
+mutation crates/gw-store/src/invites.rs killed \
+  's/        if self.baseline_for(principal).await? >= Baseline::Admin {/        if true {/' \
+  'invites: the listing is filtered per path, not handed over wholesale'
+mutation crates/gw-store/src/invites.rs killed \
+  's/        if !principal.is_authenticated() || !principal.active {/        if false {/' \
+  'invites: the listing refuses an anonymous caller before any row is read'
+mutation crates/gw-store/src/invites.rs killed \
+  's/            let subject = Subject::Principal(principal_id.clone());/            let subject = Subject::Principal("niemand".to_string());/' \
+  'invites: the grant an acceptance writes names the account it just created'
+mutation crates/gw-store/src/invites.rs killed \
+  's/INSERT OR IGNORE INTO team_members (team_id, principal_id) VALUES (?1, ?2)/INSERT OR IGNORE INTO team_members (team_id, principal_id) VALUES (?2, ?1)/' \
+  'invites: a team-carrying invite really joins the team'
+mutation crates/gw-api/src/auth/invite.rs killed \
+  's/            &hash_token(&session),/            \&session,/' \
+  'invites: the session an acceptance issues is stored as a digest, never as the cookie'
+mutation crates/gw-api/src/auth/invite.rs killed \
+  "s/            '<' => out.push_str(\"&lt;\"),/            '<' => out.push('<'),/" \
+  'invites: the page escapes names chosen by somebody else'
+mutation crates/gw-api/src/auth/invite.rs equivalent \
+  's/        Ok(Some(offer)) if constant_time_eq(&offer.token_hash, &presented) => Some(offer),/        Ok(Some(offer)) => Some(offer),/' \
+  'invites: the constant-time confirmation is unreachable-by-value — the SELECT already matched on the digest, so a row that came back cannot carry a different one; it is there so no code path in this file compares a secret with ==, and so that a future non-indexed lookup cannot become a timing oracle by omission'
+
+# --- the password policy, reached through the invite page as well as the console ------
+#
+# Both halves of D-M2-16, and the second one is the reason this pair is here at all.
+#
+# It was killable by exactly one test for a while, and the history is the point: the admin
+# API's own breached-password test submitted "password" — EIGHT characters against a floor
+# of twelve — so it was refused by the length check and passed whether or not the corpus
+# was ever consulted, while its comment claimed the opposite. Its stub was wrong in a
+# second way that hid the first: it answered with the digest of "password" whatever was
+# asked, so it reported nothing else as breached and lengthening the password alone would
+# have turned the test red rather than honest. Both were fixed on 2026-08-11, so two tests
+# now kill the corpus mutation — `a_breached_password_is_refused_and_creates_nothing` in
+# tests/invites.rs and `an_administrator_cannot_create_an_account_with_a_breached_password`
+# in tests/admin.rs. If either stops killing it, that test has gone vacuous again.
+mutation crates/gw-auth/src/password.rs killed \
+  's/    validate_password_strength(plain)?;/    let _ = validate_password_strength(plain);/' \
+  'password policy: the length floor refuses a password somebody is SETTING'
+mutation crates/gw-auth/src/password.rs killed \
+  's/        Ok(times) => Err(PasswordError::Breached { times }),/        Ok(_times) => Ok(BreachCheck::Clean),/' \
+  'password policy: a password the corpus knows is refused, not merely looked up'
+
+# --- view-as: the permission engine, run as somebody else (D-M2-17) -------------------
+#
+# This mode deliberately makes a request answer as a DIFFERENT principal, so every defence
+# below is holding back something the code is otherwise built to do. Three of them are the
+# ones the decision names, and each has a shape that looks fine while doing nothing:
+#
+#   1. The refusal is a LAYER, applied after every route so it wraps the 404 fallback too.
+#      Deleted, the suite must notice via a path that does not exist — a per-handler check
+#      would pass every test written today and fail open for every handler written later.
+#   2. The SUBSTITUTION must actually replace the principal. Skipped, the administrator
+#      sees their own documents while the banner says otherwise, which is the one outcome
+#      worse than the feature not existing: it answers "what can this person see?" with
+#      somebody else's answer.
+#   3. The cookie must NAME a server-side record rather than carry the target. The fourth
+#      mutation writes the naive design — `view_as=<principal id>` — and it must die,
+#      because that design is a privilege escalation anything on the network can perform.
+#
+# The rest guard the ways the mode can quietly outlive its authority: a record that is not
+# checked against the caller, a viewer who has been demoted since, a target who has been
+# deactivated since.
+mutation crates/gw-api/src/view_as.rs killed \
+  's/    if method == Method::GET || method == Method::HEAD || is_exit(method, request.uri().path())/    if true/' \
+  'view-as: the non-GET block actually refuses mutating requests, before routing'
+mutation crates/gw-api/src/routes/mod.rs killed \
+  's/            Some(active) => (active.principal, source),/            Some(_) => (real, source),/' \
+  'view-as: the substitution actually replaces the principal the engine runs as'
+mutation crates/gw-api/src/view_as.rs killed \
+  's/    if !real.is_authenticated() || !real.active || real.id != record.viewer_id {/    if false {/' \
+  'view-as: the record is bound to the administrator who created it'
+mutation crates/gw-api/src/view_as.rs killed \
+  's|    let record = state.view_as.lookup(jar.get(VIEW_AS_COOKIE)?.value())?;|    let record = Record { viewer_id: real.id.clone(), target_id: jar.get(VIEW_AS_COOKIE)?.value().to_string(), expires_at: Instant::now() + Duration::from_secs(60) };|' \
+  'view-as: the cookie names a server-side record rather than carrying the target itself'
+mutation crates/gw-api/src/view_as.rs killed \
+  's/^        Ok(baseline) if baseline >= Baseline::Admin$/        Ok(baseline) if baseline >= Baseline::Public/' \
+  'view-as: substituting needs the admin baseline on EVERY request, not only at the start'
+mutation crates/gw-api/src/view_as.rs killed \
+  's/            let usable = still_admin \&\& stored.active;/            let usable = true;/' \
+  'view-as: a substitution that cannot be completed falls back to nobody, never to the viewer'
+mutation crates/gw-api/src/view_as.rs killed \
+  's/    if !target.active {/    if false {/' \
+  'view-as: a deactivated account cannot be viewed as'
+mutation crates/gw-api/src/view_as.rs killed \
+  's/    method == Method::POST \&\& path == EXIT_PATH/    method == Method::POST \&\& path.starts_with(EXIT_PATH)/' \
+  'view-as: the exit exemption is one exact path, not a prefix that covers what is mounted under it later'
+mutation crates/gw-api/src/view_as.rs killed \
+  's/            "view-as.start",/            "view-as.begonnen",/' \
+  'view-as: activation writes an audit row at all'
+mutation crates/gw-api/src/view_as.rs killed \
+  's/                "viewer_id": actor.id,/                "viewer_id": target.id,/' \
+  'view-as: the audit row names the ADMINISTRATOR as well as the person being viewed as'
+mutation crates/gw-api/src/view_as.rs killed \
+  's/            "view-as.stop",/            "view-as.beendet",/' \
+  'view-as: leaving the mode is recorded too, so the window has a known end'
+# This one SURVIVED when the mode was first written, and it is the reason `Registry` carries
+# its lifetime as a field rather than reading the constant. The deadline was thirty minutes,
+# no test could outlive it, and so deleting the filter — turning a bounded window into a
+# substitution that never ends — broke nothing. It is also what a `view-as.start` row with
+# no matching stop row rests on: "until the deadline at the latest" is only true if there
+# is one. Killed by `a_substitution_does_not_outlive_its_deadline`, which is the only test
+# that constructs a registry it can outlive.
+mutation crates/gw-api/src/view_as.rs killed \
+  's/            .filter(|record| record.expires_at > Instant::now())//' \
+  'view-as: a substitution stops resolving once its deadline has passed'
 
 # --- default reach by visibility ---------------------------------------------------
 mutation crates/gw-store/src/acl.rs killed \
@@ -271,7 +432,16 @@ probe_for() {
     # and `-p gw-api` on its own would build all six integration binaries — nearly the
     # whole workspace. This names the one that covers the admin routes. If that stops
     # being true the probe simply stops firing.
-    crates/gw-api/src/routes/admin.rs) echo "-p gw-api --test admin" ;;
+    crates/gw-api/src/routes/admin.rs) echo "-p gw-api --test admin --test invites" ;;
+    # The invite page needs both: the escaping lives in this crate's unit tests and the
+    # flow in the integration binary, and a probe that ran only one of them would fall
+    # through to the whole workspace for half the invite mutations.
+    crates/gw-api/src/auth/invite.rs) echo "-p gw-api --lib --test invites" ;;
+    # Same argument for view-as. `routes/mod.rs` is named as well because the one mutation
+    # made there — skipping the substitution — is a view-as defence living in the file that
+    # resolves the principal; every test that notices it is in this binary.
+    crates/gw-api/src/view_as.rs) echo "-p gw-api --test view_as" ;;
+    crates/gw-api/src/routes/mod.rs) echo "-p gw-api --test view_as" ;;
     *) echo "" ;;
   esac
 }

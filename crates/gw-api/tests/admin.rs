@@ -96,20 +96,40 @@ async fn router(store: &Arc<Store>, who: Option<&str>) -> axum::Router {
     gw_api::build_router(state)
 }
 
-/// A corpus that reports every password as heavily breached.
+/// A password long enough to clear [`gw_auth::password::MIN_PASSWORD_LENGTH`], so that the
+/// only thing left that can refuse it is the corpus.
+///
+/// This is load-bearing and was got wrong here once: the test below submitted `"password"`,
+/// which is eight characters against a floor of twelve, so it was refused by the length
+/// check and passed whether or not the corpus was ever consulted — the exact vacuity the
+/// stub underneath exists to rule out.
+const BREACHED_BUT_LONG: &str = "geleaktespasswort";
+
+/// A corpus that reports exactly one password as heavily breached, and it is the one the
+/// test submits.
 ///
 /// Exists so one test can prove the breach check is actually CONSULTED by admin account
 /// creation. That endpoint originally called the length-only validator directly, so
 /// accounts created by an administrator skipped the corpus entirely while the policy
 /// looked implemented — a defect no test could see, because every test password was
 /// long enough and none of them asked whether the corpus was reached at all.
+///
+/// The answer is computed from the password rather than written out as a constant. A
+/// hard-coded digest is a second place the password lives, and when this one drifted from
+/// the other the corpus answered about a password nobody was submitting — which reads as
+/// "not breached" and lets the account through.
 struct BreachedCorpus;
 
 impl gw_auth::breach::BreachRange for BreachedCorpus {
     fn fetch<'a>(&'a self, _prefix: &'a str) -> gw_auth::breach::BreachFuture<'a> {
-        // The range API answers `SUFFIX:COUNT` lines. The suffix of SHA-1("password"),
-        // whose prefix is 5BAA6.
-        Box::pin(async { Ok("1E4C9B93F3F0682250B6CF8331B7EE68FD8:9545824".to_string()) })
+        // The range API answers `SUFFIX:COUNT` lines, the suffix being everything after
+        // the five-character prefix that was queried.
+        Box::pin(async {
+            Ok(format!(
+                "{}:9545824\r\n",
+                &gw_auth::breach::sha1_hex(BREACHED_BUT_LONG)[5..]
+            ))
+        })
     }
 }
 
@@ -1726,8 +1746,9 @@ async fn every_mutating_endpoint_writes_exactly_one_audit_row() {
 
 #[tokio::test]
 async fn an_administrator_cannot_create_an_account_with_a_breached_password() {
-    // The password is long enough, so the length floor alone would let it through. The
-    // only thing that can refuse it is the corpus actually being consulted.
+    // The password clears the length floor, so the floor alone would let it through and
+    // the only thing left that can refuse it is the corpus actually being consulted. It
+    // did NOT clear the floor until 2026-08-11, and so proved nothing.
     let store = fixture().await;
     let (principal, _) = store.principal_by_username("chef").await.unwrap().unwrap();
     let mut state = gw_api::AppState::for_test_principal(Arc::clone(&store), &principal);
@@ -1744,7 +1765,7 @@ async fn an_administrator_cannot_create_an_account_with_a_breached_password() {
                     json!({
                         "username": "geleakt",
                         "display_name": "Geleakt",
-                        "password": "password"
+                        "password": BREACHED_BUT_LONG
                     })
                     .to_string(),
                 ))

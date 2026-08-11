@@ -16,7 +16,8 @@ const signedIn: Me = {
   teams: [],
   baseline: 'admin',
   login_available: true,
-  source: 'session'
+  source: 'session',
+  view_as: null
 };
 
 describe('AccountMenu', () => {
