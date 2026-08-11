@@ -1,0 +1,127 @@
+# ===========================================================================
+#  great-wiki — the STACK-INTERNAL reverse proxy on cloud.vm:8100.
+#
+#  This is not the edge. The edge is Caddy on OPNsense, a different host, and it
+#  is the one that terminates TLS for wiki.ohje.ooguy.com and injects the shared
+#  secret (`server/network/opnsense/caddy.d/10-services.conf`). This file only
+#  splits one port three ways:
+#
+#      edge Caddy (OPNsense) --X-GW-Proxy--> cloud.vm:8100
+#                                              |
+#          /api/*  ---------------------------> gw-api:8092
+#          /auth/* ---------------------------> gw-api:8092
+#          /*      ---------------------------> gw-web:3000
+#
+#  ###################################################################
+#  #  THIS PROXY FORWARDS X-GW-Proxy. IT MUST NEVER SET OR INJECT IT. #
+#  ###################################################################
+#
+#  There is no `header_up X-GW-Proxy` anywhere below and there must never be one.
+#  The reason is the whole security design of this deployment, so it is written
+#  out here rather than left to be rediscovered:
+#
+#    * gw-api binds 0.0.0.0 because Caddy — the edge one — runs on another host.
+#      Port 8100 is therefore reachable by anything on the LAN, and so, through
+#      this proxy, is gw-api.
+#    * `GW_PROXY_SECRET` is the only thing that distinguishes "this request came
+#      through the edge" from "somebody on the LAN found the port". gw-api
+#      compares it in constant time before routing, before any handler, and
+#      before it reads any identity (`crates/gw-api/src/proxy_guard.rs`).
+#    * A request that arrives here already carrying the header came from the edge
+#      and keeps it. A request that arrives without one came from somewhere else
+#      and must keep NOT having it.
+#
+#  If this proxy added the header itself, it would attest every request that
+#  reached it — including the ones that reached it by skipping the edge. The
+#  guard would then be enforced against a value this stack supplies to itself,
+#  which is to say not enforced at all. `just dev` would still work, every test
+#  would still pass, and the boundary would be gone with nothing to show for it.
+#
+#  Caddy's `reverse_proxy` passes request headers through unchanged (it adds the
+#  X-Forwarded-* family and strips hop-by-hop headers, and touches nothing else),
+#  so forwarding is what happens when this file says nothing. Adding a line is
+#  what breaks it.
+# ===========================================================================
+# (No blank line before this block: `caddy fmt` removes leading blank lines, and
+# an unformatted Caddyfile makes Caddy log a warning on every single start.)
+{
+	# The admin API is a root-equivalent control plane — it can rewrite this
+	# config at runtime — and it listens on :2019 by default. Nothing here uses
+	# it, so it should not exist.
+	admin off
+
+	# Every site below is addressed by port, not by hostname; TLS is terminated
+	# at the edge and this hop is plain HTTP inside the compose network. With no
+	# hostname there is nothing to issue a certificate for, and saying so keeps
+	# Caddy from ever trying.
+	auto_https off
+
+	servers {
+		# The only thing in front of this is the edge Caddy, on a private
+		# address. Declaring it trusted is what makes Caddy treat the incoming
+		# X-Forwarded-For as real rather than as client-supplied noise.
+		#
+		# It grants nothing on its own: a request from the LAN that forged
+		# X-Forwarded-For still has no X-GW-Proxy, so gw-api answers 403 before
+		# anything reads the header.
+		trusted_proxies static private_ranges
+	}
+}
+
+# ---------------------------------------------------------------------------
+#  Everything that belongs to the API.
+#
+#  `/auth/*` is on the API and not on SvelteKit deliberately: it is the OIDC
+#  login flow, and the browser is redirected out to Authelia and back to
+#  /auth/callback, so the path has to reach the application rather than
+#  SvelteKit's router. `vite.config.ts` proxies the same two prefixes in
+#  development for the same reason.
+# ---------------------------------------------------------------------------
+(gw_api) {
+	reverse_proxy gw-api:8092 {
+		# Pass the edge's X-Forwarded-For through UNCHANGED instead of appending
+		# to it.
+		#
+		# `auth::client_address` counts failed sign-ins against the RIGHTMOST
+		# X-Forwarded-For entry, because that is the one entry no client could
+		# have written — the edge appends it. Its module doc says outright that
+		# the rule assumes the edge is the outermost and only proxy, and warns
+		# that a second proxy in front makes every request share one bucket.
+		#
+		# This is that second proxy. Left alone, Caddy would append its own view
+		# of the peer (the edge's LAN address) and the rightmost entry would be
+		# that address for every request on the internet — throttling would still
+		# fail closed, but one wrong guest password would rate-limit everybody.
+		# Handing the header on untouched keeps the application's assumption true.
+		header_up X-Forwarded-For {http.request.header.X-Forwarded-For}
+	}
+}
+
+:8100 {
+	# The deploy playbook's HTTP gate. It proves the published port routes into
+	# this proxy — which is exactly what a container healthcheck on gw-api
+	# cannot prove.
+	#
+	# Deliberately NOT a proxy to /api/health: that route is behind the
+	# attestation guard, so probing it from the host would need the shared
+	# secret, and giving this container the secret is the first step towards
+	# somebody using it to "fix" a 403 by injecting the header.
+	handle /healthz {
+		respond "ok" 200
+	}
+
+	handle /api/* {
+		import gw_api
+	}
+
+	handle /auth/* {
+		import gw_api
+	}
+
+	# Everything else is the application. `handle` blocks are mutually exclusive
+	# and Caddy orders them by path specificity, so this matcher-less one is
+	# always last.
+	handle {
+		reverse_proxy gw-web:3000
+	}
+}

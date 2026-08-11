@@ -1,0 +1,59 @@
+# What never belongs in a build context.
+#
+# One file, at the repository root, because all three images build from the root:
+# the Rust image needs `Cargo.toml` + `crates/`, the web image needs `web/`, and a
+# per-image context would mean three contexts and three copies of this list.
+#
+# Two reasons an entry is here. Either it is LARGE and would be uploaded to the
+# daemon on every build (`target/` is gigabytes, `web/node_modules/` hundreds of
+# megabytes), or it is DERIVED and would silently win over the copy the build is
+# supposed to produce — `web/build/` from a developer's laptop landing in the image
+# instead of the one `npm run build` just made is the kind of difference that only
+# shows up in production.
+
+# --- Build artefacts, derived ------------------------------------------------
+target/
+**/target/
+web/build/
+web/.svelte-kit/
+web/node_modules/
+**/node_modules/
+*.tsbuildinfo
+
+# --- Runtime state, derived --------------------------------------------------
+data/
+web/data/
+media/
+*.db
+*.db-wal
+*.db-shm
+
+# --- Never in an image, and several of them never in the repository either ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+secrets-generated/
+
+# --- Repository and agent machinery ------------------------------------------
+.git/
+.gitignore
+.gitattributes
+.github/
+.forgejo/
+.serena/
+.claude/
+.mcp.json
+.mutate-backups/
+graphify-out/
+GRAPH_*.html
+
+# --- Prose. None of it is read at runtime. -----------------------------------
+docs/
+webpage/
+content-example/
+content-darm/
+*.md
+!crates/**/*.md
