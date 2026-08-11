@@ -171,6 +171,45 @@ the mode is active, *before* reaching any handler — so an endpoint written nex
 forget the check. Per-handler checks would be more flexible and would fail open for code
 that does not exist yet, which is precisely the class of bug this project keeps finding.
 
+**D-M2-18 — Nobody may deactivate the last instance admin.** The refusal lives in the API,
+not only the interface, and counts the remaining admins inside the same transaction as the
+deactivation — otherwise two concurrent requests each see one other admin and both succeed.
+It applies whoever is asking: deactivating somebody else's account is exactly as capable of
+locking everyone out.
+
+Authelia's `admins` group stays the source of truth for real system administrators, and
+great-wiki never writes Authelia's user database (ADR 0002). **Authelia groups are not used
+for space-level access at all** — that is what teams and path grants are for, and adding
+group mappings per space would put reach in two places.
+
+Because great-wiki cannot add anyone to an Authelia group, handing over needs a mechanism of
+its own: a **per-account promotion inside great-wiki**, offered as the fallback for exactly
+the case it exists for — the last Authelia admin is leaving and somebody has to take over.
+It promotes the person chosen and nobody else. A group mapping would have promoted every
+other member of that group as a side effect, which is not what "hand over to this person"
+means.
+
+The hand-over proposes candidates **sorted by most recent activity**, because the useful
+default is somebody who is actually here.
+
+**D-M2-19 — The first grant on a path still replaces what it inherited, and the console
+says so before you confirm.** Nearest-ancestor-wins is what makes narrowing a subtree
+possible at all, so the rule stays. What was wrong was that it happened invisibly: granting
+a team read on a sub-page could drop your own access to it in the same request, with nothing
+said. Copying inherited grants down automatically would have made narrowing require a
+delete, turning the common case into two steps to avoid a surprise in the rare one.
+
+**D-M2-20 — An invite may carry a direct grant AND a team membership.** Both, because they
+answer different questions: "read this one page" and "everything this team can reach". An
+invite that could only create an account would leave a person able to sign in and see
+nothing, and the gap between the two steps is where somebody gets forgotten. The inviter may
+only name paths they administer, enforced against the permission engine server-side rather
+than by hiding options in the interface.
+
+**D-M2-21 — Invite links last 30 days.** Single-use regardless, so the window only matters
+until acceptance. Long enough that a homelab invitation does not expire unnoticed and read
+as a broken system; short enough that a link in an old message does not stay live forever.
+
 ## What M2 replaces
 
 M1 left two deliberate stubs, both commented as such. M2 must **replace** them, not sit
