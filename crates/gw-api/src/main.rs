@@ -4,6 +4,7 @@
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use gw_api::config;
+use gw_auth::password::HashingCost;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -32,6 +33,28 @@ enum Command {
         #[arg(long)]
         content: PathBuf,
     },
+}
+
+/// Refuse to answer a sign-in with anything but Authelia's parameters.
+///
+/// The cheap cost exists so the test suite does not spend a minute a run on argon2. It is
+/// reachable only through `AppState::for_test*`, and it is not a build-time switch — there
+/// is deliberately no Cargo feature, because features unify across a build graph and a
+/// mistake in some other crate's dependency list would silently reach this binary with
+/// nothing in the diff to show for it.
+///
+/// This is the backstop for the one remaining way it could arrive here: somebody editing
+/// this file, or assigning to the public `hashing` field. Both are visible in a diff; this
+/// makes them non-shippable as well, because the process exits rather than serving a login
+/// form whose hashes cost eight kilobytes to compute.
+fn refuse_weak_hashing(cost: HashingCost) -> Result<()> {
+    if cost != HashingCost::PRODUCTION {
+        bail!(
+            "refusing to serve: passwords would be hashed at test parameters, which makes \
+             every account here cheaper to attack than the same account on Authelia"
+        );
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -83,16 +106,11 @@ async fn main() -> Result<()> {
                     None
                 }
             };
-            let state = gw_api::AppState {
-                store,
-                dev_identity: cfg.dev_identity.clone(),
-                proxy_guard: gw_api::ProxyGuard::from_config(&cfg),
-                oidc,
-                // The real corpus. If it cannot even be constructed the process still
-                // starts: an unreachable corpus is already a handled, audited state
-                // (D-M2-16), and refusing to boot over it would make an outside service
-                // able to stop this one.
-                corpus: match gw_api::auth::breach::HibpCorpus::new() {
+            // The real corpus. If it cannot even be constructed the process still starts:
+            // an unreachable corpus is already a handled, audited state (D-M2-16), and
+            // refusing to boot over it would make an outside service able to stop this one.
+            let corpus: std::sync::Arc<dyn gw_auth::breach::BreachRange> =
+                match gw_api::auth::breach::HibpCorpus::new() {
                     Ok(corpus) => std::sync::Arc::new(corpus),
                     Err(error) => {
                         tracing::warn!(
@@ -102,8 +120,19 @@ async fn main() -> Result<()> {
                         );
                         std::sync::Arc::new(gw_auth::breach::UnavailableCorpus)
                     }
-                },
-            };
+                };
+            // `serving` takes no hashing cost and offers none: a server hashes at
+            // Authelia's parameters. The check below is what makes that true of the
+            // *process* rather than only of this line, since `AppState`'s fields are
+            // public and a future edit could set one directly.
+            let state = gw_api::AppState::serving(
+                store,
+                cfg.dev_identity.clone(),
+                gw_api::ProxyGuard::from_config(&cfg),
+                oidc,
+                corpus,
+            );
+            refuse_weak_hashing(state.hashing)?;
             let app = gw_api::build_router(state).layer(
                 tower_http::limit::RequestBodyLimitLayer::new(2 * 1024 * 1024),
             );
@@ -112,5 +141,20 @@ async fn main() -> Result<()> {
             axum::serve(listener, app).await?;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refuse_weak_hashing;
+    use gw_auth::password::HashingCost;
+
+    #[test]
+    fn a_server_may_only_start_at_authelia_s_parameters() {
+        assert!(refuse_weak_hashing(HashingCost::PRODUCTION).is_ok());
+        assert!(
+            refuse_weak_hashing(HashingCost::CHEAP_FOR_TESTS).is_err(),
+            "the cheap test cost reached a serving process and nothing stopped it"
+        );
     }
 }

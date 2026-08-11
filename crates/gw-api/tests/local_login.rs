@@ -15,7 +15,7 @@ use gw_api::auth::session::hash_token;
 use gw_api::auth::OidcConfig;
 use gw_api::proxy_guard::ProxyGuard;
 use gw_api::AppState;
-use gw_auth::hash_password;
+use gw_auth::password::{hash_password_at, HashingCost};
 use gw_core::{Block, DocumentType, Visibility};
 use gw_store::{NewDocument, Store, LOGIN_FAILURE_LIMIT};
 use serde_json::{json, Value};
@@ -56,19 +56,45 @@ async fn seed_store(store: &Store) {
         .unwrap();
 }
 
-/// A store holding one local guest account whose password is [`GOOD_PASSWORD`].
-async fn with_guest() -> Arc<Store> {
+/// A store holding one local guest account whose password is [`GOOD_PASSWORD`], hashed at
+/// `cost`.
+///
+/// The cost has to be stated because a stored hash carries its own parameters: whatever
+/// `create_local_principal` is handed here is what `verify_password` will later do the work
+/// of. Everything in this file except the timing test is about *which* answer the form
+/// gives rather than how long it takes to give it, so everything except the timing test
+/// uses [`HashingCost::CHEAP_FOR_TESTS`].
+async fn with_guest_at(cost: HashingCost) -> Arc<Store> {
     let store = Store::open("sqlite::memory:").await.unwrap();
     seed_store(&store).await;
     store
-        .create_local_principal("gast", "Gast", None, &hash_password(GOOD_PASSWORD).unwrap())
+        .create_local_principal(
+            "gast",
+            "Gast",
+            None,
+            &hash_password_at(GOOD_PASSWORD, cost).unwrap(),
+        )
         .await
         .unwrap();
     Arc::new(store)
 }
 
+async fn with_guest() -> Arc<Store> {
+    with_guest_at(HashingCost::CHEAP_FOR_TESTS).await
+}
+
 fn app(store: &Arc<Store>) -> Router {
     gw_api::build_router(AppState::for_test(Arc::clone(store), None))
+}
+
+/// The same application a server runs, as far as password work is concerned: argon2id at
+/// Authelia's parameters, for both the stored hash and the stand-in the unknown-username
+/// path verifies against.
+fn app_at_production_cost(store: &Arc<Store>) -> Router {
+    gw_api::build_router(AppState {
+        hashing: HashingCost::PRODUCTION,
+        ..AppState::for_test(Arc::clone(store), None)
+    })
 }
 
 /// An application that enforces proxy attestation, which is the only configuration in
@@ -396,7 +422,12 @@ async fn the_session_token_is_stored_hashed_and_the_plaintext_is_nowhere_in_the_
     let store = Arc::new(Store::open(&url).await.unwrap());
     seed_store(&store).await;
     store
-        .create_local_principal("gast", "Gast", None, &hash_password(GOOD_PASSWORD).unwrap())
+        .create_local_principal(
+            "gast",
+            "Gast",
+            None,
+            &hash_password_at(GOOD_PASSWORD, HashingCost::CHEAP_FOR_TESTS).unwrap(),
+        )
         .await
         .unwrap();
 
@@ -491,10 +522,31 @@ async fn an_unknown_username_still_costs_a_password_verification() {
     //
     // A lower bound only. An upper bound would be flaky on a loaded machine; this one can
     // fail for exactly one reason, which is the check being skipped.
-    let store = with_guest().await;
-    let app = app(&store);
+    //
+    // The rest of this file hashes at `HashingCost::CHEAP_FOR_TESTS`, because a suite that
+    // signs in a few hundred times cannot afford argon2 at Authelia's parameters and
+    // almost none of it is about what a hash costs. This test IS about what a hash costs,
+    // so it takes the production parameters — for the stored hash *and* for the stand-in,
+    // which `AppState` derives from the same `hashing` value. A ten-millisecond floor
+    // against eight-kilobyte hashes would be a floor nothing could ever hit, so it would
+    // have had to be lowered until it measured nothing; instead the one test that needs
+    // the real cost pays for it, once.
+    let store = with_guest_at(HashingCost::PRODUCTION).await;
+    let app = app_at_production_cost(&store);
     let mut jar = Jar::default();
     let csrf = open_the_page(&app, &mut jar, false).await;
+
+    // The stand-in hash is built on first use, so the first unknown-username request pays
+    // for a hash as well as a verification. That would satisfy the bound below for the
+    // wrong reason; this warms it so what is measured is what an attacker would measure —
+    // the steady-state cost of a request for a username that does not exist. (Two failures
+    // for one account, well inside `LOGIN_FAILURE_LIMIT`, so nothing here is throttled.)
+    send(
+        &app,
+        Call::post("/auth/local", form("gibt-es-nicht", GOOD_PASSWORD, &csrf)),
+        &mut jar,
+    )
+    .await;
 
     let started = std::time::Instant::now();
     send(

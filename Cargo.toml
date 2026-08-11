@@ -32,3 +32,18 @@ opt-level = 3
 
 [profile.dev.package.num-bigint-dig]
 opt-level = 3
+
+# The same trade for the same reason, and the numbers are worse: argon2id at Authelia's
+# parameters costs about 1.6 s per hash unoptimised and about 0.1 s optimised, so gw-auth's
+# password tests alone took sixteen seconds to prove things about a function that runs in a
+# tenth of that in production. This changes NOTHING about the parameters — `[profile.dev]`
+# does not exist in a release build, and `HashingCost::PRODUCTION` is a value in the source
+# either way. It only stops the debug build from being thirty times slower than the thing
+# it is testing.
+[profile.dev.package.argon2]
+opt-level = 3
+
+# argon2's inner compression function. Optimising argon2 without it leaves most of the cost
+# where it was.
+[profile.dev.package.blake2]
+opt-level = 3

@@ -15,8 +15,8 @@
 //!   row commonly means the grant lives on an ancestor and is still in force, so an
 //!   administrator reading "done" has concluded the opposite of what happened.
 
-use crate::acl::{permission_column, subject_columns};
-use crate::principals::{apply_active, insert_local_principal};
+use crate::acl::{active_instance_admins, permission_column, subject_columns};
+use crate::principals::{apply_active, apply_instance_admin, insert_local_principal};
 use crate::Store;
 use anyhow::Result;
 use gw_auth::{Permission, Principal, Subject};
@@ -37,6 +37,54 @@ pub enum MembershipOutcome {
     NoSuchTeam,
     /// The id names no principal.
     NoSuchPrincipal,
+}
+
+/// What a change to an account's active flag actually did.
+///
+/// Boxed principal because the other two variants carry nothing and this one is the whole
+/// account.
+#[derive(Debug, Clone)]
+pub enum ActiveOutcome {
+    /// The flag is now what the caller asked for.
+    Changed(Box<Principal>),
+    /// The id names nobody.
+    NoSuchPrincipal,
+    /// Refused: committing would have left the instance with no active administrator.
+    LastAdmin,
+}
+
+/// What a change to the per-account promotion actually did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstanceAdminOutcome {
+    /// A row was written or removed.
+    Changed,
+    /// The promotion already matched the request. Nothing written, nothing recorded.
+    ///
+    /// For a demotion this is NOT "administration withdrawn": the person may administer
+    /// the instance through their Authelia group, which no row here can take away. The
+    /// caller has to say so rather than report a revocation that did not happen.
+    Unchanged,
+    /// The id names nobody.
+    NoSuchPrincipal,
+    /// Refused: committing would have left the instance with no active administrator.
+    LastAdmin,
+}
+
+/// Refuse a transaction that would leave nobody able to administer the instance.
+///
+/// **Counted after the change and inside the same transaction**, so what it asserts is the
+/// state this commit would actually leave behind — not a number read beforehand, which two
+/// concurrent requests can both read as two and both act on, ending at zero. Both callers
+/// have already WRITTEN by the time they ask, so the transaction holds SQLite's write lock
+/// and the second request cannot get past its own write until the first has committed or
+/// rolled back; it then counts against the committed result.
+///
+/// It is the resulting count that decides, never who the caller is. "You may not
+/// deactivate yourself" would be a different rule, and a weaker one: it lets two
+/// administrators deactivate each other, and it refuses a self-deactivation that is
+/// perfectly safe because somebody else is still there.
+async fn leaves_an_administrator(tx: &mut sqlx::SqliteConnection) -> Result<bool> {
+    Ok(active_instance_admins(tx).await? > 0)
 }
 
 async fn team_id(conn: &mut sqlx::SqliteConnection, slug: &str) -> Result<Option<String>> {
@@ -91,23 +139,38 @@ impl Store {
             .ok_or_else(|| anyhow::anyhow!("principal vanished immediately after insert"))
     }
 
-    /// Activate or deactivate an account. `Ok(None)` when the id names nobody.
+    /// Activate or deactivate an account.
     ///
     /// Deactivating deletes every session that principal holds, in this same transaction
     /// (D-M2-7) — so the flag, the sessions and the record of it either all happen or
     /// none of them do.
+    ///
+    /// It is also where the safety interlock lives: a deactivation that would leave the
+    /// instance with NO active administrator is refused and rolled back, whoever asked and
+    /// whoever the target is. Without it, the last administrator can suspend their own
+    /// account and lock everybody out of administration permanently — great-wiki cannot
+    /// promote anybody in Authelia (ADR 0002), so there is no way back from inside.
+    ///
+    /// The rollback matters as much as the refusal: the session sweep happens before the
+    /// count, so a refusal that only undid the flag would still have signed the last
+    /// administrator out of the console they were just told they could keep.
     pub async fn set_principal_active_audited(
         &self,
         actor: &str,
         id: &str,
         active: bool,
-    ) -> Result<Option<Principal>> {
+    ) -> Result<ActiveOutcome> {
         let mut tx = self.pool.begin().await?;
         if !apply_active(&mut tx, id, active).await? {
             // Nothing matched: roll back rather than recording an action that did not
             // happen.
             tx.rollback().await?;
-            return Ok(None);
+            return Ok(ActiveOutcome::NoSuchPrincipal);
+        }
+        // Only a deactivation can reduce the count, so only a deactivation is asked.
+        if !active && !leaves_an_administrator(&mut tx).await? {
+            tx.rollback().await?;
+            return Ok(ActiveOutcome::LastAdmin);
         }
         Self::record_audit(
             &mut *tx,
@@ -124,7 +187,69 @@ impl Store {
         .await?;
         tx.commit().await?;
 
-        Ok(self.principal_by_id(id).await?.map(|(p, _)| p))
+        match self.principal_by_id(id).await? {
+            Some((principal, _)) => Ok(ActiveOutcome::Changed(Box::new(principal))),
+            // The row was there a moment ago inside the transaction, so this is a
+            // concurrent deletion rather than a bad id. Reported as "nobody" either way.
+            None => Ok(ActiveOutcome::NoSuchPrincipal),
+        }
+    }
+
+    /// Promote or demote an account as an instance administrator (0006).
+    ///
+    /// The FALLBACK for an instance whose Authelia administrators are gone. It promotes
+    /// exactly the principal named and has no effect on anybody else — in particular it is
+    /// not a group mapping, so nobody sharing a group or a team with the promoted account
+    /// gains anything.
+    ///
+    /// A demotion goes through the same floor check as a deactivation, in the same
+    /// transaction, for the same reason: it is the other way to reach zero administrators.
+    pub async fn set_instance_admin_audited(
+        &self,
+        actor: &str,
+        id: &str,
+        admin: bool,
+    ) -> Result<InstanceAdminOutcome> {
+        let mut tx = self.pool.begin().await?;
+
+        // Looked up explicitly, so promoting an id that names nobody is a typo the caller
+        // hears about rather than a row conferring administration on nothing. The foreign
+        // key would refuse the insert but cannot be told apart from any other failure, and
+        // the DELETE would report a clean no-op.
+        if !principal_exists(&mut tx, id).await? {
+            tx.rollback().await?;
+            return Ok(InstanceAdminOutcome::NoSuchPrincipal);
+        }
+
+        if !apply_instance_admin(&mut tx, id, admin, actor).await? {
+            tx.rollback().await?;
+            return Ok(InstanceAdminOutcome::Unchanged);
+        }
+
+        // Only a demotion can reduce the count. A promotion that changed nothing never
+        // reaches here, so a no-op can never be refused by the floor.
+        if !admin && !leaves_an_administrator(&mut tx).await? {
+            tx.rollback().await?;
+            return Ok(InstanceAdminOutcome::LastAdmin);
+        }
+
+        Self::record_audit(
+            &mut *tx,
+            Some(actor),
+            if admin {
+                "principal.promote"
+            } else {
+                "principal.demote"
+            },
+            Some(id),
+            // Instance-wide: administering the instance belongs to no subtree, so only
+            // instance admins read it (0004).
+            None,
+            &json!({ "instance_admin": admin }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(InstanceAdminOutcome::Changed)
     }
 
     pub async fn create_team_audited(&self, actor: &str, slug: &str, name: &str) -> Result<String> {
@@ -355,12 +480,30 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    use super::MembershipOutcome;
+    use super::{ActiveOutcome, InstanceAdminOutcome, MembershipOutcome};
     use crate::Store;
     use gw_auth::{Permission, Principal, Subject};
 
     async fn store() -> Store {
         Store::open("sqlite::memory:").await.unwrap()
+    }
+
+    /// An Authelia account in `admins`, which 0002 maps to the admin baseline. Returns
+    /// its id.
+    async fn admin(store: &Store, username: &str) -> String {
+        store
+            .upsert_oidc_principal(username, username, None, &["admins".into()])
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// The principal from an outcome that must have been a change.
+    fn changed(outcome: ActiveOutcome) -> Principal {
+        match outcome {
+            ActiveOutcome::Changed(principal) => *principal,
+            other => panic!("expected the change to be applied, got {other:?}"),
+        }
     }
 
     /// The audit log as an instance admin sees it: everything.
@@ -503,11 +646,13 @@ mod tests {
     #[tokio::test]
     async fn deactivating_an_account_that_does_not_exist_changes_and_records_nothing() {
         let store = store().await;
-        assert!(store
-            .set_principal_active_audited("chef", "niemand", false)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(matches!(
+            store
+                .set_principal_active_audited("chef", "niemand", false)
+                .await
+                .unwrap(),
+            ActiveOutcome::NoSuchPrincipal
+        ));
         assert!(entries(&store).await.is_empty());
     }
 
@@ -547,6 +692,10 @@ mod tests {
         // The audited variant shares one implementation with the plain one, so this pins
         // that it did not quietly become an UPDATE with no session sweep (D-M2-7).
         let store = store().await;
+        // Somebody has to be left administering the instance, or the interlock refuses
+        // this — and rightly: a store with no administrator at all is the state the
+        // interlock exists to prevent, not one to deactivate accounts from.
+        admin(&store, "chef").await;
         let gast = store
             .create_local_principal("gast", "Gast", None, "x")
             .await
@@ -556,12 +705,189 @@ mod tests {
             .await
             .unwrap();
 
-        let updated = store
-            .set_principal_active_audited("chef", &gast.id, false)
-            .await
-            .unwrap()
-            .expect("the account exists");
+        let updated = changed(
+            store
+                .set_principal_active_audited("chef", &gast.id, false)
+                .await
+                .unwrap(),
+        );
         assert!(!updated.active);
         assert_eq!(store.session_count_for(&gast.id).await.unwrap(), 0);
+    }
+
+    // --- the safety interlock: the instance always keeps one administrator -------------
+
+    #[tokio::test]
+    async fn deactivating_the_last_administrator_is_refused_whoever_asks() {
+        // Both directions of the rule, because it is a rule about the RESULT and not
+        // about the caller. The API cannot reach the second case — a caller who is not an
+        // administrator never gets this far, and one who is would still be counted — but
+        // the store must not be the thing that relies on that.
+        let store = store().await;
+        let chef = admin(&store, "chef").await;
+
+        assert!(
+            matches!(
+                store
+                    .set_principal_active_audited(&chef, &chef, false)
+                    .await
+                    .unwrap(),
+                ActiveOutcome::LastAdmin
+            ),
+            "the last administrator deactivated themselves"
+        );
+        assert!(
+            matches!(
+                store
+                    .set_principal_active_audited("jemand-anders", &chef, false)
+                    .await
+                    .unwrap(),
+                ActiveOutcome::LastAdmin
+            ),
+            "somebody else deactivated the last administrator"
+        );
+
+        let (loaded, _) = store.principal_by_id(&chef).await.unwrap().unwrap();
+        assert!(loaded.active, "a refused deactivation took effect anyway");
+        assert!(
+            entries(&store).await.is_empty(),
+            "a deactivation that did not happen was recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_administrator_is_deactivated_while_a_second_one_is_active() {
+        let store = store().await;
+        let chef = admin(&store, "chef").await;
+        let zweite = admin(&store, "zweite").await;
+
+        let updated = changed(
+            store
+                .set_principal_active_audited(&zweite, &chef, false)
+                .await
+                .unwrap(),
+        );
+        assert!(!updated.active);
+
+        // And now the second one is the last, so the same call is refused.
+        assert!(matches!(
+            store
+                .set_principal_active_audited(&zweite, &zweite, false)
+                .await
+                .unwrap(),
+            ActiveOutcome::LastAdmin
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_deactivated_administrator_does_not_hold_the_floor_open() {
+        // The floor counts administrators who can still sign in. A suspended account
+        // cannot, and D-M2-7 has already deleted its sessions.
+        let store = store().await;
+        let chef = admin(&store, "chef").await;
+        let zweite = admin(&store, "zweite").await;
+
+        changed(
+            store
+                .set_principal_active_audited(&chef, &zweite, false)
+                .await
+                .unwrap(),
+        );
+        assert!(
+            matches!(
+                store
+                    .set_principal_active_audited(&chef, &chef, false)
+                    .await
+                    .unwrap(),
+                ActiveOutcome::LastAdmin
+            ),
+            "a deactivated administrator was counted as one"
+        );
+    }
+
+    #[tokio::test]
+    async fn demoting_the_last_administrator_is_refused_by_the_same_rule() {
+        let store = store().await;
+        let chef = store
+            .create_local_principal("chef", "Chef", None, "x")
+            .await
+            .unwrap()
+            .id;
+        assert_eq!(
+            store
+                .set_instance_admin_audited("system", &chef, true)
+                .await
+                .unwrap(),
+            InstanceAdminOutcome::Changed
+        );
+
+        assert_eq!(
+            store
+                .set_instance_admin_audited(&chef, &chef, false)
+                .await
+                .unwrap(),
+            InstanceAdminOutcome::LastAdmin
+        );
+        assert!(
+            store.is_instance_admin(&chef).await.unwrap(),
+            "a refused demotion took effect anyway"
+        );
+        assert_eq!(
+            entries(&store).await.len(),
+            1,
+            "a demotion that did not happen was recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_promotion_that_changes_nothing_records_nothing() {
+        let store = store().await;
+        let gast = store
+            .create_local_principal("gast", "Gast", None, "x")
+            .await
+            .unwrap()
+            .id;
+
+        assert_eq!(
+            store
+                .set_instance_admin_audited("chef", "niemand", true)
+                .await
+                .unwrap(),
+            InstanceAdminOutcome::NoSuchPrincipal
+        );
+        assert_eq!(
+            store
+                .set_instance_admin_audited("chef", &gast, false)
+                .await
+                .unwrap(),
+            InstanceAdminOutcome::Unchanged,
+            "demoting somebody who was never promoted removes nothing"
+        );
+        assert!(entries(&store).await.is_empty());
+
+        assert_eq!(
+            store
+                .set_instance_admin_audited("chef", &gast, true)
+                .await
+                .unwrap(),
+            InstanceAdminOutcome::Changed
+        );
+        assert_eq!(
+            store
+                .set_instance_admin_audited("chef", &gast, true)
+                .await
+                .unwrap(),
+            InstanceAdminOutcome::Unchanged,
+            "promoting twice writes one row"
+        );
+
+        let log = entries(&store).await;
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(log[0].action, "principal.promote");
+        assert_eq!(log[0].target.as_deref(), Some(gast.as_str()));
+        assert_eq!(
+            log[0].path, None,
+            "administering the instance belongs to no subtree"
+        );
     }
 }

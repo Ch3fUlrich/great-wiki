@@ -9,9 +9,10 @@ use axum::routing::get;
 use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
 use gw_auth::breach::BreachRange;
+use gw_auth::password::HashingCost;
 use gw_auth::Principal;
 use gw_store::Store;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// The cookie a signed-in browser presents. Defined next to the code that issues it; this
 /// re-export exists because [`AppState::principal`] is the other end of the same contract.
@@ -63,9 +64,55 @@ pub struct AppState {
     /// directly, so accounts created by an administrator skipped the corpus entirely while
     /// the policy looked implemented.
     pub corpus: Arc<dyn BreachRange>,
+    /// What one argon2id hash costs here.
+    ///
+    /// In the state for the same reason `corpus` is: it is a value the composition root
+    /// supplies, not a constant compiled into the code that uses it. [`AppState::serving`]
+    /// — the only constructor a running server has — writes
+    /// [`HashingCost::PRODUCTION`] itself and takes no argument that could say otherwise,
+    /// and `great-wiki serve` re-checks it before it binds a listener.
+    ///
+    /// The `for_test*` constructors supply [`HashingCost::CHEAP_FOR_TESTS`], which is why
+    /// a suite that signs in a few hundred times no longer spends a minute doing it. What
+    /// the cheap cost never buys is a claim about cost: the two tests that assert one —
+    /// `the_hash_declares_argon2id_with_authelia_parameters` in gw-auth, and
+    /// `an_unknown_username_still_costs_a_password_verification` in `tests/local_login.rs`
+    /// — name the production cost themselves.
+    pub hashing: HashingCost,
+    /// The stand-in hash the unknown-username path verifies against, built once on first
+    /// use from 256 random bits at [`AppState::hashing`].
+    ///
+    /// Here rather than in a `static` because it has to be made at *this* state's cost:
+    /// a placeholder cheaper than the stored hashes would hand back exactly the timing
+    /// oracle it exists to close, and a process-wide one would be whichever cost happened
+    /// to ask first. A server has one state, so "once per state" and "once per process"
+    /// are the same thing where it matters.
+    pub placeholder: Arc<OnceLock<String>>,
 }
 
 impl AppState {
+    /// The state a running server uses.
+    ///
+    /// There is no hashing-cost parameter and there will not be one: a server hashes at
+    /// [`HashingCost::PRODUCTION`], so there is nothing here for a caller to get wrong.
+    pub fn serving(
+        store: Arc<Store>,
+        dev_identity: Option<Identity>,
+        proxy_guard: ProxyGuard,
+        oidc: Option<Arc<OidcClient>>,
+        corpus: Arc<dyn BreachRange>,
+    ) -> Self {
+        Self {
+            store,
+            dev_identity,
+            proxy_guard,
+            oidc,
+            corpus,
+            hashing: HashingCost::PRODUCTION,
+            placeholder: Arc::new(OnceLock::new()),
+        }
+    }
+
     /// Unenforced, matching the loopback bind a test implies. Tests that are about the
     /// boundary itself use `for_test_with_guard`.
     pub fn for_test(store: Arc<Store>, dev_identity: Option<Identity>) -> Self {
@@ -86,6 +133,11 @@ impl AppState {
             // keeps the length rule under test without a network call deciding whether
             // the suite passes.
             corpus: Arc::new(gw_auth::breach::UnseenCorpus),
+            // Cheap, because almost no test is about what a hash costs — and the two that
+            // are ask for the production cost by name. See `HashingCost` for why this is a
+            // value here rather than a Cargo feature.
+            hashing: HashingCost::CHEAP_FOR_TESTS,
+            placeholder: Arc::new(OnceLock::new()),
         }
     }
 

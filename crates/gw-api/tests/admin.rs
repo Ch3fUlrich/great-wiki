@@ -13,7 +13,7 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use gw_auth::{Permission, Subject};
-use gw_store::{AuditEntry, Store};
+use gw_store::{AuditEntry, Store, SESSION_TTL_SECONDS};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -196,6 +196,11 @@ fn instance_wide_mutations(principal_id: &str) -> Vec<(Method, String, Option<Va
         ),
         (
             Method::POST,
+            format!("/api/admin/principals/{principal_id}/instance-admin"),
+            Some(json!({"admin": true})),
+        ),
+        (
+            Method::POST,
             format!("/api/admin/principals/{principal_id}/active"),
             Some(json!({"active": false})),
         ),
@@ -244,6 +249,9 @@ fn instance_wide(principal_id: &str) -> Vec<(Method, String, Option<Value>)> {
         // No `path`: the index of every path carrying a grant is instance-wide, because
         // it names subtrees the caller may administer none of.
         (Method::GET, "/api/admin/acl".into(), None),
+        // Who could be promoted names every active account. Instance-wide by the same
+        // argument as listing principals.
+        (Method::GET, "/api/admin/admins/candidates".into(), None),
     ];
     all.extend(instance_wide_mutations(principal_id));
     all
@@ -570,6 +578,411 @@ async fn activating_an_account_that_does_not_exist_is_not_a_success() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+// -------------------------------------------------------------------------------------
+// The administrative safety interlock.
+//
+// An instance admin who deactivates the last active administrator locks everybody out of
+// administration for good: there is no in-app recovery, and great-wiki never writes
+// Authelia's user database (ADR 0002), so there is nothing to fix it from either. Every
+// test below is about the floor of one, and about the per-account promotion that exists
+// so the floor can be raised without touching Authelia.
+// -------------------------------------------------------------------------------------
+
+/// Promote or demote through the API, as `chef`.
+async fn set_instance_admin(
+    store: &Arc<Store>,
+    who: &str,
+    id: &str,
+    admin: bool,
+) -> (StatusCode, Value) {
+    post(
+        store,
+        Some(who),
+        &format!("/api/admin/principals/{id}/instance-admin"),
+        json!({ "admin": admin }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn the_last_instance_admin_cannot_deactivate_themselves() {
+    // `chef` is the fixture's only administrator, by the `admins` group. Answering 200
+    // here is the bug this interlock exists for: the account is suspended, its sessions
+    // are swept, and nobody can ever reach the admin console again.
+    let store = fixture().await;
+    let chef = id_of(&store, "chef").await;
+    store
+        .create_session(&chef, "chef-digest", SESSION_TTL_SECONDS)
+        .await
+        .unwrap();
+
+    let (status, response) = post(
+        &store,
+        Some("chef"),
+        &format!("/api/admin/principals/{chef}/active"),
+        json!({"active": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+
+    let (loaded, _) = store.principal_by_username("chef").await.unwrap().unwrap();
+    assert!(loaded.active, "a refused deactivation took effect anyway");
+    // The session sweep happens in the same transaction as the flag, so a refusal that
+    // only rolled back the UPDATE would still have signed the last administrator out.
+    assert_eq!(
+        store.session_count_for(&chef).await.unwrap(),
+        1,
+        "a refused deactivation still ended the administrator's session"
+    );
+    assert_eq!(
+        get(&store, Some("chef"), "/api/admin/principals").await.0,
+        StatusCode::OK,
+        "the administrator lost the console to a request that was refused"
+    );
+    assert!(
+        audit(&store).await.is_empty(),
+        "a deactivation that did not happen was recorded as if it had"
+    );
+}
+
+#[tokio::test]
+async fn an_admin_may_be_deactivated_while_another_active_admin_remains() {
+    // The other half of the rule, without which the interlock would simply be "admins
+    // cannot be deactivated". `gast` holds no groups at all, so the per-account promotion
+    // is the only thing that can make them count.
+    let store = fixture().await;
+    let chef = id_of(&store, "chef").await;
+    let gast = id_of(&store, "gast").await;
+
+    let (status, response) = set_instance_admin(&store, "chef", &gast, true).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+
+    let (status, response) = post(
+        &store,
+        Some("chef"),
+        &format!("/api/admin/principals/{chef}/active"),
+        json!({"active": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["active"], false);
+
+    // `gast` is now the last one, and the same request is refused for them.
+    let (status, response) = post(
+        &store,
+        Some("gast"),
+        &format!("/api/admin/principals/{gast}/active"),
+        json!({"active": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+}
+
+#[tokio::test]
+async fn a_promoted_account_administers_the_instance_with_no_groups_at_all() {
+    // The fallback D-M2-1 does not provide: `gast` is a local account, so there is no
+    // Authelia group that could ever confer this, and great-wiki must not write one.
+    let store = fixture().await;
+    let gast = id_of(&store, "gast").await;
+
+    assert_eq!(
+        get(&store, Some("gast"), "/api/admin/principals").await.0,
+        StatusCode::FORBIDDEN,
+        "the fixture's guest must start with nothing, or this test proves nothing"
+    );
+
+    let (status, response) = set_instance_admin(&store, "chef", &gast, true).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["changed"], true);
+    assert_eq!(response["instance_admin"], true);
+
+    let (status, listed) = get(&store, Some("gast"), "/api/admin/principals").await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+
+    // And it is reversible.
+    let (status, response) = set_instance_admin(&store, "chef", &gast, false).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["changed"], true);
+    assert_eq!(response["instance_admin"], false);
+    assert_eq!(
+        get(&store, Some("gast"), "/api/admin/principals").await.0,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn promoting_one_account_promotes_nobody_else() {
+    // The owner's constraint, checked rather than assumed: the promotion names one
+    // principal, so it cannot have a side effect on the other members of any group or
+    // team. A `group_roles` row would have exactly that side effect, which is why this is
+    // not implemented as one.
+    let store = fixture().await;
+    let gast = id_of(&store, "gast").await;
+
+    // Everybody here shares a team with the promoted account, so a promotion that leaked
+    // through team membership would show up.
+    for username in ["gast", "lektor", "leser"] {
+        let id = id_of(&store, username).await;
+        post(
+            &store,
+            Some("chef"),
+            "/api/admin/teams/gaeste/members",
+            json!({"principal_id": id}),
+        )
+        .await;
+    }
+
+    set_instance_admin(&store, "chef", &gast, true).await;
+
+    for username in ["lektor", "leser"] {
+        assert_eq!(
+            get(&store, Some(username), "/api/admin/principals").await.0,
+            StatusCode::FORBIDDEN,
+            "promoting `gast` promoted `{username}` as well"
+        );
+    }
+}
+
+#[tokio::test]
+async fn demoting_the_last_instance_admin_is_refused() {
+    // Demotion is the other way to reach zero, and it must be refused by the same rule
+    // rather than by a second one written next to it.
+    let store = fixture().await;
+    let chef = id_of(&store, "chef").await;
+    let gast = id_of(&store, "gast").await;
+
+    // Asserted, not assumed. `set_instance_admin` returns a status this test previously
+    // discarded, so a promotion that failed left `gast` un-promoted and every assertion
+    // below measured the wrong situation.
+    let (promoted, body) = set_instance_admin(&store, "chef", &gast, true).await;
+    assert_eq!(promoted, StatusCode::OK, "promoting gast failed: {body}");
+
+    let (status, body) = post(
+        &store,
+        Some("chef"),
+        &format!("/api/admin/principals/{chef}/active"),
+        json!({"active": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, response) = set_instance_admin(&store, "gast", &gast, false).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(
+        get(&store, Some("gast"), "/api/admin/principals").await.0,
+        StatusCode::OK,
+        "a refused demotion took effect anyway"
+    );
+}
+
+#[tokio::test]
+async fn a_deactivated_instance_admin_does_not_count_toward_the_floor() {
+    // The floor is ACTIVE administrators. A suspended account cannot sign in, so counting
+    // it would let the last usable administrator suspend themselves next to a row that
+    // looks like a second one.
+    let store = fixture().await;
+    let chef = id_of(&store, "chef").await;
+    let gast = id_of(&store, "gast").await;
+
+    set_instance_admin(&store, "chef", &gast, true).await;
+    let (status, _) = post(
+        &store,
+        Some("chef"),
+        &format!("/api/admin/principals/{gast}/active"),
+        json!({"active": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "deactivating the second admin");
+
+    let (status, response) = post(
+        &store,
+        Some("chef"),
+        &format!("/api/admin/principals/{chef}/active"),
+        json!({"active": false}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a deactivated admin was counted as an administrator: {response}"
+    );
+}
+
+#[tokio::test]
+async fn the_candidates_are_active_non_admins_most_recently_active_first() {
+    let store = fixture().await;
+    let gast = id_of(&store, "gast").await;
+    let leser = id_of(&store, "leser").await;
+    let lektor = id_of(&store, "lektor").await;
+
+    // Two more accounts, so the list has something to order: one Authelia account and one
+    // local one, neither of which has ever been seen.
+    store
+        .upsert_oidc_principal("kollege", "Kollege", None, &["users".into()])
+        .await
+        .unwrap();
+    post(
+        &store,
+        Some("chef"),
+        "/api/admin/principals",
+        json!({"username": "neu", "display_name": "Neu", "password": PASSPHRASE}),
+    )
+    .await;
+
+    // Excluded: already an administrator by promotion, already one by Authelia group
+    // (`chef`), and deactivated (`lektor`). Promoting any of them would add nobody.
+    set_instance_admin(&store, "chef", &leser, true).await;
+    store.set_principal_active(&lektor, false).await.unwrap();
+    // `gast` has signed in; nobody else has.
+    store
+        .create_session(&gast, "gast-digest", SESSION_TTL_SECONDS)
+        .await
+        .unwrap();
+
+    let (status, list) = get(&store, Some("chef"), "/api/admin/admins/candidates").await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let names: Vec<&str> = list
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|c| c["username"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["gast", "kollege", "neu"],
+        "candidates must exclude administrators and deactivated accounts, most recently \
+         active first"
+    );
+
+    // The console shows where the account comes from and what it already carries, so the
+    // person choosing a successor is not choosing from a list of bare usernames.
+    let gast_entry = &list[0];
+    assert_eq!(gast_entry["id"], gast.as_str());
+    assert_eq!(gast_entry["kind"], "local");
+    assert!(gast_entry["groups"].as_array().unwrap().is_empty());
+    assert!(
+        gast_entry["last_active_at"].as_str().is_some(),
+        "a candidate with a session must report when they were last active: {gast_entry}"
+    );
+
+    let kollege = &list[1];
+    assert_eq!(kollege["kind"], "oidc", "the Authelia accounts are marked");
+    assert_eq!(kollege["groups"][0], "users");
+    assert_eq!(
+        kollege["last_active_at"],
+        Value::Null,
+        "an account with no session and no audit entry has no derived activity"
+    );
+}
+
+#[tokio::test]
+async fn a_caller_with_no_admin_baseline_is_refused_both_interlock_endpoints() {
+    // Instance-wide, both of them: the candidate list names every active account, and the
+    // promotion hands over the whole instance.
+    let store = fixture().await;
+    let gast = id_of(&store, "gast").await;
+
+    for who in [None, Some("gast"), Some("lektor"), Some("leser")] {
+        assert_eq!(
+            get(&store, who, "/api/admin/admins/candidates").await.0,
+            StatusCode::FORBIDDEN,
+            "{who:?} read the candidate list"
+        );
+        let (status, _) = post(
+            &store,
+            who,
+            &format!("/api/admin/principals/{gast}/instance-admin"),
+            json!({"admin": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{who:?} promoted an account");
+    }
+
+    assert_eq!(
+        get(&store, Some("gast"), "/api/admin/principals").await.0,
+        StatusCode::FORBIDDEN,
+        "a refused promotion took effect anyway"
+    );
+    assert!(
+        audit(&store).await.is_empty(),
+        "a refused request wrote to the audit log"
+    );
+}
+
+#[tokio::test]
+async fn promotion_and_demotion_each_write_one_instance_wide_audit_row() {
+    let store = fixture().await;
+    let gast = id_of(&store, "gast").await;
+
+    set_instance_admin(&store, "chef", &gast, true).await;
+    let entries = audit(&store).await;
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].action, "principal.promote");
+    assert_eq!(entries[0].target.as_deref(), Some(gast.as_str()));
+    assert_eq!(
+        entries[0].path, None,
+        "administering the instance belongs to no subtree (0004)"
+    );
+    assert_eq!(
+        entries[0].principal_id.as_deref(),
+        Some(id_of(&store, "chef").await.as_str())
+    );
+
+    // Promoting somebody who is already promoted changes nothing, so it records nothing.
+    let (status, response) = set_instance_admin(&store, "chef", &gast, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["changed"], false);
+    assert_eq!(audit(&store).await.len(), 1);
+
+    let (status, response) = set_instance_admin(&store, "chef", &gast, false).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let entries = audit(&store).await;
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    let demotion = entries
+        .iter()
+        .find(|e| e.action == "principal.demote")
+        .expect("the demotion must be recorded");
+    assert_eq!(demotion.target.as_deref(), Some(gast.as_str()));
+    assert_eq!(demotion.path, None);
+}
+
+#[tokio::test]
+async fn promoting_an_account_that_does_not_exist_is_not_a_success() {
+    let store = fixture().await;
+    let (status, _) = set_instance_admin(&store, "chef", "gibt-es-nicht", true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(audit(&store).await.is_empty());
+
+    // The same request against an id that does exist, so the 404 cannot be the router's
+    // 404 for a route nobody registered.
+    let gast = id_of(&store, "gast").await;
+    let (status, _) = set_instance_admin(&store, "chef", &gast, true).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn demoting_somebody_who_administers_by_group_says_they_still_do() {
+    // The failure this endpoint could most plausibly hide. `chef` administers the
+    // instance through Authelia's `admins` group, which great-wiki neither reads from nor
+    // writes to here — so removing a promotion row they never had withdraws nothing. A
+    // console told only "changed: false" would still be right; one told "done" would have
+    // announced a revocation that did not happen.
+    let store = fixture().await;
+    let chef = id_of(&store, "chef").await;
+
+    let (status, response) = set_instance_admin(&store, "chef", &chef, false).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["changed"], false);
+    assert_eq!(
+        response["instance_admin"], true,
+        "a demotion that withdrew nothing reported that it had"
+    );
+    assert_eq!(
+        get(&store, Some("chef"), "/api/admin/principals").await.0,
+        StatusCode::OK
+    );
 }
 
 // -------------------------------------------------------------------------------------

@@ -131,6 +131,89 @@ fn permits(
     }
 }
 
+/// Whether `principal_id` carries a per-account promotion row (0006).
+async fn promoted(conn: &mut sqlx::SqliteConnection, principal_id: &str) -> Result<bool> {
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT 1 FROM instance_admins WHERE principal_id = ?1")
+            .bind(principal_id)
+            .fetch_optional(conn)
+            .await?;
+    Ok(row.is_some())
+}
+
+/// The baseline of a caller already known to be signed in and active, on ONE connection.
+///
+/// This is the single implementation of D-M2-1 and of the 0006 fallback. It takes a
+/// connection rather than the pool so that the interlock can ask the same question inside
+/// the transaction that is about to deactivate somebody: a second copy of this rule —
+/// written in SQL against `group_roles`, say, because that counts in one statement — is
+/// exactly how the count and the authorisation decision come to disagree, and the shape of
+/// that disagreement is "the console says there are two administrators and there are none".
+///
+/// The activity and authentication checks live in [`Store::baseline_for`] and in the
+/// counter, because each knows a different way to establish them: one has a `Principal`,
+/// the other a database row.
+pub(crate) async fn baseline_on(
+    conn: &mut sqlx::SqliteConnection,
+    principal_id: &str,
+    groups: &[String],
+) -> Result<Baseline> {
+    // The fallback, first: it names one principal, so it can neither be widened by a
+    // group nor narrowed by one.
+    if promoted(&mut *conn, principal_id).await? {
+        return Ok(Baseline::Admin);
+    }
+    if groups.is_empty() {
+        return Ok(Baseline::Public);
+    }
+
+    // Only the `?` placeholders are built from the group COUNT; every group name is
+    // bound. No value is ever formatted into SQL.
+    let placeholders = vec!["?"; groups.len()].join(",");
+    let sql = format!("SELECT baseline FROM group_roles WHERE group_name IN ({placeholders})");
+    let mut query = sqlx::query_as::<_, (String,)>(&sql);
+    for group in groups {
+        query = query.bind(group);
+    }
+    let rows: Vec<(String,)> = query.fetch_all(conn).await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(b,)| Baseline::from_stored(&b))
+        .max()
+        .unwrap_or_default())
+}
+
+/// How many ACTIVE principals hold the admin baseline, on ONE connection.
+///
+/// Active, because the floor exists to guarantee somebody can still sign in and
+/// administer: a deactivated account has no sessions (D-M2-7) and cannot get one, so
+/// counting it would let the last usable administrator suspend themselves next to a row
+/// that merely looks like a second.
+///
+/// Written as a query for the candidates and a loop for the verdict, rather than as one
+/// clever statement: the group half of the rule lives in a JSON column, and expressing it
+/// in SQL would mean a second implementation of [`baseline_on`] that nothing keeps honest.
+/// The loop is one indexed lookup per active account, on a path taken when somebody
+/// deactivates an account — never per request.
+pub(crate) async fn active_instance_admins(conn: &mut sqlx::SqliteConnection) -> Result<i64> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, groups FROM principals WHERE active = 1")
+            .fetch_all(&mut *conn)
+            .await?;
+
+    let mut count = 0;
+    for (id, groups) in rows {
+        // An unreadable `groups` value confers nothing, exactly as an unrecognised
+        // baseline string does. It must never be guessed upward into an administrator.
+        let groups: Vec<String> = serde_json::from_str(&groups).unwrap_or_default();
+        if baseline_on(&mut *conn, &id, &groups).await? >= Baseline::Admin {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 impl Store {
     pub async fn add_grant(
         &self,
@@ -206,31 +289,38 @@ impl Store {
     ///
     /// The strongest baseline across the principal's groups wins. An unmapped group, or
     /// no groups at all — which is every local guest account, since great-wiki never
-    /// writes Authelia's user database — confers `public` only.
+    /// writes Authelia's user database — confers `public` only. A per-account promotion
+    /// (0006) confers `admin` on its own, whatever the groups say.
     ///
-    /// Authentication is checked BEFORE the groups are read, for the same reason `can()`
+    /// Authentication is checked BEFORE anything is read, for the same reason `can()`
     /// checks it first: a `groups` list on a request that is not signed in is not
     /// evidence of anything, and a deactivated account's groups are stale by definition.
     pub async fn baseline_for(&self, principal: &Principal) -> Result<Baseline> {
-        if !principal.is_authenticated() || !principal.active || principal.groups.is_empty() {
+        if !principal.is_authenticated() || !principal.active {
             return Ok(Baseline::Public);
         }
+        let mut conn = self.pool.acquire().await?;
+        baseline_on(&mut conn, &principal.id, &principal.groups).await
+    }
 
-        // Only the `?` placeholders are built from the group COUNT; every group name is
-        // bound. No value is ever formatted into SQL.
-        let placeholders = vec!["?"; principal.groups.len()].join(",");
-        let sql = format!("SELECT baseline FROM group_roles WHERE group_name IN ({placeholders})");
-        let mut query = sqlx::query_as::<_, (String,)>(&sql);
-        for group in &principal.groups {
-            query = query.bind(group);
-        }
-        let rows: Vec<(String,)> = query.fetch_all(&self.pool).await?;
+    /// Whether `principal_id` carries the per-account promotion (0006).
+    ///
+    /// The stored fact only. Whether it takes effect is [`Store::baseline_for`]'s answer,
+    /// which also refuses a deactivated account — so this must not be used as a gate.
+    pub async fn is_instance_admin(&self, principal_id: &str) -> Result<bool> {
+        let mut conn = self.pool.acquire().await?;
+        promoted(&mut conn, principal_id).await
+    }
 
-        Ok(rows
-            .into_iter()
-            .map(|(b,)| Baseline::from_stored(&b))
-            .max()
-            .unwrap_or_default())
+    /// How many people can administer this instance right now.
+    ///
+    /// The number the interlock protects, for a console that wants to say "you are the
+    /// last one" before the refusal does. The refusal itself counts inside its own
+    /// transaction — see [`crate::admin`] — because a number read here is already stale
+    /// by the time anything acts on it.
+    pub async fn active_instance_admin_count(&self) -> Result<i64> {
+        let mut conn = self.pool.acquire().await?;
+        active_instance_admins(&mut conn).await
     }
 
     /// Fetch a document only if `principal` may perform `action` on it.
@@ -385,6 +475,11 @@ pub(crate) fn permission_column(permission: Permission) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{ancestors, Baseline};
+    use crate::Store;
+
+    async fn store() -> Store {
+        Store::open("sqlite::memory:").await.unwrap()
+    }
 
     #[test]
     fn ancestors_are_nearest_first_and_stop_below_the_root() {
@@ -406,5 +501,130 @@ mod tests {
         assert!(Baseline::Admin > Baseline::Internal);
         assert!(Baseline::Internal > Baseline::Public);
         assert_eq!(Baseline::default(), Baseline::Public);
+    }
+
+    // --- the per-account promotion (0006) ---------------------------------------------
+
+    #[tokio::test]
+    async fn a_promoted_account_holds_the_admin_baseline_with_no_groups_at_all() {
+        // The fallback D-M2-1 cannot provide. A local account has no Authelia groups and
+        // never will — great-wiki does not write that database — so if this were derived
+        // from groups there would be no way back into an instance whose administrators
+        // have left.
+        let store = store().await;
+        let gast = store
+            .create_local_principal("gast", "Gast", None, "x")
+            .await
+            .unwrap();
+        assert!(gast.groups.is_empty(), "the fixture must have no groups");
+        assert_eq!(store.baseline_for(&gast).await.unwrap(), Baseline::Public);
+
+        assert!(store.set_instance_admin(&gast.id, true).await.unwrap());
+        assert_eq!(store.baseline_for(&gast).await.unwrap(), Baseline::Admin);
+
+        // And it is exactly reversible.
+        assert!(store.set_instance_admin(&gast.id, false).await.unwrap());
+        assert_eq!(store.baseline_for(&gast).await.unwrap(), Baseline::Public);
+    }
+
+    #[tokio::test]
+    async fn promoting_one_account_changes_nobody_else_s_baseline() {
+        // The owner's constraint: the promotion names one person. A `group_roles` row
+        // would promote everybody holding that group — including people added to it later
+        // in Authelia, where nothing here can see it happen — which is why the fallback is
+        // not implemented as one.
+        let store = store().await;
+        let promoted = store
+            .upsert_oidc_principal("chef", "Chef", None, &["redaktion".into()])
+            .await
+            .unwrap();
+        let colleague = store
+            .upsert_oidc_principal("kollege", "Kollege", None, &["redaktion".into()])
+            .await
+            .unwrap();
+        let guest = store
+            .create_local_principal("gast", "Gast", None, "x")
+            .await
+            .unwrap();
+
+        store.set_instance_admin(&promoted.id, true).await.unwrap();
+
+        assert_eq!(
+            store.baseline_for(&promoted).await.unwrap(),
+            Baseline::Admin
+        );
+        assert_eq!(
+            store.baseline_for(&colleague).await.unwrap(),
+            Baseline::Public,
+            "promoting one member of `redaktion` promoted the whole group"
+        );
+        assert_eq!(store.baseline_for(&guest).await.unwrap(), Baseline::Public);
+        assert_eq!(store.active_instance_admin_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_promotion_does_not_survive_deactivation_or_signing_out() {
+        // Authentication and activity are checked before the promotion is read, exactly as
+        // they are before the groups: a row in `instance_admins` is not evidence about a
+        // request that has not said who it is.
+        let store = store().await;
+        let mut gast = store
+            .create_local_principal("gast", "Gast", None, "x")
+            .await
+            .unwrap();
+        store.set_instance_admin(&gast.id, true).await.unwrap();
+        assert_eq!(store.active_instance_admin_count().await.unwrap(), 1);
+
+        // Two separate facts, and they are separate on purpose. `baseline_for` answers
+        // about the principal a REQUEST is carrying, so the flag on that principal is what
+        // decides. The count answers about the instance, so it reads the stored rows —
+        // nobody hands it a principal to be wrong about.
+        store.set_principal_active(&gast.id, false).await.unwrap();
+        gast.active = false;
+        assert_eq!(store.baseline_for(&gast).await.unwrap(), Baseline::Public);
+        assert_eq!(
+            store.active_instance_admin_count().await.unwrap(),
+            0,
+            "a deactivated promotion still counted as an administrator"
+        );
+
+        let mut forged = gw_auth::Principal::anonymous();
+        forged.id = gast.id.clone();
+        assert_eq!(store.baseline_for(&forged).await.unwrap(), Baseline::Public);
+    }
+
+    #[tokio::test]
+    async fn the_authelia_group_path_is_untouched_by_the_promotion() {
+        // The fallback is additional, never a replacement: D-M2-1 has to keep working
+        // exactly as it did, including for somebody who is both.
+        let store = store().await;
+        let by_group = store
+            .upsert_oidc_principal("sergej", "Sergej", None, &["admins".into()])
+            .await
+            .unwrap();
+        let by_both = store
+            .upsert_oidc_principal("beides", "Beides", None, &["admins".into()])
+            .await
+            .unwrap();
+        let by_users = store
+            .upsert_oidc_principal("kollege", "Kollege", None, &["users".into()])
+            .await
+            .unwrap();
+        store.set_instance_admin(&by_both.id, true).await.unwrap();
+
+        assert_eq!(
+            store.baseline_for(&by_group).await.unwrap(),
+            Baseline::Admin
+        );
+        assert_eq!(
+            store.baseline_for(&by_users).await.unwrap(),
+            Baseline::Internal
+        );
+        assert_eq!(store.active_instance_admin_count().await.unwrap(), 2);
+
+        // Demoting somebody who also holds the group takes nothing away — great-wiki
+        // cannot revoke an Authelia group, and must not pretend it can.
+        store.set_instance_admin(&by_both.id, false).await.unwrap();
+        assert_eq!(store.baseline_for(&by_both).await.unwrap(), Baseline::Admin);
     }
 }

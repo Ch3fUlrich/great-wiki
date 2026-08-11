@@ -56,9 +56,18 @@ behaviour:
 
 # Break the security-critical code on purpose and check the tests notice.
 #
-# NOT part of `ci`: it rebuilds the workspace once per mutation, which is minutes on the
-# runner. Run it by hand after touching gw-auth or gw-store — that is where a passing
-# suite has three times now failed to notice a defence being removed entirely.
+# About a minute for the whole set, which it was not: it had grown past ten minutes and
+# timed out rather than finishing, and a gate too slow to run is a gate that stops being
+# run. Run it by hand after touching gw-auth or gw-store — that is where a passing suite
+# has three times now failed to notice a defence being removed entirely.
+#
+# NOTHING ELSE MAY TOUCH THE REPOSITORY WHILE THIS RUNS. It rewrites source files in place
+# and restores them; a concurrent `cargo fmt` can write its copy back afterwards and
+# reinstate a mutation. The script refuses to start while another cargo is running and
+# checks every file it touched at the end, but the cheap answer is to run it alone.
+#
+# Still NOT part of `ci`: a minute per push is a minute, and the runner's image has no
+# toolchain at all.
 mutate:
     ./scripts/mutate.sh
 

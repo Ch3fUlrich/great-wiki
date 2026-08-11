@@ -1,10 +1,14 @@
-//! The admin API: principals, teams, path-scoped grants and the audit log.
+//! The admin API: principals, teams, path-scoped grants, the audit log, and the interlock
+//! that keeps the instance from being left with nobody able to administer it.
 //!
 //! Two gates, and the difference between them is the whole design.
 //!
 //! [`instance_admin`] guards what concerns the instance — creating an account, creating a
 //! team, listing everyone. It asks for the `admin` baseline, which under D-M2-1 comes from
-//! the verified Authelia group and from nowhere else.
+//! the verified Authelia group, and additionally from the per-account promotion in 0006 —
+//! the fallback for an instance whose Authelia administrators are gone, since great-wiki
+//! never writes that database (ADR 0002). Both are `Store::baseline_for`'s answer; neither
+//! is decided here.
 //!
 //! [`path_admin`] guards what concerns one subtree. It asks `can()` for `Action::Admin` on
 //! **that path**, so whoever administers `/raum` administers `/raum` and its descendants
@@ -31,6 +35,8 @@ use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
 use gw_auth::{can, Action, Grant, Permission, Principal, Subject};
 use gw_core::Visibility;
+use gw_store::admin::{ActiveOutcome, InstanceAdminOutcome};
+use gw_store::principals::AdminCandidate;
 use gw_store::{AuditPage, Baseline, MembershipOutcome, TeamSummary};
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +47,11 @@ pub fn routes() -> Router<AppState> {
             get(list_principals).post(create_principal),
         )
         .route("/api/admin/principals/{id}/active", post(set_active))
+        .route(
+            "/api/admin/principals/{id}/instance-admin",
+            post(set_instance_admin),
+        )
+        .route("/api/admin/admins/candidates", get(admin_candidates))
         .route("/api/admin/teams", get(list_teams).post(create_team))
         .route("/api/admin/teams/{slug}/members", post(add_member))
         .route(
@@ -256,6 +267,16 @@ pub struct ActiveFlag {
     active: bool,
 }
 
+/// What a refused deactivation or demotion says, and the only advice that helps.
+///
+/// The interlock is not a permission problem — the caller may do this, and would be
+/// allowed to a moment after promoting somebody — so it is 409 rather than 403, and it
+/// names the way out. Only instance admins reach either endpoint, and they can already
+/// list every account, so saying how many administrators are left reveals nothing to them
+/// that the console does not already show.
+const LAST_ADMIN: &str = "this would leave the instance with no active administrator; \
+                          promote somebody from /api/admin/admins/candidates first";
+
 pub async fn set_active(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -267,13 +288,111 @@ pub async fn set_active(
     // 404 rather than a silent 200: only an instance admin reaches this, and they can
     // already list every account, so naming an id that does not exist reveals nothing
     // they could not read directly.
-    state
+    match state
         .store
         .set_principal_active_audited(&actor.id, &id, body.active)
         .await
         .map_err(ApiError::Internal)?
+    {
+        ActiveOutcome::Changed(principal) => Ok(Json(*principal)),
+        ActiveOutcome::NoSuchPrincipal => Err(ApiError::NotFound),
+        // Refused by the store, in the transaction that would have committed it. The rule
+        // is not restated here: a second copy in this handler could disagree with the one
+        // that actually decides, and it is the one in the transaction that is safe against
+        // two administrators deactivating themselves at the same moment.
+        ActiveOutcome::LastAdmin => Err(ApiError::Conflict(LAST_ADMIN.into())),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct InstanceAdminFlag {
+    admin: bool,
+}
+
+/// What a promotion or demotion did, and what the person can do afterwards.
+#[derive(Serialize)]
+pub struct InstanceAdminView {
+    /// Whether a promotion row was written or removed. Same field name as every other
+    /// mutating endpoint, so a client can ask the question generically.
+    changed: bool,
+    /// Whether they administer the instance NOW.
+    ///
+    /// Not implied by `changed`, and this is the one place where the difference is a
+    /// disclosure rather than a nicety: somebody who administers through Authelia's
+    /// `admins` group still does after a demotion here, because great-wiki never writes
+    /// that database (ADR 0002). A console reading only `changed` would announce a
+    /// revocation that did not happen.
+    instance_admin: bool,
+}
+
+/// Promote or demote a single account (0006).
+///
+/// Instance admins only, and audited instance-wide. This is the fallback for an instance
+/// whose Authelia administrators are gone; it is not a way to hand out space access, which
+/// stays with teams and path grants.
+pub async fn set_instance_admin(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+    Json(body): Json<InstanceAdminFlag>,
+) -> Result<Json<InstanceAdminView>, ApiError> {
+    let actor = instance_admin(&state, &jar).await?;
+
+    let changed = match state
+        .store
+        .set_instance_admin_audited(&actor.id, &id, body.admin)
+        .await
+        .map_err(ApiError::Internal)?
+    {
+        InstanceAdminOutcome::Changed => true,
+        // The promotion already said what was asked. Not an error: unlike a revoked
+        // grant, the state afterwards IS what the caller wanted — `instance_admin` below
+        // is what tells them whether that state means what they think it does.
+        InstanceAdminOutcome::Unchanged => false,
+        InstanceAdminOutcome::NoSuchPrincipal => return Err(ApiError::NotFound),
+        InstanceAdminOutcome::LastAdmin => return Err(ApiError::Conflict(LAST_ADMIN.into())),
+    };
+
+    // Asked of the same function every gate asks, rather than assumed from `body.admin`:
+    // the answer for somebody in the `admins` group is different from the answer for
+    // somebody who only ever had the promotion row.
+    let subject = state
+        .store
+        .principal_by_id(&id)
+        .await
+        .map_err(ApiError::Internal)?
+        .map(|(principal, _)| principal)
+        .ok_or(ApiError::NotFound)?;
+    let instance_admin = state
+        .store
+        .baseline_for(&subject)
+        .await
+        .map_err(ApiError::Internal)?
+        >= Baseline::Admin;
+
+    Ok(Json(InstanceAdminView {
+        changed,
+        instance_admin,
+    }))
+}
+
+/// Who could be promoted, most recently active first.
+///
+/// Instance-wide by the same argument as listing principals: it names every active
+/// account. The ordering is the point — this list is read by somebody who is about to
+/// hand over, usually because they are losing their own access, and the useful first
+/// answer is "the people who have actually been here lately".
+pub async fn admin_candidates(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<Vec<AdminCandidate>>, ApiError> {
+    instance_admin(&state, &jar).await?;
+    state
+        .store
+        .admin_candidates()
+        .await
         .map(Json)
-        .ok_or(ApiError::NotFound)
+        .map_err(ApiError::Internal)
 }
 
 // -------------------------------------------------------------------------------------

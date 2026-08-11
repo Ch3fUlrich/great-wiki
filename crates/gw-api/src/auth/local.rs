@@ -29,9 +29,8 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Form};
 use axum_extra::extract::CookieJar;
-use gw_auth::password::{hash_password, verify_password};
+use gw_auth::password::{hash_password_at, verify_password, HashingCost};
 use serde::Deserialize;
-use std::sync::OnceLock;
 use subtle::ConstantTimeEq;
 
 use super::client_address::client_address;
@@ -54,21 +53,25 @@ pub struct Credentials {
     csrf: String,
 }
 
-/// An argon2id hash of 256 random bits, made once per process.
+/// An argon2id hash of 256 random bits, made once and kept on the state.
 ///
 /// Verified against when the submitted username has no account, or has one with no
 /// password — an OIDC principal, which has no credential row at all. Its only job is to
 /// make the work identical: without it, "no such user" returns in microseconds while a
 /// real user costs tens of milliseconds, and the difference is measurable from anywhere.
 ///
-/// Random per process rather than a constant, so there is no fixed input that would
-/// verify against it.
-fn placeholder_hash() -> &'static str {
-    static HASH: OnceLock<String> = OnceLock::new();
-    HASH.get_or_init(|| {
-        hash_password(&random_secret())
-            .expect("the argon2 parameters are constants and are exercised by gw-auth's tests")
-    })
+/// Random rather than a constant, so there is no fixed input that would verify against it,
+/// and made at [`AppState::hashing`] — the same cost as the stored hashes it stands in for,
+/// which is the whole point of it.
+fn placeholder_hash(state: &AppState) -> &str {
+    state
+        .placeholder
+        .get_or_init(|| new_placeholder(state.hashing))
+}
+
+fn new_placeholder(cost: HashingCost) -> String {
+    hash_password_at(&random_secret(), cost)
+        .expect("both hashing costs are valid argon2 parameters and gw-auth's tests exercise them")
 }
 
 /// Constant-time comparison for the CSRF token. `==` on strings returns at the first
@@ -132,7 +135,7 @@ pub async fn sign_in(
     // worker stalls every other request sharing the thread.
     let candidate = stored
         .clone()
-        .unwrap_or_else(|| placeholder_hash().to_string());
+        .unwrap_or_else(|| placeholder_hash(&state).to_string());
     let password = credentials.password.clone();
     let verified =
         match tokio::task::spawn_blocking(move || verify_password(&password, &candidate)).await {
@@ -205,18 +208,32 @@ fn throttled(jar: CookieJar, homelab: bool) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{constant_time_eq, placeholder_hash};
-    use gw_auth::password::verify_password;
+    use super::{constant_time_eq, new_placeholder};
+    use gw_auth::password::{verify_password, HashingCost};
 
     #[test]
     fn the_placeholder_is_a_real_hash_that_nothing_verifies_against() {
         // If it were malformed, `verify_password` would return false immediately and the
         // timing floor it exists to provide would be gone.
-        let hash = placeholder_hash();
+        let hash = new_placeholder(HashingCost::CHEAP_FOR_TESTS);
         assert!(hash.starts_with("$argon2id$"), "{hash}");
-        for guess in ["", "password", "gast", hash] {
-            assert!(!verify_password(guess, hash), "verified `{guess}`");
+        for guess in ["", "password", "gast", &hash] {
+            assert!(!verify_password(guess, &hash), "verified `{guess}`");
         }
+    }
+
+    #[test]
+    fn the_placeholder_a_server_uses_costs_what_a_stored_hash_costs() {
+        // The one above is about the hash being well-formed and unguessable, so it is made
+        // cheaply. This one is about the cost, so it is made the way a server makes it —
+        // and asserts the parameters rather than timing them, which is the same claim
+        // without a stopwatch in it.
+        let hash = new_placeholder(HashingCost::PRODUCTION);
+        assert!(
+            hash.starts_with("$argon2id$v=19$m=65536,t=3,p=4$"),
+            "a stand-in cheaper than the hashes it stands in for is the timing oracle it \
+             exists to close: {hash}"
+        );
     }
 
     #[test]
