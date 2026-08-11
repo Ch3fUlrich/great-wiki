@@ -1723,23 +1723,42 @@ The interface must state whose view is shown, persistently and unmissably.
 
 ## Milestone exit criteria
 
-- [ ] `just ci` passes.
-- [ ] A first-time Authelia sign-in gets exactly the reach its group implies — `admins`
-      everything, `users` public plus internal, anyone else public only.
-- [ ] A space admin can invite a guest into their own space and **cannot** scope an invite
-      to a space they do not administer.
-- [ ] A guest signs in **without Authelia** and reaches only what they were granted.
-- [ ] Viewing-as another principal shows exactly their view, refuses writes, and is audited.
-- [ ] **The `import authelia` lines are gone from both wiki site blocks**, a published page
-      is readable anonymously, and a restricted one is not.
-- [ ] A local guest account can be created in the admin console, added to a team, granted
-      read on one subtree, and signs in.
-- [ ] That guest sees **only** the granted subtree plus public pages, in the tree and by
-      direct URL.
-- [ ] Deactivating the guest takes effect on the next request, not the next login.
-- [ ] A read-scoped API token cannot perform a write, even for an admin.
-- [ ] `grep -rn "may_read" crates/` returns nothing — the M1 stub is gone, not shadowed.
-- [ ] Every admin mutation appears in `/api/admin/audit`.
+Checked 2026-08-11. A box is ticked only where a test proves it; where the proof is a
+test rather than a live system, the test is named, because "passes in CI" and "works on
+the box" are different claims and this list has to say which one is being made.
+
+- [x] `just ci` passes. — 422 Rust tests, 92 web tests, fmt, clippy, `npm run check`, the
+      production build and the secret scan, all green. 59 mutations, all as expected.
+- [x] A first-time Authelia sign-in gets exactly the reach its group implies — `admins`
+      everything, `users` public plus internal, anyone else public only. — `gw-store`
+      `acl.rs` unit tests. **Against the real Authelia this has not been run**; see below.
+- [x] A space admin can invite a guest into their own space and **cannot** scope an invite
+      to a space they do not administer. — `tests/invites.rs`, including the separate rule
+      that attaching a *team* needs an instance admin.
+- [x] A guest signs in **without Authelia** and reaches only what they were granted. —
+      `tests/local_login.rs` and `tests/milestone_m2.rs`.
+- [x] Viewing-as another principal shows exactly their view, refuses writes, and is
+      audited. — `tests/view_as.rs`, 15 tests; the read tests assert *equality* with what
+      the target sees directly, and the refusal is tested against routes that do not exist.
+- [~] **The `import authelia` lines are gone from both wiki site blocks** — done, in
+      `Server/server/network/opnsense/caddy.d/10-services.conf` — but "a published page is
+      readable anonymously, and a restricted one is not" is **unverified in production**:
+      `wiki.ohje.ooguy.com` still points at `cloud.vm:8100`, which serves nothing.
+- [x] A local guest account can be created in the admin console, added to a team, granted
+      read on one subtree, and signs in. — `tests/milestone_m2.rs`, through the HTTP API
+      only.
+- [x] That guest sees **only** the granted subtree plus public pages, in the tree and by
+      direct URL. — same test, both doors, and it ends by removing the membership to show
+      the reach goes with it.
+- [x] Deactivating the guest takes effect on the next request, not the next login. —
+      `tests/api.rs::a_deactivated_principal_is_refused_everything_but_public`.
+- [ ] A read-scoped API token cannot perform a write, even for an admin. — **deferred to
+      M14 by owner decision (2026-08-10).** Not implemented, not attempted.
+- [x] `grep -rn "may_read" crates/` returns nothing — the M1 stub is gone, not shadowed.
+- [x] Every admin mutation appears in `/api/admin/audit`. — and as of 2026-08-11 the list
+      that checks this is itself checked: `every_mutating_admin_route_is_covered_by_the_-
+      audit_list_or_explicitly_exempt` reads the route table out of the source, because the
+      hand-maintained list had silently missed three new endpoints.
 
 ## Self-Review
 

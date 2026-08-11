@@ -219,6 +219,14 @@ fn instance_wide_mutations(principal_id: &str) -> Vec<(Method, String, Option<Va
             format!("/api/admin/principals/{principal_id}/instance-admin"),
             Some(json!({"admin": true})),
         ),
+        // Before the deactivation below, and that ordering is load-bearing: a deactivated
+        // account cannot be viewed as, so this would answer 400 and the loop would read it
+        // as a missing audit row rather than as the refusal it is.
+        (
+            Method::POST,
+            format!("/api/admin/view-as/{principal_id}"),
+            None,
+        ),
         (
             Method::POST,
             format!("/api/admin/principals/{principal_id}/active"),
@@ -247,6 +255,19 @@ fn path_scoped_mutations() -> Vec<(Method, String, Option<Value>)> {
             Some(json!({
                 "path": "/raum",
                 "subject": {"kind": "team", "id": "gaeste"},
+                "permission": "read",
+            })),
+        ),
+        // An invite carrying a path grant is bounded by that path, so it is gated by it —
+        // the same door as the grant above, which is why it belongs in this list and not
+        // the instance-wide one. An invite carrying a TEAM is instance-only and is covered
+        // by tests/invites.rs, where the distinction is the point.
+        (
+            Method::POST,
+            "/api/admin/invites".into(),
+            Some(json!({
+                "username": "eingeladen",
+                "path": "/raum",
                 "permission": "read",
             })),
         ),
@@ -1787,5 +1808,147 @@ async fn an_administrator_cannot_create_an_account_with_a_breached_password() {
             .unwrap()
             .is_none(),
         "a refused password still created an account"
+    );
+}
+
+// -------------------------------------------------------------------------------------
+// The list above promises to be exhaustive. This is what makes that true.
+// -------------------------------------------------------------------------------------
+
+/// `mutations()` carries the comment "one list, so a new endpoint cannot be added while
+/// quietly escaping the audit-row test". That was a promise, not a mechanism, and on
+/// 2026-08-11 it turned out to be false: invitations and view-as had added four mutating
+/// admin routes and none of them was in the list. Nothing failed, because nothing was
+/// checking.
+///
+/// So the route table is read from the source and compared against the list. A new
+/// mutating route now has to appear in `mutations()` or be named in `AUDIT_EXEMPT` with a
+/// reason — and the second is deliberately awkward to write.
+const ADMIN_ROUTES: &str = include_str!("../src/routes/admin.rs");
+const VIEW_AS_ROUTES: &str = include_str!("../src/view_as.rs");
+
+/// Mutating routes that cannot be driven from a static list, each audited elsewhere.
+///
+/// Every entry needs a test named in its comment. "It is hard to test here" is a reason to
+/// point at the test that does it, not a reason to skip it.
+const AUDIT_EXEMPT: &[(&str, &str, &str)] = &[
+    (
+        "delete",
+        "/api/admin/invites/{id}",
+        "needs an invite id that only exists after a request, so it cannot be a constant. \
+         Audited by tests/invites.rs, and the mutation `invites: revoking one is gated by \
+         the scope of the invite itself`.",
+    ),
+    (
+        "post",
+        "/api/admin/view-as/exit",
+        "writes its row only when a mode is actually active, and every request in the list \
+         above goes through a freshly built router, so no mode can be. Audited by \
+         tests/view_as.rs, and the mutation `view-as: leaving the mode is recorded too, so \
+         the window has a known end`.",
+    ),
+];
+
+/// Every (method, path) in the admin router that changes something, read from the source.
+///
+/// Source-level rather than by asking the router, because axum's `Router` does not expose
+/// its table. The parse is deliberately dumb: it finds `.route(`, takes the first quoted
+/// string as the path, and looks for a mutating verb before the next `.route(`.
+fn declared_mutating_routes() -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for src in [ADMIN_ROUTES, VIEW_AS_ROUTES] {
+        let mut rest = src;
+        while let Some(at) = rest.find(".route(") {
+            rest = &rest[at + ".route(".len()..];
+            let block_end = rest.find(".route(").unwrap_or(rest.len());
+            let block = &rest[..block_end];
+
+            let path = route_path(block, src).unwrap_or_else(|| {
+                panic!(
+                    "a route's path could not be read, so it would have escaped this \
+                     check silently — which is exactly the failure the check exists for. \
+                     Write the path as a literal, or as a `const NAME: &str = \"…\"` in \
+                     the same file:\n{}",
+                    block.lines().take(3).collect::<Vec<_>>().join("\n")
+                )
+            });
+
+            for verb in ["post", "delete", "put", "patch"] {
+                if block.contains(&format!("{verb}(")) {
+                    found.push((verb.to_string(), path.clone()));
+                }
+            }
+        }
+    }
+    assert!(
+        found.len() > 5,
+        "the route parse found {} routes, so it has stopped working and this test is \
+         no longer checking anything",
+        found.len()
+    );
+    found
+}
+
+/// The path a `.route(` block registers, whether written as a literal or named by a const.
+///
+/// The const case is not a nicety. `view_as::routes()` registers its exit as
+/// `.route(EXIT_PATH, post(exit))`, and an earlier version of this parser looked for a
+/// quoted string, found none, and skipped it — so the one route that is deliberately
+/// exempt from the view-as refusal was also, silently, exempt from this check. A parser
+/// that quietly ignores what it cannot read is worse than no parser at all.
+fn route_path(block: &str, src: &str) -> Option<String> {
+    let head = block.trim_start();
+
+    if let Some(rest) = head.strip_prefix('"') {
+        return rest.find('"').map(|end| rest[..end].to_string());
+    }
+
+    let ident: String = head
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if ident.is_empty() {
+        return None;
+    }
+    let declaration = format!("const {ident}: &str = \"");
+    let at = src.find(&declaration)?;
+    let value = &src[at + declaration.len()..];
+    value.find('"').map(|end| value[..end].to_string())
+}
+
+/// Does a concrete request URI match a route pattern? `{id}` matches one segment.
+fn matches_pattern(pattern: &str, uri: &str) -> bool {
+    let uri = uri.split('?').next().unwrap_or(uri);
+    let pattern: Vec<&str> = pattern.split('/').collect();
+    let actual: Vec<&str> = uri.split('/').collect();
+    pattern.len() == actual.len()
+        && pattern
+            .iter()
+            .zip(actual.iter())
+            .all(|(p, a)| p.starts_with('{') || p == a)
+}
+
+#[test]
+fn every_mutating_admin_route_is_covered_by_the_audit_list_or_explicitly_exempt() {
+    let listed = mutations("irrelevant-for-matching");
+
+    let mut escaped = Vec::new();
+    for (verb, path) in declared_mutating_routes() {
+        let exempt = AUDIT_EXEMPT
+            .iter()
+            .any(|(v, p, _)| *v == verb && *p == path);
+        let covered = listed.iter().any(|(method, uri, _)| {
+            method.as_str().eq_ignore_ascii_case(&verb) && matches_pattern(&path, uri)
+        });
+        if !exempt && !covered {
+            escaped.push(format!("{} {path}", verb.to_uppercase()));
+        }
+    }
+
+    assert!(
+        escaped.is_empty(),
+        "these mutating admin routes are in neither `mutations()` nor `AUDIT_EXEMPT`, so \
+         nothing checks that they write an audit row:\n  {}",
+        escaped.join("\n  ")
     );
 }
