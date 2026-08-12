@@ -63,10 +63,69 @@ describe('BlockView', () => {
     // what makes a document unreadable on a phone. A scrollable box is only reachable
     // without a mouse if it is focusable, and only announced if it is named.
     const out = html(table);
-    const wrapper = out.match(/<div[^>]*>/)?.[0] ?? '';
+    // Located by the role it claims, not by being the first `<div>` in the output — the
+    // table now sits inside an outer wrapper that carries the controls, and "first div"
+    // silently started pointing at that instead.
+    const wrapper = out.match(/<div[^>]*role="region"[^>]*>/)?.[0] ?? '';
     expect(wrapper).toContain('tabindex="0"');
-    expect(wrapper).toContain('role="region"');
     expect(wrapper).toMatch(/aria-label="[^"]+"/);
+  });
+
+  // --- Progressive enhancement -------------------------------------------------------
+  //
+  // Sorting and filtering are added by TableView AFTER the component mounts. Everything
+  // below is about the other half of that bargain: what a reader with no JavaScript gets,
+  // which is the complete table and no control that does nothing.
+
+  /// A table with `rows` body rows — above the control threshold when asked for.
+  function bigTable(rows: number): Block {
+    return {
+      kind: 'table',
+      content: [
+        {
+          kind: 'tableRow',
+          content: [cell('tableHeader', 'Stamm'), cell('tableHeader', 'Dosis', 'right')]
+        },
+        ...Array.from({ length: rows }, (_, i) => ({
+          kind: 'tableRow' as const,
+          content: [cell('tableCell', `Stamm ${i}`), cell('tableCell', `${i} mg`, 'right')]
+        }))
+      ]
+    };
+  }
+
+  it('renders every row of a long table on the server, in document order', () => {
+    const out = html(bigTable(26));
+    expect(out.match(/<tr>/g)).toHaveLength(27);
+    for (let i = 0; i < 26; i += 1) expect(out).toContain(`Stamm ${i}`);
+    // Document order, not the order some default sort would produce.
+    expect(out.indexOf('Stamm 0')).toBeLessThan(out.indexOf('Stamm 1'));
+    expect(out.indexOf('Stamm 24')).toBeLessThan(out.indexOf('Stamm 25'));
+  });
+
+  it('offers no control at all before it can work', () => {
+    // A filter box that does nothing is worse than no filter box: it invites a reader to
+    // type into it and then silently shows them everything.
+    const out = html(bigTable(26));
+    expect(out).not.toContain('<button');
+    expect(out).not.toContain('<input');
+    expect(out).not.toContain('aria-sort');
+    expect(out).not.toContain('von 26 Zeilen');
+  });
+
+  it('keeps column alignment in the long table too', () => {
+    const out = html(bigTable(26));
+    // The right-aligned column: its header and all 26 of its body cells.
+    expect(out.match(/text-align:\s*right/g)).toHaveLength(27);
+  });
+
+  it('leaves a short table exactly as it was', () => {
+    // Three rows do not need a toolbar, and one in front of them is noise where the whole
+    // table is already in view.
+    const out = html(bigTable(3));
+    expect(out.match(/<tr>/g)).toHaveLength(4);
+    expect(out).not.toContain('<button');
+    expect(out).not.toContain('<input');
   });
 
   it('still renders the blocks it always did', () => {

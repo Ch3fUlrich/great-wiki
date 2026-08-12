@@ -26,6 +26,50 @@ Die Kopfzeile ist keine erste Zeile mit anderem Aussehen, sondern eine Zeile aus
 Kopfzellen — für einen Screenreader der Unterschied zwischen einer benannten
 Spalte und einem Feld ohne Beschriftung.
 
+Diese Tabelle hat zwei Zeilen und bekommt deshalb **keine** Bedienelemente. Ein
+Suchfeld über zwei Zeilen ist Lärm vor dem Inhalt: man sieht ohnehin alles.
+
+## Sortieren und filtern
+
+Ab sechs Zeilen bekommt eine Tabelle Bedienelemente — ein Suchfeld für die ganze
+Tabelle, ein Filterfeld je Spalte, eine Sortierschaltfläche in jedem Spaltenkopf
+und eine Zeilenzählung.
+
+| Probe | Menge | Geprüft | Anteil |
+|---|---:|:---:|---:|
+| Öl | 900 g | ✅ | 12 % |
+| Apfel | 1.200 g | ❌ | 3-5 % |
+| Ähre | <0,5 g | ✅ | <0,5 % |
+| Zucker | 42 g | ❌ | 80 % |
+| Möhre | 1,5 g | ✅ |  |
+| Äpfel | 3-5 g | — | 7 % |
+| Bohne | 80 g | ✅ | 1,5 % |
+| Nuss |  | ❌ | 25 % |
+
+Was beim Sortieren passiert, ist an dieser Tabelle ablesbar:
+
+- **Zahlen sind Zahlen.** *Menge* steigt von `<0,5 g` bis `1.200 g`, nicht von
+  `1,5` bis `900` — Einheit, Vergleichszeichen und das deutsche Dezimalkomma
+  werden gelesen und dann beiseitegelegt. Ein Bereich wie `3-5 g` zählt mit
+  seiner Untergrenze.
+- **Umlaute stehen dort, wo ein deutscher Leser sie sucht.** *Probe* beginnt mit
+  `Ähre`, nicht mit `Zucker` — nach Zeichencode käme jedes Ä hinter das Z.
+- **Leere Zellen stehen immer unten**, in beiden Richtungen. Sie oben zu zeigen
+  hieße, die gesuchten Zeilen aus dem Bild zu schieben.
+- **Ob eine Spalte aus Zahlen besteht, entscheidet die Spalte**, nicht die
+  einzelne Zelle: sonst würde aus einem Namen wie `5-HTP` eine Fünf.
+- **Die Sortierung ist stabil.** Erst nach *Geprüft*, dann nach *Probe* sortiert,
+  bleibt innerhalb gleicher Namen die vorige Reihenfolge stehen — so entsteht
+  eine zweispaltige Sortierung ohne eine Bedienoberfläche dafür.
+
+Die Zeilenzählung steht immer da, auch ungefiltert: *8 von 8 Zeilen*. Eine
+gefilterte Tabelle, die vollständig aussieht, ist derselbe Fehler wie eine
+Antwort, die verschweigt, was sie weggelassen hat.
+
+Ohne JavaScript erscheint keines dieser Bedienelemente — und die Tabelle steht
+trotzdem vollständig da. Ein Filterfeld, das nichts tut, wäre schlimmer als
+keines.
+
 Ist eine Tabelle breiter als die Seite, scrollt sie in ihrem eigenen Kasten. Die
 Seite selbst scrollt nie seitwärts — das ist es, was ein Dokument auf dem Handy
 unlesbar macht. Der Kasten ist mit der Tabulatortaste erreichbar, sonst käme man

@@ -6,6 +6,49 @@ Entries describe the *effect* of a change, not the diff.
 
 ## [Unreleased]
 
+### Added
+
+- Tables of six rows or more can be sorted and filtered. Every column header is a real
+  button carrying `aria-sort`, every column has its own filter box named after it, there is
+  one search box over the whole table, and the row count is always stated as displayed out
+  of total — a filtered table that looks complete is the defect this project keeps finding,
+  and the denominator is the only thing that tells a reader the difference. A filter
+  matching nothing says so instead of showing an empty table.
+- All of that is a progressive enhancement: the server sends the complete table in the
+  author's order with no control of any kind, and the controls appear only once the page
+  has mounted in a browser, where they can actually do something. Without JavaScript the
+  document is intact — never a shell, never a spinner, never a filter box that silently
+  does nothing.
+- The comparison rules are written down and tested rather than left to `Array#sort`, which
+  is codepoint order: quantities are read through their units, comparator prefixes and the
+  German decimal comma (`>1200 ppm`, `<0,5 %`, `3-5 %`, `1.200 g`), ✅ sorts after ❌,
+  umlauts sort where a German reader looks for them, and empty cells stay LAST in both
+  directions — reversing them to the top would push the rows being hunted for off the
+  bottom. Whether a column is numeric is decided per column, not per cell, so a strain name
+  like `5-HTP` does not become a five. Sorting is stable and applies to the order on screen,
+  so sorting by a second column keeps the first one inside its ties. Below six rows a table
+  is left exactly as it was.
+- Append-only revisions. Publishing writes the revision and advances the document in one
+  transaction; restoring appends a new revision rather than rewinding, so a restore can
+  never destroy the history it restored from — and the schema refuses an `UPDATE` to a
+  revision outright, so that holds for code nobody has written yet. Every accessor takes a
+  `Principal` and goes through the one permission-checked document accessor: seeing history
+  follows read, restoring follows write (D-M3-5). The author recorded is the authenticated
+  principal, never a name a caller supplied, and the display name is snapshotted beside the
+  id so attribution survives the account being deleted (D-M3-4).
+- `gw-collab`: the collaborative editing core. A Yjs-compatible CRDT (`yrs` 0.27) holds live
+  document state, so concurrent edits from people and agents merge rather than clobber.
+  Block trees round-trip through it losslessly — every block kind, per-column table
+  alignment, ragged and empty cells, deeply nested lists — proven as a property over
+  hundreds of generated trees and through the encoded bytes, not by example. Malformed
+  updates and malformed state vectors from a client are errors rather than panics, and a
+  rejected update is never relayed to the other editors. `Rooms::join` returns one room per
+  document under a single lock, so two connections arriving together cannot end up editing
+  two copies of one page.
+  Known and tested limit: inline marks and link destinations live in the CRDT but have no
+  field in `Block`, so a published snapshot keeps the text and drops the emphasis until M4
+  adds marks.
+
 ### Fixed
 
 - The server-rendered pages now attest themselves to the API. They did not, and the way

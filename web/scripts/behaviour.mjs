@@ -286,6 +286,349 @@ await check('B8 the dialog can be reopened after being closed', async (page) => 
   assert(await dialog.isVisible(), '.gw-dialog did not reopen after being closed once');
 });
 
+// ---------------------------------------------------------------------------------------
+// Group C — sorting and filtering (web/src/lib/components/TableView.svelte)
+//
+// Against the tour page, which carries two tables on purpose: a two-row one that must stay
+// plain, and an eight-row one whose cells were chosen to exercise every rule the comparator
+// has (German umlauts, a thousands point, a decimal comma, a comparator prefix, a range,
+// ticks and crosses, and one empty cell in each of two columns).
+//
+// Every assertion below is an EXACT expected value or a structural fact. None of them is of
+// the "differs from the previous value" shape that made A2 a false pass for months: a
+// regression that reorders rows differently would satisfy "the order changed" just as well
+// as the fix does.
+// ---------------------------------------------------------------------------------------
+
+const TABLE_PAGE = '/rundgang/tabellen-was-heute-passiert';
+
+/**
+ * Polls for a condition instead of sleeping, and reports what it last actually saw — a
+ * fixed sleep either flakes or wastes time, and "timed out" with no observed value is the
+ * least useful failure a check can produce.
+ */
+async function until(read, message, timeout = 5_000) {
+  const deadline = Date.now() + timeout;
+  let last;
+  for (;;) {
+    last = await read();
+    if (last.ok) return last;
+    if (Date.now() > deadline) {
+      throw new CheckFailure(`${message} — last saw ${JSON.stringify(last.saw)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+/**
+ * Loads the tour page and returns both tables. `networkidle` for the reason loadDialogPage
+ * gives: the controls are added by client-side hydration, which is a dynamic import that
+ * resolves after domcontentloaded — and here that is the whole point, because the SSR HTML
+ * deliberately has no controls at all.
+ */
+async function loadTablePage(page) {
+  await page.goto(BASE + TABLE_PAGE, { waitUntil: 'networkidle' });
+  const plain = page.locator('.gw-tbl').first();
+  const table = page.locator('.gw-tbl').nth(1);
+  await table.locator('.gw-tbl-count').waitFor({ state: 'visible', timeout: 5_000 });
+  return { plain, table };
+}
+
+/** One column of the body, top to bottom, as trimmed text. */
+const column = (table, index) =>
+  table
+    .locator('tbody tr')
+    .evaluateAll((rows, i) => rows.map((row) => row.cells[i]?.textContent.trim() ?? ''), index);
+
+const ariaSorts = (table) =>
+  table.locator('thead th').evaluateAll((ths) => ths.map((th) => th.getAttribute('aria-sort')));
+
+/** Clicks a column's sort button and waits until `aria-sort` actually says so. */
+async function sortBy(table, index, expected) {
+  await table.locator('.gw-tbl-sort').nth(index).click();
+  await until(
+    async () => {
+      const saw = await ariaSorts(table);
+      return { ok: saw[index] === expected, saw };
+    },
+    `column ${index} never reported aria-sort="${expected}"`
+  );
+}
+
+await check('C1 a short table gets no controls at all', async (page) => {
+  // Two rows do not need a toolbar; a filter box in front of a table you can already see
+  // whole is noise, and this one must stay exactly as it was.
+  const { plain } = await loadTablePage(page);
+  assert((await plain.locator('.gw-tbl-bar').count()) === 0, 'the two-row table grew a toolbar');
+  assert((await plain.locator('.gw-tbl-sort').count()) === 0, 'the two-row table grew sort buttons');
+  assert(
+    (await plain.locator('th[aria-sort]').count()) === 0,
+    'the two-row table claims a sort state it cannot change'
+  );
+});
+
+await check('C2 a long table gets named controls and a row count', async (page) => {
+  const { table } = await loadTablePage(page);
+
+  assert(
+    (await table.locator('.gw-tbl-count').textContent()) === '8 von 8 Zeilen',
+    'the unfiltered row count must still state the total, not just the visible rows'
+  );
+
+  // Real buttons in the header, not click handlers on the `th`: only a button is reachable
+  // by Tab, operable with both Enter and Space, and announced as something to press.
+  const names = await table
+    .locator('.gw-tbl-sort')
+    .evaluateAll((els) => els.map((el) => el.textContent.replace(/\s+/g, ' ').trim()));
+  assert(names.length === 4, `expected four sort buttons, found ${names.length}`);
+  assert(
+    names[0] === 'Probe, aufsteigend sortieren ⇅',
+    `a sort button must say which column AND what pressing it does, got "${names[0]}"`
+  );
+
+  // Every column filter is a real <label for=…> naming its own column. Eight boxes all
+  // called "Filter" are eight boxes a screen-reader user has to count along.
+  const labelled = await table.locator('.gw-tbl-filter').evaluateAll((fields) =>
+    fields.map((field) => {
+      const label = field.querySelector('label');
+      const input = field.querySelector('input');
+      return label && input && label.htmlFor === input.id ? label.textContent.trim() : null;
+    })
+  );
+  assert(
+    JSON.stringify(labelled) ===
+      JSON.stringify(['Probe filtern', 'Menge filtern', 'Geprüft filtern', 'Anteil filtern']),
+    `each column filter must be labelled with its column, got ${JSON.stringify(labelled)}`
+  );
+
+  const live = await table.locator('.gw-tbl-count').getAttribute('aria-live');
+  assert(live === 'polite', `the row count must be a polite live region, got ${live}`);
+});
+
+await check('C3 aria-sort cycles ascending, descending, none — one column at a time', async (page) => {
+  const { table } = await loadTablePage(page);
+  assert(
+    JSON.stringify(await ariaSorts(table)) === JSON.stringify(['none', 'none', 'none', 'none']),
+    'every sortable column must state a sort of "none" before anything is sorted'
+  );
+
+  await sortBy(table, 0, 'ascending');
+  assert(
+    JSON.stringify(await ariaSorts(table)) ===
+      JSON.stringify(['ascending', 'none', 'none', 'none']),
+    'exactly one column may claim to be sorted'
+  );
+
+  await sortBy(table, 0, 'descending');
+  await sortBy(table, 0, 'none');
+
+  // Off means the order the author wrote, which in a document is itself information.
+  const back = await column(table, 0);
+  assert(
+    JSON.stringify(back) ===
+      JSON.stringify(['Öl', 'Apfel', 'Ähre', 'Zucker', 'Möhre', 'Äpfel', 'Bohne', 'Nuss']),
+    `a third press must restore document order, got ${JSON.stringify(back)}`
+  );
+});
+
+await check('C4 a numeric column sorts by value, with empties last both ways', async (page) => {
+  const { table } = await loadTablePage(page);
+
+  await sortBy(table, 1, 'ascending');
+  const up = await column(table, 1);
+  assert(
+    JSON.stringify(up) ===
+      JSON.stringify(['<0,5 g', '1,5 g', '3-5 g', '42 g', '80 g', '900 g', '1.200 g', '']),
+    `units, comparator prefixes, a range and a thousands point must all be read, got ${JSON.stringify(up)}`
+  );
+
+  await sortBy(table, 1, 'descending');
+  const down = await column(table, 1);
+  assert(
+    JSON.stringify(down) ===
+      JSON.stringify(['1.200 g', '900 g', '80 g', '42 g', '3-5 g', '1,5 g', '<0,5 g', '']),
+    `descending must reverse the values, got ${JSON.stringify(down)}`
+  );
+  // The one that a negated comparator gets wrong: the gap must NOT float to the top, where
+  // it reads as "these are the matches" and pushes the rows being hunted for off the bottom.
+  assert(down[down.length - 1] === '', 'an empty cell must stay last when sorting descending');
+});
+
+await check('C5 German text sorts as a German reader expects', async (page) => {
+  const { table } = await loadTablePage(page);
+  await sortBy(table, 0, 'ascending');
+  const names = await column(table, 0);
+  assert(
+    JSON.stringify(names) ===
+      JSON.stringify(['Ähre', 'Apfel', 'Äpfel', 'Bohne', 'Möhre', 'Nuss', 'Öl', 'Zucker']),
+    `codepoint order would put every umlaut after Z; got ${JSON.stringify(names)}`
+  );
+});
+
+await check('C6 a second sort keeps the first one inside its ties', async (page) => {
+  const { table } = await loadTablePage(page);
+  await sortBy(table, 0, 'ascending'); // by name
+  await sortBy(table, 2, 'ascending'); // then by the tick column, which has three ties
+
+  const ticks = await column(table, 2);
+  const names = await column(table, 0);
+  const combined = ticks.map((tick, i) => `${tick}:${names[i]}`);
+  assert(
+    JSON.stringify(combined) ===
+      JSON.stringify([
+        '❌:Apfel',
+        '❌:Nuss',
+        '❌:Zucker',
+        '✅:Ähre',
+        '✅:Bohne',
+        '✅:Möhre',
+        '✅:Öl',
+        '—:Äpfel'
+      ]),
+    `inside each group the previous sort must survive, and a lone dash counts as empty; got ${JSON.stringify(combined)}`
+  );
+  assert(combined.length === 8, 'no row may be lost or duplicated by sorting');
+});
+
+await check('C7 filtering changes the count and never hides the total', async (page) => {
+  const { table } = await loadTablePage(page);
+  const search = table.locator('.gw-tbl-bar input');
+
+  await search.fill('öl');
+  await until(
+    async () => {
+      const saw = await table.locator('.gw-tbl-count').textContent();
+      return { ok: saw === '1 von 8 Zeilen', saw };
+    },
+    'the row count must state both the visible rows and the total'
+  );
+  assert((await table.locator('tbody tr').count()) === 1, 'exactly one row matches "öl"');
+
+  // Case and umlaut marks are folded, so a filter typed in a hurry still finds the row.
+  await search.fill('OL');
+  await until(
+    async () => {
+      const saw = await table.locator('.gw-tbl-count').textContent();
+      return { ok: saw === '1 von 8 Zeilen', saw };
+    },
+    '"OL" must find "Öl" — a filter that only matches perfect spelling is a filter nobody uses'
+  );
+
+  // A column filter confines itself to its column.
+  await search.fill('');
+  await table.locator('.gw-tbl-filter input').nth(2).fill('✅');
+  await until(
+    async () => {
+      const saw = await table.locator('.gw-tbl-count').textContent();
+      return { ok: saw === '4 von 8 Zeilen', saw };
+    },
+    'the tick column filter must keep exactly the four ticked rows'
+  );
+
+  // Reset puts everything back and then has nothing left to do.
+  await table.locator('.gw-tbl-reset').click();
+  await until(
+    async () => {
+      const saw = await table.locator('.gw-tbl-count').textContent();
+      return { ok: saw === '8 von 8 Zeilen', saw };
+    },
+    'resetting the filters must restore every row'
+  );
+  assert(
+    await table.locator('.gw-tbl-reset').isDisabled(),
+    'with nothing filtered the reset button must not offer to do anything'
+  );
+});
+
+await check('C8 a filter that matches nothing says so', async (page) => {
+  // An empty tbody looks like a broken table. Saying "0 von 8" and naming the reason is the
+  // difference between a filtered table and a lost one.
+  const { table } = await loadTablePage(page);
+  await table.locator('.gw-tbl-bar input').fill('zzzz');
+  await until(
+    async () => {
+      const saw = await table.locator('.gw-tbl-count').textContent();
+      return { ok: saw === '0 von 8 Zeilen', saw };
+    },
+    'the count must report zero against the total'
+  );
+  const empty = table.locator('.gw-tbl-empty');
+  await empty.waitFor({ state: 'visible', timeout: 5_000 });
+  assert(
+    (await empty.getAttribute('colspan')) === '4',
+    'the message must span the table rather than sitting under the first column'
+  );
+});
+
+await check('C9 a sort button works from the keyboard, with Enter and with Space', async (page) => {
+  const { table } = await loadTablePage(page);
+  const button = table.locator('.gw-tbl-sort').nth(1);
+  await button.focus();
+
+  await page.keyboard.press('Enter');
+  await until(
+    async () => {
+      const saw = await ariaSorts(table);
+      return { ok: saw[1] === 'ascending', saw };
+    },
+    'Enter did not sort the column'
+  );
+
+  // Space too. A div with a click handler answers Enter through no mechanism at all and
+  // Space never — which is exactly the failure a real <button> exists to prevent.
+  await page.keyboard.press(' ');
+  await until(
+    async () => {
+      const saw = await ariaSorts(table);
+      return { ok: saw[1] === 'descending', saw };
+    },
+    'Space did not sort the column'
+  );
+
+  assert(
+    await button.evaluate((el) => el === document.activeElement),
+    'focus must stay on the button that was pressed'
+  );
+});
+
+await check('C10 the header stays put while the table scrolls under it', async (page) => {
+  // Sized so eight rows cannot fit in the box's 70vh, which is what makes the box a real
+  // scrollport — a sticky header in a box that never scrolls looks correct and does nothing.
+  await page.setViewportSize({ width: 1280, height: 320 });
+  const { table } = await loadTablePage(page);
+  const box = table.locator('.gw-tbl-scroll');
+
+  const scrollable = await box.evaluate((el) => el.scrollHeight > el.clientHeight + 1);
+  assert(scrollable, 'the scroll box must actually scroll vertically at this height');
+
+  const geometry = await box.evaluate(async (el) => {
+    el.scrollTop = 200;
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    const th = el.querySelector('thead th');
+    const firstRow = el.querySelector('tbody tr');
+    return {
+      offset: th.getBoundingClientRect().top - el.getBoundingClientRect().top,
+      firstRowTop: firstRow.getBoundingClientRect().top,
+      headerTop: th.getBoundingClientRect().top,
+      background: getComputedStyle(th).backgroundColor
+    };
+  });
+  assert(
+    Math.abs(geometry.offset) < 2,
+    `the header must sit at the top of the scrolled box, it sat ${geometry.offset}px away`
+  );
+  assert(
+    geometry.firstRowTop < geometry.headerTop,
+    'the first row must have scrolled up behind the header, not stayed below it'
+  );
+  // Without an opaque background the rows scroll THROUGH the header and both become
+  // unreadable — which is a rendering bug that a geometry assertion alone cannot see.
+  assert(
+    geometry.background !== 'rgba(0, 0, 0, 0)' && geometry.background !== 'transparent',
+    `the sticky header must be opaque, computed background was ${geometry.background}`
+  );
+});
+
 await browser.close();
 
 // ---------------------------------------------------------------------------------------

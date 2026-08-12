@@ -1,0 +1,22 @@
+[package]
+name = "gw-collab"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gw-core = { path = "../gw-core" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+# `yrs` is the Rust implementation of the same CRDT the browser runs, so server and client
+# converge by construction rather than through an interop layer we would have to test.
+#
+# 0.27 rather than the 0.21 the M3 plan named: 0.21 pins `thiserror 1`, which would put a
+# second major version of it in a workspace that has otherwise moved to 2. The wire format
+# is unchanged between them — item clocks are UTF-16 counted in both, which is what makes
+# an update from a JavaScript client mean the same thing here.
+yrs = "0.27"

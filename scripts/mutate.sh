@@ -317,6 +317,67 @@ mutation crates/gw-store/src/acl.rs killed \
   's/Visibility::Restricted => baseline >= Baseline::Admin,/Visibility::Restricted => true,/' \
   'acl: restricted documents are not readable by everyone'
 
+# --- revisions: the append-only history under every page -----------------------------
+#
+# Two different kinds of wrong answer live here, and both are below.
+#
+# The first is an ordinary disclosure. A revision body IS page content — it is the page as
+# it was last Tuesday — so `revisions_for` and `revision_for` are retrievers in the sense
+# architecture rule 2 means, and handing one to somebody who cannot read the page is the
+# same leak as handing them the page. Both gates go through `document_for`, so what these
+# mutations really check is that the call is still there and still asks for the right
+# action.
+#
+# The second is subtler and has no equivalent elsewhere in this file: a revision is a
+# RECORD OF WHO. The byline is what a reader trusts to answer "who wrote this", and three
+# things have to hold for that trust to be warranted — the author is the authenticated
+# principal and not a name a caller supplied; the id recorded is the principal's id; and
+# the name is the display name as it was at the time, which is what makes attribution
+# survive the account being deleted (D-M3-4). Each is one mutation.
+#
+# The anonymous mutation needs the same fixture trick the audit log needed. `can()` answers
+# an `Anyone` grant BEFORE it looks at authentication — that is what a public share link is
+# — so `an_anonymous_caller_cannot_publish_even_where_anyone_may_write` puts `anyone: write`
+# on the path deliberately. Without that grant no subject would match, the publish would be
+# refused by the permission check, and the test would pass with the authentication check
+# deleted: the right assertion for the wrong reason, which is the failure this whole file
+# exists to catch.
+mutation crates/gw-store/src/revisions.rs killed \
+  's/        if !self.may(author, document_id, Action::Write).await? {/        if !self.may(author, document_id, Action::Read).await? {/' \
+  'revisions: publishing needs WRITE on the page, never merely read (D-M2-8)'
+mutation crates/gw-store/src/revisions.rs killed \
+  's/        if !author.is_authenticated() || !author.active {/        if false {/' \
+  'revisions: an edit is attributed to a signed-in account, established before any grant is consulted'
+mutation crates/gw-store/src/revisions.rs killed \
+  's/        if !self.may(principal, document_id, Action::Read).await? {/        if false {/' \
+  "revisions: a page's history is handed only to somebody who may read the page (D-M3-5)"
+mutation crates/gw-store/src/revisions.rs killed \
+  's/        if !readable {/        if false {/' \
+  'revisions: one revision body is gated by the same read as the page it belongs to'
+mutation crates/gw-store/src/revisions.rs killed \
+  's/        .bind(&author.id)/        .bind(\&author.username)/' \
+  'revisions: the author recorded is the principal, by id — the thing a rename cannot move'
+mutation crates/gw-store/src/revisions.rs killed \
+  's/        .bind(byline(author))/        .bind(author.username.as_str())/' \
+  'revisions: the byline is the display name as it was then, which is what survives deletion'
+# Not a disclosure, but the two ways a history can be quietly wrong about ITSELF. The
+# timeline and the parent chain are read against each other by diff, restore and blame; if
+# they disagree, every one of those answers something else's question.
+mutation crates/gw-store/src/revisions.rs killed \
+  's/WHERE document_id = ?1 ORDER BY created_at DESC, id DESC/WHERE document_id = ?1 ORDER BY created_at DESC/' \
+  "revisions: the timeline breaks ties on the uuid v7 id — datetime('now') is per-second, so two edits in one second are otherwise unordered"
+mutation crates/gw-store/src/revisions.rs killed \
+  's/sqlx::query_scalar("SELECT current_revision_id FROM documents WHERE id = ?1")/sqlx::query_scalar("SELECT NULL FROM documents WHERE id = ?1")/' \
+  'revisions: parent_id is the revision the document actually pointed at, not NULL for everything'
+# The schema half of append-only. `BEFORE UPDATE ON revisions` is NOT the line to mutate —
+# pointing the trigger at another table makes the migration itself fail, because the table
+# is created further down, and 109 tests then die of "no such table". That kills the entry
+# while proving nothing about the defence. Emptying the trigger's body leaves the migration
+# valid and the trigger firing, and exactly one test notices.
+mutation crates/gw-store/migrations/0008_revisions.sql killed \
+  "s/    SELECT RAISE(ABORT, 'revisions are append-only: publish a new one instead');/    SELECT 1;/" \
+  'revisions: the append-only trigger actually refuses an UPDATE, rather than merely existing'
+
 # --- crash recovery ------------------------------------------------------------------
 #
 # A trap does not survive SIGKILL, and a killed run leaves the mutated file in place.
@@ -352,6 +413,10 @@ readonly MARKER="$BACKUP_DIR/in-progress"
 # reports a hole and one that closes it.
 readonly PRISTINE_DIR="$BACKUP_DIR/pristine"
 readonly MANIFEST="$BACKUP_DIR/pristine.sha256"
+# What the REST of the tree looked like. `verify_tree` guards the files a mutation writes
+# to; nothing guarded the files the suite merely READS, and a verdict can be flipped by
+# either. See `note_drift` for the run where that happened.
+readonly TREE_STATE="$BACKUP_DIR/tree-state"
 
 mkdir -p "$BACKUP_DIR"
 
@@ -377,7 +442,44 @@ if [ -f "$MARKER" ]; then
 fi
 
 filter="${1:-}"
-killed=0 survived=0 unexpected=0
+killed=0 survived=0 unexpected=0 drifted=0
+drifted_at=()
+
+# Did anything ELSE in the repository change while that mutation was being scored?
+#
+# `verify_tree` answers a narrower question — are the files this run MUTATES still what
+# they were — and it answers it well. It cannot see the other half. A mutation is scored
+# KILLED because a test failed, and a test can fail because somebody edited a FIXTURE the
+# suite reads. Nothing in this file touches such a file, so nothing checks it.
+#
+# That is not hypothetical. On 2026-08-12, with several agents working in this repository
+# at once, `content-example/rundgang/tabellen.md` was edited between the preflight and the
+# invites mutations. `crates/gw-api/tests/seed.rs` reads that directory, it failed, and the
+# entry recorded as `equivalent` was reported as "the suite killed it — the note is wrong".
+# Re-running it alone on a quiet tree gave `(equiv)` immediately. The verdict was false and
+# nothing in the output said so; the note it accused had been right all along.
+#
+# This WARNS and does not fail. Voiding a four-minute run because somebody saved a Svelte
+# file would be a check that cries wolf, and this file has already learned where those end
+# up. What it does instead is name the mutation whose window the change landed in, so the
+# reader knows which line not to believe — and then re-baselines, so one edit is attributed
+# to one verdict rather than to every verdict after it.
+note_drift() {
+  local description="$1" now
+  [ -f "$TREE_STATE" ] || return 0
+  # If git cannot answer, say nothing. It failed for a second the first time this ran,
+  # because another agent's `git` held `.git/index.lock`, and the empty output that came
+  # back was compared as though every file in the repository had vanished — fifteen lines
+  # of alarm about a tree that was fine. An answer a command could not give is not evidence.
+  now="$(git status --porcelain=v1 2>/dev/null)" || return 0
+  [ "$now" = "$(cat "$TREE_STATE")" ] && return 0
+  echo "           WARNING: the repository changed while this was being scored. If a test"
+  echo "                    reads what changed, this verdict means nothing. Re-run it alone."
+  diff <(cat "$TREE_STATE") <(echo "$now") | grep '^[<>]' | sed 's/^/                    /'
+  printf '%s' "$now" > "$TREE_STATE"
+  drifted=$((drifted + 1))
+  drifted_at+=("$description")
+}
 
 # HOW LONG THIS IS ALLOWED TO TAKE
 # --------------------------------
@@ -619,6 +721,12 @@ preflight() {
     # shellcheck disable=SC2046
     sha256sum $(selected_files) > "$MANIFEST" 2>/dev/null || true
   fi
+
+  # 5. And everything else, as a baseline for `note_drift`. Taken AFTER the preflight suite
+  #    run, so it describes the tree the first mutation is actually scored against. If git
+  #    cannot answer, the file is removed rather than left empty: `note_drift` skips a
+  #    missing baseline, and would read an empty one as "everything has changed".
+  git status --porcelain=v1 > "$TREE_STATE" 2>/dev/null || rm -f "$TREE_STATE"
 }
 
 preflight
@@ -690,6 +798,8 @@ for entry in "${MUTATIONS[@]}"; do
       echo "           recorded as equivalent but the suite killed it — the note is wrong."
       unexpected=$((unexpected + 1)) ;;
   esac
+  # After the verdict, so the warning sits directly under the line it casts doubt on.
+  note_drift "$description"
 done
 
 # The last word, and it is about the tree rather than about the mutations: a summary
@@ -701,6 +811,13 @@ echo
 # and the last time it stopped being run it was because it had quietly grown past ten
 # minutes — which nothing in its own output said.
 printf 'mutation testing: %dm %02ds total\n' $((SECONDS / 60)) $((SECONDS % 60))
+if [ "$drifted" -gt 0 ]; then
+  echo "mutation testing: $drifted verdict(s) were scored while the repository was being"
+  echo "                  changed underneath them, and are not evidence of anything:"
+  printf '                    %s\n' "${drifted_at[@]}"
+  echo "                  Re-run each one alone — \`scripts/mutate.sh <words from it>\` —"
+  echo "                  with nothing else writing to the tree."
+fi
 if [ "$survived" -gt 0 ] || [ "$unexpected" -gt 0 ]; then
   echo "mutation testing: $killed as expected, $survived survived, $unexpected mis-recorded"
   exit 1

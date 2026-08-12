@@ -5,6 +5,7 @@ pub mod documents;
 pub mod invites;
 pub mod login_attempts;
 pub mod principals;
+pub mod revisions;
 pub mod sessions;
 
 pub use acl::Baseline;
@@ -17,6 +18,7 @@ pub use invites::{
 };
 pub use login_attempts::{LoginScope, LOGIN_FAILURE_LIMIT, LOGIN_LOCKOUT_SECONDS};
 pub use principals::TeamSummary;
+pub use revisions::Revision;
 pub use sessions::SESSION_TTL_SECONDS;
 
 use anyhow::Result;
