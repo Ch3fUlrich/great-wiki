@@ -101,7 +101,9 @@ system with only trash cannot do that at all, and eventually has to.
 ## File Structure
 
 ```
-crates/gw-store/migrations/0004_revisions.sql   revisions, crdt state, trash
+crates/gw-store/migrations/0008_revisions.sql   revisions, crdt state, trash
+                                                (planned as 0004; M2 shipped through
+                                                 0007_invites, so this renumbered)
 crates/gw-collab/Cargo.toml                     the CRDT: awareness, updates, snapshots
 crates/gw-collab/src/doc.rs                     yrs <-> Block conversion
 crates/gw-collab/src/room.rs                    per-document room, broadcast, persistence
@@ -123,7 +125,7 @@ where fidelity is lost if it is wrong — is unit-testable with no network.
 ## Task 1: The revision model
 
 **Files:**
-- Create: `crates/gw-store/migrations/0004_revisions.sql`
+- Create: `crates/gw-store/migrations/0008_revisions.sql`
 - Create: `crates/gw-store/src/revisions.rs`
 - Modify: `crates/gw-store/src/lib.rs`
 - Modify: `CHANGELOG.md`
@@ -139,7 +141,7 @@ where fidelity is lost if it is wrong — is unit-testable with no network.
 
 - [ ] **Step 1: Write the migration**
 
-`crates/gw-store/migrations/0004_revisions.sql`:
+`crates/gw-store/migrations/0008_revisions.sql`:
 ```sql
 -- Revisions are APPEND-ONLY and never updated in place. That is what makes diff, restore
 -- and blame trivial rather than features, and what makes "restore" safe: restoring
