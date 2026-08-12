@@ -16,16 +16,34 @@ sign-in works against either — but only one of them is a service.
 
 ## Who can reach it
 
-**Nobody outside the LAN.** No name under `ohje.ooguy.com` resolves in public DNS — not the
-apex either — so from the internet the wiki does not exist. On the home network it is
-`192.168.178.76`, the OPNsense Caddy.
+**The whole internet.** `wiki.ohje.ooguy.com` resolves publicly to `109.250.70.12`.
 
-Making it reachable from outside is not a deployment change, it is a decision: it needs a
-public record *and* an answer to what an anonymous visitor may see. Today that second half
-is moot, because every imported page is `restricted` and an anonymous caller gets `[]` from
-`/api/tree` and 403 from every document. That is the fail-closed default doing its job, not
-a configuration to rely on — publish one page and it is world-readable to whoever can reach
-the host.
+This document first said the opposite, and the way that happened is worth keeping: `dig`
+against 1.1.1.1, 8.8.8.8 and 9.9.9.9 all returned empty, so the name looked unresolvable —
+but **outbound DNS to public resolvers is blocked from coding.vm**, and a control query for
+`example.com` came back just as empty. Three resolvers agreeing meant nothing; they were
+all failing the same way. Anything measured from inside this network about what the outside
+can see must be checked from outside it — resolving through a DoH endpoint, or fetching the
+site from somewhere else entirely.
+
+What stands between the internet and the content:
+
+- Every imported page is `restricted`, so an anonymous caller gets `[]` from `/api/tree`
+  and 403 from every document. **This is the only thing making the corpus private**, and it
+  is a per-page property: publishing one page makes it world-readable. There is no second
+  gate behind it.
+- `/api/me` answers anonymously but reports nothing — no username, no groups, no hint that
+  any particular account exists.
+- Admin sign-in is Authelia OIDC with `authorization_policy: two_factor`.
+- Local accounts (from invites) are a password login exposed to the internet. It is rate
+  limited at ten failures per five minutes, counted **twice** — once per submitted username
+  and once per client address — so neither a single account nor a single source can be
+  ground down, and a wrong username costs the attacker the same as a right one.
+- HSTS (two years, `includeSubDomains`, `preload`), `nosniff`, `SAMEORIGIN` and
+  `strict-origin-when-cross-origin` come from the edge's `secure_headers` snippet.
+
+**Known gap: there is no Content-Security-Policy.** For a wiki that renders authored
+content to the public internet, that is the header that matters most and it is absent.
 
 ## Where the content actually is
 
