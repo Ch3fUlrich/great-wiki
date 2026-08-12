@@ -16,16 +16,26 @@ path = "src/main.rs"
 
 [dependencies]
 gw-auth = { path = "../gw-auth" }
+gw-collab = { path = "../gw-collab" }
 gw-core = { path = "../gw-core" }
 gw-store = { path = "../gw-store" }
 anyhow = { workspace = true }
-axum = "0.8"
+# `ws` for the collaboration endpoint. It is the only feature added here, and it brings
+# `tokio-tungstenite` with it — which the collaboration tests then use as a CLIENT, pinned
+# to the same version in `dev-dependencies` so the suite cannot end up speaking a different
+# protocol implementation from the one the server compiled against.
+axum = { version = "0.8", features = ["ws"] }
 # Cookies only. The session cookie is how a request names its principal, and parsing a
 # `Cookie:` header by hand is a small thing to get subtly wrong for something that decides
 # who somebody is.
 axum-extra = { version = "0.10", default-features = false, features = ["cookie"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
+# `StreamExt::split`, so one task can read a socket and write to it from the same select
+# loop. `futures-util` rather than the `futures` facade the M3 plan named: the facade adds
+# an executor, a channel implementation and `futures-task` for one method, and axum has
+# already put this exact crate in the tree.
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # ID-token verification. Pure-Rust backend (`rust_crypto`) rather than `aws_lc_rs`: no C
 # toolchain in the build, and `rsa` is already in the tree.
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
@@ -71,4 +81,12 @@ url = "2.5"
 rsa = "0.9"
 tempfile = "3"
 tokio = { workspace = true }
+# The WebSocket CLIENT the collaboration tests drive the endpoint with. A refusal that is
+# a CLOSE frame rather than a status code can only be observed over a real socket, so
+# those tests bind a real listener instead of calling the router in-process.
+#
+# Pinned to the version `axum`'s `ws` feature already brings in. Two versions of it would
+# compile twice and, worse, would mean the suite proves an interop property against an
+# implementation the server does not use.
+tokio-tungstenite = "0.29"
 tower = { version = "0.5", features = ["util"] }

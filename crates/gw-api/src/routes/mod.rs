@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod collab;
 pub mod docs;
 pub mod tree;
 
@@ -95,6 +96,13 @@ pub struct AppState {
     /// It is deliberately NOT in the database — see [`crate::view_as::Registry`]: losing
     /// every session of it on restart is a property, not a cost.
     pub view_as: Arc<crate::view_as::Registry>,
+    /// Every open editing session, and the limits they run under.
+    ///
+    /// In the state for the same reason `view_as` is: two servers in one process are two
+    /// servers, and a `static` would let a test's rooms be another test's rooms. Unlike the
+    /// view-as registry, losing this on restart is a COST rather than a property — it holds
+    /// what people have typed — which is what [`collab::sweep`] is for.
+    pub collab: Arc<collab::CollabState>,
 }
 
 impl AppState {
@@ -109,7 +117,7 @@ impl AppState {
         oidc: Option<Arc<OidcClient>>,
         corpus: Arc<dyn BreachRange>,
     ) -> Self {
-        Self {
+        let state = Self {
             store,
             dev_identity,
             proxy_guard,
@@ -118,7 +126,16 @@ impl AppState {
             hashing: HashingCost::PRODUCTION,
             placeholder: Arc::new(OnceLock::new()),
             view_as: Arc::new(crate::view_as::Registry::default()),
-        }
+            collab: Arc::new(collab::CollabState::default()),
+        };
+        // A server that holds editing sessions in memory and never writes them out loses
+        // them, so the janitor starts with the state that owns them rather than being one
+        // more thing a composition root has to remember. It is started HERE and not in
+        // `build_router` because a test builds routers by the hundred and needs no
+        // background task behind each of them — `collab::sweep` is driven directly there,
+        // which is also the only way eviction can be asserted without sleeping.
+        collab::spawn_janitor(state.clone());
+        state
     }
 
     /// Unenforced, matching the loopback bind a test implies. Tests that are about the
@@ -147,6 +164,10 @@ impl AppState {
             hashing: HashingCost::CHEAP_FOR_TESTS,
             placeholder: Arc::new(OnceLock::new()),
             view_as: Arc::new(crate::view_as::Registry::default()),
+            // No janitor: a test drives `collab::sweep` itself, which is what makes
+            // "the room was written out and then evicted" assertable in milliseconds
+            // rather than at the production interval.
+            collab: Arc::new(collab::CollabState::default()),
         }
     }
 
@@ -328,6 +349,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/tree", get(tree::get_tree))
         .route("/api/documents/{*path}", get(docs::get_document))
+        .merge(collab::routes())
         .merge(admin::routes())
         .merge(crate::auth::routes())
         .merge(crate::view_as::routes())

@@ -8,6 +8,24 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- Collaborative editing over a WebSocket at `/api/collab/{path}`. Authorisation happens
+  before the upgrade and asks for `Action::Write` through the store's one permission-checked
+  accessor: reading a page is not permission to join its editing session, and an
+  administrator viewing as somebody else cannot open one at all — an upgrade is a GET, so
+  the layer that refuses every mutating request while that mode is active did not cover it.
+  That hole was open, and a snapshot of such a session would have been filed in the
+  append-only history under the impersonating administrator's name.
+- The session is re-authorised every ten seconds and closed with a policy code and a reason
+  when it should no longer exist — a revoked grant, a deactivated account, an ended session
+  or a deleted page. A malformed or forged update closes the connection rather than being
+  discarded, because a socket that swallows updates looks to the person typing like an
+  editor that is saving their work.
+- `POST /api/collab/{path}` publishes what is in the live session as a revision, and a
+  background sweep writes out every room that has changed every thirty seconds and drops the
+  ones nobody is in — so an unpublished editing session survives a restart, and a crash can
+  lose at most that interval.
+- Limits, because the endpoint faces the internet: one mebibyte a message, 240 messages and
+  one mebibyte a second per connection, thirty-two connections per page.
 - A reader can now see where a page sits, what hangs below it, and who is allowed to read
   it. Every page carries a breadcrumb from the root — titles taken from the tree, never
   assembled from path segments, so a page whose ancestors the caller may not see gets no
