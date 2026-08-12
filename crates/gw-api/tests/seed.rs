@@ -431,7 +431,7 @@ async fn autorin(store: &Store, path: &str) -> Principal {
 
 #[tokio::test]
 async fn without_the_flag_an_existing_page_is_still_refused_not_overwritten() {
-    // The default has not moved: `insert_document`'s UNIQUE constraint stays the authority
+    // The default has not moved: `create_document`'s UNIQUE constraint stays the authority
     // and a collision is an error. Updating had to be a separate, named act, not a relaxed
     // constraint.
     let store = loaded(&[("notiz.md", "---\ntitle: Notiz\n---\nAlt.\n")]).await;
@@ -470,10 +470,17 @@ async fn with_the_flag_the_body_is_updated_and_the_old_one_stays_in_the_history(
     assert!(doc.body.contains("Neu."), "{}", doc.body);
 
     // "Update" must not mean "replace": the previous text is still readable, attributed,
-    // and restorable. That is the whole difference between this and `ON CONFLICT DO UPDATE`.
+    // and restorable. That is the whole difference between this and `ON CONFLICT DO UPDATE`
+    // — and it only became demonstrable when creation started publishing revision 1. Before
+    // that this page's first body existed nowhere but in the column the update overwrote,
+    // so "the old one stays in the history" was a claim the test could not check.
     let autorin = Principal::test("autorin", &[], &[]);
     let history = store.revisions_for(&autorin, &doc.id).await.unwrap();
-    assert_eq!(history.len(), 1, "one revision for one change");
+    assert_eq!(
+        history.len(),
+        2,
+        "the import created one, the update added one"
+    );
     assert!(history[0].body.contains("Neu."));
     assert_eq!(history[0].author_name, "autorin");
     assert!(
@@ -483,6 +490,22 @@ async fn with_the_flag_the_body_is_updated_and_the_old_one_stays_in_the_history(
             .is_some_and(|s| s.contains("notiz.md")),
         "the history must say where the change came from: {:?}",
         history[0].summary
+    );
+
+    assert!(
+        history[1].body.contains("Alt."),
+        "the text the update replaced must still be in the history: {}",
+        history[1].body
+    );
+    assert!(
+        !history[1].author_is_an_account(),
+        "the operator import wrote it, and no account did"
+    );
+    assert_eq!(
+        history[0].parent_id.as_deref(),
+        Some(history[1].id.as_str()),
+        "the update must be published ON TOP of revision 1, not beside it — a chain with a \
+         break in it is what makes a diff have nothing to compare against"
     );
 }
 
@@ -501,13 +524,16 @@ async fn a_file_that_says_what_the_page_already_holds_writes_nothing_at_all() {
 
     let doc = fetch(&store, "/notiz").await.unwrap();
     let autorin = Principal::test("autorin", &[], &[]);
+    let history = store.revisions_for(&autorin, &doc.id).await.unwrap();
+    assert_eq!(
+        history.len(),
+        1,
+        "re-seeding must not add a second revision saying the same thing; the one revision \
+         here is the one the import created"
+    );
     assert!(
-        store
-            .revisions_for(&autorin, &doc.id)
-            .await
-            .unwrap()
-            .is_empty(),
-        "an unchanged page must not appear in its own history"
+        !history[0].author_is_an_account(),
+        "and it is still the import's, not the account that re-ran the command"
     );
 }
 
@@ -779,6 +805,133 @@ async fn a_file_holding_formatting_the_database_cannot_store_says_so_on_an_updat
     assert!(notes.contains("inline-marks"), "{notes}");
     assert!(notes.contains("emphasis dropped"), "{notes}");
     assert!(notes.contains("destination dropped"), "{notes}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Revision 1: the history an import leaves behind for the first edit to build on
+// ---------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_imported_page_starts_with_exactly_one_revision_holding_its_body() {
+    // The defect this section exists for: creating a page wrote `documents.body` and no
+    // revision, so the first edit anybody made became revision 1 with no parent and the
+    // first diff had nothing to compare against. The imported text was attributed to
+    // nothing at all.
+    let store = loaded(&[("notiz.md", "---\ntitle: Notiz\n---\nErster Text.\n")]).await;
+    let doc = fetch(&store, "/notiz").await.unwrap();
+
+    let history = store.revisions_for(&admin(), &doc.id).await.unwrap();
+    assert_eq!(
+        history.len(),
+        1,
+        "an imported page must not start with an empty history"
+    );
+    assert_eq!(
+        history[0].body, doc.body,
+        "revision 1 must say exactly what the page says"
+    );
+    assert!(
+        history[0].parent_id.is_none(),
+        "revision 1 is the first: it has nothing behind it"
+    );
+    assert!(
+        history[0]
+            .summary
+            .as_deref()
+            .is_some_and(|s| s.contains("notiz.md")),
+        "revision 1 must say where the page came from, exactly as an update does: {:?}",
+        history[0].summary
+    );
+}
+
+#[tokio::test]
+async fn an_operator_import_files_revision_one_under_nobody_rather_than_a_person() {
+    // `seed` with no `--as` is the identity-less bootstrap path — it is how the production
+    // corpus was loaded — and it has no author to name. So it names none, rather than
+    // borrowing whichever account happened to be handy: `author_name` is a snapshot that is
+    // deliberately never corrected afterwards, so a wrong one is wrong for ever.
+    let store = loaded(&[("notiz.md", "---\ntitle: Notiz\n---\nText.\n")]).await;
+    let doc = fetch(&store, "/notiz").await.unwrap();
+    let history = store.revisions_for(&admin(), &doc.id).await.unwrap();
+
+    assert_eq!(history[0].author_id, gw_store::IMPORT_AUTHOR_ID);
+    assert_eq!(history[0].author_name, gw_store::IMPORT_AUTHOR_NAME);
+    assert!(
+        !history[0].author_is_an_account(),
+        "whatever renders a byline must be able to tell this from a person without \
+         reading the name"
+    );
+    assert!(
+        store
+            .principal_by_username(gw_store::IMPORT_AUTHOR_NAME)
+            .await
+            .unwrap()
+            .is_none(),
+        "the import byline must not be a username anybody could sign in as"
+    );
+}
+
+#[tokio::test]
+async fn an_import_as_an_account_files_revision_one_under_that_account() {
+    // `seed --as <account>`: the account is subject to permissions on the way in, and is
+    // the author on the way out — the same answer the editor will give when a person
+    // creates a page in the browser.
+    let store = loaded(&[(
+        "handbuch.md",
+        "---\ntitle: Handbuch\nvisibility: public\n---\nText.\n",
+    )])
+    .await;
+    let who = granted(&store, "autorin", "/handbuch", Permission::Write).await;
+    let report = again(
+        &store,
+        &[
+            (
+                "handbuch.md",
+                "---\ntitle: Handbuch\nvisibility: public\n---\nText.\n",
+            ),
+            (
+                "handbuch/neu.md",
+                "---\ntitle: Neu\nvisibility: public\n---\nEin Satz.\n",
+            ),
+        ],
+        &who,
+        true,
+    )
+    .await;
+    assert_eq!(report.count(Outcome::Created), 1, "{report}");
+
+    let child = fetch(&store, "/handbuch/neu").await.unwrap();
+    let history = store.revisions_for(&admin(), &child.id).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].author_id, who.id, "the named account wrote it");
+    assert_eq!(history[0].author_name, "autorin");
+    assert!(history[0].author_is_an_account());
+
+    // …and the page the operator created in the same wiki is still attributed honestly.
+    let parent = fetch(&store, "/handbuch").await.unwrap();
+    let parent_history = store.revisions_for(&admin(), &parent.id).await.unwrap();
+    assert_eq!(parent_history[0].author_id, gw_store::IMPORT_AUTHOR_ID);
+}
+
+#[tokio::test]
+async fn re_seeding_a_corpus_does_not_add_a_second_revision() {
+    // The default path: a second run over the same directory is refused as a collision, so
+    // nothing is written — and in particular no duplicate revision 1. Re-running the seeder
+    // is the most ordinary thing anybody does with it, and a history that grows a row each
+    // time says the page changed when it did not.
+    let file = &[("notiz.md", "---\ntitle: Notiz\n---\nText.\n")];
+    let store = loaded(file).await;
+    let doc = fetch(&store, "/notiz").await.unwrap();
+    let first = store.revisions_for(&admin(), &doc.id).await.unwrap();
+    assert_eq!(first.len(), 1);
+
+    let dir = corpus(file);
+    let second = seed::run(&store, dir.path()).await.unwrap();
+    assert!(!second.is_complete(), "{second}");
+
+    let after = store.revisions_for(&admin(), &doc.id).await.unwrap();
+    assert_eq!(after.len(), 1, "the refused run wrote a revision anyway");
+    assert_eq!(after[0].id, first[0].id, "and it is the same one");
 }
 
 #[tokio::test]

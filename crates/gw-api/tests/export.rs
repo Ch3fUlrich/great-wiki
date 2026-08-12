@@ -11,7 +11,7 @@ use gw_api::export::{self, ExportReport, FIDELITY_FILE};
 use gw_api::seed;
 use gw_auth::{Action, Principal};
 use gw_core::{Block, DocumentType, Visibility};
-use gw_store::{NewDocument, Store};
+use gw_store::{Author, NewDocument, Store};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -290,16 +290,20 @@ async fn a_document_markdown_cannot_hold_is_refused_and_no_file_is_written() {
     )
     .unwrap();
     store
-        .insert_document(&NewDocument {
-            parent_path: None,
-            doc_type: DocumentType::Page,
-            title: "Zwei Absätze in einer Zelle".into(),
-            slug: None,
-            language: "de".into(),
-            visibility: Visibility::Public,
-            body,
-            sort_key: 0,
-        })
+        .create_document(
+            Author::Import,
+            &NewDocument {
+                parent_path: None,
+                doc_type: DocumentType::Page,
+                title: "Zwei Absätze in einer Zelle".into(),
+                slug: None,
+                language: "de".into(),
+                visibility: Visibility::Public,
+                body,
+                sort_key: 0,
+            },
+            None,
+        )
         .await
         .unwrap();
 
@@ -344,16 +348,20 @@ async fn a_heading_that_repeats_the_title_is_refused_rather_than_dropped_on_the_
     )
     .unwrap();
     store
-        .insert_document(&NewDocument {
-            parent_path: None,
-            doc_type: DocumentType::Page,
-            title: "Notiz".into(),
-            slug: None,
-            language: "de".into(),
-            visibility: Visibility::Public,
-            body,
-            sort_key: 0,
-        })
+        .create_document(
+            Author::Import,
+            &NewDocument {
+                parent_path: None,
+                doc_type: DocumentType::Page,
+                title: "Notiz".into(),
+                slug: None,
+                language: "de".into(),
+                visibility: Visibility::Public,
+                body,
+                sort_key: 0,
+            },
+            None,
+        )
         .await
         .unwrap();
 

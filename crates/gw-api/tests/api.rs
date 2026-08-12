@@ -2,7 +2,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use gw_auth::Permission;
 use gw_core::{Block, DocumentType, Visibility};
-use gw_store::{NewDocument, Store};
+use gw_store::{Author, NewDocument, Store};
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -17,16 +17,20 @@ fn body() -> Block {
 
 async fn insert(store: &Store, parent: Option<&str>, title: &str, visibility: Visibility) {
     store
-        .insert_document(&NewDocument {
-            parent_path: parent.map(str::to_string),
-            doc_type: DocumentType::Page,
-            title: title.into(),
-            slug: None,
-            language: "de".into(),
-            visibility,
-            body: body(),
-            sort_key: 0,
-        })
+        .create_document(
+            Author::Import,
+            &NewDocument {
+                parent_path: parent.map(str::to_string),
+                doc_type: DocumentType::Page,
+                title: title.into(),
+                slug: None,
+                language: "de".into(),
+                visibility,
+                body: body(),
+                sort_key: 0,
+            },
+            None,
+        )
         .await
         .unwrap();
 }

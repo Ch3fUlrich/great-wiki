@@ -21,7 +21,7 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use gw_core::{Block, DocumentType, Visibility};
-use gw_store::{NewDocument, Store};
+use gw_store::{Author, NewDocument, Store};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -38,16 +38,20 @@ fn body() -> Block {
 
 async fn insert(store: &Store, parent: Option<&str>, slug: &str, title: &str, vis: Visibility) {
     store
-        .insert_document(&NewDocument {
-            parent_path: parent.map(str::to_string),
-            doc_type: DocumentType::Page,
-            title: title.into(),
-            slug: Some(slug.into()),
-            language: "de".into(),
-            visibility: vis,
-            body: body(),
-            sort_key: 0,
-        })
+        .create_document(
+            Author::Import,
+            &NewDocument {
+                parent_path: parent.map(str::to_string),
+                doc_type: DocumentType::Page,
+                title: title.into(),
+                slug: Some(slug.into()),
+                language: "de".into(),
+                visibility: vis,
+                body: body(),
+                sort_key: 0,
+            },
+            None,
+        )
         .await
         .unwrap();
 }

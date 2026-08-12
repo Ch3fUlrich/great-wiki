@@ -8,6 +8,29 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- An import creates the page **and** publishes its first revision, in one transaction.
+  Creating a document used to write the body straight into `documents` and record no
+  revision at all, so every seeded page began with an empty history: the first edit anybody
+  made became revision 1 with no parent, and the first diff had nothing to compare against.
+  A page can no longer exist with a body and no revision, nor a revision and no page — a
+  failure anywhere in between takes both back, which is forced in a test rather than argued
+  in a comment.
+- Revision 1 says who wrote it, including when the honest answer is "no account did".
+  `seed --as <account>` files it under that account. `seed` with no account — the operator
+  bootstrap path — files it under an author that is not a person and can never become one:
+  the id `system:import`, which is outside the space account ids are minted in, shown as
+  "Import (kein Konto)". Attributing a bootstrap corpus to whoever happened to run the
+  command is a lie a history then keeps for ever, because the byline is a snapshot that is
+  deliberately never corrected. Anything rendering a byline asks
+  `Revision::author_is_an_account()` rather than reading the name.
+- `Store::insert_document` is now `Store::create_document(author, doc, summary)`. The rename
+  is the point: it was one INSERT and is now a page together with its history, and the old
+  name is how a second write path sat unnoticed beside the revision system (AGENTS.md rule
+  1). Creation and editing now go through one function that writes a revision, so "a body
+  changes only by publishing a revision" is a property of the code rather than a rule
+  everyone has to remember.
+- Pages imported before this change keep their empty histories until they are imported
+  again; nothing was backfilled, because a revision nobody published is not history.
 - `great-wiki export --content <dir> --as <account>`: the page tree written back out as
   markdown with YAML frontmatter, folders mirroring the tree, so `export` then `seed` into
   an empty wiki reproduces the database exactly — proven over the shipped corpus, compared

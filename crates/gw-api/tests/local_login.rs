@@ -17,7 +17,7 @@ use gw_api::proxy_guard::ProxyGuard;
 use gw_api::AppState;
 use gw_auth::password::{hash_password_at, HashingCost};
 use gw_core::{Block, DocumentType, Visibility};
-use gw_store::{NewDocument, Store, LOGIN_FAILURE_LIMIT};
+use gw_store::{Author, NewDocument, Store, LOGIN_FAILURE_LIMIT};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -42,16 +42,20 @@ fn body_block() -> Block {
 
 async fn seed_store(store: &Store) {
     store
-        .insert_document(&NewDocument {
-            parent_path: None,
-            doc_type: DocumentType::Page,
-            title: "Öffentlich".into(),
-            slug: None,
-            language: "de".into(),
-            visibility: Visibility::Public,
-            body: body_block(),
-            sort_key: 0,
-        })
+        .create_document(
+            Author::Import,
+            &NewDocument {
+                parent_path: None,
+                doc_type: DocumentType::Page,
+                title: "Öffentlich".into(),
+                slug: None,
+                language: "de".into(),
+                visibility: Visibility::Public,
+                body: body_block(),
+                sort_key: 0,
+            },
+            None,
+        )
         .await
         .unwrap();
 }

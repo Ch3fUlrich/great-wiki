@@ -20,7 +20,7 @@ use gw_api::view_as::{Registry, VIEW_AS_COOKIE};
 use gw_api::{AppState, Identity};
 use gw_auth::{Permission, Subject};
 use gw_core::{Block, DocumentType, Visibility};
-use gw_store::{NewDocument, Store};
+use gw_store::{Author, NewDocument, Store};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,16 +41,20 @@ fn body() -> Block {
 /// against by name, and a change to the slug rules must not quietly move them.
 async fn insert(store: &Store, parent: Option<&str>, slug: &str, title: &str, vis: Visibility) {
     store
-        .insert_document(&NewDocument {
-            parent_path: parent.map(str::to_string),
-            doc_type: DocumentType::Page,
-            title: title.into(),
-            slug: Some(slug.into()),
-            language: "de".into(),
-            visibility: vis,
-            body: body(),
-            sort_key: 0,
-        })
+        .create_document(
+            Author::Import,
+            &NewDocument {
+                parent_path: parent.map(str::to_string),
+                doc_type: DocumentType::Page,
+                title: title.into(),
+                slug: Some(slug.into()),
+                language: "de".into(),
+                visibility: vis,
+                body: body(),
+                sort_key: 0,
+            },
+            None,
+        )
         .await
         .unwrap();
 }

@@ -13,6 +13,13 @@
 //! byline anybody can choose answers nothing. The author's id and a snapshot of their
 //! display name are both stored — see the migration for why both.
 //!
+//! A page's body changes in exactly one place: [`append_revision`]. Creating a document
+//! publishes revision 1 through it ([`Store::create_document`]) and every later edit
+//! publishes through it too ([`Store::publish_revision`]), which is why there is no way to
+//! end up with a body nothing in the history accounts for. It takes a connection rather
+//! than the pool precisely so creation can put the document and its first revision in ONE
+//! transaction; see its own comment.
+//!
 //! Everything public here takes a `Principal` and goes through [`Store::document_for`],
 //! which is the crate's single permission-checked document accessor. A revision body IS
 //! page content: handing one to somebody who cannot read the page is the same disclosure
@@ -33,6 +40,87 @@ use sqlx::FromRow;
 const REVISION_COLUMNS: &str = "id, document_id, parent_id, body, summary, author_id, \
                                 author_name, byte_size, created_at";
 
+/// The `author_id` of a revision written by an import that ran with no account behind it.
+///
+/// Deliberately neither a uuid nor a username. Every `principals.id` is a uuid v7 minted
+/// inside this crate — no caller ever chooses one — so this value cannot name an account
+/// that exists, cannot be claimed by one later, and `principal_by_id` answers `None` for it
+/// for ever. That is the machine-checkable half of "nobody wrote this": a byline renderer
+/// asks [`Revision::author_is_an_account`] instead of pattern-matching on a display name.
+pub const IMPORT_AUTHOR_ID: &str = "system:import";
+
+/// The byline an identity-less import is filed under.
+///
+/// The other half, in the place a reader actually looks. `author_name` is what a timeline
+/// renders, so the answer to "who wrote this" has to be honest *there* and not only in a
+/// column nobody displays — and it has to read as a machine rather than as somebody with an
+/// unusual name. Attributing the bootstrap corpus to whichever operator happened to run the
+/// command would be a lie the history then keeps for ever, since `author_name` is a
+/// snapshot that is deliberately never corrected.
+///
+/// German, because it is rendered in a German interface beside German page titles, and a
+/// byline is not a log line. Changed while the only rows holding it lived in throwaway test
+/// databases; `author_name` is never rewritten, so every row written from here on keeps
+/// whatever this said at the time.
+pub const IMPORT_AUTHOR_NAME: &str = "Import (kein Konto)";
+
+/// Who a revision is filed under.
+///
+/// Two variants because publishing has two callers with genuinely different answers, and
+/// collapsing them would mean inventing an identity for one of them. Creation and
+/// revision-publishing sit on opposite sides of the authorisation model — `create_document`
+/// takes no permission decision, `publish_revision` requires `Action::Write` — but they
+/// agree completely on what an *author* is, which is what this type carries.
+#[derive(Debug, Clone, Copy)]
+pub enum Author<'a> {
+    /// A signed-in, active account: a person editing in the browser, or `seed --as`.
+    Account(&'a Principal),
+    /// `seed` with no `--as` — the operator bootstrap path, which has no identity to name.
+    ///
+    /// **Never a person's edit.** A request that arrived over HTTP always has a principal,
+    /// even if that principal is anonymous, and an anonymous one is refused rather than
+    /// filed under this. This variant means "a command was run at the console against this
+    /// database", and it exists so that the corpus loaded that way is attributed honestly
+    /// instead of being attributed to whoever was at the keyboard.
+    Import,
+}
+
+impl Author<'_> {
+    /// The identity, as `revisions.author_id` records it.
+    fn id(&self) -> &str {
+        match self {
+            Author::Account(principal) => &principal.id,
+            Author::Import => IMPORT_AUTHOR_ID,
+        }
+    }
+
+    /// The byline, as `revisions.author_name` records it.
+    fn name(&self) -> &str {
+        match self {
+            Author::Account(principal) => byline(principal),
+            Author::Import => IMPORT_AUTHOR_NAME,
+        }
+    }
+
+    /// Refuse an `Account` that is not one.
+    ///
+    /// The backstop for every caller of [`append_revision`], present and future.
+    /// [`Store::publish_revision`] answers the same question earlier and more gently — it
+    /// returns `Ok(None)`, because there "not signed in" is a permission outcome rather
+    /// than a broken call — so this only ever fires for a caller that reached the write
+    /// itself with nobody to attribute it to.
+    fn refuse_if_nobody(&self) -> Result<()> {
+        if let Author::Account(principal) = self {
+            anyhow::ensure!(
+                principal.is_authenticated() && principal.active,
+                "a revision records who wrote it, and this call named no signed-in, active \
+                 account to record"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// One published version of a document.
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Revision {
@@ -52,6 +140,78 @@ pub struct Revision {
     pub author_name: String,
     pub byte_size: i64,
     pub created_at: String,
+}
+
+impl Revision {
+    /// Whether a person wrote this, as against an import that ran with no account.
+    ///
+    /// What anything rendering a byline should ask before linking the author to a profile,
+    /// showing an avatar, or writing "by …". It asks about the *id*, which no account can
+    /// ever hold, rather than about the name, which is only prose.
+    pub fn author_is_an_account(&self) -> bool {
+        self.author_id != IMPORT_AUTHOR_ID
+    }
+}
+
+/// Write one revision and point its document at it. The ONE place either happens.
+///
+/// Takes a connection rather than the pool because the caller owns the transaction
+/// boundary, and the two callers need different ones: [`Store::publish_revision`] wraps
+/// this alone, while [`Store::create_document`] runs it inside the same transaction that
+/// inserts the document, so a new page cannot exist with a body and no revision. A function
+/// that opened its own transaction could not give the create case that, and the create case
+/// is exactly where the half state would be invisible.
+///
+/// `parent_id` is read from the document INSIDE that transaction, so it is what the
+/// document actually pointed at when this revision landed — and it comes out `NULL` for
+/// revision 1 with nothing here special-casing creation, because a document that was just
+/// inserted points at nothing yet.
+pub(crate) async fn append_revision(
+    conn: &mut sqlx::SqliteConnection,
+    document_id: &str,
+    author: Author<'_>,
+    body_json: &str,
+    summary: Option<&str>,
+) -> Result<String> {
+    author.refuse_if_nobody()?;
+
+    let id = uuid::Uuid::now_v7().to_string();
+    let size = body_json.len() as i64;
+
+    let parent: Option<String> =
+        sqlx::query_scalar("SELECT current_revision_id FROM documents WHERE id = ?1")
+            .bind(document_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .flatten();
+
+    sqlx::query(
+        "INSERT INTO revisions \
+         (id, document_id, parent_id, body, summary, author_id, author_name, byte_size) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )
+    .bind(&id)
+    .bind(document_id)
+    .bind(parent)
+    .bind(body_json)
+    .bind(summary)
+    .bind(author.id())
+    .bind(author.name())
+    .bind(size)
+    .execute(&mut *conn)
+    .await?;
+
+    sqlx::query(
+        "UPDATE documents SET body = ?2, current_revision_id = ?3, \
+         updated_at = datetime('now') WHERE id = ?1",
+    )
+    .bind(document_id)
+    .bind(body_json)
+    .bind(&id)
+    .execute(&mut *conn)
+    .await?;
+
+    Ok(id)
 }
 
 impl Store {
@@ -99,10 +259,12 @@ impl Store {
     /// `Ok(None)` means the document is not there or `author` may not write it — the same
     /// conflation [`Store::document_for`] makes, and for the same reason.
     ///
-    /// The revision and the document body are written in ONE transaction, so the document
-    /// can never point at a revision that does not exist, nor hold content with no revision
-    /// behind it. `parent_id` is read inside that transaction rather than before it, so it
-    /// is what the document actually pointed at when this revision landed.
+    /// The revision and the document body are written in ONE transaction by
+    /// [`append_revision`], so the document can never point at a revision that does not
+    /// exist, nor hold content with no revision behind it. This is the *edit* case;
+    /// [`Store::create_document`] is the create case, and both go through that one function
+    /// so that "a body changes only by publishing a revision" is a property of the code
+    /// rather than a rule everybody has to remember.
     pub async fn publish_revision(
         &self,
         author: &Principal,
@@ -128,44 +290,16 @@ impl Store {
         }
 
         let json = serde_json::to_string(body)?;
-        let id = uuid::Uuid::now_v7().to_string();
-        let size = json.len() as i64;
 
         let mut tx = self.pool.begin().await?;
-
-        let parent: Option<String> =
-            sqlx::query_scalar("SELECT current_revision_id FROM documents WHERE id = ?1")
-                .bind(document_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .flatten();
-
-        sqlx::query(
-            "INSERT INTO revisions \
-             (id, document_id, parent_id, body, summary, author_id, author_name, byte_size) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        let id = append_revision(
+            &mut tx,
+            document_id,
+            Author::Account(author),
+            &json,
+            summary,
         )
-        .bind(&id)
-        .bind(document_id)
-        .bind(parent)
-        .bind(&json)
-        .bind(summary)
-        .bind(&author.id)
-        .bind(byline(author))
-        .bind(size)
-        .execute(&mut *tx)
         .await?;
-
-        sqlx::query(
-            "UPDATE documents SET body = ?2, current_revision_id = ?3, \
-             updated_at = datetime('now') WHERE id = ?1",
-        )
-        .bind(document_id)
-        .bind(&json)
-        .bind(&id)
-        .execute(&mut *tx)
-        .await?;
-
         tx.commit().await?;
         Ok(Some(id))
     }
@@ -239,7 +373,7 @@ impl Store {
             return Ok(None);
         };
         let body: Block = serde_json::from_str(&rev.body)?;
-        let summary = format!("Restored revision {}", short(&rev.id));
+        let summary = format!("Fassung {} wiederhergestellt", short(&rev.id));
         self.publish_revision(author, &rev.document_id, &body, Some(&summary))
             .await
     }
@@ -268,7 +402,7 @@ fn short(id: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use crate::{NewDocument, Store};
+    use crate::{Author, NewDocument, Store};
     use gw_auth::{Permission, Principal, Subject};
     use gw_core::{Block, DocumentType, Visibility};
 
@@ -284,18 +418,28 @@ mod tests {
     }
 
     /// A page at `/notiz`, at the visibility asked for.
+    ///
+    /// **It already has a revision.** Creating a document publishes revision 1, so every
+    /// count below is "the creation, plus what this test published". That is why the
+    /// numbers here are one higher than the publishes each test makes, and it is the point
+    /// rather than an accident: a page whose history starts empty is the defect this
+    /// fixture used to reproduce.
     async fn page(store: &Store, visibility: Visibility) -> String {
         store
-            .insert_document(&NewDocument {
-                parent_path: None,
-                doc_type: DocumentType::Page,
-                title: "Notiz".into(),
-                slug: None,
-                language: "de".into(),
-                visibility,
-                body: body("hallo"),
-                sort_key: 0,
-            })
+            .create_document(
+                Author::Import,
+                &NewDocument {
+                    parent_path: None,
+                    doc_type: DocumentType::Page,
+                    title: "Notiz".into(),
+                    slug: None,
+                    language: "de".into(),
+                    visibility,
+                    body: body("hallo"),
+                    sort_key: 0,
+                },
+                None,
+            )
             .await
             .unwrap()
     }
@@ -341,7 +485,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(doc.body.contains("erste Fassung"), "got {}", doc.body);
-        assert_eq!(store.revisions_for(&autorin, &id).await.unwrap().len(), 1);
+        let revs = store.revisions_for(&autorin, &id).await.unwrap();
+        assert_eq!(
+            revs.len(),
+            2,
+            "the page was created with one, this added one"
+        );
+        assert_eq!(revs[0].id, rev, "newest first");
         assert_eq!(
             store
                 .revision_for(&autorin, &rev)
@@ -372,12 +522,21 @@ mod tests {
             .unwrap();
 
         let revs = store.revisions_for(&autorin, &id).await.unwrap();
-        assert_eq!(revs.len(), 2);
-        // Both are published within the same second, so `created_at` cannot order them
+        assert_eq!(revs.len(), 3, "the creation and the two publishes");
+        // All three are published within the same second, so `created_at` cannot order them
         // and the tie-break on the uuid v7 id is what makes this deterministic.
         assert_eq!(revs[0].id, second, "newest first");
         assert_eq!(revs[0].parent_id.as_deref(), Some(first.as_str()));
-        assert!(revs[1].parent_id.is_none(), "the first has no parent");
+        assert_eq!(
+            revs[1].parent_id.as_deref(),
+            Some(revs[2].id.as_str()),
+            "the first published edit hangs off the revision the import created — an edit \
+             with no parent is one the diff view has nothing to compare against"
+        );
+        assert!(
+            revs[2].parent_id.is_none(),
+            "only the creation has no parent"
+        );
     }
 
     #[test]
@@ -466,7 +625,11 @@ mod tests {
             .expect("the writer may restore");
 
         let revs = store.revisions_for(&autorin, &id).await.unwrap();
-        assert_eq!(revs.len(), 3, "restore appends; it does not remove");
+        assert_eq!(
+            revs.len(),
+            4,
+            "restore appends; it does not remove — the creation, two publishes, the restore"
+        );
         assert_eq!(revs[0].id, restored, "the restore is the newest revision");
         assert_ne!(
             restored, first,
@@ -682,7 +845,7 @@ mod tests {
         // Read back as somebody else who may read the page: the author is gone.
         let leserin = granted(&store, "leserin", Permission::Read).await;
         let revs = store.revisions_for(&leserin, &id).await.unwrap();
-        assert_eq!(revs.len(), 1);
+        assert_eq!(revs.len(), 2, "the creation and her edit");
         assert_eq!(
             revs[0].author_name, "Sergej Maulser",
             "history lost its attribution"
@@ -715,8 +878,15 @@ mod tests {
         );
 
         let revs = store.revisions_for(&autorin, &id).await.unwrap();
-        assert_eq!(revs.len(), 1, "the refusal still wrote a revision");
-        assert!(!revs[0].body.contains("meins"), "got {}", revs[0].body);
+        assert_eq!(
+            revs.len(),
+            2,
+            "the refusal still wrote a revision (the creation and her edit are the two)"
+        );
+        assert!(
+            !revs.iter().any(|r| r.body.contains("meins")),
+            "the reader's text reached the history anyway"
+        );
         let doc = store
             .document_by_path_unchecked("/notiz")
             .await
@@ -749,11 +919,23 @@ mod tests {
             "an anonymous caller wrote a revision"
         );
 
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM revisions")
-            .fetch_one(&store.pool)
+        // Counted by body rather than by rows: the page's creation legitimately left one
+        // revision behind, so "no rows at all" stopped being the question. What must be
+        // true is that nothing the anonymous caller sent is in the history.
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM revisions WHERE body LIKE '%niemand%'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0, "a revision was written by nobody");
+
+        // And the one revision that IS there is the import's, which is a different thing
+        // from an anonymous request: it was written at the console, not asked for over HTTP.
+        let authors: Vec<String> = sqlx::query_scalar("SELECT author_id FROM revisions")
+            .fetch_all(&store.pool)
             .await
             .unwrap();
-        assert_eq!(count, 0, "a revision was written by nobody");
+        assert_eq!(authors, vec![crate::IMPORT_AUTHOR_ID.to_string()]);
     }
 
     #[tokio::test]
@@ -789,7 +971,7 @@ mod tests {
 
         assert_eq!(
             store.revisions_for(&leserin, &id).await.unwrap().len(),
-            1,
+            2,
             "somebody who may read the page may read its history"
         );
         assert!(store.revision_for(&leserin, &rev).await.unwrap().is_some());
@@ -829,7 +1011,7 @@ mod tests {
             .unwrap();
 
         // She can see it — that is the point of an open history.
-        assert_eq!(store.revisions_for(&leserin, &id).await.unwrap().len(), 2);
+        assert_eq!(store.revisions_for(&leserin, &id).await.unwrap().len(), 3);
 
         assert!(
             store
@@ -840,7 +1022,7 @@ mod tests {
             "a reader restored an old revision"
         );
         let revs = store.revisions_for(&autorin, &id).await.unwrap();
-        assert_eq!(revs.len(), 2, "the refused restore changed the history");
+        assert_eq!(revs.len(), 3, "the refused restore changed the history");
         let doc = store
             .document_by_path_unchecked("/notiz")
             .await

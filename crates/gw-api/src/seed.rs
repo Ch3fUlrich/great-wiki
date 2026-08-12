@@ -3,8 +3,10 @@
 //! Exists so there is real content to develop against before the editor lands (M3), and so
 //! bulk content can be moved in and out (M12). The database stays the source of truth
 //! (AGENTS.md rule 1): this is an *import*, and it is not a second write path — it creates
-//! through `Store::insert_document` and updates through `Store::publish_revision`, exactly
-//! as a person editing in the browser does.
+//! through `Store::create_document`, which publishes revision 1 in the same transaction,
+//! and updates through `Store::publish_revision`, exactly as a person editing in the
+//! browser does. Every page this command produces has a history from its first line, and
+//! the history says who wrote it — including when the honest answer is "no account did".
 //!
 //! Three rules shape the whole module:
 //!
@@ -399,7 +401,18 @@ async fn load_one(
                 return skip_at(&path, reason);
             }
         }
-        if let Err(e) = store.insert_document(&new).await {
+        // Who revision 1 is filed under. A named account authors its own imports, exactly
+        // as it authors its own updates. A run with no `--as` has nobody to name, so it says
+        // so — `Author::Import` is not an account and cannot become one — rather than
+        // attributing the corpus to whoever was at the keyboard.
+        let author = match options.principal {
+            Some(principal) => gw_store::Author::Account(principal),
+            None => gw_store::Author::Import,
+        };
+        // The same summary an update writes, from the first revision onward, so a page's
+        // history says where it came from rather than starting with a row that says nothing.
+        let summary = format!("importiert aus {}", rel.display());
+        if let Err(e) = store.create_document(author, &new, Some(&summary)).await {
             let message = e.to_string();
             // A collision that slipped past the check above — another writer, or a slug
             // rule this code got wrong. The UNIQUE constraint, not the pre-check, is the
@@ -492,7 +505,7 @@ async fn update_one(
         return Ok(Ok(Outcome::Unchanged));
     }
 
-    let summary = format!("imported from {}", rel.display());
+    let summary = format!("importiert aus {}", rel.display());
     match store
         .publish_revision(principal, &existing.id, &new.body, Some(&summary))
         .await?
@@ -518,8 +531,9 @@ fn metadata_refusal(path: &str, field: &str, in_file: &str, in_wiki: &str) -> St
 
 /// Whether `principal` may create the document `new` describes, or the reason they may not.
 ///
-/// **This system has no permission-checked "create a document" yet.** `insert_document` takes
-/// no principal and there is no HTTP route that creates one, so there is no existing rule to
+/// **This system has no permission-checked "create a document" yet.** `create_document` takes
+/// an *author* — who revision 1 is filed under — and deliberately no permission decision, and
+/// there is no HTTP route that creates a document at all, so there is no existing rule to
 /// call — and inventing an authorisation rule here would make this the *second* place that
 /// decides access, which is always the one that gets it wrong when the rules change.
 ///

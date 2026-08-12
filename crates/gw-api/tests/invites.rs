@@ -34,7 +34,7 @@ use gw_api::AppState;
 use gw_auth::breach::{BreachFuture, BreachRange};
 use gw_auth::{Permission, Subject};
 use gw_core::{Block, DocumentType, Visibility};
-use gw_store::{NewDocument, Store};
+use gw_store::{Author, NewDocument, Store};
 use serde_json::{json, Value};
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Column, Row, SqlitePool};
@@ -114,7 +114,10 @@ async fn fixture() -> Fixture {
         page(None, "Anderer Raum", Visibility::Restricted),
         page(None, "Offen", Visibility::Restricted),
     ] {
-        store.insert_document(&doc).await.unwrap();
+        store
+            .create_document(Author::Import, &doc, None)
+            .await
+            .unwrap();
     }
 
     store

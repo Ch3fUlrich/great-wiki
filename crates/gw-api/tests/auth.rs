@@ -21,7 +21,7 @@ use base64::Engine;
 use gw_api::auth::session::hash_token;
 use gw_api::auth::OidcConfig;
 use gw_core::{Block, DocumentType, Visibility};
-use gw_store::{NewDocument, Store};
+use gw_store::{Author, NewDocument, Store};
 use jsonwebtoken::jwk::{Jwk, JwkSet};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::{json, Value};
@@ -250,16 +250,20 @@ async fn seed() -> Arc<Store> {
         ("Geheim", Visibility::Restricted),
     ] {
         store
-            .insert_document(&NewDocument {
-                parent_path: None,
-                doc_type: DocumentType::Page,
-                title: title.into(),
-                slug: None,
-                language: "de".into(),
-                visibility,
-                body: body_block(),
-                sort_key: 0,
-            })
+            .create_document(
+                Author::Import,
+                &NewDocument {
+                    parent_path: None,
+                    doc_type: DocumentType::Page,
+                    title: title.into(),
+                    slug: None,
+                    language: "de".into(),
+                    visibility,
+                    body: body_block(),
+                    sort_key: 0,
+                },
+                None,
+            )
             .await
             .unwrap();
     }

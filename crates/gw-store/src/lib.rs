@@ -18,7 +18,7 @@ pub use invites::{
 };
 pub use login_attempts::{LoginScope, LOGIN_FAILURE_LIMIT, LOGIN_LOCKOUT_SECONDS};
 pub use principals::TeamSummary;
-pub use revisions::Revision;
+pub use revisions::{Author, Revision, IMPORT_AUTHOR_ID, IMPORT_AUTHOR_NAME};
 pub use sessions::SESSION_TTL_SECONDS;
 
 use anyhow::Result;
@@ -114,7 +114,11 @@ mod tests {
     async fn insert_then_fetch_by_path() {
         let store = Store::open("sqlite::memory:").await.unwrap();
         store
-            .insert_document(&new_doc(None, "Größe und Maß", Visibility::Public))
+            .create_document(
+                Author::Import,
+                &new_doc(None, "Größe und Maß", Visibility::Public),
+                None,
+            )
             .await
             .unwrap();
 
@@ -132,15 +136,19 @@ mod tests {
     async fn path_is_derived_from_parent_and_slug() {
         let store = Store::open("sqlite::memory:").await.unwrap();
         store
-            .insert_document(&new_doc(None, "Handbuch", Visibility::Public))
+            .create_document(
+                Author::Import,
+                &new_doc(None, "Handbuch", Visibility::Public),
+                None,
+            )
             .await
             .unwrap();
         store
-            .insert_document(&new_doc(
-                Some("/handbuch"),
-                "Erste Schritte",
-                Visibility::Public,
-            ))
+            .create_document(
+                Author::Import,
+                &new_doc(Some("/handbuch"), "Erste Schritte", Visibility::Public),
+                None,
+            )
             .await
             .unwrap();
 
@@ -156,11 +164,19 @@ mod tests {
         // Silent overwrite on slug collision is data loss. It must be an error.
         let store = Store::open("sqlite::memory:").await.unwrap();
         store
-            .insert_document(&new_doc(None, "Notes", Visibility::Public))
+            .create_document(
+                Author::Import,
+                &new_doc(None, "Notes", Visibility::Public),
+                None,
+            )
             .await
             .unwrap();
         let second = store
-            .insert_document(&new_doc(None, "Notes", Visibility::Public))
+            .create_document(
+                Author::Import,
+                &new_doc(None, "Notes", Visibility::Public),
+                None,
+            )
             .await;
         assert!(second.is_err(), "a colliding path must fail loudly");
     }
@@ -186,10 +202,17 @@ mod tests {
         let store = Store::open("sqlite::memory:").await.unwrap();
         let doc = new_doc(Some("/handbuch"), "Größe und Maß", Visibility::Public);
         store
-            .insert_document(&new_doc(None, "Handbuch", Visibility::Public))
+            .create_document(
+                Author::Import,
+                &new_doc(None, "Handbuch", Visibility::Public),
+                None,
+            )
             .await
             .unwrap();
-        store.insert_document(&doc).await.unwrap();
+        store
+            .create_document(Author::Import, &doc, None)
+            .await
+            .unwrap();
         assert_eq!(doc.resolved_path().unwrap(), "/handbuch/groesse-und-mass");
         assert!(store
             .document_by_path_unchecked(&doc.resolved_path().unwrap())
@@ -212,7 +235,11 @@ mod tests {
     async fn tree_nests_children_under_parents_in_sort_order() {
         let store = Store::open("sqlite::memory:").await.unwrap();
         store
-            .insert_document(&new_doc(None, "Handbuch", Visibility::Public))
+            .create_document(
+                Author::Import,
+                &new_doc(None, "Handbuch", Visibility::Public),
+                None,
+            )
             .await
             .unwrap();
 
@@ -220,8 +247,14 @@ mod tests {
         b.sort_key = 2;
         let mut a = new_doc(Some("/handbuch"), "Alpha", Visibility::Public);
         a.sort_key = 1;
-        store.insert_document(&b).await.unwrap();
-        store.insert_document(&a).await.unwrap();
+        store
+            .create_document(Author::Import, &b, None)
+            .await
+            .unwrap();
+        store
+            .create_document(Author::Import, &a, None)
+            .await
+            .unwrap();
 
         let tree = store.tree().await.unwrap();
         assert_eq!(tree.len(), 1);
@@ -243,23 +276,35 @@ mod tests {
     async fn seeded() -> Store {
         let store = Store::open("sqlite::memory:").await.unwrap();
         store
-            .insert_document(&new_doc(None, "Handbuch", Visibility::Restricted))
+            .create_document(
+                Author::Import,
+                &new_doc(None, "Handbuch", Visibility::Restricted),
+                None,
+            )
             .await
             .unwrap();
         store
-            .insert_document(&new_doc(
-                Some("/handbuch"),
-                "Onboarding",
-                Visibility::Restricted,
-            ))
+            .create_document(
+                Author::Import,
+                &new_doc(Some("/handbuch"), "Onboarding", Visibility::Restricted),
+                None,
+            )
             .await
             .unwrap();
         store
-            .insert_document(&new_doc(None, "Öffentlich", Visibility::Public))
+            .create_document(
+                Author::Import,
+                &new_doc(None, "Öffentlich", Visibility::Public),
+                None,
+            )
             .await
             .unwrap();
         store
-            .insert_document(&new_doc(None, "Intern", Visibility::Internal))
+            .create_document(
+                Author::Import,
+                &new_doc(None, "Intern", Visibility::Internal),
+                None,
+            )
             .await
             .unwrap();
         store
@@ -866,7 +911,11 @@ mod tests {
     async fn soft_deleted_documents_are_excluded() {
         let store = Store::open("sqlite::memory:").await.unwrap();
         let id = store
-            .insert_document(&new_doc(None, "Temporär", Visibility::Public))
+            .create_document(
+                Author::Import,
+                &new_doc(None, "Temporär", Visibility::Public),
+                None,
+            )
             .await
             .unwrap();
         sqlx::query("UPDATE documents SET deleted_at = datetime('now') WHERE id = ?1")
