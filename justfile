@@ -47,11 +47,33 @@ build:
 # is a separate decision the owner has not made. The container is required for the same
 # reason shots.mjs needs it — Playwright's own Chromium cannot start on this host because
 # libnspr4.so is missing and installing it needs root.
+#
+# The image is ~2 GB and is NOT pulled automatically. That is deliberate: this box has run
+# out of disk mid-task more than once, and a recipe that silently starts a 2 GB pull turns
+# "run the checks" into a failed build somewhere else entirely. The preflight below says
+# exactly what to run instead of failing with docker's own message, which names the image
+# but not the fix — an agent hit precisely this and worked around it by hand-symlinking a
+# different image's browser, which is not something to leave as folklore.
+#
+# Deterministic browser checks (needs `just dev`, and a ~2 GB image pulled first).
 behaviour:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    image=mcr.microsoft.com/playwright:v1.56.0-noble
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+      echo "The behaviour harness needs $image, which is not pulled here." >&2
+      echo "It is about 2 GB. Free space first ($(df -h / | awk 'NR==2{print $4}') available), then:" >&2
+      echo "    docker pull $image" >&2
+      exit 1
+    fi
+    if ! curl -sS -o /dev/null -m 5 "${SHOT_BASE:-http://127.0.0.1:5173}"; then
+      echo "Nothing is serving ${SHOT_BASE:-http://127.0.0.1:5173} — start it with \`just dev\` first." >&2
+      exit 1
+    fi
     docker run --rm --network host --user "$(id -u):$(id -g)" \
       -v "$PWD/web/scripts:/scripts:ro" -e HOME=/tmp \
-      -e SHOT_BASE=http://127.0.0.1:5173 -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
-      mcr.microsoft.com/playwright:v1.56.0-noble \
+      -e SHOT_BASE="${SHOT_BASE:-http://127.0.0.1:5173}" -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+      "$image" \
       sh -c 'mkdir -p /tmp/pw && cd /tmp/pw && npm init -y >/dev/null && npm i playwright@1.56.0 >/dev/null && cp /scripts/behaviour.mjs . && node behaviour.mjs'
 
 # Break the security-critical code on purpose and check the tests notice.
