@@ -8,6 +8,25 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- A reader can now see where a page sits, what hangs below it, and who is allowed to read
+  it. Every page carries a breadcrumb from the root — titles taken from the tree, never
+  assembled from path segments, so a page whose ancestors the caller may not see gets no
+  invented parents — a list of its children as links, and a panel stating visibility in a
+  full German sentence. "Öffentlich im Internet … ohne Anmeldung" rather than the bare
+  "Öffentlich", because in an intranet that word routinely means "everyone in the
+  organisation" and this wiki answers on the public internet. A visibility value the server
+  cannot parse is reported as "Eingeschränkt", which is what the permission engine actually
+  does with it, rather than as "unbekannt". Language is named only when it differs from the
+  German interface, and document type only when it is not the default; a row of facts that
+  says nothing teaches people to stop reading the panel.
+- Subpages are listed because a container page rendered a back-link and nothing else, which
+  reads as a page somebody forgot to write. Its children *are* its content, and they were
+  previously visible only in the sidebar tree — which on a phone sits at the very bottom of
+  the document.
+- **Not** shown, and deliberately not faked: when a page was last edited and by whom. There
+  is no revisions endpoint yet. The row is written, styled and tested, and renders nothing
+  at all until real data is passed — a dash or an "unbekannt" beside three genuine facts
+  would be read as a fourth.
 - An import creates the page **and** publishes its first revision, in one transaction.
   Creating a document used to write the body straight into `documents` and record no
   revision at all, so every seeded page began with an empty history: the first edit anybody

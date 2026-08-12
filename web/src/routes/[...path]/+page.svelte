@@ -1,10 +1,20 @@
 <script lang="ts">
   import BlockView from '$lib/components/BlockView.svelte';
+  import Breadcrumb from '$lib/components/Breadcrumb.svelte';
+  import PageMeta from '$lib/components/PageMeta.svelte';
+  import Subpages from '$lib/components/Subpages.svelte';
   import Tree from '$lib/components/Tree.svelte';
   import { outline } from '$lib/blocks/render';
+  import { breadcrumb, childrenOf } from '$lib/pagemeta';
 
   let { data } = $props();
   const headings = $derived(outline(data.body));
+
+  // Derived here rather than in the loader on purpose: `$derived` runs during server
+  // rendering too, so the markup is complete in the first response, and the tree is
+  // already in the payload — computing these server-side would ship the same titles twice.
+  const crumbs = $derived(breadcrumb(data.tree, data.doc));
+  const subpages = $derived(childrenOf(data.tree, data.doc.path));
 </script>
 
 <svelte:head><title>{data.doc.title} — great-wiki</title></svelte:head>
@@ -14,9 +24,35 @@
     <Tree nodes={data.tree} current={data.doc.path} />
   </nav>
 
-  <main id="content" class="prose" lang={data.doc.language}>
+  <!-- `.prose` moved off `<main>` and onto the article, and `lang` with it. Both were
+       right while `<main>` held nothing but the document, and both became wrong the
+       moment it grew chrome around one.
+
+       `.prose` is scoped to rendered document content so its rules never reach the
+       interface, and one of those rules cannot be overridden by a component at all: the
+       print block at the end of app.css is UNLAYERED on purpose, so
+       `.prose a::after { content: ' (' attr(href) ')' }` outranks every layered rule
+       regardless of specificity. With `.prose` on `<main>`, a printed page would have had
+       its own URL spelled out after every crumb and every subpage link.
+
+       `lang` on `<main>` claimed the German metadata panel was written in the document's
+       language. On the 29 English pages of the corpus a screen reader would have
+       announced "Sichtbarkeit" with English phonemes; the document's language belongs on
+       the document. -->
+  <main id="content" class="page">
+    <Breadcrumb {crumbs} />
     <h1>{data.doc.title}</h1>
-    <BlockView block={data.body} />
+    <PageMeta
+      visibility={data.doc.visibility}
+      language={data.doc.language}
+      docType={data.doc.doc_type}
+    />
+
+    <article class="prose" lang={data.doc.language}>
+      <BlockView block={data.body} />
+    </article>
+
+    <Subpages nodes={subpages} />
   </main>
 
   {#if headings.length > 1}
@@ -107,12 +143,26 @@
     border-inline-start-color: var(--accent);
   }
 
-  .prose h1 {
+  /* The page column: chrome, then the document, then the children.
+     `.prose > * + *` in `@layer content` no longer reaches any of this — it applies
+     inside the article — so the rhythm between the parts is stated here, and stated
+     unevenly on purpose. The breadcrumb belongs to the title, so the gap above the
+     heading is small; the subpage list is a different thing from the document, so the
+     gap above it is the largest on the page. */
+  .page > * + * {
+    margin-block-start: var(--space-6);
+  }
+
+  .page > h1 {
     font-size: var(--text-4xl);
     line-height: var(--leading-tight);
     letter-spacing: -0.02em;
-    margin-block-end: var(--space-8);
+    margin-block-start: var(--space-3);
     text-wrap: balance;
+  }
+
+  .page > :global(.subpages) {
+    margin-block-start: var(--space-12);
   }
 
   /* One column below 64rem.

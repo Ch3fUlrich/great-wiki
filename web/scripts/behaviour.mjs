@@ -629,6 +629,204 @@ await check('C10 the header stays put while the table scrolls under it', async (
   );
 });
 
+// ---------------------------------------------------------------------------------------
+// Group D — the page metadata (Breadcrumb.svelte, PageMeta.svelte, Subpages.svelte)
+//
+// Against the tour corpus, which has what this needs: a container page with six children,
+// a branch three levels deep, and pages that are actually `public` — so every check below
+// works for an anonymous visitor. Nothing here touches `/rundgang/nur-intern`, which is
+// `restricted` on purpose and would 403 for a developer whose `.env` sets no dev identity,
+// failing for a reason that has nothing to do with this code.
+//
+// The colour assertions resolve the token through a probe element rather than comparing
+// against a hex copied out of tokens.css, and they assert EQUALITY with the resolved
+// value. "Differs from something else" is the shape that made A2 a false pass for months.
+// ---------------------------------------------------------------------------------------
+
+const CONTAINER_PAGE = '/rundgang'; // public, six children
+const NESTED_PAGE = '/rundgang/import-export'; // public, one child, two levels down
+const DEEP_PAGE = '/rundgang/import-export/heikel'; // public, the deepest page there is
+
+/** The computed value of a custom property, as this page currently resolves it. */
+const resolveToken = (locator, token) =>
+  locator.evaluate((el, name) => {
+    const probe = document.createElement('span');
+    probe.style.color = `var(${name})`;
+    el.appendChild(probe);
+    const value = getComputedStyle(probe).color;
+    probe.remove();
+    return value;
+  }, token);
+
+await check('D1 the whole panel is in the HTML the server sends, before any script runs', async (page) => {
+  // `page.request` is a plain HTTP fetch through the browser's networking stack: nothing
+  // is rendered, nothing hydrates, no module is imported. What comes back is exactly what
+  // a reader with JavaScript switched off receives — which is the requirement, and which
+  // no amount of poking at the live DOM can demonstrate, because by then the app has run.
+  const response = await page.request.get(BASE + CONTAINER_PAGE);
+  assert(response.ok(), `expected 200 from ${CONTAINER_PAGE}, got ${response.status()}`);
+  const html = await response.text();
+
+  assert(/<nav[^>]*aria-label="Pfad"/.test(html), 'no breadcrumb in the server-rendered HTML');
+  assert(
+    /aria-label="Angaben zu dieser Seite"/.test(html),
+    'no metadata panel in the server-rendered HTML'
+  );
+  assert(
+    html.includes('Öffentlich im Internet'),
+    'the server-rendered HTML does not state the visibility'
+  );
+
+  // The subpage links, checked INSIDE the subpage list. Every one of these paths also
+  // appears in the sidebar tree on the same page, so searching the whole document would
+  // pass with the list missing entirely.
+  const section = html.match(/<nav[^>]*aria-labelledby="gw-subpages"[\s\S]*?<\/nav>/)?.[0];
+  assert(section !== undefined, 'no subpage list in the server-rendered HTML');
+  assert(section.includes('Unterseiten'), 'the subpage list is not headed');
+  assert(
+    section.includes(`href="${NESTED_PAGE}"`),
+    'the subpage list does not link the child it is supposed to list'
+  );
+});
+
+await check('D2 breadcrumb links read as chrome, and still read as links', async (page) => {
+  // Two failures in one check, because the fix for either alone reintroduces the other.
+  //
+  // The colour is muted ink DELIBERATELY — accent blue above every heading competes with
+  // the heading. But muted with no underline is exactly the regression A2 documents: it
+  // reads as a row of labels rather than as something you can click. So: muted AND
+  // underlined, both asserted.
+  //
+  // Equality with the resolved `--ink-muted` is also the only thing that would notice a
+  // cascade-layer regression here. `@layer base` sets `a { color: var(--accent) }`; the
+  // breadcrumb's own rule lives in `@layer components` and wins only because `components`
+  // comes later in the order app.css declares. Load the page stylesheet before the
+  // layout's `@layer` statement and the order silently inverts — every breadcrumb turns
+  // accent blue and nothing else in this suite notices.
+  await page.goto(BASE + NESTED_PAGE, { waitUntil: 'domcontentloaded' });
+  const link = page.locator('nav[aria-label="Pfad"] a').first();
+  await link.waitFor({ state: 'visible' });
+
+  const muted = await resolveToken(link, '--ink-muted');
+  const { color, underlined } = await link.evaluate((el) => {
+    const cs = getComputedStyle(el);
+    return { color: cs.color, underlined: cs.textDecorationLine.includes('underline') };
+  });
+
+  assert(color === muted, `a breadcrumb link is ${color}, expected --ink-muted (${muted})`);
+  assert(underlined, 'a breadcrumb link is muted AND unmarked, so it does not read as a link');
+});
+
+await check('D3 the breadcrumb names every level and marks only the current one', async (page) => {
+  await page.goto(BASE + DEEP_PAGE, { waitUntil: 'domcontentloaded' });
+  const crumbs = page.locator('nav[aria-label="Pfad"] a');
+  await crumbs.first().waitFor({ state: 'visible' });
+
+  const hrefs = await crumbs.evaluateAll((els) => els.map((el) => el.getAttribute('href')));
+  assert(
+    JSON.stringify(hrefs) ===
+      JSON.stringify(['/', '/rundgang', NESTED_PAGE, DEEP_PAGE]),
+    `the breadcrumb must run root-first through every ancestor, got ${JSON.stringify(hrefs)}`
+  );
+
+  const marked = await page
+    .locator('nav[aria-label="Pfad"] a[aria-current="page"]')
+    .evaluateAll((els) => els.map((el) => el.getAttribute('href')));
+  assert(
+    JSON.stringify(marked) === JSON.stringify([DEEP_PAGE]),
+    `exactly one crumb — the last — may claim to be the current page, got ${JSON.stringify(marked)}`
+  );
+});
+
+await check('D4 a breadcrumb ancestor and a subpage link both actually navigate', async (page) => {
+  // The two directions a reader moves from this page. Asserted by navigating, not by
+  // reading the href: an anchor with a correct href inside a container that swallows the
+  // click is a link that looks right in the markup and does nothing.
+  await page.goto(BASE + DEEP_PAGE, { waitUntil: 'domcontentloaded' });
+  await page.locator(`nav[aria-label="Pfad"] a[href="${NESTED_PAGE}"]`).click();
+  await page.waitForURL(`**${NESTED_PAGE}`, { timeout: 5_000 });
+
+  const down = page.locator(`nav[aria-labelledby="gw-subpages"] a[href="${DEEP_PAGE}"]`);
+  await down.waitFor({ state: 'visible' });
+  await down.click();
+  await page.waitForURL(`**${DEEP_PAGE}`, { timeout: 5_000 });
+
+  const heading = (await page.locator('h1').first().textContent()) ?? '';
+  assert(
+    heading.trim().startsWith('Heikler Text'),
+    `the subpage link did not land on the subpage, the heading says "${heading.trim()}"`
+  );
+});
+
+await check('D5 a container page lists its children, a leaf offers no empty section', async (page) => {
+  await page.goto(BASE + CONTAINER_PAGE, { waitUntil: 'domcontentloaded' });
+  const list = page.locator('nav[aria-labelledby="gw-subpages"] a');
+  await list.first().waitFor({ state: 'visible' });
+  const count = await list.count();
+  assert(count === 6, `the tour page has six children, the list shows ${count}`);
+
+  // The one child that has a child of its own says so, and says it in German.
+  const note = await page
+    .locator(`nav[aria-labelledby="gw-subpages"] li:has(a[href="${NESTED_PAGE}"]) .count`)
+    .textContent();
+  assert(note?.trim() === '1 Unterseite', `expected "1 Unterseite", got "${note?.trim()}"`);
+
+  // A page with no children gets no heading, no rule and no empty list — a permanent cost
+  // for every leaf otherwise, and an empty section reads as a section that failed to load.
+  await page.goto(BASE + DEEP_PAGE, { waitUntil: 'domcontentloaded' });
+  const sections = await page.locator('nav[aria-labelledby="gw-subpages"]').count();
+  assert(sections === 0, 'a page with no children still rendered a subpage section');
+});
+
+await check('D6 a world-readable page says so, in the colour that means "notice this"', async (page) => {
+  // Not a value judgement about being public — it is the state whose consequences are
+  // irreversible if unintended, on a wiki whose every imported page is `restricted`. The
+  // words carry the meaning on their own; the tint only makes it visible from across the
+  // room, and is mixed from `--warn` so a theme repaints it along with everything else.
+  await page.goto(BASE + CONTAINER_PAGE, { waitUntil: 'domcontentloaded' });
+  const chip = page.locator('[aria-label="Angaben zu dieser Seite"] .chip');
+  await chip.waitFor({ state: 'visible' });
+
+  const label = (await chip.textContent())?.trim();
+  assert(
+    label === 'Öffentlich im Internet',
+    `"Öffentlich" alone reads as "everyone in the organisation" in an intranet; got "${label}"`
+  );
+  assert(
+    (await chip.getAttribute('data-visibility')) === 'public',
+    'the chip does not state which of the three levels it is showing'
+  );
+
+  const detail = await page
+    .locator('[aria-label="Angaben zu dieser Seite"] .detail')
+    .textContent();
+  assert(
+    detail?.trim() === 'Jede Person kann diese Seite ohne Anmeldung lesen.',
+    `the sentence that makes the label unmistakable is missing, got "${detail?.trim()}"`
+  );
+
+  const warn = await resolveToken(chip, '--warn');
+  const border = await chip.evaluate((el) => getComputedStyle(el).borderTopColor);
+  assert(border === warn, `the public chip is bordered ${border}, expected --warn (${warn})`);
+});
+
+await check('D7 no horizontal scroll at 390px with the panel and the subpage grid', async (page) => {
+  // A4 checks this for the widest thing a document can contain. This checks it for the
+  // two new grids: the panel's `max-content` label column, which a long term can push
+  // wide, and the subpage list's `minmax(14rem, 1fr)` columns.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(BASE + CONTAINER_PAGE, { waitUntil: 'networkidle' });
+
+  const { scrollWidth, innerWidth } = await page.evaluate(() => ({
+    scrollWidth: document.documentElement.scrollWidth,
+    innerWidth: window.innerWidth
+  }));
+  assert(
+    scrollWidth <= innerWidth + 1,
+    `document.documentElement.scrollWidth (${scrollWidth}) exceeds window.innerWidth + 1 (${innerWidth + 1})`
+  );
+});
+
 await browser.close();
 
 // ---------------------------------------------------------------------------------------
