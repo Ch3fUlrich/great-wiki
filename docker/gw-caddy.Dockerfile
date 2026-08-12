@@ -32,4 +32,28 @@ COPY docker/Caddyfile /etc/caddy/Caddyfile
 # deploy. It dials no upstreams — `gw-api` and `gw-web` do not have to resolve.
 RUN caddy validate --adapter caddyfile --config /etc/caddy/Caddyfile
 
+# Strip the file capability from the binary, and note WHY, because the failure it
+# causes names nothing that would lead you here.
+#
+# The upstream image ships /usr/bin/caddy with `cap_net_bind_service=ep` so it can
+# bind ports below 1024. The compose runs this container as `user: 1000:1000`
+# under `no-new-privileges`, and the kernel refuses `execve` of a file carrying
+# file capabilities in that combination — EPERM, reported by Docker as
+#
+#     exec /usr/bin/caddy: operation not permitted
+#
+# which reads like a missing binary or a broken mount rather than a capability.
+# The container restart-loops, the deploy's HTTP gate gets connection refused, and
+# the other two services sit there healthy. That is exactly how the first deploy
+# of this stack failed.
+#
+# The capability is not needed: this proxy listens on 8100. Copying the file is
+# what removes it — capabilities do not survive a copy — so no libcap is
+# installed to take one away. Dropping the capability rather than the hardening
+# is the right way round: the container gets strictly less privilege than
+# upstream, not more.
+RUN cp /usr/bin/caddy /usr/bin/caddy.stripped \
+    && mv -f /usr/bin/caddy.stripped /usr/bin/caddy \
+    && chmod 0755 /usr/bin/caddy
+
 EXPOSE 8100
