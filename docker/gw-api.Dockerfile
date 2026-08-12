@@ -52,21 +52,33 @@ RUN set -eu; \
 #
 # Every workspace member is listed by hand rather than globbed, because
 # `COPY crates/*/Cargo.toml` flattens the paths into one directory and cargo then
-# cannot find the members at all. A NEW CRATE HAS TO BE ADDED HERE; if it is
-# forgotten the dependency layer simply misses it and the real build compiles it
-# — slower, never wrong.
+# cannot find the members at all.
+#
+# A NEW CRATE HAS TO BE ADDED HERE, IN BOTH PLACES — the COPY list and the loop
+# below. This comment used to say that forgetting one made the dependency layer
+# miss it and the real build compile it, "slower, never wrong". That was wrong,
+# and `gw-collab` proved it: the workspace is `members = ["crates/*"]`, so cargo
+# resolves every member from `Cargo.toml` and fails outright on the one whose
+# manifest is absent —
+#
+#     failed to load manifest for workspace member `/src/crates/gw-api`
+#       failed to read `/src/crates/gw-collab/Cargo.toml`
+#
+# It is a hard failure at image build time, not a slow path. That is the better
+# of the two behaviours, but only if the comment says so.
 COPY Cargo.toml Cargo.lock ./
-COPY crates/gw-api/Cargo.toml   crates/gw-api/Cargo.toml
-COPY crates/gw-auth/Cargo.toml  crates/gw-auth/Cargo.toml
-COPY crates/gw-core/Cargo.toml  crates/gw-core/Cargo.toml
-COPY crates/gw-store/Cargo.toml crates/gw-store/Cargo.toml
+COPY crates/gw-api/Cargo.toml    crates/gw-api/Cargo.toml
+COPY crates/gw-auth/Cargo.toml   crates/gw-auth/Cargo.toml
+COPY crates/gw-collab/Cargo.toml crates/gw-collab/Cargo.toml
+COPY crates/gw-core/Cargo.toml   crates/gw-core/Cargo.toml
+COPY crates/gw-store/Cargo.toml  crates/gw-store/Cargo.toml
 
 # The stand-in artefacts are removed afterwards, fingerprints included. Without
 # that, cargo considers the real crates already built and the image ships four
 # empty libraries and an empty `main` — a container that starts, exits 0, and
 # looks like a healthy deploy.
 RUN set -eu; \
-    for crate in gw-api gw-auth gw-core gw-store; do \
+    for crate in gw-api gw-auth gw-collab gw-core gw-store; do \
       mkdir -p "crates/$crate/src"; \
       : > "crates/$crate/src/lib.rs"; \
     done; \
