@@ -28,11 +28,60 @@ enum Command {
     /// Nothing is invented: a file with no title, or whose parent document does not
     /// exist, is skipped and named. Exits non-zero if anything was skipped, so a
     /// half-loaded corpus cannot pass for a loaded one in a script.
+    ///
+    /// Nothing is destroyed either. A page that already exists is an error unless
+    /// `--update` says otherwise, and a page in the wiki that no file claims is reported
+    /// and left exactly where it is — this command has no delete.
     Seed {
         /// Directory of `.md` files with YAML frontmatter.
         #[arg(long)]
         content: PathBuf,
+        /// Run as this account, subject to its permissions: creating a page needs write on
+        /// its parent, updating one needs write on the page, and pages the account cannot
+        /// read stay invisible to the report.
+        #[arg(long = "as", value_name = "USERNAME")]
+        identity: Option<String>,
+        /// Allow a file to replace the body of a page that already exists.
+        ///
+        /// Off by default: a slug collision is an error, not an overwrite. When on, the
+        /// change is appended as a revision authored by `--as`, the previous body stays in
+        /// the history, and the page's title, type, visibility, language and ordering are
+        /// still refused — those move a page or change who can see it, and a file drop
+        /// does not get to do either.
+        #[arg(long, requires = "identity")]
+        update: bool,
     },
+    /// Write the page tree out as a directory of markdown files.
+    ///
+    /// The mirror of `seed`: folders are the page tree, frontmatter is the metadata, and
+    /// `export` then `seed` into an empty wiki reproduces what was exported. Every
+    /// document is re-imported and compared before its file is written; one that would
+    /// come back different is NOT written, is named, and fails the run.
+    Export {
+        /// Directory to write into. Must be empty, or a previous export.
+        #[arg(long)]
+        content: PathBuf,
+        /// Export as this account. Required, and not a formality: reading the tree is
+        /// permission-filtered, so pages this account cannot read are simply not in the
+        /// export.
+        #[arg(long = "as", value_name = "USERNAME")]
+        identity: String,
+    },
+}
+
+/// Resolve `--as` to the principal the store holds for it.
+///
+/// Deliberately the same lookup a sign-in does, and deliberately not a constructed
+/// `Principal`: an identity assembled in this process would carry whatever groups the
+/// command line claimed, which is not an identity, it is an assertion.
+async fn identity(store: &gw_store::Store, username: &str) -> Result<gw_auth::Principal> {
+    let Some((principal, _)) = store.principal_by_username(username).await? else {
+        bail!("no account named `{username}` — create it in the admin console first");
+    };
+    if !principal.active {
+        bail!("the account `{username}` is deactivated");
+    }
+    Ok(principal)
 }
 
 /// Refuse to answer a sign-in with anything but Authelia's parameters.
@@ -74,9 +123,25 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        Command::Seed { content } => {
+        Command::Seed {
+            content,
+            identity: username,
+            update,
+        } => {
             let store = gw_store::Store::open(&cfg.database_url).await?;
-            let report = gw_api::seed::run(&store, &content).await?;
+            let principal = match &username {
+                Some(username) => Some(identity(&store, username).await?),
+                None => None,
+            };
+            let report = gw_api::seed::run_as(
+                &store,
+                &content,
+                gw_api::seed::Options {
+                    principal: principal.as_ref(),
+                    update,
+                },
+            )
+            .await?;
             println!("seeding from {}", content.display());
             println!("{report}");
             if report.is_complete() {
@@ -87,6 +152,28 @@ async fn main() -> Result<()> {
                 bail!(
                     "{} file(s) skipped — none of them were guessed at; fix them and run again",
                     report.skipped.len()
+                )
+            }
+        }
+        Command::Export {
+            content,
+            identity: username,
+        } => {
+            let store = gw_store::Store::open(&cfg.database_url).await?;
+            let principal = identity(&store, &username).await?;
+            let report = gw_api::export::run(&store, &principal, &content).await?;
+            println!("exporting to {}", content.display());
+            println!("{report}");
+            if report.is_complete() {
+                Ok(())
+            } else {
+                // Non-zero for the same reason `seed` is: a directory that is quietly
+                // missing a page is worse than no directory at all, because it looks
+                // finished.
+                bail!(
+                    "{} document(s) were NOT written — the export is incomplete and must not \
+                     be treated as a backup",
+                    report.refused.len()
                 )
             }
         }

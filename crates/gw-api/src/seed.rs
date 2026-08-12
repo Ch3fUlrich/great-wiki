@@ -1,32 +1,101 @@
 //! `great-wiki seed --content <dir>` — load a directory of markdown files into the store.
 //!
-//! Exists so there is real content to develop against before the editor lands (M3). The
-//! database stays the source of truth (AGENTS.md rule 1): this is an *import*, it runs
-//! once against an empty tree, and it is not a second write path — it inserts through
-//! `Store::insert_document` like anything else.
+//! Exists so there is real content to develop against before the editor lands (M3), and so
+//! bulk content can be moved in and out (M12). The database stays the source of truth
+//! (AGENTS.md rule 1): this is an *import*, and it is not a second write path — it creates
+//! through `Store::insert_document` and updates through `Store::publish_revision`, exactly
+//! as a person editing in the browser does.
 //!
-//! Two rules shape the whole module:
+//! Three rules shape the whole module:
 //!
 //! * **Nothing is invented.** No implicit parent, no title guessed from a filename, no
 //!   visibility assumed. A file that cannot be placed exactly as written is skipped and
 //!   named in the report.
 //! * **Every skip is reported and the process exits non-zero**, so this is usable in a
 //!   script and a half-loaded corpus cannot pass for a loaded one.
+//! * **Nothing is destroyed.** A path that already exists is an error by default. Updating
+//!   one is a separate, explicit opt-in ([`Options::update`]) that names the person doing
+//!   it, appends a revision rather than replacing one, and still refuses to change a live
+//!   page's title, type, visibility, language or ordering — the fields that decide where a
+//!   page is and who may see it are not things a file drop gets to move. And nothing is
+//!   ever deleted: a page in the wiki that no file claims is *reported*, never removed.
+//!
+//! # A note for whoever wires M3's collaborative editor to the store
+//!
+//! `gw-collab`'s CRDT can hold inline marks that `Block` cannot, which makes a `Block`
+//! snapshot a lossy view of a live document (see that crate's header). The update path here
+//! writes a `Block`. The moment a document has live CRDT state behind it, writing a `Block`
+//! over it is the loss that crate warns about, and this importer will need to refuse a
+//! document that has one. Nothing persists CRDT state today, so nothing here can hit it
+//! yet — but the day it does, this is the paragraph that says so.
 
 use anyhow::{Context, Result};
+use gw_auth::{Action, Principal};
 use gw_core::{markdown, slugify, split_frontmatter, Block, BlockKind, SeedMeta};
 use gw_store::{NewDocument, Store};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-/// A document that reached the database.
+/// How an import may act on the wiki it is loading into.
+///
+/// The default is the historical one and the safe one: no identity, no updating, and a
+/// collision is an error.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Options<'a> {
+    /// Who the import runs as.
+    ///
+    /// Supplying one does not merely label the run — it *subjects* it to that account's
+    /// permissions: creating a page needs write on its parent (or instance admin at the
+    /// root), updating one needs write on the page itself, and pages the account cannot
+    /// read are invisible to the "in the wiki but not in this directory" report. Running
+    /// without one is the operator-level path the seeder has always had, and it cannot
+    /// update anything.
+    pub principal: Option<&'a Principal>,
+    /// Whether a file may replace the body of a page that already exists.
+    ///
+    /// Spelled `update` rather than `force` or `overwrite` because that is what it does and
+    /// what the report then says: the verb in the flag and the verb in the output are the
+    /// same word. `--force` would name an objection being ignored without naming the
+    /// consequence, and `--overwrite` would claim more than happens — the previous body is
+    /// not replaced, it stays in the revision history with the earlier author's name on it.
+    ///
+    /// Requires [`Options::principal`]; an update with no author is refused before any file
+    /// is read.
+    pub update: bool,
+}
+
+/// What an import did to one document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The page did not exist and now does.
+    Created,
+    /// The page existed and its body changed. A revision was appended, attributed to the
+    /// principal the run named.
+    Updated,
+    /// The page existed and the file said exactly what it already held. Nothing was
+    /// written — a no-op revision in the timeline is noise that hides the real edits.
+    Unchanged,
+}
+
+impl Outcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Created => "created",
+            Outcome::Updated => "updated",
+            Outcome::Unchanged => "unchanged",
+        }
+    }
+}
+
+/// A document that reached the database, and what happened to it.
 #[derive(Debug, Clone)]
-pub struct Inserted {
+pub struct Applied {
     /// Path relative to the content directory, so the report is readable regardless of
     /// where the corpus lives.
     pub file: PathBuf,
     pub path: String,
+    pub outcome: Outcome,
 }
 
 /// A file that did not, and exactly why.
@@ -48,9 +117,17 @@ pub struct Note {
 
 #[derive(Debug, Clone, Default)]
 pub struct SeedReport {
-    pub inserted: Vec<Inserted>,
+    pub applied: Vec<Applied>,
     pub skipped: Vec<Skipped>,
     pub notes: Vec<Note>,
+    /// Paths that exist in the wiki and that no file in the directory claims.
+    ///
+    /// Listed, never acted on. Deleting is a different verb and this command does not have
+    /// it: a directory that is missing a file — because somebody exported a subtree, or
+    /// because a `git checkout` went sideways — must not be able to empty a wiki. Only
+    /// populated when the run names a principal, and then only with pages that principal
+    /// can see, because a list of paths is itself a disclosure.
+    pub absent: Vec<String>,
 }
 
 impl SeedReport {
@@ -58,15 +135,33 @@ impl SeedReport {
     pub fn is_complete(&self) -> bool {
         self.skipped.is_empty()
     }
+
+    /// How many documents had this outcome.
+    pub fn count(&self, outcome: Outcome) -> usize {
+        self.applied.iter().filter(|a| a.outcome == outcome).count()
+    }
 }
 
 impl fmt::Display for SeedReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for i in &self.inserted {
-            writeln!(f, "  inserted  {:<40} {}", i.path, i.file.display())?;
+        for a in &self.applied {
+            writeln!(
+                f,
+                "  {:<9} {:<40} {}",
+                a.outcome.as_str(),
+                a.path,
+                a.file.display()
+            )?;
         }
         for n in &self.notes {
             writeln!(f, "  note      {}: {}", n.file.display(), n.detail)?;
+        }
+        for path in &self.absent {
+            writeln!(
+                f,
+                "  absent    {path} — in the wiki, not in this directory; nothing was \
+                 deleted, because deleting is a different command"
+            )?;
         }
         for s in &self.skipped {
             // `reason` already names the file — see `Skipped::reason`.
@@ -74,19 +169,43 @@ impl fmt::Display for SeedReport {
         }
         write!(
             f,
-            "{} inserted, {} skipped",
-            self.inserted.len(),
-            self.skipped.len()
+            "{} created, {} updated, {} unchanged, {} skipped, {} in the wiki but not here",
+            self.count(Outcome::Created),
+            self.count(Outcome::Updated),
+            self.count(Outcome::Unchanged),
+            self.skipped.len(),
+            self.absent.len()
         )
     }
 }
 
+/// Load every `.md` file under `content_dir` with the default options: no identity, and a
+/// collision is an error.
+pub async fn run(store: &Store, content_dir: &Path) -> Result<SeedReport> {
+    run_as(store, content_dir, Options::default()).await
+}
+
 /// Load every `.md` file under `content_dir`.
 ///
-/// Errors returned here are failures of the *run* (an unreadable directory); a file that
-/// cannot be loaded is a skip inside the report, not an error, so one bad file never
-/// hides the state of the other ninety.
-pub async fn run(store: &Store, content_dir: &Path) -> Result<SeedReport> {
+/// This is the library seam: the CLI is a thin shell over it, and anything else holding a
+/// [`Store`] — an HTTP handler, the MCP server the owner has chosen — calls the same
+/// function with the same [`Options`] and gets the same [`SeedReport`] back. Nothing about
+/// the rules lives in `main.rs`.
+///
+/// Errors returned here are failures of the *run* (an unreadable directory, or an update
+/// with nobody to attribute it to); a file that cannot be loaded is a skip inside the
+/// report, not an error, so one bad file never hides the state of the other ninety.
+pub async fn run_as(store: &Store, content_dir: &Path, options: Options<'_>) -> Result<SeedReport> {
+    // Refused before a single file is read, rather than per file: an update is a named
+    // person's edit and appears in the history under their name, so a run that cannot name
+    // one is a misconfiguration of the whole run.
+    anyhow::ensure!(
+        !options.update || options.principal.is_some(),
+        "updating existing pages needs an account to attribute the edits to — pass the \
+         identity as well, because every revision this writes carries an author and the \
+         permission check that goes with it"
+    );
+
     let files = collect_markdown(content_dir)
         .with_context(|| format!("reading content directory {}", content_dir.display()))?;
 
@@ -94,29 +213,76 @@ pub async fn run(store: &Store, content_dir: &Path) -> Result<SeedReport> {
     // Which file claimed which path during *this* run, so a collision names both sides
     // rather than only the loser.
     let mut claimed: HashMap<String, PathBuf> = HashMap::new();
+    // Every path a file in this directory is *about*, whether or not it was applied. A
+    // skipped file has still been seen, and listing its page as "in the wiki but not here"
+    // would point at the wrong problem — the fix is the skip above it, not a missing file.
+    let mut seen: HashSet<String> = HashSet::new();
 
     for rel in files {
-        match load_one(store, content_dir, &rel, &claimed).await? {
-            Loaded::Inserted { path, notes } => {
+        match load_one(store, content_dir, &rel, &claimed, options).await? {
+            Loaded::Applied {
+                path,
+                outcome,
+                notes,
+            } => {
                 claimed.insert(path.clone(), rel.clone());
+                seen.insert(path.clone());
                 for detail in notes {
                     report.notes.push(Note {
                         file: rel.clone(),
                         detail,
                     });
                 }
-                report.inserted.push(Inserted { file: rel, path });
+                report.applied.push(Applied {
+                    file: rel,
+                    path,
+                    outcome,
+                });
             }
-            Loaded::Skipped(reason) => report.skipped.push(Skipped { file: rel, reason }),
+            Loaded::Skipped { reason, path } => {
+                seen.extend(path);
+                report.skipped.push(Skipped { file: rel, reason });
+            }
         }
+    }
+
+    if let Some(principal) = options.principal {
+        report.absent = readable_paths(store, principal)
+            .await?
+            .into_iter()
+            .filter(|path| !seen.contains(path))
+            .collect();
     }
 
     Ok(report)
 }
 
+/// Every path `principal` may read, parents first.
+async fn readable_paths(store: &Store, principal: &Principal) -> Result<Vec<String>> {
+    fn walk(nodes: &[gw_store::TreeNode], out: &mut Vec<String>) {
+        for node in nodes {
+            out.push(node.path.clone());
+            walk(&node.children, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(&store.tree_for(principal).await?, &mut out);
+    Ok(out)
+}
+
 enum Loaded {
-    Inserted { path: String, notes: Vec<String> },
-    Skipped(String),
+    Applied {
+        path: String,
+        outcome: Outcome,
+        notes: Vec<String>,
+    },
+    Skipped {
+        reason: String,
+        /// The page the file was about, where the skip happened late enough to know it. A
+        /// file with no title never gets one, and inventing a path for it would be the
+        /// exact guess this module refuses everywhere else.
+        path: Option<String>,
+    },
 }
 
 async fn load_one(
@@ -124,11 +290,25 @@ async fn load_one(
     root: &Path,
     rel: &Path,
     claimed: &HashMap<String, PathBuf>,
+    options: Options<'_>,
 ) -> Result<Loaded> {
     let display = rel.display().to_string();
     // Every skip reason names its own file. `FrontmatterError` already does so itself, so
     // it is the one case that does not go through here.
-    let skip = |message: String| Ok(Loaded::Skipped(format!("{display}: {message}")));
+    // Every skip carries the page it was about when that is known, so the "in the wiki but
+    // not in this directory" list does not accuse a file that IS here of being missing.
+    let skip = |message: String| {
+        Ok(Loaded::Skipped {
+            reason: format!("{display}: {message}"),
+            path: None,
+        })
+    };
+    let skip_at = |path: &str, message: String| {
+        Ok(Loaded::Skipped {
+            reason: format!("{display}: {message}"),
+            path: Some(path.to_string()),
+        })
+    };
 
     let raw = match std::fs::read_to_string(root.join(rel)) {
         Ok(raw) => raw,
@@ -139,7 +319,12 @@ async fn load_one(
     let (yaml, body) = split_frontmatter(&raw);
     let meta = match SeedMeta::parse(yaml, &display) {
         Ok(meta) => meta,
-        Err(e) => return Ok(Loaded::Skipped(e.to_string())),
+        Err(e) => {
+            return Ok(Loaded::Skipped {
+                reason: e.to_string(),
+                path: None,
+            })
+        }
     };
 
     let parent_path = match parent_path_of(rel) {
@@ -178,22 +363,6 @@ async fn load_one(
         Err(e) => return skip(e.to_string()),
     };
 
-    // Checked before the insert so the message can say *what* collided. The UNIQUE
-    // constraint is still the authority — see the fallback below.
-    if store.document_exists(&path).await? {
-        return skip(collision_reason(&path, claimed));
-    }
-
-    if let Err(e) = store.insert_document(&new).await {
-        let message = e.to_string();
-        // A collision that slipped past the check above — another writer, or a slug rule
-        // this code got wrong. The UNIQUE constraint, not the pre-check, is the authority.
-        if message.contains("UNIQUE") {
-            return skip(collision_reason(&path, claimed));
-        }
-        return skip(format!("could not be inserted: {message}"));
-    }
-
     let mut notes: Vec<String> = conversion.notes.iter().map(|n| n.to_string()).collect();
     if !meta.unknown_keys.is_empty() {
         notes.push(format!(
@@ -203,7 +372,200 @@ async fn load_one(
         ));
     }
 
-    Ok(Loaded::Inserted { path, notes })
+    // Checked before writing so the message can say *what* collided. The UNIQUE constraint
+    // is still the authority — see the fallback below.
+    let outcome = if store.document_exists(&path).await? {
+        if !options.update {
+            return skip_at(&path, collision_reason(&path, claimed));
+        }
+        // `run_as` refuses an update with no principal before any file is opened, so this
+        // cannot be `None` here. Expressed as a skip rather than an `expect` all the same:
+        // a future caller constructing `Options` by hand should get a message, not a panic.
+        let Some(principal) = options.principal else {
+            return skip_at(
+                &path,
+                "updating needs an account to attribute the edit to".to_string(),
+            );
+        };
+        match update_one(store, principal, &path, &new, rel, &mut notes).await? {
+            Ok(outcome) => outcome,
+            Err(reason) => return skip_at(&path, reason),
+        }
+    } else {
+        // Naming an identity means being subject to it. Without one this is the operator
+        // path the seeder has always been, and the store's own insert is the only gate.
+        if let Some(principal) = options.principal {
+            if let Some(reason) = refuse_create(store, principal, &new, &path).await? {
+                return skip_at(&path, reason);
+            }
+        }
+        if let Err(e) = store.insert_document(&new).await {
+            let message = e.to_string();
+            // A collision that slipped past the check above — another writer, or a slug
+            // rule this code got wrong. The UNIQUE constraint, not the pre-check, is the
+            // authority.
+            if message.contains("UNIQUE") {
+                return skip_at(&path, collision_reason(&path, claimed));
+            }
+            return skip_at(&path, format!("could not be inserted: {message}"));
+        }
+        Outcome::Created
+    };
+
+    Ok(Loaded::Applied {
+        path,
+        outcome,
+        notes,
+    })
+}
+
+/// Replace the body of a page that already exists, or say why not.
+///
+/// `Err(reason)` is a skip, not a failure of the run. The write goes through
+/// [`Store::publish_revision`], which is the same call the editor makes: it checks the
+/// author may write *this* page, appends a revision rather than replacing one, and leaves
+/// the previous body in the history under whoever wrote it. There is deliberately no path
+/// here that touches `documents.body` directly — a second write path is how a wiki loses
+/// the ability to say who changed what.
+async fn update_one(
+    store: &Store,
+    principal: &Principal,
+    path: &str,
+    new: &NewDocument,
+    rel: &Path,
+    notes: &mut Vec<String>,
+) -> Result<std::result::Result<Outcome, String>> {
+    let Some(existing) = store.document_for(principal, path, Action::Read).await? else {
+        return Ok(Err(format!(
+            "`{path}` already exists but `{}` cannot read it, so this run cannot tell \
+             whether the file would change it — grant access or run as somebody who has it",
+            principal.username
+        )));
+    };
+
+    // The fields that decide where a page lives and who may see it are NOT importable.
+    // Changing them is reported and refused, because the failure mode is unrecoverable in
+    // exactly the wrong direction: a stray `visibility: public` in a file drop would
+    // publish a restricted page, and nothing in a bulk run is watching closely enough to
+    // catch it. Moving a page is worse still — it orphans every child under the old path.
+    for (field, in_file, in_wiki) in [
+        ("title", new.title.as_str(), existing.title.as_str()),
+        ("type", new.doc_type.as_str(), existing.doc_type.as_str()),
+        (
+            "visibility",
+            new.visibility.as_str(),
+            existing.visibility.as_str(),
+        ),
+        (
+            "language",
+            new.language.as_str(),
+            existing.language.as_str(),
+        ),
+    ] {
+        if in_file != in_wiki {
+            notes.push(metadata_refusal(path, field, in_file, in_wiki));
+        }
+    }
+    if new.sort_key != existing.sort_key {
+        notes.push(metadata_refusal(
+            path,
+            "sort_key",
+            &new.sort_key.to_string(),
+            &existing.sort_key.to_string(),
+        ));
+    }
+
+    let stored: Block = match serde_json::from_str(&existing.body) {
+        Ok(body) => body,
+        Err(e) => {
+            return Ok(Err(format!(
+                "`{path}` already exists but its stored body is not a block tree ({e}), so \
+                 this run cannot tell an update from a no-op"
+            )))
+        }
+    };
+    // Compared as JSON because that is what the store holds and what the editor loads;
+    // comparing extracted text instead would call a table turned into paragraphs
+    // "unchanged". An unchanged page writes NOTHING: a no-op revision per file per run
+    // buries the real edits in a history nobody can then read.
+    if serde_json::to_value(&stored)? == serde_json::to_value(&new.body)? {
+        return Ok(Ok(Outcome::Unchanged));
+    }
+
+    let summary = format!("imported from {}", rel.display());
+    match store
+        .publish_revision(principal, &existing.id, &new.body, Some(&summary))
+        .await?
+    {
+        Some(_) => Ok(Ok(Outcome::Updated)),
+        None => Ok(Err(format!(
+            "`{path}` exists and this file would change it, but `{}` may not write it — an \
+             import edits through the same permission check a person does, and writing is \
+             only ever an explicit grant",
+            principal.username
+        ))),
+    }
+}
+
+fn metadata_refusal(path: &str, field: &str, in_file: &str, in_wiki: &str) -> String {
+    format!(
+        "`{path}`: the file says {field} `{in_file}`, the wiki says `{in_wiki}` — the BODY \
+         was updated and this was NOT. A file drop does not get to move a page or change \
+         who can see it; do that in the admin console, where it is one deliberate act with \
+         a name on it"
+    )
+}
+
+/// Whether `principal` may create the document `new` describes, or the reason they may not.
+///
+/// **This system has no permission-checked "create a document" yet.** `insert_document` takes
+/// no principal and there is no HTTP route that creates one, so there is no existing rule to
+/// call — and inventing an authorisation rule here would make this the *second* place that
+/// decides access, which is always the one that gets it wrong when the rules change.
+///
+/// So exactly one question is asked, and it is one the store already answers: may this
+/// account write the page the new one would hang under? Adding a child is an edit of the
+/// branch, and `document_for(.., Write)` is the same check `publish_revision` makes.
+///
+/// At the root there is no parent to ask about and therefore no answer that is not a guess,
+/// so creating a top-level page is **refused** whenever a principal is named. That is not a
+/// gap being papered over: bootstrapping a wiki is the identity-less operator path (`seed`
+/// with no account), which is unchanged and still unchecked, exactly as it was before this
+/// milestone. When a permission-checked create lands with the editor, this function is where
+/// it plugs in.
+async fn refuse_create(
+    store: &Store,
+    principal: &Principal,
+    new: &NewDocument,
+    path: &str,
+) -> Result<Option<String>> {
+    if !principal.is_authenticated() || !principal.active {
+        return Ok(Some(format!(
+            "`{path}` would be created, but the run named no active, signed-in account to \
+             create it as"
+        )));
+    }
+    let Some(parent) = new.parent_path.as_deref() else {
+        return Ok(Some(format!(
+            "`{path}` would be a new TOP-LEVEL page, and nothing in this system yet says who \
+             may create one — there is no parent to check write access on, and guessing a \
+             rule here would put a second, weaker answer next to the real one. Create \
+             top-level pages by running without an account (the operator path), then use an \
+             account for everything below them"
+        )));
+    };
+    if store
+        .document_for(principal, parent, Action::Write)
+        .await?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "`{path}` would be created, but `{}` may not write its parent `{parent}` — adding a \
+         page under a branch is an edit of that branch",
+        principal.username
+    )))
 }
 
 /// Drop a leading `# Title` that only repeats the frontmatter title.
@@ -216,7 +578,7 @@ async fn load_one(
 /// whose first heading genuinely differs from its title keeps both, because only the
 /// author knows whether "Größe" under a page titled "Größe und Maß" is a repetition or a
 /// section. Guessing wrong here deletes writing, which is worse than a duplicated line.
-fn drop_duplicate_title_heading(doc: &mut Block, title: &str) {
+pub(crate) fn drop_duplicate_title_heading(doc: &mut Block, title: &str) {
     let Some(first) = doc.content.first() else {
         return;
     };

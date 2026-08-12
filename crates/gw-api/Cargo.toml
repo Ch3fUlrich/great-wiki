@@ -43,6 +43,10 @@ reqwest = { version = "0.13", default-features = false, features = ["charset", "
 rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The export writes YAML frontmatter. Serialised through the same library the importer
+# parses it with, so a title holding a colon, a quote or a leading `-` is quoted by the
+# rules that will read it back rather than by a format string that guesses.
+serde_yaml = { workspace = true }
 sha2 = "0.10"
 # sqlx is a DIRECT dependency because handlers query. The predecessor plan omitted it
 # from this crate's manifest while calling sqlx from four of its modules.

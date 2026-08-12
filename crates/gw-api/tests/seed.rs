@@ -61,7 +61,7 @@ async fn a_document_lands_at_the_path_its_title_slugifies_to() {
     let (store, report) = seed(dir.path()).await;
 
     assert!(report.is_complete(), "{report}");
-    assert_eq!(report.inserted.len(), 1);
+    assert_eq!(report.applied.len(), 1);
 
     // German end to end: umlauts in the title, an ASCII path in the database.
     let doc = fetch(&store, "/groesse-und-mass")
@@ -86,8 +86,8 @@ async fn a_child_is_nested_under_the_document_its_directory_names() {
     let (store, report) = seed(dir.path()).await;
 
     assert!(report.is_complete(), "{report}");
-    assert_eq!(report.inserted[0].path, "/handbuch", "shallowest first");
-    assert_eq!(report.inserted[1].path, "/handbuch/erste-schritte");
+    assert_eq!(report.applied[0].path, "/handbuch", "shallowest first");
+    assert_eq!(report.applied[1].path, "/handbuch/erste-schritte");
 
     let child = fetch(&store, "/handbuch/erste-schritte")
         .await
@@ -100,7 +100,7 @@ async fn a_missing_title_is_reported_with_the_filename_never_guessed() {
     let dir = corpus(&[("ohne-titel.md", "---\ntype: page\n---\nText.\n")]);
     let (store, report) = seed(dir.path()).await;
 
-    assert_eq!(report.inserted.len(), 0);
+    assert_eq!(report.applied.len(), 0);
     assert!(!report.is_complete(), "a skipped file must fail the run");
 
     let reason = reason_for(&report, "ohne-titel.md");
@@ -132,7 +132,7 @@ async fn two_files_claiming_one_path_name_both_sides() {
     ]);
     let (store, report) = seed(dir.path()).await;
 
-    assert_eq!(report.inserted.len(), 1);
+    assert_eq!(report.applied.len(), 1);
     assert_eq!(report.skipped.len(), 1);
 
     let reason = reason_for(&report, "b-notiz.md");
@@ -175,7 +175,7 @@ async fn a_child_without_a_parent_document_is_skipped_not_given_an_invented_one(
     )]);
     let (store, report) = seed(dir.path()).await;
 
-    assert_eq!(report.inserted.len(), 0);
+    assert_eq!(report.applied.len(), 0);
     let reason = reason_for(&report, "handbuch/erste-schritte.md");
     assert!(reason.contains("/handbuch"), "{reason}");
     assert!(reason.contains("parent"), "{reason}");
@@ -317,7 +317,10 @@ async fn the_summary_names_every_skipped_file_and_its_reason() {
     let (_store, report) = seed(dir.path()).await;
 
     let summary = report.to_string();
-    assert!(summary.contains("1 inserted, 1 skipped"), "{summary}");
+    assert!(
+        summary.contains("1 created, 0 updated, 0 unchanged, 1 skipped"),
+        "{summary}"
+    );
     assert!(summary.contains("/gut"), "{summary}");
 
     let skip_line = summary
@@ -337,7 +340,7 @@ async fn an_empty_directory_succeeds_with_nothing_to_do() {
     let dir = tempfile::tempdir().unwrap();
     let (_store, report) = seed(dir.path()).await;
     assert!(report.is_complete());
-    assert_eq!(report.inserted.len(), 0);
+    assert_eq!(report.applied.len(), 0);
 }
 
 #[tokio::test]
@@ -360,7 +363,7 @@ async fn the_shipped_example_corpus_seeds_cleanly() {
     let (store, report) = seed(&dir).await;
 
     assert!(report.is_complete(), "{report}");
-    assert!(report.inserted.len() >= 4, "{report}");
+    assert!(report.applied.len() >= 4, "{report}");
     assert!(
         !report.notes.iter().any(|n| n.detail.contains("table")),
         "the corpus contains a table and tables are modelled now; a note here means the \
@@ -369,5 +372,439 @@ async fn the_shipped_example_corpus_seeds_cleanly() {
     assert!(
         !store.tree_for(&admin()).await.unwrap().is_empty(),
         "the example corpus must produce a navigable tree"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Updating: the opt-in that lets a file change a page that already exists
+// ---------------------------------------------------------------------------------------
+
+use gw_api::seed::{Options, Outcome};
+use gw_auth::{Permission, Subject};
+
+/// An account holding exactly `permission` on `path`, and nothing else.
+///
+/// Every fixture here carries an explicit grant because writing is only ever an explicit
+/// grant (D-M2-8): no baseline confers it, not even the admin one — which is why the
+/// `admin()` principal above can read the whole corpus and still not update a line of it.
+async fn granted(store: &Store, username: &str, path: &str, permission: Permission) -> Principal {
+    let principal = Principal::test(username, &[], &[]);
+    store
+        .add_grant(path, Subject::Principal(principal.id.clone()), permission)
+        .await
+        .unwrap();
+    principal
+}
+
+fn options<'a>(principal: &'a Principal, update: bool) -> Options<'a> {
+    Options {
+        principal: Some(principal),
+        update,
+    }
+}
+
+/// A store holding `files`, loaded by the identity-less operator path.
+async fn loaded(files: &[(&str, &str)]) -> Store {
+    let store = Store::open("sqlite::memory:").await.unwrap();
+    let dir = corpus(files);
+    let report = seed::run(&store, dir.path()).await.unwrap();
+    assert!(
+        report.is_complete(),
+        "the first pass must load cleanly: {report}"
+    );
+    store
+}
+
+/// Import `files` again, as `principal`, with updating on or off.
+async fn again(store: &Store, files: &[(&str, &str)], who: &Principal, update: bool) -> SeedReport {
+    let dir = corpus(files);
+    seed::run_as(store, dir.path(), options(who, update))
+        .await
+        .unwrap()
+}
+
+/// The account these tests update as: an explicit `write` grant on the page, and nothing
+/// else. `autorin` because "author" is what a revision records.
+async fn autorin(store: &Store, path: &str) -> Principal {
+    granted(store, "autorin", path, Permission::Write).await
+}
+
+#[tokio::test]
+async fn without_the_flag_an_existing_page_is_still_refused_not_overwritten() {
+    // The default has not moved: `insert_document`'s UNIQUE constraint stays the authority
+    // and a collision is an error. Updating had to be a separate, named act, not a relaxed
+    // constraint.
+    let store = loaded(&[("notiz.md", "---\ntitle: Notiz\n---\nAlt.\n")]).await;
+    let who = autorin(&store, "/notiz").await;
+    let report = again(
+        &store,
+        &[("notiz.md", "---\ntitle: Notiz\n---\nNeu.\n")],
+        &who,
+        false,
+    )
+    .await;
+
+    assert!(!report.is_complete(), "{report}");
+    assert_eq!(report.count(Outcome::Updated), 0);
+    assert!(reason_for(&report, "notiz.md").contains("already exists"));
+    assert!(fetch(&store, "/notiz").await.unwrap().body.contains("Alt."));
+}
+
+#[tokio::test]
+async fn with_the_flag_the_body_is_updated_and_the_old_one_stays_in_the_history() {
+    let store = loaded(&[("notiz.md", "---\ntitle: Notiz\n---\nAlt.\n")]).await;
+    let who = autorin(&store, "/notiz").await;
+    let report = again(
+        &store,
+        &[("notiz.md", "---\ntitle: Notiz\n---\nNeu.\n")],
+        &who,
+        true,
+    )
+    .await;
+
+    assert!(report.is_complete(), "{report}");
+    assert_eq!(report.count(Outcome::Updated), 1, "{report}");
+    assert_eq!(report.count(Outcome::Created), 0, "{report}");
+
+    let doc = fetch(&store, "/notiz").await.unwrap();
+    assert!(doc.body.contains("Neu."), "{}", doc.body);
+
+    // "Update" must not mean "replace": the previous text is still readable, attributed,
+    // and restorable. That is the whole difference between this and `ON CONFLICT DO UPDATE`.
+    let autorin = Principal::test("autorin", &[], &[]);
+    let history = store.revisions_for(&autorin, &doc.id).await.unwrap();
+    assert_eq!(history.len(), 1, "one revision for one change");
+    assert!(history[0].body.contains("Neu."));
+    assert_eq!(history[0].author_name, "autorin");
+    assert!(
+        history[0]
+            .summary
+            .as_deref()
+            .is_some_and(|s| s.contains("notiz.md")),
+        "the history must say where the change came from: {:?}",
+        history[0].summary
+    );
+}
+
+#[tokio::test]
+async fn a_file_that_says_what_the_page_already_holds_writes_nothing_at_all() {
+    // A no-op revision per file per run buries the real edits in a timeline nobody can
+    // then read — and re-importing an unchanged export is the common case, not the rare one.
+    let same = "---\ntitle: Notiz\n---\nGleich.\n";
+    let store = loaded(&[("notiz.md", same)]).await;
+    let who = autorin(&store, "/notiz").await;
+    let report = again(&store, &[("notiz.md", same)], &who, true).await;
+
+    assert!(report.is_complete(), "{report}");
+    assert_eq!(report.count(Outcome::Unchanged), 1, "{report}");
+    assert_eq!(report.count(Outcome::Updated), 0, "{report}");
+
+    let doc = fetch(&store, "/notiz").await.unwrap();
+    let autorin = Principal::test("autorin", &[], &[]);
+    assert!(
+        store
+            .revisions_for(&autorin, &doc.id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an unchanged page must not appear in its own history"
+    );
+}
+
+#[tokio::test]
+async fn an_import_updates_the_body_and_refuses_to_republish_the_page() {
+    // The dangerous field. A stray `visibility: public` in a bulk file drop must not be
+    // able to publish a page nobody meant to publish — so the body lands, the visibility
+    // does not, and the report says so in as many words.
+    let store = loaded(&[("notiz.md", "---\ntitle: Notiz\n---\nAlt.\n")]).await;
+    let who = autorin(&store, "/notiz").await;
+    let report = again(
+        &store,
+        &[(
+            "notiz.md",
+            "---\ntitle: Notiz\nvisibility: public\nsort_key: 9\n---\nNeu.\n",
+        )],
+        &who,
+        true,
+    )
+    .await;
+
+    assert!(report.is_complete(), "{report}");
+    assert_eq!(report.count(Outcome::Updated), 1, "{report}");
+
+    let doc = fetch(&store, "/notiz").await.unwrap();
+    assert!(doc.body.contains("Neu."), "the body must still update");
+    assert_eq!(
+        doc.visibility, "restricted",
+        "a file drop published a page: {report}"
+    );
+    assert_eq!(doc.sort_key, 0, "and moved it in the navigation: {report}");
+
+    let notes = report
+        .notes
+        .iter()
+        .map(|n| n.detail.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(notes.contains("visibility"), "{notes}");
+    assert!(notes.contains("sort_key"), "{notes}");
+    assert!(
+        notes.contains("NOT"),
+        "the note must say the field was refused, not merely that it differs: {notes}"
+    );
+}
+
+#[tokio::test]
+async fn an_account_that_may_read_but_not_write_cannot_update() {
+    // The permission-checked path is the point: an import edits through exactly the check
+    // a person editing in the browser goes through, and reading a page never implies
+    // editing it.
+    let store = loaded(&[(
+        "notiz.md",
+        "---\ntitle: Notiz\nvisibility: public\n---\nAlt.\n",
+    )])
+    .await;
+    let who = granted(&store, "leserin", "/notiz", Permission::Read).await;
+    let report = again(
+        &store,
+        &[(
+            "notiz.md",
+            "---\ntitle: Notiz\nvisibility: public\n---\nNeu.\n",
+        )],
+        &who,
+        true,
+    )
+    .await;
+
+    assert!(!report.is_complete(), "{report}");
+    assert_eq!(report.count(Outcome::Updated), 0, "{report}");
+    let reason = reason_for(&report, "notiz.md");
+    assert!(reason.contains("leserin"), "{reason}");
+    assert!(reason.contains("may not write"), "{reason}");
+    assert!(
+        fetch(&store, "/notiz").await.unwrap().body.contains("Alt."),
+        "the refused write must not have landed anyway"
+    );
+}
+
+#[tokio::test]
+async fn the_admin_baseline_alone_does_not_let_an_import_rewrite_a_page() {
+    // D-M2-8: no baseline confers writing. An account that can read the whole wiki — which
+    // is exactly the account somebody would reach for to run a bulk import — still cannot
+    // change a line of it without an explicit grant.
+    let store = loaded(&[("notiz.md", "---\ntitle: Notiz\n---\nAlt.\n")]).await;
+    let chefin = Principal::test("chefin", &["admins"], &[]);
+    let report = again(
+        &store,
+        &[("notiz.md", "---\ntitle: Notiz\n---\nNeu.\n")],
+        &chefin,
+        true,
+    )
+    .await;
+
+    assert!(!report.is_complete(), "{report}");
+    assert!(reason_for(&report, "notiz.md").contains("may not write"));
+    assert!(fetch(&store, "/notiz").await.unwrap().body.contains("Alt."));
+}
+
+#[tokio::test]
+async fn updating_with_nobody_to_attribute_it_to_is_refused_before_any_file_is_read() {
+    let dir = corpus(&[("notiz.md", "---\ntitle: Notiz\n---\nText.\n")]);
+    let store = Store::open("sqlite::memory:").await.unwrap();
+    let err = seed::run_as(
+        &store,
+        dir.path(),
+        Options {
+            principal: None,
+            update: true,
+        },
+    )
+    .await
+    .expect_err("an update with no author must not run");
+    assert!(err.to_string().contains("attribute"), "{err}");
+    assert!(
+        !store.document_exists("/notiz").await.unwrap(),
+        "the run must stop before it writes anything, not part-way through"
+    );
+}
+
+#[tokio::test]
+async fn a_page_in_the_wiki_that_no_file_claims_is_reported_and_left_alone() {
+    // Deleting is a different verb. A directory missing a file — a partial export, a
+    // `git checkout` gone sideways — must never be able to empty a wiki.
+    let notiz = "---\ntitle: Notiz\nvisibility: public\n---\nText.\n";
+    let store = loaded(&[
+        ("notiz.md", notiz),
+        (
+            "alt.md",
+            "---\ntitle: Alt\nvisibility: public\n---\nBleibt.\n",
+        ),
+        ("geheim.md", "---\ntitle: Geheim\n---\nNicht sichtbar.\n"),
+    ])
+    .await;
+    let who = autorin(&store, "/notiz").await;
+    let report = again(&store, &[("notiz.md", notiz)], &who, true).await;
+
+    assert!(report.is_complete(), "{report}");
+    assert_eq!(report.absent, vec!["/alt".to_string()], "{report}");
+    assert!(
+        store.document_exists("/alt").await.unwrap(),
+        "the page must still be there"
+    );
+    assert!(
+        report.to_string().contains("nothing was deleted"),
+        "the report must say what it did not do: {report}"
+    );
+
+    // `/geheim` is restricted and this account has no grant on it, so it is missing from
+    // the list too — a list of paths is a disclosure, and "you have not covered this page"
+    // is exactly as much of one as showing the page would be.
+    assert!(
+        store.document_exists("/geheim").await.unwrap(),
+        "and it is certainly still there"
+    );
+    assert!(
+        !report.absent.iter().any(|p| p == "/geheim"),
+        "a page the account cannot read must not be named back to it: {report}"
+    );
+}
+
+#[tokio::test]
+async fn a_run_with_no_account_reports_nothing_absent_because_it_can_see_nothing() {
+    // The absent list is a list of paths, and a list of paths is a disclosure. Without an
+    // identity there is nobody to filter it for, so it is empty rather than complete.
+    let dir = corpus(&[("notiz.md", "---\ntitle: Notiz\n---\nText.\n")]);
+    let store = Store::open("sqlite::memory:").await.unwrap();
+    seed::run(&store, dir.path()).await.unwrap();
+
+    let empty = corpus(&[]);
+    let report = seed::run(&store, empty.path()).await.unwrap();
+    assert!(report.absent.is_empty(), "{report}");
+}
+
+#[tokio::test]
+async fn creating_a_child_needs_write_on_the_branch_it_hangs_under() {
+    let store = Store::open("sqlite::memory:").await.unwrap();
+    let first = corpus(&[(
+        "handbuch.md",
+        "---\ntitle: Handbuch\nvisibility: public\n---\nText.\n",
+    )]);
+    seed::run(&store, first.path()).await.unwrap();
+
+    let second = corpus(&[
+        (
+            "handbuch.md",
+            "---\ntitle: Handbuch\nvisibility: public\n---\nText.\n",
+        ),
+        (
+            "handbuch/neu.md",
+            "---\ntitle: Neu\nvisibility: public\n---\nText.\n",
+        ),
+    ]);
+
+    // A reader may not extend the branch.
+    let leserin = granted(&store, "leserin", "/handbuch", Permission::Read).await;
+    let report = seed::run_as(&store, second.path(), options(&leserin, true))
+        .await
+        .unwrap();
+    let reason = reason_for(&report, "handbuch/neu.md");
+    assert!(reason.contains("may not write its parent"), "{reason}");
+    assert!(!store.document_exists("/handbuch/neu").await.unwrap());
+
+    // A writer may.
+    let autorin = granted(&store, "autorin", "/handbuch", Permission::Write).await;
+    let report = seed::run_as(&store, second.path(), options(&autorin, true))
+        .await
+        .unwrap();
+    assert!(report.is_complete(), "{report}");
+    assert_eq!(report.count(Outcome::Created), 1, "{report}");
+    assert!(store.document_exists("/handbuch/neu").await.unwrap());
+}
+
+#[tokio::test]
+async fn creating_a_top_level_page_under_an_account_is_refused_rather_than_guessed() {
+    // Nothing in this system says who may create a top-level page: there is no parent to
+    // check write access on and no permission-checked create anywhere. A rule invented here
+    // would be a second, weaker answer sitting next to the real one, so there is none.
+    let store = Store::open("sqlite::memory:").await.unwrap();
+    let dir = corpus(&[("neu.md", "---\ntitle: Neu\n---\nText.\n")]);
+    let chefin = Principal::test("chefin", &["admins"], &[]);
+
+    let report = seed::run_as(&store, dir.path(), options(&chefin, true))
+        .await
+        .unwrap();
+    assert!(!report.is_complete(), "{report}");
+    let reason = reason_for(&report, "neu.md");
+    assert!(reason.contains("TOP-LEVEL"), "{reason}");
+    assert!(!store.document_exists("/neu").await.unwrap());
+
+    // …and the operator path — no account at all — is unchanged and still works, which is
+    // how a wiki gets bootstrapped in the first place.
+    let report = seed::run(&store, dir.path()).await.unwrap();
+    assert!(report.is_complete(), "{report}");
+    assert!(store.document_exists("/neu").await.unwrap());
+}
+
+#[tokio::test]
+async fn a_file_holding_formatting_the_database_cannot_store_says_so_on_an_update_too() {
+    // The trap this whole milestone is about. A person edits an exported file, adds bold
+    // and a link, and imports it back. The text lands; the emphasis and the destination do
+    // not, because `Block` has nowhere to put them. That has to be said out loud on the way
+    // in, every time — a silent degradation is the one outcome that cannot be found later.
+    let store = loaded(&[(
+        "notiz.md",
+        "---\ntitle: Notiz\nvisibility: public\n---\nSchlicht.\n",
+    )])
+    .await;
+    let who = autorin(&store, "/notiz").await;
+    let report = again(
+        &store,
+        &[(
+            "notiz.md",
+            "---\ntitle: Notiz\nvisibility: public\n---\nEin **fettes** Wort und \
+             [ein Verweis](/handbuch).\n",
+        )],
+        &who,
+        true,
+    )
+    .await;
+
+    assert_eq!(report.count(Outcome::Updated), 1, "{report}");
+    let notes = report
+        .notes
+        .iter()
+        .map(|n| n.detail.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(notes.contains("inline-marks"), "{notes}");
+    assert!(notes.contains("emphasis dropped"), "{notes}");
+    assert!(notes.contains("destination dropped"), "{notes}");
+}
+
+#[tokio::test]
+async fn a_page_whose_file_was_skipped_is_not_also_reported_as_missing() {
+    // Found by running the real command: a file that IS in the directory but could not be
+    // applied was named twice — once as a skip, once as "in the wiki, not in this
+    // directory". The second line is false and points at the wrong fix, which is exactly
+    // how somebody ends up deleting a file to make a message go away.
+    let notiz = "---\ntitle: Notiz\nvisibility: public\n---\nAlt.\n";
+    let store = loaded(&[("notiz.md", notiz)]).await;
+    let who = granted(&store, "leserin", "/notiz", Permission::Read).await;
+
+    let report = again(
+        &store,
+        &[(
+            "notiz.md",
+            "---\ntitle: Notiz\nvisibility: public\n---\nNeu.\n",
+        )],
+        &who,
+        true,
+    )
+    .await;
+
+    assert_eq!(report.skipped.len(), 1, "{report}");
+    assert!(
+        report.absent.is_empty(),
+        "the skipped file's page is present in the directory: {report}"
     );
 }

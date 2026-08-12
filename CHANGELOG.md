@@ -8,6 +8,30 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- `great-wiki export --content <dir> --as <account>`: the page tree written back out as
+  markdown with YAML frontmatter, folders mirroring the tree, so `export` then `seed` into
+  an empty wiki reproduces the database exactly — proven over the shipped corpus, compared
+  document by document including the full block tree, not by eye. Reading is
+  permission-filtered like every other retrieval path: pages the account cannot read are
+  not in the export, and the report says so rather than pretending to be complete.
+- Export refuses rather than degrades. Every document is re-imported and compared *before*
+  its file is written; one that would come back different is not written at all, is named,
+  and fails the run — the mirror of the seeder skipping a file it cannot place. It also
+  refuses to write into a directory holding markdown it did not put there, because
+  replacing hand-written source with an export destroys the bold and the links the database
+  never kept.
+- The fidelity warning outlives the terminal: `EXPORT-README.txt` sits beside the files
+  saying that the database stores no inline formatting, that this is a faithful copy of the
+  DATABASE rather than of the markdown imported into it, and that these files must not be
+  written over source. Not a `.md` file, so re-importing never turns the warning into a page.
+- `seed --update --as <account>` can now change a page that already exists. Off by default:
+  a slug collision is still an error, never an overwrite. An update appends a revision
+  through the same permission-checked call the editor makes, attributed to the named account
+  with the file it came from as the summary; a page whose file says exactly what it already
+  holds is left untouched, because a no-op revision per file per run buries the real edits.
+  Title, type, visibility, language and ordering are reported and refused — a bulk file drop
+  does not get to move a page or publish one. Nothing is ever deleted: a page in the wiki
+  that no file claims is listed and left where it is.
 - Tables of six rows or more can be sorted and filtered. Every column header is a real
   button carrying `aria-sort`, every column has its own filter box named after it, there is
   one search box over the whole table, and the row count is always stated as displayed out
@@ -49,19 +73,6 @@ Entries describe the *effect* of a change, not the diff.
   field in `Block`, so a published snapshot keeps the text and drops the emphasis until M4
   adds marks.
 
-### Fixed
-
-- The server-rendered pages now attest themselves to the API. They did not, and the way
-  that would have failed is worth recording: the API refuses any request without the
-  proxy secret whenever it is bound to anything but loopback — which is every deployment —
-  so every server-side call would have been refused. The layout deliberately turns a
-  failed identity lookup into "nobody signed in" rather than an error page, so the result
-  would have been a wiki that quietly showed the public view to people who were signed in,
-  with nothing in any log a reader would see. It never reached anybody only because
-  nothing had been deployed yet: every test ran against a loopback API that demands no
-  attestation, which is exactly the configuration that cannot notice.
-
-### Added
 
 - Invitations: a single-use link that creates an account and gives it access in the same
   act. There is no moment where the account exists with nothing granted, which is the gap
@@ -176,14 +187,6 @@ Entries describe the *effect* of a change, not the diff.
   failing closed would mean an outage stops everybody, including whoever is trying to fix
   it, from setting a password at all.
 
-### Changed
-
-- `X-Forwarded-For` is now read, but only on a request the proxy boundary attested, and
-  only its rightmost entry — the one Caddy appended and no client can write. There was no
-  trustworthy client address in the application before this; the TCP peer is Caddy and a
-  raw header is whatever the caller typed.
-
-### Added
 
 - The temporary edge gate is gone. Both wiki hosts now rely on the application's own
   sign-in, so published pages are readable without a homelab account and guest accounts
@@ -208,39 +211,13 @@ Entries describe the *effect* of a change, not the diff.
 - Screenshot tooling: the reader is captured at desktop and phone widths in both themes, so
   a layout can be looked at rather than inferred from a status code.
 
-### Fixed
-
-- Every page rendered its title twice — once from frontmatter and once from the body's own
-  leading heading. The seeder now drops a leading level-1 heading when it exactly matches
-  the title, and keeps it when it does not.
-- The prose column stretched to the viewport while the text inside stayed capped at the
-  measure, so on a wide screen the text hugged the left edge with dead space beside it.
-- On a phone you scrolled past two navigation blocks before reaching the article. The short
-  outline now comes first, then the article, then the site tree.
-
-- A real design system: tokens for type, space and colour as CSS custom properties, and
-  content typography for headings, lists, quotes, code, tables and figures. The reader
-  previously styled only the page chrome, so documents rendered as unstyled browser
-  defaults on a dark background.
-- Application styles live in named cascade layers and plugin CSS will load unlayered, so a
-  theme overrides anything by construction — no `!important`, no specificity contest.
-- A three-way theme control in the header: light, dark, or follow the system. The choice
-  is applied before first paint by a blocking inline script, so there is no flash of the
-  wrong theme, and it is a radio group rather than a toggle because "follow the system" is
-  a genuinely different choice from picking one.
-- Print styles: the document without the application around it, link targets spelled out,
-  and no page breaks inside code blocks or immediately after a heading.
-
-- API authorisation now runs through the permission engine. `may_read` is deleted rather
-  than deprecated, and `Store::tree`, `Store::document_by_path` and `Store::pool` are all
-  crate-private — so no code outside the storage layer can obtain an unfiltered document,
-  an unfiltered tree, or raw database access to go around either.
-- Principals are re-read from the store on every request, so revoking a grant or
-  deactivating an account takes effect on the next click rather than at the next sign-in.
-- The development identity now drives the real engine rather than bypassing it: its groups
-  determine its reach, so local work exercises the same rules production does.
-
 ### Changed
+
+- `X-Forwarded-For` is now read, but only on a request the proxy boundary attested, and
+  only its rightmost entry — the one Caddy appended and no client can write. There was no
+  trustworthy client address in the application before this; the TCP peer is Caddy and a
+  raw header is whatever the caller typed.
+
 
 - An authenticated account no longer reaches restricted content by virtue of being signed
   in. Reach follows the Authelia group, so an account by itself confers nothing beyond
@@ -323,3 +300,47 @@ Entries describe the *effect* of a change, not the diff.
 - `.serena/project.yml` with a conservative language list. TypeScript is omitted on purpose
   until the running image is verified to carry its language server — an absent server takes
   the entire Serena instance down rather than degrading.
+
+### Fixed
+
+- The server-rendered pages now attest themselves to the API. They did not, and the way
+  that would have failed is worth recording: the API refuses any request without the
+  proxy secret whenever it is bound to anything but loopback — which is every deployment —
+  so every server-side call would have been refused. The layout deliberately turns a
+  failed identity lookup into "nobody signed in" rather than an error page, so the result
+  would have been a wiki that quietly showed the public view to people who were signed in,
+  with nothing in any log a reader would see. It never reached anybody only because
+  nothing had been deployed yet: every test ran against a loopback API that demands no
+  attestation, which is exactly the configuration that cannot notice.
+
+
+- Every page rendered its title twice — once from frontmatter and once from the body's own
+  leading heading. The seeder now drops a leading level-1 heading when it exactly matches
+  the title, and keeps it when it does not.
+- The prose column stretched to the viewport while the text inside stayed capped at the
+  measure, so on a wide screen the text hugged the left edge with dead space beside it.
+- On a phone you scrolled past two navigation blocks before reaching the article. The short
+  outline now comes first, then the article, then the site tree.
+
+- A real design system: tokens for type, space and colour as CSS custom properties, and
+  content typography for headings, lists, quotes, code, tables and figures. The reader
+  previously styled only the page chrome, so documents rendered as unstyled browser
+  defaults on a dark background.
+- Application styles live in named cascade layers and plugin CSS will load unlayered, so a
+  theme overrides anything by construction — no `!important`, no specificity contest.
+- A three-way theme control in the header: light, dark, or follow the system. The choice
+  is applied before first paint by a blocking inline script, so there is no flash of the
+  wrong theme, and it is a radio group rather than a toggle because "follow the system" is
+  a genuinely different choice from picking one.
+- Print styles: the document without the application around it, link targets spelled out,
+  and no page breaks inside code blocks or immediately after a heading.
+
+- API authorisation now runs through the permission engine. `may_read` is deleted rather
+  than deprecated, and `Store::tree`, `Store::document_by_path` and `Store::pool` are all
+  crate-private — so no code outside the storage layer can obtain an unfiltered document,
+  an unfiltered tree, or raw database access to go around either.
+- Principals are re-read from the store on every request, so revoking a grant or
+  deactivating an account takes effect on the next click rather than at the next sign-in.
+- The development identity now drives the real engine rather than bypassing it: its groups
+  determine its reach, so local work exercises the same rules production does.
+
