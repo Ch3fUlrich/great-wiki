@@ -10,6 +10,39 @@
   let { data } = $props();
   const headings = $derived(outline(data.body));
 
+  /**
+   * Whether to offer editing at all, and why the answer is this crude.
+   *
+   * There is no capability on the wire. `/api/documents` returns ten fields and none of
+   * them is "may I write this"; `/api/me` reports groups and a baseline, and D-M2-8 is
+   * explicit that no baseline confers write — an instance admin with no grant is refused
+   * like anybody else. The only endpoint that knows is the collaboration socket, and it
+   * cannot be asked without either a real WebSocket handshake (which allocates a room on
+   * the server, on every page view) or a POST (which would publish somebody else's live
+   * session as a revision). Neither belongs in a page render.
+   *
+   * So the control is offered to whoever is signed in, and the true answer is given the
+   * moment it is pressed: `Editor.svelte` opens the session, and a refusal produces a
+   * sentence rather than an editor. That is the honest arrangement available today — the
+   * button can be a false offer, but it can never be a false editor.
+   *
+   * What would fix it is one boolean from the API; the accompanying report names it.
+   * Anonymous readers are left out because nothing in this deployment grants write to
+   * `anyone`, and an offer nobody can accept is worse than no offer.
+   */
+  const mayOfferEditing = $derived(data.me?.authenticated === true);
+
+  /**
+   * `null` means "whatever the URL said". The control is a real link to `?edit=1`, so it
+   * works before hydration and survives being opened in a new tab; once hydrated its click
+   * handler switches in place instead, and "Fertig" switches back — neither needs a round
+   * trip, and neither needs the URL and the state to be kept in step.
+   */
+  let toggled = $state<boolean | null>(null);
+  const editing = $derived(mayOfferEditing && (toggled ?? data.edit === true));
+
+  const editorName = $derived(data.me?.display_name || data.me?.username || 'Unbekannt');
+
   // Derived here rather than in the loader on purpose: `$derived` runs during server
   // rendering too, so the markup is complete in the first response, and the tree is
   // already in the payload — computing these server-side would ship the same titles twice.
@@ -48,9 +81,60 @@
       docType={data.doc.doc_type}
     />
 
-    <article class="prose" lang={data.doc.language}>
-      <BlockView block={data.body} />
-    </article>
+    <!-- Offered only to somebody signed in, and it is a LINK: before hydration it navigates
+         to `?edit=1`, which renders the same page with the editor asked for. A button would
+         be a control that looks live and does nothing until the bundle arrives. -->
+    {#if mayOfferEditing && !editing}
+      <p class="editbar no-print">
+        <a
+          class="edit-start"
+          href="?edit=1"
+          onclick={(event) => {
+            event.preventDefault();
+            toggled = true;
+          }}>Bearbeiten</a
+        >
+      </p>
+    {/if}
+
+    {#if editing}
+      <!-- Imported here and nowhere else. TipTap, ProseMirror and Yjs together are a few
+           hundred kilobytes, and a reader — which is nearly every visit — must not pay for
+           them. It also keeps the whole editor out of the server bundle, so the reading
+           HTML is rendered by code that has never heard of it.
+
+           Every branch below still renders the document. That is the requirement: the page
+           content is in the first response exactly as it is now, and the editor is what
+           arrives afterwards. A blank page while a bundle loads is a regression for every
+           reader, including the one who asked to edit. -->
+      {#await import('$lib/editor/Editor.svelte')}
+        <p class="editor-loading" role="status">Der Editor wird geladen …</p>
+        <article class="prose" lang={data.doc.language}>
+          <BlockView block={data.body} />
+        </article>
+      {:then module}
+        {@const Editor = module.default}
+        <Editor
+          path={data.doc.path}
+          title={data.doc.title}
+          body={data.body}
+          language={data.doc.language}
+          {editorName}
+          onLeave={() => (toggled = false)}
+        />
+      {:catch}
+        <p class="editor-loading" role="alert">
+          Der Editor konnte nicht geladen werden. Die Seite selbst ist unverändert.
+        </p>
+        <article class="prose" lang={data.doc.language}>
+          <BlockView block={data.body} />
+        </article>
+      {/await}
+    {:else}
+      <article class="prose" lang={data.doc.language}>
+        <BlockView block={data.body} />
+      </article>
+    {/if}
 
     <Subpages nodes={subpages} />
   </main>
@@ -163,6 +247,33 @@
 
   .page > :global(.subpages) {
     margin-block-start: var(--space-12);
+  }
+
+  /* Tight to the metadata panel above it rather than a block of its own: it is a thing you
+     can do to this page, like the panel is a thing that is true of it. `.page > * + *`
+     would otherwise put a full --space-6 between two rows of chrome. */
+  .editbar {
+    margin-block-start: var(--space-3);
+  }
+
+  .edit-start {
+    display: inline-block;
+    padding: var(--space-1) var(--space-3);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    color: var(--accent);
+    text-decoration: none;
+    font-size: var(--text-sm);
+  }
+
+  .edit-start:hover,
+  .edit-start:focus-visible {
+    background: var(--accent-soft);
+  }
+
+  .editor-loading {
+    color: var(--ink-muted);
+    font-size: var(--text-sm);
   }
 
   /* One column below 64rem.

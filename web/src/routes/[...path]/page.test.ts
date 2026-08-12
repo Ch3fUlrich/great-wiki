@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import Page from './+page.svelte';
-import { ANONYMOUS, type StoredDocument, type TreeNode } from '$lib/api';
+import { ANONYMOUS, type Me, type StoredDocument, type TreeNode } from '$lib/api';
 import type { Block } from '$lib/blocks/render';
 
 /**
@@ -53,13 +53,26 @@ const body: Block = {
   content: [{ kind: 'paragraph', content: [{ kind: 'text', text: 'Ein Satz.' }] }]
 };
 
+/** Somebody signed in. Says nothing about whether they may WRITE anything — see below. */
+const signedIn: Me = {
+  ...ANONYMOUS,
+  authenticated: true,
+  username: 'sergej',
+  display_name: 'Sergej',
+  baseline: 'admin',
+  source: 'session'
+};
+
 /**
- * `me` comes from the root layout's load and is part of this page's `data` type even
- * though the page itself never reads it; the anonymous reader is the case that matters
- * here anyway, since it is the one whose tree is filtered hardest.
+ * `me` comes from the root layout's load. The anonymous reader is still the case that
+ * matters most here — it is the one whose tree is filtered hardest — but the editor's
+ * affordance is decided from `me`, so both are needed.
  */
-function html(doc: StoredDocument = container): string {
-  return render(Page, { props: { data: { me: ANONYMOUS, doc, body, tree } } }).body.replace(
+function html(
+  doc: StoredDocument = container,
+  { me = ANONYMOUS, edit = false }: { me?: Me; edit?: boolean } = {}
+): string {
+  return render(Page, { props: { data: { me, doc, body, tree, edit } } }).body.replace(
     /<!--.*?-->/g,
     ''
   );
@@ -122,5 +135,45 @@ describe('the reader page, server-rendered', () => {
     expect(out).not.toContain('Unterseiten');
     expect(out).toMatch(/aria-label="Pfad"/);
     expect(out).toContain('Sichtbarkeit');
+  });
+});
+
+describe('offering the editor', () => {
+  it('offers nothing to somebody who is not signed in', () => {
+    // Nobody anonymous can write anything in this deployment: write comes only from an
+    // explicit grant (D-M2-8), and no grant names `anyone`. A control that can only ever be
+    // refused is worse than no control.
+    expect(html()).not.toContain('Bearbeiten');
+  });
+
+  it('offers a signed-in reader a link, not a button that needs a bundle first', () => {
+    // A real `href`, so it works before hydration and in a new tab. Hydration replaces the
+    // navigation with an in-place switch; without one, the control is visible and dead for
+    // as long as the JavaScript takes to arrive.
+    const out = html(container, { me: signedIn });
+    expect(out).toContain('Bearbeiten');
+    expect(out).toMatch(/<a[^>]*href="\?edit=1"/);
+  });
+
+  it('is honest that the offer is not the answer', () => {
+    // The page cannot know whether this person may write — no endpoint says so. The socket
+    // decides, on press. So the SSR HTML must not contain an editing surface, a toolbar or
+    // anything else that would let somebody start typing before that decision was taken.
+    const out = html(container, { me: signedIn, edit: true });
+    expect(out).not.toContain('contenteditable');
+    expect(out).not.toContain('role="textbox"');
+    expect(out).not.toContain('role="toolbar"');
+  });
+
+  it('still ships the whole page in the first response when the editor was asked for', () => {
+    // The requirement that outranks the feature: a reader must never meet a blank page
+    // waiting for JavaScript, and "the reader" includes the person who just clicked
+    // Bearbeiten. The editor is a few hundred kilobytes that arrive afterwards; the
+    // document is in the HTML either way.
+    const out = html(container, { me: signedIn, edit: true });
+    expect(out).toContain('Ein Satz.');
+    expect(out).toMatch(/<article[^>]*class="prose/);
+    expect(out).toMatch(/aria-label="Pfad"/);
+    expect(out).toContain('Unterseiten');
   });
 });

@@ -33,7 +33,15 @@ export default defineConfig({
 		// redirected out to Authelia and back to /auth/callback, so the path has to reach
 		// the application rather than SvelteKit's router.
 		proxy: {
-			'/api': { target: 'http://127.0.0.1:8092', changeOrigin: true },
+			// `ws: true` is what makes `/api/collab/*` work at all in development, and it was
+			// measured rather than assumed: Vite registers an `upgrade` listener only for a
+			// proxy entry that asks for one, so without it the handshake is never forwarded
+			// and the client simply HANGS — no open, no error, no close, until whatever
+			// timeout the caller brought. The same socket opened straight at 127.0.0.1:8092
+			// answers immediately. Caddy proxies WebSockets natively, so production would
+			// never have shown this and the editor would have looked broken only in
+			// development, which is the worst place for a difference to live.
+			'/api': { target: 'http://127.0.0.1:8092', changeOrigin: true, ws: true },
 			'/auth': { target: 'http://127.0.0.1:8092', changeOrigin: true }
 		}
 	}

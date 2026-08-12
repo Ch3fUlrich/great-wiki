@@ -8,6 +8,18 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- In-place editing on the rendered page: TipTap over the shared CRDT, opened only when
+  somebody asks to edit and only after the server has agreed to the session — so a person
+  who may not write sees an honest German refusal, never an editor that discards what they
+  type. A refused upgrade reaches the browser as close code 1006 with no status, which is
+  indistinguishable from an outage, so the two are told apart by asking whether the page is
+  still readable. The editor's node schema is asserted equal to the server's block kinds by
+  a test, and so is every attribute `gw-core` writes: TipTap deletes an element it cannot
+  name from the CRDT and drops an attribute it does not declare, which for the tables in
+  this corpus would have silently destroyed column alignment one edited cell at a time.
+  Inline formatting is deliberately absent rather than offered and thrown away, because a
+  revision has nowhere to store it until M4. The page content is still server-rendered in
+  full, with the editor loaded afterwards as a separate chunk.
 - Collaborative editing over a WebSocket at `/api/collab/{path}`. Authorisation happens
   before the upgrade and asks for `Action::Write` through the store's one permission-checked
   accessor: reading a page is not permission to join its editing session, and an
@@ -367,6 +379,10 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Fixed
 
+- `/api/collab/*` now works in development. Vite proxies WebSocket upgrades only for a proxy
+  entry that asks for one; without `ws: true` the handshake was never forwarded and the
+  client simply hung. Caddy proxies WebSockets natively, so this was a development-only
+  difference — the worst place for one to live.
 - Autosave no longer files a revision. An actively edited page collected one every thirty
   seconds — a history full of versions nobody published, which is the opposite of what an
   append-only history is for. The background sweep now writes the live CRDT state to the

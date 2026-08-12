@@ -26,6 +26,15 @@
 		"vitest": "^4.1.10"
 	},
 	"dependencies": {
-		"@ark-ui/svelte": "^5.23.0"
+		"@ark-ui/svelte": "^5.23.0",
+		"@tiptap/core": "3.30.0",
+		"@tiptap/extension-collaboration": "3.30.0",
+		"@tiptap/extension-collaboration-caret": "3.30.0",
+		"@tiptap/extension-table": "3.30.0",
+		"@tiptap/pm": "3.30.0",
+		"@tiptap/starter-kit": "3.30.0",
+		"y-protocols": "1.0.7",
+		"y-websocket": "3.1.0",
+		"yjs": "13.6.32"
 	}
 }

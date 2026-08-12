@@ -827,6 +827,166 @@ await check('D7 no horizontal scroll at 390px with the panel and the subpage gri
   );
 });
 
+// ---------------------------------------------------------------------------------------
+// Group E — the editor (web/src/lib/editor/**)
+//
+// Everything here works for BOTH answers to "may this developer write this page", because
+// the answer depends on a grant in whatever database the dev server is pointed at, and a
+// check that only passes on a seeded-and-granted instance is a check that gets deleted.
+//
+// The refusal is the case worth the most: a fresh instance has NO write grants at all —
+// `seed` creates none and no migration inserts any — so this is what nearly every developer
+// and every reader actually meets. What must be true either way is that the reading page
+// never regresses, that no editable surface exists before the server has agreed to one, and
+// that whatever the editor says about the work is not a lie.
+// ---------------------------------------------------------------------------------------
+
+const EDIT_PAGE = '/rundgang';
+
+/** Waits for the session to settle into a state that has a headline. */
+async function loadEditor(page) {
+  await page.goto(BASE + EDIT_PAGE + '?edit=1', { waitUntil: 'networkidle' });
+  const region = page.locator('section[aria-label="Seite bearbeiten"]');
+  await region.waitFor({ state: 'visible', timeout: 10_000 });
+  const head = region.locator('.gw-ed-status-head');
+  await head.waitFor({ state: 'visible', timeout: 10_000 });
+  // Not "connecting": that is the state before an answer, and asserting against it would
+  // pass whatever the answer turned out to be.
+  const settled = await until(
+    async () => {
+      const saw = (await head.textContent())?.trim() ?? '';
+      return { ok: saw.length > 0 && !saw.includes('wird geöffnet'), saw };
+    },
+    'the editing session never settled into an answer',
+    10_000
+  );
+  return { region, headline: settled.saw };
+}
+
+await check('E1 asking to edit still serves the whole document in the first response', async (page) => {
+  // The requirement that outranks the feature. `page.request` is a plain fetch: nothing
+  // hydrates, no module is imported, so this is exactly what a reader with JavaScript off
+  // receives — and it must be the page, not a mount point for one.
+  const response = await page.request.get(BASE + EDIT_PAGE + '?edit=1');
+  assert(response.ok(), `expected 200, got ${response.status()}`);
+  const html = await response.text();
+
+  assert(/<article[^>]*class="prose/.test(html), 'the document is not in the server-rendered HTML');
+  assert(/<nav[^>]*aria-label="Pfad"/.test(html), 'the breadcrumb went missing while editing');
+  // And nothing editable, because the server has not been asked yet whether this caller may.
+  assert(!html.includes('contenteditable'), 'the SSR HTML contains an editable surface');
+  assert(!html.includes('role="textbox"'), 'the SSR HTML claims an editing surface exists');
+});
+
+await check('E2 the editor never both refuses and offers a place to type', async (page) => {
+  // The one thing that must never happen, whichever way the permission goes: an editor that
+  // appears and silently throws keystrokes away. Either the session is live and there is a
+  // surface, or it is not and there is none — never a surface without a live session.
+  const { region, headline } = await loadEditor(page);
+  const live = headline.includes('Verbunden');
+  const surfaces = await region.locator('[contenteditable="true"]').count();
+
+  if (live) {
+    assert(surfaces === 1, `a live session must have exactly one surface, found ${surfaces}`);
+  } else {
+    assert(
+      surfaces === 0,
+      `the session says "${headline}" and yet offers ${surfaces} place(s) to type`
+    );
+    // A refusal has to say what to do about it, and must not read as a network fault.
+    const detail = await region.locator('.gw-ed-status-detail').textContent();
+    assert(
+      /Berechtigung|Verbindung|Server/.test(detail ?? ''),
+      `the refusal explains nothing: "${detail}"`
+    );
+  }
+});
+
+await check('E3 the reading page is intact underneath, whatever the session decided', async (page) => {
+  // A refused session must leave a readable page behind, not a blank frame where the
+  // document was. This is the failure a reader would notice first and forgive least.
+  const { region, headline } = await loadEditor(page);
+  if (headline.includes('Verbunden')) {
+    const text = await region.locator('[contenteditable="true"]').textContent();
+    assert((text ?? '').trim().length > 0, 'the live editor mounted with no content in it');
+  } else {
+    const article = page.locator('article.prose');
+    await article.waitFor({ state: 'visible', timeout: 5_000 });
+    const text = await article.textContent();
+    assert((text ?? '').trim().length > 0, 'a refused session left an empty page behind');
+  }
+});
+
+await check('E4 the history warning is on screen the whole time somebody is editing', async (page) => {
+  // D-M2-9 and D-M3-5 require this AT THE POINT OF EDITING rather than in documentation:
+  // anyone who may read the page may read every revision, so removing a sentence is an edit
+  // and not a redaction. Somebody pasting a password needs to learn that now, not later.
+  const { region } = await loadEditor(page);
+  const warning = region.locator('.gw-ed-history');
+  await warning.waitFor({ state: 'visible', timeout: 5_000 });
+  const text = (await warning.textContent()) ?? '';
+  assert(/Versionsgeschichte/.test(text), `the warning does not mention the history: "${text}"`);
+  assert(/lösch/i.test(text), `the warning does not mention deleting: "${text}"`);
+  // Permanent, not a toast: nothing may dismiss it.
+  assert(
+    (await region.locator('.gw-ed-history button').count()) === 0,
+    'the history warning can be dismissed, which makes it a notification rather than a fact'
+  );
+});
+
+await check('E5 the toolbar offers only what a revision can actually store', async (page) => {
+  // `gw_core::Block` has no field for inline marks, so `to_block` keeps the text and drops
+  // the emphasis. A bold button would therefore be a control whose effect disappears at the
+  // next publish — discovered only after the text has been written. Every control here maps
+  // onto a BlockKind, and this check is what stops one being added that does not.
+  const { region } = await loadEditor(page);
+  const toolbar = region.locator('[role="toolbar"]');
+  await toolbar.waitFor({ state: 'visible', timeout: 5_000 });
+
+  const labels = await toolbar
+    .locator('button')
+    .evaluateAll((els) => els.map((el) => el.getAttribute('aria-label')));
+  assert(
+    JSON.stringify(labels) ===
+      JSON.stringify([
+        'Überschrift 2',
+        'Überschrift 3',
+        'Überschrift 4',
+        'Aufzählung',
+        'Nummerierte Liste',
+        'Zitat',
+        'Codeblock'
+      ]),
+    `the toolbar offers something the server cannot store, or lost something it can: ${JSON.stringify(labels)}`
+  );
+  // The controls a person would look for and must not find, because the system would throw
+  // their effect away.
+  for (const forbidden of ['Fett', 'Kursiv', 'Link', 'Unterstrichen', 'Durchgestrichen']) {
+    assert(!labels.includes(forbidden), `the toolbar offers "${forbidden}", which publishing drops`);
+  }
+});
+
+await check('E6 a control that cannot reach the document says so by being disabled', async (page) => {
+  // A refused session's toolbar must not look operable. An enabled button that does nothing
+  // is the same lie as an editor that discards keystrokes, in a smaller box.
+  const { region, headline } = await loadEditor(page);
+  const buttons = region.locator('[role="toolbar"] button');
+  await buttons.first().waitFor({ state: 'attached', timeout: 5_000 });
+  const disabled = await buttons.evaluateAll((els) => els.map((el) => el.disabled));
+
+  if (headline.includes('Verbunden')) {
+    assert(
+      disabled.every((d) => d === false),
+      'a live session left its toolbar disabled'
+    );
+  } else {
+    assert(
+      disabled.every((d) => d === true),
+      `the session says "${headline}" and yet its toolbar is operable`
+    );
+  }
+});
+
 await browser.close();
 
 // ---------------------------------------------------------------------------------------

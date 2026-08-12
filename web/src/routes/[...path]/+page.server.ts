@@ -2,7 +2,7 @@ import { error } from '@sveltejs/kit';
 import { apiGet, parseBody, type StoredDocument, type TreeNode } from '$lib/api';
 import type { PageServerLoad } from './$types';
 
-export const load: PageServerLoad = async ({ params, fetch, request }) => {
+export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
   const cookie = request.headers.get('cookie');
   const { status, data } = await apiGet<StoredDocument>(
     fetch,
@@ -14,5 +14,12 @@ export const load: PageServerLoad = async ({ params, fetch, request }) => {
   if (!data) error(404, 'Page not found.');
 
   const { data: tree } = await apiGet<TreeNode[]>(fetch, '/api/tree', cookie);
-  return { doc: data, body: parseBody(data), tree: tree ?? [] };
+
+  // Read here rather than from `$app/state` in the component, for two reasons: the flag is
+  // then part of the page's data and a server-render test can set it, and the component
+  // does not have to reach for a SvelteKit runtime that only exists inside a request.
+  //
+  // It asks for the editor; it does not decide anything. Whether this caller may actually
+  // write is settled by the collaboration socket, which is the only thing that knows.
+  return { doc: data, body: parseBody(data), tree: tree ?? [], edit: url.searchParams.get('edit') === '1' };
 };
