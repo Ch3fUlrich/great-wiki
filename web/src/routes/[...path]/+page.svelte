@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { browser } from '$app/environment';
   import BlockView from '$lib/components/BlockView.svelte';
   import Breadcrumb from '$lib/components/Breadcrumb.svelte';
   import PageMeta from '$lib/components/PageMeta.svelte';
@@ -42,6 +43,28 @@
   const editing = $derived(mayOfferEditing && (toggled ?? data.edit === true));
 
   const editorName = $derived(data.me?.display_name || data.me?.username || 'Unbekannt');
+
+  /**
+   * Load the editor, in the browser only.
+   *
+   * The `browser` guard is not defensive — it is what keeps TipTap out of the **server**
+   * bundle. `$app/environment`'s `browser` is replaced with a literal at build time, so in
+   * the SSR build this reads `false ? import(…) : …` and rollup drops the import entirely;
+   * no server chunk is emitted and the server bundle names no `@tiptap/*` package. A bare
+   * `import()` inside `{#if editing}` does NOT achieve that: the branch never executes on
+   * the server, but the chunk is still emitted, and the runtime image ships no
+   * `node_modules` for it to resolve against. The container build refuses such a bundle,
+   * which is how this was caught — before that, a comment three lines below claimed the
+   * editor was already out of the server bundle.
+   *
+   * The server-side branch returns a promise that never settles. It is unreachable —
+   * `editing` is false while rendering — and a rejection would render the failure branch
+   * into the SSR HTML for a reader who never asked to edit.
+   */
+  const loadEditor = () =>
+    browser
+      ? import('$lib/editor/Editor.svelte')
+      : new Promise<typeof import('$lib/editor/Editor.svelte')>(() => {});
 
   // Derived here rather than in the loader on purpose: `$derived` runs during server
   // rendering too, so the markup is complete in the first response, and the tree is
@@ -100,14 +123,21 @@
     {#if editing}
       <!-- Imported here and nowhere else. TipTap, ProseMirror and Yjs together are a few
            hundred kilobytes, and a reader — which is nearly every visit — must not pay for
-           them. It also keeps the whole editor out of the server bundle, so the reading
-           HTML is rendered by code that has never heard of it.
+           them.
+
+           Loaded through `loadEditor` rather than a bare `import()` so that it is out of
+           the SERVER bundle too, which a bare one is not. `{#if editing}` is false when the
+           server renders, so the import never executes there — but Vite still EMITS a
+           server chunk for it, carrying bare `@tiptap/*` specifiers, and the runtime image
+           ships no `node_modules`. The container build refuses exactly that, which is how
+           this was found: the comment here used to claim the editor was out of the server
+           bundle, and it was not. See `loadEditor` for why the guard is what removes it.
 
            Every branch below still renders the document. That is the requirement: the page
            content is in the first response exactly as it is now, and the editor is what
            arrives afterwards. A blank page while a bundle loads is a regression for every
            reader, including the one who asked to edit. -->
-      {#await import('$lib/editor/Editor.svelte')}
+      {#await loadEditor()}
         <p class="editor-loading" role="status">Der Editor wird geladen …</p>
         <article class="prose" lang={data.doc.language}>
           <BlockView block={data.body} />
