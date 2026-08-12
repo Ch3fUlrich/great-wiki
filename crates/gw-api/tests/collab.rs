@@ -485,6 +485,66 @@ fn edit(replica: &CollabDoc, text: &str) -> Vec<u8> {
     replica.encode_diff(&before).unwrap()
 }
 
+/// The same, but the whole paragraph is bold — an inline MARK, which `Block` cannot hold.
+///
+/// Built with `yrs` directly rather than through `gw_collab::CollabDoc`, because that type
+/// deliberately exposes no way to write a mark: its whole surface is the block tree, and
+/// the block tree is the thing that cannot express one. A browser running TipTap produces
+/// exactly this shape — an `XmlText` carrying formatting — so building it by hand here is
+/// the closest a Rust test gets to somebody pressing Ctrl-B.
+///
+/// ASCII on purpose: `Doc::new` counts text offsets in bytes while the server counts them
+/// in UTF-16, and a fixture whose two ends disagree about what index 4 means would be
+/// asserting against its own bug.
+fn bold_edit(replica: &CollabDoc, text: &str) -> Vec<u8> {
+    use yrs::updates::decoder::Decode;
+    use yrs::{
+        ReadTxn, Text, Transact, Update, WriteTxn, XmlElementPrelim, XmlFragment, XmlTextPrelim,
+    };
+
+    assert!(text.is_ascii(), "see the note about offset kinds");
+    let doc = yrs::Doc::new();
+    doc.transact_mut()
+        .apply_update(Update::decode_v1(&replica.encode_state()).unwrap())
+        .unwrap();
+
+    let before = doc.transact().state_vector();
+    {
+        let mut txn = doc.transact_mut();
+        let fragment = txn.get_or_insert_xml_fragment(gw_collab::CONTENT_FIELD);
+        let paragraph = fragment
+            .push_back(&mut txn, XmlElementPrelim::empty("paragraph"))
+            .clone();
+        let leaf = paragraph.push_back(&mut txn, XmlTextPrelim::new(text));
+        let mut attrs = yrs::types::Attrs::new();
+        attrs.insert("bold".into(), true.into());
+        leaf.format(&mut txn, 0, text.len() as u32, attrs);
+    }
+    // Bound rather than returned directly: the transaction borrows `doc`, and a temporary
+    // in tail position outlives the local it borrows from.
+    let diff = doc.transact().encode_diff_v1(&before);
+    diff
+}
+
+/// Whether an encoded CRDT state carries a bold mark.
+///
+/// Read through `get_string`, which renders formatting back as pseudo-XML — the one thing
+/// that method is good for, and the reason `gw-collab` refuses to use it for content.
+fn has_bold(state: &[u8]) -> bool {
+    use yrs::updates::decoder::Decode;
+    use yrs::{GetString, ReadTxn, Transact, Update};
+
+    let doc = yrs::Doc::new();
+    doc.transact_mut()
+        .apply_update(Update::decode_v1(state).unwrap())
+        .unwrap();
+    let txn = doc.transact();
+    txn.get_xml_fragment(gw_collab::CONTENT_FIELD)
+        .expect("the content fragment")
+        .get_string(&txn)
+        .contains("<bold>")
+}
+
 /// The close frame the server ended the session with, skipping anything still in flight.
 async fn close_code(socket: &mut Socket) -> CloseCode {
     let deadline = tokio::time::Instant::now() + PATIENCE;
@@ -555,6 +615,29 @@ async fn document_id(store: &Store, username: &str, path: &str) -> String {
         .unwrap()
         .expect("the fixture's page must be readable by this account")
         .id
+}
+
+/// The CRDT state the database holds for `/handbuch`, if any.
+///
+/// Read as `leserin`, who may read the page and may not edit it. That is not incidental:
+/// every assertion below therefore also keeps saying that the live state is reachable by
+/// exactly the people the page is, which is the half of `crdt_state_for` that would
+/// otherwise only be covered by `gw-store`'s own tests.
+async fn stored_state(store: &Store) -> Option<Vec<u8>> {
+    let leserin = principal(store, "leserin").await;
+    let id = document_id(store, "leserin", "/handbuch").await;
+    store.crdt_state_for(&leserin, &id).await.unwrap()
+}
+
+/// The stored CRDT state as plain text — empty when the page has never been edited.
+async fn stored_text(store: &Store) -> String {
+    match stored_state(store).await {
+        Some(state) => CollabDoc::from_state(&state)
+            .expect("the stored CRDT state must load")
+            .to_block()
+            .plain_text(),
+        None => String::new(),
+    }
 }
 
 /// Every revision body of `/handbuch`, newest first, as read by somebody who may read it.
@@ -748,6 +831,50 @@ async fn a_demoted_writer_s_next_update_is_refused_with_a_close() {
         !history(&store).await.iter().any(|b| b.contains("Entzug")),
         "an update sent after the grant was revoked reached the history"
     );
+    assert!(
+        !stored_text(&store).await.contains("Entzug"),
+        "an update sent after the grant was revoked reached the stored CRDT state"
+    );
+}
+
+#[tokio::test]
+async fn a_sweep_writes_nothing_once_the_last_writer_may_no_longer_write() {
+    // The decision recorded in `persist`, pinned so that changing it has to be deliberate.
+    //
+    // Storing CRDT state is still `Action::Write`, because `gw-store` has exactly one
+    // answer to "who may change this page's content" and a persistence path does not get a
+    // weaker one of its own. The cost is real and is what this test states: she typed this
+    // while she still held the grant, it was applied, it was broadcast to everyone else in
+    // the room — and when the room goes, it goes. There is no author column in
+    // `crdt_state` to be dishonest about; the refusal is about the permission and nothing
+    // else.
+    let store = fixture().await;
+    let state = under(state_as(&store, "autorin").await, brisk());
+    let addr = serve(state.clone()).await;
+    let mut ws = connect(&addr, "handbuch", None).await.unwrap();
+    let replica = sync(&mut ws).await;
+
+    // DEMOTED to `read` rather than stripped of every grant, and that is what makes this
+    // test mean what it says. With no grant at all she also loses the read permission, and
+    // the test would then pass against a `save_crdt_state` that checked `Action::Read` —
+    // asserting "she cannot reach this page" while claiming to assert "writing is an
+    // explicit grant". Verified: with the store's check weakened to `Read`, the version of
+    // this test without the line below stayed green.
+    send_update(&mut ws, &edit(&replica, "vor dem Entzug")).await;
+    let _ = settle(&mut ws, &replica).await;
+    revoke(&store, "autorin", Permission::Write).await;
+    grant(&store, "autorin", Permission::Read).await;
+
+    sweep(&state).await;
+
+    assert!(
+        stored_state(&store).await.is_none(),
+        "the CRDT state was stored for somebody who may no longer write the page"
+    );
+    assert!(
+        !history(&store).await.iter().any(|b| b.contains("Entzug")),
+        "and it must not have gone into the history either"
+    );
 }
 
 #[tokio::test]
@@ -929,13 +1056,21 @@ async fn publishing_records_what_was_typed_and_needs_write_to_do_it() {
         "the refused publish wrote a revision anyway"
     );
 
+    let before = history(&store).await.len();
     assert_eq!(
         publish_as(&store, &state, &addr, "autorin", "erste Fassung").await,
         StatusCode::OK
     );
+    let after = history(&store).await;
     assert!(
-        history(&store).await[0].contains("von A"),
+        after[0].contains("von A"),
         "the published revision does not hold what was typed"
+    );
+    assert_eq!(
+        after.len(),
+        before + 1,
+        "a publish writes exactly one revision — this is the half of the sweep change that \
+         must NOT have gone away with it"
     );
 }
 
@@ -1006,6 +1141,7 @@ async fn what_was_typed_reaches_the_database_without_anybody_publishing() {
     let store = fixture().await;
     let state = under(state_as(&store, "autorin").await, brisk());
     let addr = serve(state.clone()).await;
+    let before = history(&store).await.len();
     let mut ws = connect(&addr, "handbuch", None).await.unwrap();
     let replica = sync(&mut ws).await;
 
@@ -1014,11 +1150,15 @@ async fn what_was_typed_reaches_the_database_without_anybody_publishing() {
 
     sweep(&state).await;
 
-    let history = history(&store).await;
+    let stored = stored_text(&store).await;
     assert!(
-        history[0].contains("noch nicht veröffentlicht"),
-        "an unpublished session was not written out: {:?}",
-        history[0]
+        stored.contains("noch nicht veröffentlicht"),
+        "an unpublished session was not written out: {stored:?}"
+    );
+    assert_eq!(
+        history(&store).await.len(),
+        before,
+        "it was written out as a revision; autosave is not a publish"
     );
 }
 
@@ -1035,14 +1175,15 @@ async fn a_room_nobody_is_in_is_written_out_and_then_forgotten() {
     ws.close(None).await.unwrap();
 
     sweep_until_empty(&state).await;
-    assert!(history(&store).await[0].contains("und dann ging sie"));
+    assert!(stored_text(&store).await.contains("und dann ging sie"));
 }
 
 #[tokio::test]
-async fn a_session_that_typed_nothing_leaves_no_revision_behind() {
+async fn a_session_that_typed_nothing_leaves_nothing_behind() {
     // A client's first sync reply is an update like any other, so without a comparison
     // against what the database already holds, opening an editor and closing it again
-    // would publish a revision identical to the one before it — once per sweep, for ever.
+    // would write once per sweep for ever — a revision under the old design, a row under
+    // this one. Neither may happen.
     let store = fixture().await;
     let state = under(state_as(&store, "autorin").await, brisk());
     let addr = serve(state.clone()).await;
@@ -1057,6 +1198,10 @@ async fn a_session_that_typed_nothing_leaves_no_revision_behind() {
         history(&store).await.len(),
         before,
         "a session in which nothing was typed added a revision"
+    );
+    assert!(
+        stored_state(&store).await.is_none(),
+        "a session in which nothing was typed stored a CRDT state"
     );
 }
 
@@ -1075,7 +1220,7 @@ async fn a_room_that_is_still_being_edited_is_written_out_but_not_evicted() {
     let _ = settle(&mut ws, &replica).await;
     sweep(&state).await;
 
-    assert!(history(&store).await[0].contains("mitten im Satz"));
+    assert!(stored_text(&store).await.contains("mitten im Satz"));
     assert_eq!(
         state.collab.open_rooms(),
         1,
@@ -1086,5 +1231,125 @@ async fn a_room_that_is_still_being_edited_is_written_out_but_not_evicted() {
     send_update(&mut ws, &edit(&replica, "und weiter")).await;
     let _ = settle(&mut ws, &replica).await;
     sweep(&state).await;
-    assert!(history(&store).await[0].contains("und weiter"));
+    assert!(stored_text(&store).await.contains("und weiter"));
+}
+
+// -------------------------------------------------------------------------------------
+// Autosave writes CRDT STATE, and only a person writes a revision.
+// -------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_sweep_files_no_revision_for_an_ordinary_editing_session() {
+    // The defect this suite exists to pin. An autosave every thirty seconds that lands in
+    // the append-only history means a page somebody works on for ten minutes collects
+    // twenty versions nobody published — which is the opposite of what a history is for.
+    let store = fixture().await;
+    let state = under(state_as(&store, "autorin").await, brisk());
+    let addr = serve(state.clone()).await;
+    let before = history(&store).await.len();
+
+    let mut ws = connect(&addr, "handbuch", None).await.unwrap();
+    let replica = sync(&mut ws).await;
+    send_update(&mut ws, &edit(&replica, "im Fluss")).await;
+    let _ = settle(&mut ws, &replica).await;
+
+    sweep(&state).await;
+    send_update(&mut ws, &edit(&replica, "und weiter im Fluss")).await;
+    let _ = settle(&mut ws, &replica).await;
+    sweep(&state).await;
+
+    assert_eq!(
+        history(&store).await.len(),
+        before,
+        "the sweep is still publishing revisions nobody asked for"
+    );
+}
+
+#[tokio::test]
+async fn an_evicted_room_comes_back_from_its_stored_state() {
+    // What the `crdt_state` table is for. The room is gone from memory; the only thing
+    // that can bring the session back is the CRDT state the sweep wrote, because the sweep
+    // no longer touches the page body at all.
+    let store = fixture().await;
+    let state = under(state_as(&store, "autorin").await, brisk());
+    let addr = serve(state.clone()).await;
+    let before = history(&store).await.len();
+
+    let mut ws = connect(&addr, "handbuch", None).await.unwrap();
+    let replica = sync(&mut ws).await;
+    send_update(&mut ws, &edit(&replica, "wieder da")).await;
+    let _ = settle(&mut ws, &replica).await;
+    ws.close(None).await.unwrap();
+    sweep_until_empty(&state).await;
+
+    assert_eq!(
+        history(&store).await.len(),
+        before,
+        "the eviction published a revision instead of storing the CRDT state"
+    );
+
+    let mut again = connect(&addr, "handbuch", None).await.unwrap();
+    let back = sync(&mut again).await;
+    let text = back.to_block().plain_text();
+    assert!(
+        text.contains("wieder da"),
+        "the edits did not survive the eviction: {text}"
+    );
+    // The half that catches the fork. A room rebuilt by seeding from the stored BODY and
+    // then applying the stored CRDT state has written the page's words twice, under two
+    // client ids, and the CRDT will faithfully keep both — see
+    // `seeding_twice_from_one_block_makes_two_documents_that_never_converge` in gw-collab.
+    assert_eq!(
+        text.matches("Größe und Maß").count(),
+        1,
+        "the page's body appears twice: the room was seeded AND loaded, so this document \
+         has forked: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_mark_survives_the_stored_state_and_does_not_survive_a_revision() {
+    // The quieter half of the defect, and the reason a revision cannot stand in for the
+    // CRDT state. `Block` has no field for an inline mark, so `Room::snapshot` drops it;
+    // the encoded CRDT state keeps it. Before M4 that costs nothing visible, which is
+    // exactly why it has to be proven now rather than discovered when marks arrive.
+    let store = fixture().await;
+    let state = under(state_as(&store, "autorin").await, brisk());
+    let addr = serve(state.clone()).await;
+
+    let mut ws = connect(&addr, "handbuch", None).await.unwrap();
+    let replica = sync(&mut ws).await;
+    send_update(&mut ws, &bold_edit(&replica, "fett")).await;
+    let _ = settle(&mut ws, &replica).await;
+    assert!(
+        has_bold(&replica.encode_state()),
+        "the fixture never produced a mark, so this test would prove nothing"
+    );
+
+    // A deliberate publish, so the contrast is between two things that both happened.
+    assert_eq!(
+        publish_as(&store, &state, &addr, "autorin", "mit Auszeichnung").await,
+        StatusCode::OK
+    );
+    let published = history(&store).await.remove(0);
+    assert!(
+        published.contains("fett"),
+        "the revision lost the text as well as the mark: {published}"
+    );
+    assert!(
+        !published.contains("bold"),
+        "a revision is a `Block` tree and cannot hold a mark, yet this one does — the \
+         contrast this test rests on has quietly gone away: {published}"
+    );
+
+    ws.close(None).await.unwrap();
+    sweep_until_empty(&state).await;
+
+    let mut again = connect(&addr, "handbuch", None).await.unwrap();
+    let back = sync(&mut again).await;
+    assert!(
+        has_bold(&back.encode_state()),
+        "the mark did not survive the round trip through storage: the session was rebuilt \
+         from a lossy `Block` snapshot rather than from the CRDT state"
+    );
 }

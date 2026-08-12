@@ -1,6 +1,7 @@
 pub mod acl;
 pub mod admin;
 pub mod audit;
+pub mod crdt;
 pub mod documents;
 pub mod invites;
 pub mod login_attempts;

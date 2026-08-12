@@ -228,7 +228,16 @@ impl Store {
     /// document, because `documents.path` is UNIQUE across every row including soft-deleted
     /// ones — and a soft-deleted document is refused here for the same reason it is refused
     /// there, since `document_for` will not resolve it.
-    async fn may(&self, principal: &Principal, document_id: &str, action: Action) -> Result<bool> {
+    /// `pub(crate)` and not private, so that [`crate::crdt`] asks this same question rather
+    /// than spelling out a second one. It stays out of the public surface: outside this
+    /// crate the answer is [`Store::document_for`], which hands back the document it
+    /// authorised instead of a boolean somebody has to remember to act on.
+    pub(crate) async fn may(
+        &self,
+        principal: &Principal,
+        document_id: &str,
+        action: Action,
+    ) -> Result<bool> {
         let path: Option<String> = sqlx::query_scalar("SELECT path FROM documents WHERE id = ?1")
             .bind(document_id)
             .fetch_optional(&self.pool)
@@ -374,8 +383,20 @@ impl Store {
         };
         let body: Block = serde_json::from_str(&rev.body)?;
         let summary = format!("Fassung {} wiederhergestellt", short(&rev.id));
-        self.publish_revision(author, &rev.document_id, &body, Some(&summary))
-            .await
+        let restored = self
+            .publish_revision(author, &rev.document_id, &body, Some(&summary))
+            .await?;
+
+        // A restore is the one edit that means "forget what the page says now", so the
+        // live CRDT state — which is what the page says now, in the form an editor will be
+        // handed it — has to go with it. Without this, the restore would be visible to
+        // readers and invisible to everyone who opens the editor. Only on success: a
+        // refused restore must change nothing at all. See
+        // [`Store::clear_crdt_state_unchecked`] for what this does and does not cover.
+        if restored.is_some() {
+            self.clear_crdt_state_unchecked(&rev.document_id).await?;
+        }
+        Ok(restored)
     }
 }
 

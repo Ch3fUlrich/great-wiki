@@ -378,6 +378,49 @@ mutation crates/gw-store/migrations/0008_revisions.sql killed \
   "s/    SELECT RAISE(ABORT, 'revisions are append-only: publish a new one instead');/    SELECT 1;/" \
   'revisions: the append-only trigger actually refuses an UPDATE, rather than merely existing'
 
+# --- crdt state: what is being typed, as against what has been published --------------
+#
+# The same two kinds of wrong answer as revisions, plus one that is neither.
+#
+# The DISCLOSURE half is easy to miss in review precisely because the value is a `Vec<u8>`.
+# It is the page: `CollabDoc::from_state(&bytes)?.to_block().plain_text()` is the whole
+# distance from those bytes back to the text, so `crdt_state_for` is a retriever in the
+# sense architecture rule 2 means, and it goes through the same `document_for` everything
+# else does.
+#
+# The WRITE half needed its test rewritten before it could be trusted, and the history is
+# the point. `a_sweep_writes_nothing_once_the_last_writer_may_no_longer_write` originally
+# revoked the writer's grant outright — which also takes away her READ, because the fixture
+# page is restricted. It therefore passed with the store's check weakened from `Write` to
+# `Read`: the right assertion for the wrong reason, asserting "she cannot reach this page"
+# while claiming to assert "writing is an explicit grant" (D-M2-8). It now DEMOTES her to
+# `read`, so only the action distinguishes the two outcomes.
+#
+# The third is the fork, and it has no analogue anywhere else in this file because it is
+# not an access-control failure at all — it is silent corruption. `CollabDoc::from_block`
+# *creates* content, so a room seeded from the page body and then handed its own stored
+# CRDT state holds every word of the page twice, under two client ids, and a CRDT keeps
+# both for ever: the duplicates are not a conflict to resolve, they are two legitimate
+# insertions. Nothing errors, nothing logs, the page simply says everything twice.
+mutation crates/gw-store/src/crdt.rs killed \
+  's/        if !self.may(principal, document_id, Action::Read).await? {/        if false {/' \
+  'crdt state: the live text of a page is handed only to somebody who may read the page'
+mutation crates/gw-store/src/crdt.rs killed \
+  's/        if !self.may(principal, document_id, Action::Write).await? {/        if !self.may(principal, document_id, Action::Read).await? {/' \
+  'crdt state: storing it needs WRITE on the page, never merely read (D-M2-8)'
+mutation crates/gw-store/src/revisions.rs killed \
+  's/        if restored.is_some() {/        if false {/' \
+  'crdt state: a restore discards the live state it was reaching past, or it is invisible to editors'
+mutation crates/gw-api/src/routes/collab.rs killed \
+  's/            .crdt_state_for(principal, &document.id)/            .crdt_state_for(principal, "")/' \
+  'crdt state: a room is rebuilt from the stored state, not re-seeded from the published body'
+mutation crates/gw-api/src/routes/collab.rs killed \
+  's/                    .join(&document.id, &empty_document())/                    .join(\&document.id, \&serde_json::from_str(\&document.body).unwrap_or_else(|_: serde_json::Error| empty_document()))/' \
+  'crdt state: a room loaded from stored state is NOT also seeded from the body — that forks the document'
+mutation crates/gw-api/src/routes/collab.rs killed \
+  's/    if !state.collab.differs(document_id, &encoded) {/    if false {/' \
+  'crdt state: an editing session in which nothing was typed writes no row, once per sweep for ever'
+
 # --- crash recovery ------------------------------------------------------------------
 #
 # A trap does not survive SIGKILL, and a killed run leaves the mutated file in place.

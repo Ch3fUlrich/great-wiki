@@ -273,6 +273,10 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Changed
 
+- Between two publishes, what an editor opens and what a reader sees are allowed to differ.
+  A page says what its newest revision says; the editing session is somewhere else until
+  somebody publishes it. That is what "publish" means, and it is a real change from a wiki
+  that saved every thirty seconds whether you meant it or not.
 - `X-Forwarded-For` is now read, but only on a request the proxy boundary attested, and
   only its rightmost entry — the one Caddy appended and no client can write. There was no
   trustworthy client address in the application before this; the TCP peer is Caddy and a
@@ -363,6 +367,21 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Fixed
 
+- Autosave no longer files a revision. An actively edited page collected one every thirty
+  seconds — a history full of versions nobody published, which is the opposite of what an
+  append-only history is for. The background sweep now writes the live CRDT state to the
+  `crdt_state` table migration 0008 created for it, and `POST /api/collab/{path}` is the
+  only thing that writes a revision: publishing is a person saying "this is the version I
+  mean", and a timer cannot say that.
+- An editing session that was closed and reopened silently lost its formatting. A revision
+  stores a `Block` tree, which has no field for an inline mark, so bold, italic and link
+  destinations were dropped every time a room was rebuilt from one. The stored CRDT state
+  keeps them. Nothing renders marks yet, which is exactly why this had to be fixed before
+  M4 adds them rather than after — everything written in between would already have been
+  flattened.
+- Restoring a revision is now visible to editors as well as readers. The live CRDT state is
+  discarded with the restore; without that, the next editing session would have opened on
+  the very content the restore was undoing.
 - The server-rendered pages now attest themselves to the API. They did not, and the way
   that would have failed is worth recording: the API refuses any request without the
   proxy secret whenever it is bound to anything but loopback — which is every deployment —

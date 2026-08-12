@@ -90,3 +90,10 @@ tokio = { workspace = true }
 # implementation the server does not use.
 tokio-tungstenite = "0.29"
 tower = { version = "0.5", features = ["util"] }
+# Inline MARKS, for the tests that prove they survive the CRDT state and are lost by a
+# revision. `gw_collab::CollabDoc` deliberately exposes no way to write one — its surface
+# is the block tree, which is precisely what cannot express a mark — so the test builds the
+# update a browser would send with the same CRDT library the server runs. Pinned to the
+# version `gw-collab` already depends on, or the suite would prove an interop property
+# against an implementation the server does not use.
+yrs = "0.27"

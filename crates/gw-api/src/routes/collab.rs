@@ -49,20 +49,42 @@
 //!
 //! `gw-collab` has no store dependency by design: [`gw_collab::Rooms::evict_idle`] hands
 //! the evicted rooms back *so that the caller persists them*, and this is that caller. One
-//! [`sweep`] does both halves — snapshot every room that has changed, then evict the ones
+//! [`sweep`] does both halves — write out every room that has changed, then evict the ones
 //! nobody is in — and [`spawn_janitor`] runs it every
 //! [`CollabPolicy::snapshot_interval`].
 //!
 //! **The window of loss is one snapshot interval.** A crash loses whatever was typed since
 //! the last sweep, which is at most 30 seconds of work in production.
 //!
-//! A snapshot is a revision, written through [`gw_store::Store::publish_revision`] like
-//! every other content change. That is *not* the design the schema anticipated — migration
-//! 0008 created a `crdt_state` table for exactly this, so that autosave would not churn the
-//! history — but `gw-store` exposes no accessor for it and its pool is crate-private, so
-//! there is no way to reach that table from here. The consequence is stated rather than
-//! hidden: an actively edited page collects one autosave revision per snapshot interval.
-//! See the report accompanying this change for the `gw-store` methods that would fix it.
+//! **What a sweep writes is the CRDT STATE, and never a revision.** The two are different
+//! kinds of thing and migration 0008 gave them different tables for that reason. A revision
+//! is a deliberate publish: it is append-only, it records an author, and it is what a
+//! reader sees. Autosave is neither deliberate nor a publication, and filing it as a
+//! revision meant an actively edited page collected a version every thirty seconds that
+//! nobody asked for — a history full of rows that say nothing is a history nobody can read.
+//! Publishing is what [`publish`] does, when a **person** asks for it.
+//!
+//! It also matters for what is *kept*. A `Block` — what a revision stores — has no field
+//! for an inline mark, so [`gw_collab::Room::snapshot`] drops bold, italic and link
+//! destinations on the floor; the encoded CRDT state keeps them. While a revision was the
+//! only thing surviving a restart, a session that came back had already lost its
+//! formatting. Nothing renders marks yet, which is exactly why this had to be fixed before
+//! M4 adds them rather than after.
+//!
+//! The consequence, stated because it is a real change in behaviour: between two publishes,
+//! what an **editor** opens (the CRDT state) and what a **reader** sees (`documents.body`,
+//! which only a revision moves) are allowed to differ. That is what "publish" means.
+//!
+//! # Rebuilding a room, and the one way to get it wrong
+//!
+//! [`open_room`] builds a room from the stored CRDT state whenever there is one, and seeds
+//! it from the page body **only** when there is not. That is not a preference. `from_block`
+//! *creates* content: a room seeded from the body and then given its own stored state holds
+//! every word of the page twice, under two client ids, and the CRDT will faithfully keep
+//! both for ever. `gw-collab`'s
+//! `seeding_twice_from_one_block_makes_two_documents_that_never_converge` is that failure
+//! written down, and `an_evicted_room_comes_back_from_its_stored_state` is what stops this
+//! file from causing it.
 //!
 //! # What is NOT bounded here, stated so it is not mistaken for covered
 //!
@@ -85,20 +107,13 @@ use futures_util::stream::{SplitSink, StreamExt};
 use futures_util::SinkExt;
 use gw_auth::{Action, Principal};
 use gw_collab::Room;
-use gw_core::Block;
+use gw_core::{Block, BlockKind};
 use gw_store::StoredDocument;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast::error::RecvError;
-
-/// The summary an automatic snapshot is filed under.
-///
-/// German, because it is rendered in a German timeline beside German page titles, and it
-/// says plainly that nobody pressed a button — a history where an autosave is
-/// indistinguishable from a deliberate publish is a history that cannot be read.
-pub const AUTOSAVE_SUMMARY: &str = "Automatisch gespeichert";
 
 // -------------------------------------------------------------------------------------
 // Policy: every limit and every interval, in one place and as VALUES.
@@ -198,16 +213,22 @@ impl CollabPolicy {
 struct Bookkeeping {
     /// The principal a snapshot would be attributed to: whoever last had an update accepted.
     ///
-    /// `None` means nothing has been typed since the last snapshot, so there is nothing to
+    /// `None` means nothing has been typed since the last sweep, so there is nothing to
     /// write. It is a principal *id* rather than a `Principal` because the account is
-    /// re-read at snapshot time — a snapshot is a revision, and a revision may only be
-    /// written by somebody who may still write the page.
+    /// re-read at sweep time — writing a page's content is `Action::Write` whether a person
+    /// asked for it or a timer did, and an account can be suspended between the keystroke
+    /// and the write.
     writer: Option<String>,
-    /// The body as it was last written to the database, so an unchanged room does not
-    /// collect a revision per sweep. It is not hypothetical: a client's first sync reply is
-    /// an update like any other, so opening and closing an editor would otherwise publish a
-    /// revision identical to the one before it.
-    saved: String,
+    /// The encoded CRDT state as it was last written to the database, so an unchanged room
+    /// is not rewritten once per sweep. It is not hypothetical: a client's first sync reply
+    /// is an update like any other, so opening an editor and touching nothing would
+    /// otherwise mark the room as needing a write for as long as the tab is open.
+    ///
+    /// Bytes and not a `Block`, because bytes are what is compared against and what is
+    /// stored. A comparison made on the lossy view would call two documents equal whenever
+    /// the only difference between them was formatting — which is precisely the difference
+    /// this table exists to keep.
+    saved: Vec<u8>,
 }
 
 /// Every open room, and the bookkeeping the database needs that the rooms themselves
@@ -215,6 +236,22 @@ struct Bookkeeping {
 pub struct CollabState {
     rooms: gw_collab::Rooms,
     open: Mutex<HashMap<String, Bookkeeping>>,
+    /// Held while a room is being BUILT, and for the whole of a [`sweep`].
+    ///
+    /// It exists for one interleaving, and that interleaving forks a document silently.
+    /// A sweep evicts an idle room before it writes it out — deliberately, so the only
+    /// remaining reference to what was typed is the one `evict_idle` handed back. In the
+    /// window between those two steps the room is gone from [`gw_collab::Rooms`] and its
+    /// state has not reached the database yet, so a connection arriving right then would
+    /// find no live room, be told the page has no stored state, and seed a fresh room from
+    /// the body — which the sweep then overwrites, or which later receives the stored state
+    /// on top of its own copy of every word.
+    ///
+    /// A `tokio` mutex rather than a `std` one because both holders await across it: the
+    /// sweep writes to the database, and building a room reads from it. It is taken once
+    /// per connection and once per sweep interval, so contention is not a consideration;
+    /// correctness of what a room is built from is.
+    building: tokio::sync::Mutex<()>,
     policy: CollabPolicy,
 }
 
@@ -229,6 +266,7 @@ impl CollabState {
         Self {
             rooms: gw_collab::Rooms::new(),
             open: Mutex::new(HashMap::new()),
+            building: tokio::sync::Mutex::new(()),
             policy,
         }
     }
@@ -257,9 +295,9 @@ impl CollabState {
     /// at snapshot time is between two values produced the same way. Only the first joiner
     /// sets it: a later one arrives at a room that may hold unsaved edits, and overwriting
     /// the baseline with what it looks like *now* would mark those edits as already saved.
-    /// It is a closure for the same reason — serialising a document to find out that the
+    /// It is a closure for the same reason — encoding a document to find out that the
     /// answer is already known is work done for nothing on every join.
-    fn opened(&self, document_id: &str, baseline: impl FnOnce() -> String) {
+    fn opened(&self, document_id: &str, baseline: impl FnOnce() -> Vec<u8>) {
         self.open()
             .entry(document_id.to_string())
             .or_insert_with(|| Bookkeeping {
@@ -283,18 +321,18 @@ impl CollabState {
             .collect()
     }
 
-    /// Whether `body` differs from what was last written for this room.
-    fn differs(&self, document_id: &str, body: &str) -> bool {
+    /// Whether `state` differs from what was last written for this room.
+    fn differs(&self, document_id: &str, state: &[u8]) -> bool {
         self.open()
             .get(document_id)
-            .is_none_or(|entry| entry.saved != body)
+            .is_none_or(|entry| entry.saved != state)
     }
 
-    /// Record that `body` is now in the database, and that there is nothing outstanding.
-    fn saved(&self, document_id: &str, body: String) {
+    /// Record that `state` is now in the database, and that there is nothing outstanding.
+    fn saved(&self, document_id: &str, state: Vec<u8>) {
         if let Some(entry) = self.open().get_mut(document_id) {
             entry.writer = None;
-            entry.saved = body;
+            entry.saved = state;
         }
     }
 
@@ -395,9 +433,7 @@ async fn join(
     let path = full_path(&captured);
     let (principal, document) = authorise(&state, &jar, &path).await?;
 
-    let initial: Block = serde_json::from_str(&document.body)
-        .map_err(|error| ApiError::Internal(anyhow::Error::new(error)))?;
-    let room = state.collab.rooms.join(&document.id, &initial).await;
+    let room = open_room(&state, &principal, &document).await?;
 
     // Checked after joining rather than before, which is safe precisely because the cap can
     // only be reached by a room that already existed: a room with N subscribers had them
@@ -418,13 +454,6 @@ async fn join(
     // the closure if the upgrade never completes.
     let subscription = room.subscribe();
 
-    // The baseline for "has anything changed since the database last saw this" is taken
-    // from the room rather than from `document.body`, so both sides of that comparison are
-    // produced by the same conversion. It is only recorded if this is the first joiner.
-    state.collab.opened(&document.id, || {
-        serde_json::to_string(&room.snapshot()).unwrap_or_default()
-    });
-
     let policy = state.collab.policy;
     let writer_id = principal.id.clone();
     Ok(ws
@@ -436,6 +465,96 @@ async fn join(
         .on_upgrade(move |socket| async move {
             run(socket, state, jar, path, room, subscription, writer_id).await;
         }))
+}
+
+/// A `doc` block with nothing in it.
+///
+/// The seed for a room that is about to be handed its stored CRDT state — and therefore
+/// must be handed nothing else. See [`open_room`].
+fn empty_document() -> Block {
+    Block {
+        kind: BlockKind::Doc,
+        attrs: serde_json::Map::new(),
+        content: Vec::new(),
+        text: None,
+    }
+}
+
+/// The room for `document`: the live one if there is one, otherwise one built from what the
+/// database holds.
+///
+/// Three cases, and the middle one is the whole point of this function:
+///
+/// 1. **A live room.** It outranks everything stored — it holds edits the database has not
+///    seen — and [`gw_collab::Rooms::join`] would ignore whatever was passed to it anyway.
+/// 2. **Stored CRDT state.** The room is built EMPTY and given that state. Never
+///    `from_block` as well: `from_block` creates content, so a room seeded from the page
+///    body and then given its own stored state holds every word twice, under two client
+///    ids, and a CRDT keeps both — for ever, because the duplicates are not a conflict to
+///    resolve but two legitimate insertions. That is what
+///    `seeding_twice_from_one_block_makes_two_documents_that_never_converge` demonstrates
+///    in `gw-collab`, and `an_evicted_room_comes_back_from_its_stored_state` is what stops
+///    it happening here.
+/// 3. **Nothing stored.** A page nobody has ever edited, and seeding from the body is both
+///    the only thing available and correct — exactly once, which is what
+///    [`gw_collab::Rooms::join`] guarantees under its own lock.
+///
+/// The [`CollabState::building`] lock covers the decision AND the construction, because the
+/// two must not be separated by a sweep: see the field's own note.
+async fn open_room(
+    state: &AppState,
+    principal: &Principal,
+    document: &StoredDocument,
+) -> Result<Arc<Room>, ApiError> {
+    let _building = state.collab.building.lock().await;
+
+    let room = match state.collab.rooms.get(&document.id) {
+        Some(live) => live,
+        None => match state
+            .store
+            .crdt_state_for(principal, &document.id)
+            .await
+            .map_err(ApiError::Internal)?
+        {
+            Some(stored) => {
+                let room = state
+                    .collab
+                    .rooms
+                    .join(&document.id, &empty_document())
+                    .await;
+                if let Err(error) = room.doc().apply_update(&stored) {
+                    // Refusing is the only safe answer. The room this connection would
+                    // otherwise be handed is EMPTY, and an editor that opens on an empty
+                    // page and then saves is how a document is destroyed rather than merely
+                    // unavailable. It is closed first, because the line above created it
+                    // and the next connection must not find it.
+                    state.collab.rooms.close(&document.id);
+                    tracing::error!(
+                        %error,
+                        document_id = %document.id,
+                        "the stored CRDT state of this page could not be loaded"
+                    );
+                    return Err(ApiError::Internal(anyhow::Error::new(error)));
+                }
+                room
+            }
+            None => {
+                let initial: Block = serde_json::from_str(&document.body)
+                    .map_err(|error| ApiError::Internal(anyhow::Error::new(error)))?;
+                state.collab.rooms.join(&document.id, &initial).await
+            }
+        },
+    };
+
+    // The baseline for "has anything changed since the database last saw this" is taken
+    // from the room rather than from the bytes that built it, so both sides of that
+    // comparison are produced the same way. It is only recorded if this is the first
+    // joiner: a later one arrives at a room that may hold unsaved edits, and a baseline
+    // taken then would mark those edits as already saved.
+    state
+        .collab
+        .opened(&document.id, || room.doc().encode_state());
+    Ok(room)
 }
 
 // -------------------------------------------------------------------------------------
@@ -721,6 +840,10 @@ pub struct Published {
 
 /// Publish what is in the live session as a revision.
 ///
+/// **The only thing in this file that writes a revision.** [`sweep`] used to as well, once
+/// per interval, which is what filled a page's history with versions nobody asked for.
+/// Publishing is a person saying "this is the version I mean"; a timer cannot say that.
+///
 /// Authorised twice, and neither is redundant: [`authorise`] decides whether this caller
 /// may have the document at all (and refuses the view-as mode a POST would otherwise reach
 /// only by way of the router layer), and [`gw_store::Store::publish_revision`] decides
@@ -758,11 +881,10 @@ async fn publish(
         .map_err(ApiError::Internal)?
         .ok_or(ApiError::Forbidden)?;
 
-    // The room is now in the database, so the next sweep has nothing outstanding to write.
-    state.collab.saved(
-        &document.id,
-        serde_json::to_string(&snapshot).unwrap_or_default(),
-    );
+    // The room is NOT marked as saved. Publishing wrote a `Block` snapshot, and a `Block`
+    // is a lossy view: the marks and any node kind `gw-core` cannot name are still only in
+    // the CRDT. Telling the sweep there is nothing outstanding would mean a page that was
+    // published and then closed came back without them.
 
     Ok(Json(Published { revision_id }))
 }
@@ -778,7 +900,15 @@ async fn publish(
 /// happens FIRST so that a room that is both idle and unsaved is saved from the copy that
 /// was handed back — after `evict_idle` returns it, `Rooms::get` no longer knows about it,
 /// and the only reference to what was typed is the one in that vector.
+///
+/// That ordering is why the whole pass is under [`CollabState::building`]: between the
+/// eviction and the write there is a room that exists nowhere a joining connection can find
+/// it and whose state is not yet in the database, and a connection arriving in that window
+/// would build a second copy of the page. The lock makes the window unreachable rather than
+/// merely narrow.
 pub async fn sweep(state: &AppState) {
+    let _building = state.collab.building.lock().await;
+
     let evicted = state
         .collab
         .rooms
@@ -791,7 +921,7 @@ pub async fn sweep(state: &AppState) {
             .cloned()
             .or_else(|| state.collab.rooms.get(&document_id));
         match room {
-            Some(room) => snapshot(state, &room, &writer_id).await,
+            Some(room) => persist(state, &room, &writer_id).await,
             // The room went away without being evicted here. Nothing can be written for it
             // and nothing is holding its content; say so rather than dropping it quietly.
             None => tracing::error!(
@@ -806,30 +936,32 @@ pub async fn sweep(state: &AppState) {
     }
 }
 
-/// Write one room's current content as a revision, attributed to whoever last typed in it.
+/// Write one room's CRDT state, attributed to whoever last typed in it.
 ///
-/// Through [`gw_store::Store::publish_revision`] like every other content change — there is
-/// no second write path, and this one does not get an exception for being automatic. That
-/// also means the snapshot is authorised: a room whose last writer has since been
-/// deactivated or had their grant revoked is NOT written, because a revision may only be
-/// created by somebody who may write the page. That is a refusal, so it is logged at error
-/// level with the document named: it is the one path here that can lose work.
-async fn snapshot(state: &AppState, room: &Room, writer_id: &str) {
+/// The state and not a snapshot: this is the document, where [`gw_collab::Room::snapshot`]
+/// is a view of it that cannot hold an inline mark. Nothing here touches `documents.body`
+/// or the history — [`publish`] is what moves those, when somebody asks.
+///
+/// **It is still authorised, and that is a decision rather than an oversight.** A room whose
+/// last writer has since been deactivated or had their grant revoked is NOT written.
+/// `gw-store` has exactly one answer to "who may change this page's content", and a
+/// persistence path with a weaker answer of its own would mean the question had two — the
+/// second being the one nobody updates when the rules change. The counter-argument is real
+/// and is recorded here rather than argued away: those keystrokes are already in the room,
+/// already broadcast to everyone else editing it, and the room may hold other people's work
+/// as well, since `writer` is merely whoever typed last. Refusing therefore costs more than
+/// the one person's edits. Making that precise needs `gw-collab` to say who is *in* a room,
+/// so that a still-authorised editor could stand behind the write; it exposes no such thing
+/// today. Until then this is loud rather than silent: it is the one path here that loses
+/// work, so it is logged at error level with the document named.
+async fn persist(state: &AppState, room: &Room, writer_id: &str) {
     let document_id = room.document_id();
-    let block = room.snapshot();
-    let body = match serde_json::to_string(&block) {
-        Ok(body) => body,
-        Err(error) => {
-            tracing::error!(%error, document_id, "a room's snapshot could not be serialised");
-            return;
-        }
-    };
+    let encoded = room.doc().encode_state();
 
-    if !state.collab.differs(document_id, &body) {
-        // Nothing observable changed — a client's empty first sync reply, or an edit that
-        // only touched formatting, which a `Block` cannot hold. Writing here would add a
-        // revision identical to the one before it.
-        state.collab.saved(document_id, body);
+    if !state.collab.differs(document_id, &encoded) {
+        // Nothing changed — a client's empty first sync reply is an update like any other,
+        // so without this an open editor would rewrite the same row once per sweep.
+        state.collab.saved(document_id, encoded);
         return;
     }
 
@@ -847,14 +979,19 @@ async fn snapshot(state: &AppState, room: &Room, writer_id: &str) {
 
     match state
         .store
-        .publish_revision(&author, document_id, &block, Some(AUTOSAVE_SUMMARY))
+        .save_crdt_state(&author, document_id, &encoded)
         .await
     {
-        Ok(Some(revision_id)) => {
-            state.collab.saved(document_id, body);
-            tracing::debug!(document_id, revision_id, "saved a collaboration room");
+        Ok(true) => {
+            let bytes = encoded.len();
+            state.collab.saved(document_id, encoded);
+            tracing::debug!(
+                document_id,
+                bytes,
+                "stored a collaboration room's CRDT state"
+            );
         }
-        Ok(None) => tracing::error!(
+        Ok(false) => tracing::error!(
             document_id,
             author = %author.username,
             "cannot save: the last editor may no longer write this page"
