@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import Page from './+page.svelte';
-import { layout } from '$lib/graph/layout';
+import { edgeKey, layout } from '$lib/graph/layout';
 import { ANONYMOUS, type Graph } from '$lib/api';
 
 /**
@@ -98,6 +98,24 @@ describe('the graph page', () => {
     expect(out).toContain('Noch keine Verweise');
   });
 
+  it('does not claim there are no links at all when a subtree only links outward', () => {
+    // `Store::graph_for` drops any edge with an end outside the requested root — see
+    // `within_root` in crates/gw-store/src/links.rs — so a subtree whose pages all link
+    // OUT of it renders exactly this empty graph, even though those pages have real,
+    // readable links. The old wording, "Noch keine Verweise unterhalb von /darm", reads as
+    // "nothing here links to anything", which is false in that case: they link, they just
+    // leave. The page cannot tell apart the three things that produce an empty graph here
+    // (nothing exists, nothing is readable, everything leaves) — same as it already could
+    // not tell apart the first two — so the wording must be honest for all three at once:
+    // it may only claim that no link STAYS inside the subtree, never that none exist.
+    // Matched with a collapsed-whitespace regex rather than toContain: the source template
+    // wraps this sentence across lines for readability, and the raw SSR markup this test
+    // reads keeps that literal whitespace rather than collapsing it the way a browser would.
+    const out = html(empty, { root: '/darm' }).replace(/\s+/g, ' ');
+    expect(out).toContain('die innerhalb von /darm bleiben');
+    expect(out).toContain('Verweise nach außerhalb des Teilbaums werden hier nicht angezeigt');
+  });
+
   it('says the graph could not be loaded rather than pretending it is empty', () => {
     // A dead API and an empty graph are different facts, and "there are no links" is a lie
     // about the first. The admin console makes the same distinction for the same reason.
@@ -112,6 +130,71 @@ describe('the graph page', () => {
     const out = html(graph);
     expect(out).toContain('Rundgang verweist auf Tabellen');
     expect(out).toContain('Rundgang verweist auf Import und Export');
+  });
+
+  it('draws both edges of a pair whose bare-concatenation key would collide', () => {
+    // `/x -> /y/z` and `/x/y -> /z` both stringify to "/x/y/z" under `from + '' + to`. SSR
+    // does not care about keyed-each collisions — this only documents that both edges are
+    // still in the markup once the key stops colliding; `edgeKey` below is what actually
+    // discriminates the fix, since Svelte's client `each` throws `each_key_duplicate` on
+    // hydration and that failure never shows up in a server render.
+    const ambiguous: Graph = {
+      nodes: [
+        { path: '/x', title: 'X' },
+        { path: '/x/y', title: 'X Y' },
+        { path: '/y/z', title: 'Y Z' },
+        { path: '/z', title: 'Z' }
+      ],
+      edges: [
+        { from: '/x', to: '/y/z' },
+        { from: '/x/y', to: '/z' }
+      ]
+    };
+    const out = html(ambiguous);
+    expect(out.match(/<line /g)).toHaveLength(2);
+    expect(out).toContain('X verweist auf Y Z');
+    expect(out).toContain('X Y verweist auf Z');
+  });
+});
+
+describe('the accessible edge count', () => {
+  it('states the true edge count in aria-label even when close nodes trim a line from the drawing', () => {
+    // `edgeLine` returns null — no line left to draw — for two nodes closer together than
+    // its trim distance (21 units). A chain of 35 nodes is a deterministic, reproducible
+    // fixture (found by running the pure `layout`/`edgeLine` functions directly) where the
+    // force layout happens to land node 33 and node 34 inside that trim, so `lines` drops
+    // one entry: 33 <line> elements for 34 real edges. The edge still exists — it is a real
+    // link between two real pages, just an unlucky one in this particular layout — so
+    // `aria-label` must report `data.graph.edges.length` (34), matching the sighted
+    // `<figcaption>`, not `lines.length` (33), which would tell a screen-reader user this
+    // graph has one fewer connection than the caption right next to it says.
+    const n = 35;
+    const nodes = Array.from({ length: n }, (_, i) => ({ path: `/n${i}`, title: `N${i}` }));
+    const edges = Array.from({ length: n - 1 }, (_, i) => ({ from: `/n${i}`, to: `/n${i + 1}` }));
+    const chain: Graph = { nodes, edges };
+
+    const out = html(chain);
+    const drawnLines = out.match(/<line /g)?.length ?? 0;
+    // Sanity check on the fixture itself: if the layout algorithm ever changes and this no
+    // longer trims a line, this test proves nothing and must be replaced with one that does.
+    expect(drawnLines).toBeLessThan(edges.length);
+
+    const label = out.match(/aria-label="([^"]*)"/)?.[1] ?? '';
+    expect(label).toContain(`${edges.length} Verbindungen`);
+    expect(out).toContain(`${edges.length} Verweise`);
+  });
+});
+
+describe('edgeKey', () => {
+  it('gives two edges distinct keys even when a bare "from + to" concatenation would collide', () => {
+    // The graph route keys its keyed {#each} blocks by this function. A bare
+    // `edge.from + '' + edge.to` concatenation is ambiguous with no separator: these two
+    // edges both produce "/x/y/z". Svelte's client `each` throws `each_key_duplicate` on a
+    // duplicate key, which fails hydration for the whole page — silently, since SSR itself
+    // renders fine either way.
+    const a = { from: '/x', to: '/y/z' };
+    const b = { from: '/x/y', to: '/z' };
+    expect(edgeKey(a)).not.toBe(edgeKey(b));
   });
 });
 

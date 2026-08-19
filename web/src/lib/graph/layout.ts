@@ -29,6 +29,22 @@ export interface Placed extends GraphNode {
   y: number;
 }
 
+/**
+ * A stable, collision-free key for an edge, for the graph route's keyed `{#each}` blocks.
+ *
+ * `edge.from + '' + edge.to` looks harmless and is not: concatenating two slash-prefixed
+ * paths with no separator is ambiguous. `/x -> /y/z` and `/x/y -> /z` both produce
+ * `"/x/y/z"`. SSR does not notice — it renders whatever list it is given regardless of
+ * whether two items share a key — but Svelte's CLIENT `each` throws `each_key_duplicate` on
+ * a duplicate key, in dev AND production, which fails hydration for the whole page. Nothing
+ * about that shows up in a server-rendered test, which is why this is a named, independently
+ * tested function rather than an inline expression: `JSON.stringify` quotes each path, so no
+ * choice of `from`/`to` can make two distinct edges collide.
+ */
+export function edgeKey(edge: { from: string; to: string }): string {
+  return JSON.stringify([edge.from, edge.to]);
+}
+
 /** The drawn radius of a node, in the same units as the layout. */
 export const NODE_RADIUS = 8;
 

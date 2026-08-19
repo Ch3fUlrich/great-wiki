@@ -1019,6 +1019,148 @@ await check('E7 toggling Fett on a live selection marks it up, and the toolbar a
   assert(/<strong[^>]*>fett<\/strong>/.test(html), `expected a <strong>fett</strong> run, got: ${html}`);
 });
 
+// ---------------------------------------------------------------------------------------
+// Group F — the graph (web/src/routes/graph/+page.svelte, web/src/lib/graph/layout.ts)
+//
+// The one screen in this plan that is a PICTURE rather than text or a control, so it is the
+// one none of groups A-E can stand in for: a wrong arrowhead direction, an unreachable node
+// or a broken focus style are all things `page.test.ts`'s server-rendered-string assertions
+// cannot see, because they are about what the browser actually does with the markup, not
+// about which tags are in it.
+//
+// Against `/verweisbeispiel` and its child `/verweisbeispiel/verweist-zurueck`
+// (content-example), added alongside this task for exactly this purpose: `content-example`
+// otherwise has no links at all between its pages (every existing tour page is prose with no
+// `[text](/…)` in it), so the graph route had nothing real to draw in a fresh clone. The
+// child is seeded AFTER its parent — collect_markdown's shallowest-first order guarantees
+// that regardless of alphabetical position among root files — so the one link in it
+// (`[Verweisbeispiel](/verweisbeispiel)`) always resolves to a document that already exists,
+// giving a graph of exactly two nodes and one edge, deterministically, from `content-example`
+// alone. `content-darm` is NOT used here: every page in it is `restricted`, which would need
+// a dev identity these checks do not assume, and this task is explicit that `content-darm/`
+// is not to be touched.
+// ---------------------------------------------------------------------------------------
+
+const GRAPH_SOURCE = '/verweisbeispiel/verweist-zurueck'; // the edge starts here
+const GRAPH_TARGET = '/verweisbeispiel'; // and points here
+
+await check('F1 an arrowhead marker is present and the edge points from source to target', async (page) => {
+  await page.goto(BASE + '/graph', { waitUntil: 'domcontentloaded' });
+  const svg = page.locator('svg');
+  await svg.waitFor({ state: 'visible' });
+
+  // The marker itself: a triangle, referenced by the line as `marker-end`. Not merely
+  // "some <marker> exists" — the exact id the line points at, and a path inside it, or a
+  // marker with nothing to draw would satisfy "a marker is present" just as well.
+  const markerPath = svg.locator('marker#gw-graph-pfeil path');
+  assert((await markerPath.count()) === 1, 'expected exactly one <path> inside marker#gw-graph-pfeil');
+
+  const line = svg.locator('.edges line');
+  assert((await line.count()) === 1, `expected exactly one edge, found ${await line.count()}`);
+  assert(
+    (await line.getAttribute('marker-end')) === 'url(#gw-graph-pfeil)',
+    'the edge line does not reference the arrowhead marker'
+  );
+
+  // Direction: `edgeLine` starts the line at the SOURCE node's rim and ends it at the
+  // TARGET node's rim (see web/src/lib/graph/layout.ts), so (x1,y1) must sit closer to the
+  // source's centre than to the target's, and (x2,y2) the other way round. A marker on the
+  // wrong end of a correctly-drawn line would pass every check above and still point the
+  // wrong way, which is why this is checked separately from "a marker exists".
+  const centre = async (href) => {
+    const circle = svg.locator(`a[href="${href}"] circle`);
+    const [cx, cy] = await Promise.all([circle.getAttribute('cx'), circle.getAttribute('cy')]);
+    return { x: Number(cx), y: Number(cy) };
+  };
+  const source = await centre(GRAPH_SOURCE);
+  const target = await centre(GRAPH_TARGET);
+  const [x1, y1, x2, y2] = await Promise.all([
+    line.getAttribute('x1'),
+    line.getAttribute('y1'),
+    line.getAttribute('x2'),
+    line.getAttribute('y2')
+  ]).then((vals) => vals.map(Number));
+
+  const dist = (ax, ay, b) => Math.hypot(ax - b.x, ay - b.y);
+  assert(
+    dist(x1, y1, source) < dist(x1, y1, target),
+    `the line's start (${x1},${y1}) is not closer to the source node ${JSON.stringify(source)} than to the target ${JSON.stringify(target)}`
+  );
+  assert(
+    dist(x2, y2, target) < dist(x2, y2, source),
+    `the line's end (${x2},${y2}), where the arrowhead sits, is not closer to the target node ${JSON.stringify(target)} than to the source ${JSON.stringify(source)}`
+  );
+});
+
+await check('F2 a node is a real link and navigating it reaches that page', async (page) => {
+  await page.goto(BASE + '/graph', { waitUntil: 'domcontentloaded' });
+  const node = page.locator(`svg a[href="${GRAPH_TARGET}"]`);
+  await node.waitFor({ state: 'visible' });
+  await node.click();
+  await page.waitForURL(`**${GRAPH_TARGET}`, { timeout: 5_000 });
+
+  const heading = (await page.locator('h1').first().textContent())?.trim() ?? '';
+  assert(
+    heading === 'Verweisbeispiel',
+    `clicking the node did not land on its page: heading reads "${heading}"`
+  );
+});
+
+await check('F3 keyboard focus reaches a node, with a focus style that is visibly distinct', async (page) => {
+  await page.goto(BASE + '/graph', { waitUntil: 'domcontentloaded' });
+
+  // Start from the last thing before the diagram in DOM order — the filter button — and
+  // Tab once. The <line>s and the marker's <path> carry no tabindex, so the very next stop
+  // after the button is the first node's own <a>.
+  await page.locator('.filter button[type="submit"]').focus();
+  await page.keyboard.press('Tab');
+
+  const focused = page.locator('svg .nodes a:focus');
+  assert(
+    (await focused.count()) === 1,
+    'Tab from the filter button did not land on a node link inside svg .nodes'
+  );
+
+  // The design's own rule (+page.svelte): `.nodes a:focus-visible circle { fill: var(--ink) }`
+  // against a default of `var(--accent)`. Resolved through a probe element and compared for
+  // EQUALITY with --ink specifically — not merely "different from before" — because a focus
+  // style that changed to some OTHER wrong colour would pass an inequality check too.
+  const circle = focused.locator('circle');
+  const ink = await resolveToken(circle, '--ink');
+  const fill = await circle.evaluate((el) => getComputedStyle(el).fill);
+  assert(fill === ink, `a focused node's circle is filled ${fill}, expected --ink (${ink})`);
+});
+
+await check('F4 no horizontal scroll at 390px width', async (page) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(BASE + '/graph', { waitUntil: 'networkidle' });
+
+  const { scrollWidth, innerWidth } = await page.evaluate(() => ({
+    scrollWidth: document.documentElement.scrollWidth,
+    innerWidth: window.innerWidth
+  }));
+  assert(
+    scrollWidth <= innerWidth + 1,
+    `document.documentElement.scrollWidth (${scrollWidth}) exceeds window.innerWidth + 1 (${innerWidth + 1})`
+  );
+});
+
+await check('F5 the empty state renders its German sentence and no <svg>', async (page) => {
+  // A root naming a subtree that does not exist answers an empty graph, not an error (see
+  // `within_root` in crates/gw-store/src/links.rs) — a deterministic, content-independent
+  // way to reach the empty state without relying on the whole wiki having no links.
+  await page.goto(BASE + '/graph?wurzel=%2Fnichts-hier-xyz-123', { waitUntil: 'domcontentloaded' });
+
+  const empty = page.locator('p.empty');
+  await empty.waitFor({ state: 'visible' });
+  const text = (await empty.textContent())?.replace(/\s+/g, ' ').trim() ?? '';
+  assert(
+    text.startsWith('Noch keine Verweise'),
+    `expected the empty-state paragraph to start with "Noch keine Verweise", got "${text}"`
+  );
+  assert((await page.locator('svg').count()) === 0, 'the empty state must render no <svg> at all');
+});
+
 await browser.close();
 
 // ---------------------------------------------------------------------------------------

@@ -19,7 +19,7 @@
   are ordinary links and the subtree filter is an ordinary GET form.
 -->
 <script lang="ts">
-  import { edgeLine, layout, NODE_RADIUS } from '$lib/graph/layout';
+  import { edgeKey, edgeLine, layout, NODE_RADIUS } from '$lib/graph/layout';
 
   let { data } = $props();
 
@@ -59,18 +59,31 @@
   {#if data.error}
     <p class="notice">{data.error}</p>
   {:else if placed.nodes.length === 0}
-    <!-- One message for "there are no links" and for "none of them are yours", because the
-         store deliberately answers both the same way: distinguishing them here would say
-         that something is being withheld, which is the whole of what it was hiding. -->
+    <!-- One message for "there are no links", for "none of them are yours" and — only when
+         a root is given — for "they all leave this subtree", because the store deliberately
+         answers the first two the same way: distinguishing them here would say that
+         something is being withheld, which is the whole of what it was hiding. The third is
+         different: `within_root` (crates/gw-store/src/links.rs) drops an edge whose far end
+         sits outside the requested subtree, so a subtree whose pages link only outward
+         renders this same empty graph even though it has real, readable links. "Noch keine
+         Verweise unterhalb von X" would say those links do not exist, which is false — so
+         the root case is worded to claim only that none STAY inside the subtree, which is
+         true in all three cases at once. Without a root there is no "leaves the subtree" to
+         be honest about, so that case keeps the plain, short wording. -->
     <p class="empty">
-      Noch keine Verweise{data.root ? ` unterhalb von ${data.root}` : ''}. Sobald eine Seite auf
-      eine andere verweist, erscheint die Verbindung hier.
+      {#if data.root}
+        Noch keine Verweise, die innerhalb von {data.root} bleiben. Verweise nach außerhalb
+        des Teilbaums werden hier nicht angezeigt.
+      {:else}
+        Noch keine Verweise. Sobald eine Seite auf eine andere verweist, erscheint die
+        Verbindung hier.
+      {/if}
     </p>
   {:else}
     <figure>
       <svg
         viewBox="0 0 {placed.width} {placed.height}"
-        aria-label="Verweisgraph mit {placed.nodes.length} Seiten und {lines.length} Verbindungen"
+        aria-label="Verweisgraph mit {placed.nodes.length} Seiten und {data.graph.edges.length} Verbindungen"
       >
         <defs>
           <!-- `context-stroke` so the head takes the line's colour, which is a token and
@@ -90,7 +103,7 @@
         </defs>
 
         <g class="edges">
-          {#each lines as drawn (drawn!.edge.from + '' + drawn!.edge.to)}
+          {#each lines as drawn (edgeKey(drawn!.edge))}
             <line
               x1={drawn!.line!.x1}
               y1={drawn!.line!.y1}
@@ -126,7 +139,7 @@
       the keyboard users this is meant to help.
     -->
     <ul class="twin">
-      {#each data.graph.edges as edge (edge.from + '' + edge.to)}
+      {#each data.graph.edges as edge (edgeKey(edge))}
         <li>{titles.get(edge.from) ?? edge.from} verweist auf {titles.get(edge.to) ?? edge.to}</li>
       {/each}
     </ul>
