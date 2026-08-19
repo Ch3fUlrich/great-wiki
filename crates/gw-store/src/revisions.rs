@@ -185,6 +185,23 @@ pub(crate) async fn append_revision(
             .await?
             .flatten();
 
+    // The graph is derived from the body, so it is rewritten wherever the body is — here,
+    // on the caller's connection, inside the caller's transaction. Anywhere else would be
+    // a second write path for content (AGENTS.md rule 1) and could leave a page whose
+    // edges describe a revision that was rolled back.
+    //
+    // BEFORE the revision INSERT rather than after it, so the atomicity claim has
+    // something to be about: a failure at the revision is the one ordering in which edges
+    // could outlive the revision they were read out of, and
+    // `a_failed_publish_leaves_no_edges` forces exactly that. After it, the same test
+    // would pass without a transaction at all, because nothing would have been written yet.
+    //
+    // The body arrives as JSON because that is what a revision stores; parsing it back is
+    // the price of extraction living in the ONE function every body change goes through,
+    // rather than in each of its callers where a later third caller would forget it.
+    let body: Block = serde_json::from_str(body_json)?;
+    crate::links::replace_links(&mut *conn, document_id, &body).await?;
+
     sqlx::query(
         "INSERT INTO revisions \
          (id, document_id, parent_id, body, summary, author_id, author_name, byte_size) \

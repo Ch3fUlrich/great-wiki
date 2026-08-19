@@ -421,6 +421,25 @@ mutation crates/gw-api/src/routes/collab.rs killed \
   's/    if !state.collab.differs(document_id, &encoded) {/    if false {/' \
   'crdt state: an editing session in which nothing was typed writes no row, once per sweep for ever'
 
+# --- links: the graph, and who is allowed to see an edge of it ------------------------
+#
+# A backlinks panel is an aggregate view, and an aggregate view is where filtering gets
+# forgotten — the page is protected, the list of pages pointing at it is not, and the list
+# names them. So the first mutation swaps the permission-checked accessor for the unchecked
+# one, which is the exact mistake: same shape, same types, compiles, and every candidate
+# comes back. `a_backlink_to_a_page_the_caller_cannot_read_is_not_listed` also asserts that
+# the privileged caller DOES see the backlink, so it cannot pass by having no link to hide.
+mutation crates/gw-store/src/links.rs killed \
+  's/self.document_for(principal, &path, Action::Read)/self.document_by_path_unchecked(\&path)/' \
+  'links: a backlink names only a page the caller may actually read'
+# The second is about the word "replace". Extraction runs on every publish, so an INSERT
+# that does not first clear what was there turns every edit into another copy of the graph,
+# and a link somebody DELETED from the page stays an edge for ever — visible as a backlink
+# on a page that is no longer pointed at.
+mutation crates/gw-store/src/links.rs killed \
+  's/    sqlx::query("DELETE FROM links WHERE from_doc = ?1")/    sqlx::query("SELECT 1 FROM links WHERE from_doc = ?1")/' \
+  'links: republishing replaces this page edges rather than accumulating them'
+
 # --- crash recovery ------------------------------------------------------------------
 #
 # A trap does not survive SIGKILL, and a killed run leaves the mutated file in place.

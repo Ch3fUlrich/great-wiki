@@ -4,6 +4,7 @@ pub mod audit;
 pub mod crdt;
 pub mod documents;
 pub mod invites;
+pub mod links;
 pub mod login_attempts;
 pub mod principals;
 pub mod revisions;
@@ -17,6 +18,7 @@ pub use invites::{
     AcceptOutcome, CreateInviteOutcome, InviteOffer, InviteSummary, NewInvite, RevokeInviteOutcome,
     INVITE_TTL_SECONDS,
 };
+pub use links::Backlink;
 pub use login_attempts::{LoginScope, LOGIN_FAILURE_LIMIT, LOGIN_LOCKOUT_SECONDS};
 pub use principals::TeamSummary;
 pub use revisions::{Author, Revision, IMPORT_AUTHOR_ID, IMPORT_AUTHOR_NAME};
