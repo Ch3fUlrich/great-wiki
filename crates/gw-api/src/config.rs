@@ -98,9 +98,19 @@ pub fn oidc_from(
 /// tested without mutating process globals every other test in this binary shares.
 ///
 /// Unlike the OIDC group this is ONE variable, so there is no half-configured state to
-/// refuse — only "set" and parses, or "not set". A value that is set but does NOT parse as a
-/// URL is refused rather than silently treated as unset: a typo here should be loud at
-/// startup, not a feature that is permanently missing and never explains why.
+/// refuse — only "set" and parses as an `http` or `https` URL, or "not set". A value that is
+/// set but does NOT parse as a URL, or parses to some other scheme (`mailto:`, `file:`,
+/// `data:`, …), is refused rather than silently treated as unset: a typo here should be loud
+/// at startup, not a feature that is permanently missing and never explains why. The scheme
+/// check is not pedantry on top of that — syntax validation alone leaves a real gap open:
+/// `mailto:foo@bar.com` parses as a perfectly valid absolute URL, so it would sail through a
+/// bare [`url::Url::parse`] and report "configuration OK". It would then never match a
+/// single request for the deployment's whole life: its [`url::Url::origin`] is
+/// [`url::Origin::Opaque`], which `gw_store::links::internal_path_from_absolute` (a private
+/// function, hence no link — same crate boundary this module's own doc comment on
+/// `public_origin` describes) can never find equal to a real request's `Tuple` origin. That
+/// is exactly the silent, never-explained non-function this function exists to turn into a
+/// startup error instead.
 pub fn public_origin_from(raw: Option<String>) -> Result<Option<url::Url>> {
     let Some(raw) = raw else {
         return Ok(None);
@@ -110,6 +120,14 @@ pub fn public_origin_from(raw: Option<String>) -> Result<Option<url::Url>> {
             "GW_PUBLIC_URL must be an absolute URL, e.g. https://wiki.example.com (got `{raw}`)"
         )
     })?;
+    if origin.scheme() != "http" && origin.scheme() != "https" {
+        bail!(
+            "GW_PUBLIC_URL must be an http or https URL, e.g. https://wiki.example.com (got \
+             `{raw}`, scheme `{}`) — no other scheme can be a wiki's origin, and one that \
+             parses but never matches would fail silently instead of at startup.",
+            origin.scheme()
+        );
+    }
     Ok(Some(origin))
 }
 
@@ -283,6 +301,39 @@ mod tests {
         // should be a startup error, not a feature that quietly never works.
         let error = public_origin_from(some("not a url")).unwrap_err();
         assert!(error.to_string().contains("GW_PUBLIC_URL"), "{error}");
+    }
+
+    #[test]
+    fn a_public_url_with_a_non_http_scheme_refuses_to_start() {
+        // Each of these is a syntactically valid absolute URL — `Url::parse` alone accepts
+        // every one — but none of them can be a wiki's origin. Left unchecked, one pasted
+        // by typo would report "configuration OK" and then never match a single request:
+        // its `url::Origin` is `Opaque`, which can never equal the `Tuple` origin a real
+        // request carries, so the deployment would behave as unconfigured, silently,
+        // forever — exactly the failure mode this function exists to turn into a startup
+        // error instead.
+        for raw in [
+            "mailto:foo@bar.com",
+            "file:///etc/passwd",
+            "data:text/plain,hello",
+        ] {
+            let error = public_origin_from(some(raw)).unwrap_err();
+            assert!(
+                error.to_string().contains("GW_PUBLIC_URL"),
+                "{raw}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_and_https_public_urls_both_still_pass() {
+        // The scheme check above must narrow to exactly these two, not further.
+        for raw in ["https://wiki.ohje.ooguy.com", "http://wiki.ohje.ooguy.com"] {
+            let origin = public_origin_from(some(raw))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{raw} must still be accepted"));
+            assert_eq!(origin.scheme(), &raw[..raw.find(':').unwrap()]);
+        }
     }
 
     #[test]

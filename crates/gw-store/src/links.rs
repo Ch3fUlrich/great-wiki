@@ -102,14 +102,26 @@ fn internal_path(mark: &Mark, from: &str, public_origin: Option<&Url>) -> Option
 
 /// The document path an address names, or `None` if it does not name one in this wiki.
 ///
-/// **Internal is "a relative reference with no scheme and no authority".** `web/src/routes`
-/// serves documents from `/[...path]`, so a page's `documents.path` *is* its URL path and
-/// `/rundgang/tabellen` needs no translation. Anything carrying a scheme (`https:`,
-/// `mailto:`, `javascript:`) or an authority (`//example.org/x`) addresses some other
-/// origin, and this crate has no idea which origin is its own — the deployment host is
-/// configuration, not schema — so an absolute `https://…` URL is treated as external even
-/// when it happens to point back here. Guessing otherwise would mean inventing a hostname
-/// and drawing edges from it.
+/// **Internal is "a relative reference with no scheme and no authority" — or an absolute
+/// one whose origin matches this deployment's configured `public_origin` exactly.**
+/// `web/src/routes` serves documents from `/[...path]`, so a page's `documents.path` *is*
+/// its URL path and `/rundgang/tabellen` needs no translation. Anything carrying a scheme
+/// (`https:`, `mailto:`, `javascript:`) addresses some other origin by default — this crate
+/// still has no idea which origin is its own; the deployment host is configuration, not
+/// schema — unless the caller hands that configuration in: when `public_origin` is `Some`
+/// and the address's origin matches it exactly (see [`internal_path_from_absolute`]), the
+/// URL resolves to the page it names, same as a relative reference would. With
+/// `public_origin` unset, every absolute URL is external, exactly as it always was before
+/// this parameter existed — this function still never guesses at a hostname on its own and
+/// draws edges from it.
+///
+/// Two limitations remain regardless of configuration. An authority with no scheme
+/// (`//example.org/x`, "protocol-relative") stays external unconditionally: it never
+/// reaches the branch above (see [`has_scheme`]), so `public_origin` is never consulted for
+/// it. And `public_origin` only shapes what THIS publish records: a page published before
+/// the origin was configured — or before an absolute self-link in it was ever recognised —
+/// keeps the edges that publish produced until something republishes it; nothing here
+/// backfills a page that has not changed since.
 ///
 /// **A reference with no leading slash is resolved against `from` — the linking document's
 /// OWN path — never against the site root.** `web/src/app.html` sets no `<base>`, so a

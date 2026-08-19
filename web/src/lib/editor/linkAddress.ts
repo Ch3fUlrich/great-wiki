@@ -9,7 +9,7 @@
  * clicks through without noticing anything is wrong. But `gw_store::links::wiki_path` only
  * turns a scheme-less, authority-less reference into a graph edge (`crates/gw-store/src/
  * links.rs`'s module doc explains why: it has no idea which origin is its own, and guessing
- * would mean inventing a hostname and drawing edges from it). An absolute `https://…` URL is
+ * would mean inventing a hostname and drawing edges from it). An absolute `https://…` URL was
  * therefore always read as external, even the ones that point straight back at this wiki —
  * so the dominant, PROMPTED authoring flow was the one flow that recorded no edge at all.
  * The backlinks panel and the graph both look broken, silently, for every link anyone
@@ -37,11 +37,27 @@
  *
  * # What this does NOT cover
  *
- * Markdown imported with an absolute self-link (`[siehe](https://wiki.example.org/ziel)`
- * baked into a file before it ever reaches this control) is untouched — this function runs
- * at EDITOR INSERT TIME, not on every body a revision ever holds, and the importer has no
- * origin to compare against for the same reason `gw-store` does not: the deployment host is
- * configuration, not something either of them is handed. That gap is real and unclosed.
+ * This function still never sees imported markdown — it runs at EDITOR INSERT TIME, not on
+ * every body a revision ever holds, so an absolute self-link baked into a file before import
+ * (`[siehe](https://wiki.example.org/ziel)`) never passes through it. That part of the
+ * account above is still exactly true.
+ *
+ * What changed is that the gap this used to leave is closed by a different mechanism, not
+ * by this one: `gw_store::links::replace_links` (`crates/gw-store/src/links.rs`) now accepts
+ * an absolute self-link too, when the deployment's `public_origin` is configured and the
+ * link's origin matches it exactly — and every write path threads that same configuration
+ * through, including `Store::create_document`, which is what the importer calls. So an
+ * absolute self-link in imported markdown now becomes a graph edge, same as one typed
+ * through this control, PROVIDED `public_origin` is configured. With it unset, `gw-store`
+ * still cannot resolve any absolute URL on its own — the deployment host is configuration,
+ * not something either it or the importer is handed — and every absolute link, imported or
+ * typed, is external, same as always.
+ *
+ * Two limitations remain regardless of configuration, both in `gw-store` rather than here: a
+ * protocol-relative address (`//wiki.example.org/ziel`, no scheme) is always external,
+ * unconditionally; and a page imported or published before `public_origin` was configured
+ * keeps the edges that import produced until something re-publishes it — there is no
+ * backfill.
  */
 export function normalizeLinkAddress(origin: string, currentPath: string, typed: string): string {
   const trimmed = typed.trim();
