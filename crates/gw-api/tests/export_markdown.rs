@@ -173,6 +173,68 @@ fn marks_round_trip_through_markdown() {
 }
 
 #[test]
+fn a_link_whose_text_is_emphasised_survives_whichever_way_it_was_nested() {
+    // `[**a**](url)` and `**[a](url)**` describe the same document, and the importer
+    // stores one canonical mark order for both (`gw_core::MARK_ORDER`). Whichever the
+    // author wrote, the export re-imports as the very same tree — before this was pinned,
+    // the marks came out of the importer in source order, the exporter wrote them in its
+    // own, and every `[**a**](url)` in the corpus was REFUSED rather than exported.
+    survives("Siehe [**das Handbuch**](/handbuch).\n");
+    survives("Siehe [*das Handbuch*](/handbuch).\n");
+    survives("Siehe [~~das Handbuch~~](/handbuch).\n");
+    survives("Siehe **[das Handbuch](/handbuch)**.\n");
+    survives("Siehe [`code`](/handbuch).\n");
+    survives("Siehe **`code`**.\n");
+}
+
+#[test]
+fn a_mark_run_covering_several_leaves_is_opened_once_and_closed_once() {
+    // `*kursiv und **beides***` is two leaves — one carrying em, one carrying em and
+    // strong — under ONE run of emphasis. A renderer that wraps each leaf on its own
+    // closes the emphasis in the middle and reopens it, producing `*kursiv und ****beides***`:
+    // four asterisks that no CommonMark parser reads as the author's document.
+    survives("*kursiv und **beides***\n");
+    survives("**fett und *beides***\n");
+    survives("~~weg und **fett**~~\n");
+    survives("**fett und [ein Link](https://example.org)**\n");
+    survives("[ein **fetter** Link](https://example.org)\n");
+    survives("**fett und `code` zusammen**\n");
+
+    // The one place this suite asserts on the text: a doubled delimiter is the fingerprint
+    // of a run that was closed and reopened, and it is exactly what a tree comparison can
+    // miss when the mangled markdown happens to re-parse the same way.
+    for md in [
+        "*kursiv und **beides***\n",
+        "**fett und *beides***\n",
+        "~~weg und **fett**~~\n",
+    ] {
+        let (_, _, rendered) = round_trip(md);
+        assert_eq!(rendered, md, "the mark run was not written as one run");
+    }
+}
+
+#[test]
+fn a_mark_run_the_renderer_cannot_write_is_reported_rather_than_mangled() {
+    // Emphasis cannot open before a space or close after one — `**fett **und` is not bold
+    // at all, it is four literal asterisks. Only the editor can build such a leaf (the
+    // importer cannot parse one into existence), and `render` must SAY so: `problems` is
+    // what `render_file` refuses on, and an empty `problems` on inexpressible output is a
+    // silent corruption rather than a refusal.
+    let doc: Block = serde_json::from_str(
+        r#"{"kind":"doc","content":[{"kind":"paragraph","content":[
+             {"kind":"text","text":"fett ","marks":[{"kind":"strong"}]},
+             {"kind":"text","text":"und"}]}]}"#,
+    )
+    .unwrap();
+    let out = gw_api::export::render(&doc);
+    assert!(
+        !out.problems.is_empty(),
+        "the renderer produced markdown it cannot express and said nothing: {}",
+        out.markdown
+    );
+}
+
+#[test]
 fn the_shipped_example_corpus_survives_every_file() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content-example");
     let mut checked = 0;

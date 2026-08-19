@@ -152,10 +152,12 @@ struct Builder {
     code: Option<String>,
     table: Option<Table>,
     losses: BTreeMap<Unsupported, usize>,
-    /// The marks currently open, innermost last. `Start(Tag::Strong | Emphasis |
-    /// Strikethrough | Link)` pushes, the matching `End` pops, and every text leaf is
-    /// stamped with a clone of the whole stack — that is what lets `**bold *and
-    /// italic***` land on one leaf carrying both marks.
+    /// The marks currently open, in the order the source opened them. `Start(Tag::Strong |
+    /// Emphasis | Strikethrough | Link)` pushes, the matching `End` pops, and every text
+    /// leaf is stamped with a clone of the whole stack — that is what lets `**bold *and
+    /// italic***` land on one leaf carrying both marks. [`Builder::marked_text`] sorts that
+    /// clone into [`crate::MARK_ORDER`] before it reaches the leaf, so what is stored is
+    /// the canonical nesting and not the accident of which tag the author opened first.
     active: Vec<Mark>,
 }
 
@@ -253,18 +255,25 @@ impl Builder {
     /// Append inline text carrying exactly `marks`, merging into the previous leaf only
     /// when its marks match — otherwise `**bold** plain` would fuse into one leaf and the
     /// mark boundary would be lost along with it.
-    fn marked_text(&mut self, s: &str, marks: Vec<Mark>) {
+    ///
+    /// The marks are sorted into [`crate::MARK_ORDER`] first. The source is free to nest
+    /// them either way round — `[**a**](url)` and `**[a](url)**` are the same document —
+    /// and storing them in the order the tags happened to open would mean two spellings of
+    /// one document became two different trees, only one of which the exporter can write
+    /// back. The sort is stable, so marks of the same kind keep their source nesting.
+    fn marked_text(&mut self, s: &str, mut marks: Vec<Mark>) {
         if let Some(code) = self.code.as_mut() {
             code.push_str(s);
             return;
         }
+        marks.sort_by_key(|m| m.kind.nesting_rank());
         if !matches!(self.top().kind, BlockKind::Paragraph | BlockKind::Heading) {
             self.push(block(BlockKind::Paragraph), true);
         }
         match self.top().content.last_mut() {
             // Merge into the previous leaf so two text events for the same run of marks
             // become one text node, not two.
-            Some(prev) if prev.kind == BlockKind::Text && marks_equal(&prev.marks, &marks) => {
+            Some(prev) if prev.kind == BlockKind::Text && prev.marks == marks => {
                 prev.text.get_or_insert_with(String::new).push_str(s);
             }
             _ => {
@@ -466,16 +475,6 @@ fn mark(kind: MarkKind) -> Mark {
         kind,
         attrs: serde_json::Map::new(),
     }
-}
-
-/// Whether two mark stacks are the same run, so [`Builder::marked_text`] knows whether the
-/// next leaf can merge into the previous one. `Mark` has no `PartialEq` of its own — `kind`
-/// and `attrs` each do, so this compares them field by field instead of deriving one.
-fn marks_equal(a: &[Mark], b: &[Mark]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|(x, y)| x.kind == y.kind && x.attrs == y.attrs)
 }
 
 /// The `align` attribute for a column, or `None` where the table states no alignment.
@@ -759,11 +758,13 @@ mod tests {
         // Superseded by Task 2: bold and italic used to be flattened to plain text and
         // counted as a loss. They now land as `Mark`s on the text leaf (see
         // `emphasis_and_links_survive_import_and_are_no_longer_reported_as_lost` and
-        // `nested_emphasis_stamps_both_marks_on_the_inner_text` for the marks themselves),
-        // so nothing here is unsupported any more.
+        // `nested_emphasis_stamps_both_marks_on_the_inner_text_in_canonical_order` for the
+        // marks themselves), so nothing here is unsupported any more.
         let conversion = convert("Ein **fettes** und *kursives* Wort.\n");
-        assert!(conversion.doc.plain_text().contains("fettes"));
-        assert!(conversion.doc.plain_text().contains("kursives"));
+        // Exact, not `contains`: emphasis splits the sentence into four text leaves, and a
+        // substring check passes just as happily on "Ein fettes und kursives Wort ." —
+        // where a leaf boundary has grown a space the source never had.
+        assert_eq!(conversion.doc.plain_text(), "Ein fettes und kursives Wort.");
         assert!(
             conversion.notes.is_empty(),
             "emphasis is modelled now, not lost: {:?}",
@@ -784,7 +785,10 @@ mod tests {
         // store, so it cannot tell an internal destination from an external one, and Task 7
         // is where that resolution happens (see the comment on `Tag::Link` in `start`).
         let conversion = convert("Siehe [das Handbuch](/handbuch).\n");
-        assert!(conversion.doc.plain_text().contains("das Handbuch"));
+        // Exact, not `contains`: the link splits the sentence into three text leaves, and
+        // `contains` passes on "Siehe das Handbuch ." — the full stop pushed off the word
+        // by a leaf boundary, which is what the reader's outline would then show.
+        assert_eq!(conversion.doc.plain_text(), "Siehe das Handbuch.");
         let text = collect_text_leaves(&conversion.doc);
         let link = text
             .iter()
@@ -898,18 +902,96 @@ mod tests {
         );
     }
 
-    #[test]
-    fn nested_emphasis_stamps_both_marks_on_the_inner_text() {
-        let c = convert("*kursiv und **beides***");
-        let text: Vec<_> = collect_text_leaves(&c.doc);
-        let both = text
+    /// The kinds on the leaf whose text is `text`, in stored order.
+    fn marks_on(doc: &Block, text: &str) -> Vec<MarkKind> {
+        collect_text_leaves(doc)
             .iter()
-            .find(|b| b.text.as_deref() == Some("beides"))
-            .unwrap();
+            .find(|b| b.text.as_deref() == Some(text))
+            .unwrap_or_else(|| panic!("no leaf holds `{text}`"))
+            .marks
+            .iter()
+            .map(|m| m.kind)
+            .collect()
+    }
+
+    #[test]
+    fn nested_emphasis_stamps_both_marks_on_the_inner_text_in_canonical_order() {
+        // The kinds AND their order, not just the count: the order is the nesting order,
+        // outermost first, and `gw-api`'s exporter writes the marks back out in exactly
+        // it. A count-only assertion pins nothing and lets the two sides disagree.
+        let c = convert("*kursiv und **beides***");
+        assert_eq!(marks_on(&c.doc, "beides"), [MarkKind::Strong, MarkKind::Em]);
+        assert_eq!(marks_on(&c.doc, "kursiv und "), [MarkKind::Em]);
+    }
+
+    #[test]
+    fn marks_are_stored_in_canonical_order_whichever_way_the_source_nested_them() {
+        // `[**a**](url)` and `**[a](url)**` are the same document. Storing them as two
+        // different mark arrays made the exporter — which writes one fixed nesting order —
+        // refuse to export the first of them: its own output re-imported as a different
+        // tree. One order, defined once in `MARK_ORDER`, is what closes that.
+        for md in [
+            "[**das Handbuch**](/handbuch)",
+            "**[das Handbuch](/handbuch)**",
+        ] {
+            assert_eq!(
+                marks_on(&convert(md).doc, "das Handbuch"),
+                [MarkKind::Strong, MarkKind::Link],
+                "`{md}` stored its marks out of canonical order"
+            );
+        }
         assert_eq!(
-            both.marks.len(),
-            2,
-            "an inner leaf carries every enclosing mark"
+            marks_on(&convert("[*a*](/h)").doc, "a"),
+            [MarkKind::Em, MarkKind::Link]
+        );
+        assert_eq!(
+            marks_on(&convert("[~~a~~](/h)").doc, "a"),
+            [MarkKind::Strike, MarkKind::Link]
+        );
+        // `Code` is last of all: a code span's content is literal, so nothing can nest
+        // inside one — it is the leaf's base representation, never a wrapper.
+        assert_eq!(
+            marks_on(&convert("[`a`](/h)").doc, "a"),
+            [MarkKind::Link, MarkKind::Code]
+        );
+        assert_eq!(
+            marks_on(&convert("**`a`**").doc, "a"),
+            [MarkKind::Strong, MarkKind::Code]
+        );
+    }
+
+    #[test]
+    fn the_canonical_order_places_every_mark_kind_exactly_once() {
+        // The match is exhaustive on purpose. `MarkKind` is `#[non_exhaustive]`, but that
+        // only binds OTHER crates — inside this one, adding a kind stops this test
+        // compiling until someone decides where it nests. A kind left out of `MARK_ORDER`
+        // would otherwise sort to the end by accident rather than by decision, and two
+        // kinds sorting equal puts the stored order back at the mercy of the source.
+        for kind in [
+            MarkKind::Strong,
+            MarkKind::Em,
+            MarkKind::Code,
+            MarkKind::Strike,
+            MarkKind::Link,
+        ] {
+            match kind {
+                MarkKind::Strong
+                | MarkKind::Em
+                | MarkKind::Code
+                | MarkKind::Strike
+                | MarkKind::Link => {}
+            }
+            assert!(
+                crate::MARK_ORDER.contains(&kind),
+                "{kind:?} has no place in the canonical nesting order"
+            );
+        }
+        let mut ranks: Vec<usize> = crate::MARK_ORDER.iter().map(|k| k.nesting_rank()).collect();
+        ranks.sort_unstable();
+        assert_eq!(
+            ranks,
+            (0..crate::MARK_ORDER.len()).collect::<Vec<_>>(),
+            "a kind is listed twice, so one of its ranks is unreachable"
         );
     }
 }

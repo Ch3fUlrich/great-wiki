@@ -45,12 +45,50 @@ pub enum MarkKind {
     Link,
 }
 
+/// The order a text leaf's `marks` are stored in: **outermost first, innermost last**.
+///
+/// A leaf's `marks` array is a nesting, not a set, and markdown can only write a nesting —
+/// `**[a](url)**` and `[**a**](url)` are the same rendered text and two different arrays.
+/// The importer sorts every leaf's marks into this order, so both spellings store the same
+/// tree, and `gw-api`'s exporter writes them back out in the same order it finds them. That
+/// agreement is the whole reason this constant exists in the *lower* crate rather than in
+/// the exporter: two orders that agree by coincidence stop agreeing the day one is edited,
+/// and the failure is an export that refuses every page holding a nested mark.
+///
+/// `Code` is last, and that is not arbitrary: a code span's content is literal CommonMark,
+/// so nothing can be nested *inside* one. It is a leaf's base representation rather than a
+/// wrapper around it, which makes it the innermost mark by definition.
+pub const MARK_ORDER: [MarkKind; 5] = [
+    MarkKind::Strong,
+    MarkKind::Em,
+    MarkKind::Strike,
+    MarkKind::Link,
+    MarkKind::Code,
+];
+
+impl MarkKind {
+    /// Where this kind sits in [`MARK_ORDER`] — the sort key that puts a leaf's marks in
+    /// canonical order. A kind that is not listed (a later milestone's, arriving through
+    /// `#[non_exhaustive]`) ranks past the end rather than panicking, so it sorts innermost
+    /// and the renderer that cannot write it is the one that refuses.
+    pub fn nesting_rank(self) -> usize {
+        MARK_ORDER
+            .iter()
+            .position(|&k| k == self)
+            .unwrap_or(usize::MAX)
+    }
+}
+
 /// Inline formatting on a text leaf, shaped exactly like a ProseMirror mark.
 ///
 /// A link carries EITHER `doc` (an internal target, per D-5) or `href` (external, or an
 /// internal one that could not be resolved). Never both: `target_doc` reading an `href`
 /// as an id would turn a URL into a document reference.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Equality is by kind *and* attrs, because that is what decides whether two neighbouring
+/// leaves are one run of formatting or two: `[a](u)` beside `[b](u)` is one link, and
+/// `[a](u)` beside `[b](v)` is two.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mark {
     pub kind: MarkKind,
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
@@ -115,28 +153,40 @@ impl Block {
     /// This feeds the search index and the embedding chunker, so it must be stable: two
     /// documents that read identically must produce identical text.
     ///
-    /// Leaves are joined with a space and runs of whitespace are then collapsed, rather
-    /// than concatenated directly. Direct concatenation fuses the last word of one block
-    /// to the first word of the next — a heading "…Maß" followed by a paragraph "Ein…"
-    /// becomes the token "MaßEin", which is in the index and matches nothing anyone would
-    /// ever search for. The collapse is what keeps this identical to the TypeScript
-    /// implementation, which joins the same way.
+    /// A **block** boundary is written as a space and runs of whitespace are then
+    /// collapsed. Without the space the last word of one block fuses to the first of the
+    /// next — a heading "…Maß" followed by a paragraph "Ein…" becomes the token "MaßEin",
+    /// which is in the index and matches nothing anyone would ever search for.
+    ///
+    /// Adjacent **inline** leaves of one parent get no separator, because they are one run
+    /// of prose that a mark boundary happened to split: `Siehe [das Handbuch](/h).` is
+    /// three leaves and one sentence, and a space between them would put the full stop off
+    /// the end of the word — "Siehe das Handbuch ." — in the search index, in the reader's
+    /// table of contents, in a heading's anchor id, and in the seeder's exact comparison of
+    /// a body heading against the page title.
+    ///
+    /// `web/src/lib/blocks/render.ts::plainText` is a deliberate mirror of this and must
+    /// stay byte-identical; the shared cases in `PLAIN_TEXT_CASES` are duplicated in its
+    /// test suite so a drift turns one of them red.
     pub fn plain_text(&self) -> String {
-        let mut parts: Vec<&str> = Vec::new();
-        self.collect_text(&mut parts);
-        parts
-            .join(" ")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
+        let mut out = String::new();
+        self.collect_text(&mut out);
+        out.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
-    fn collect_text<'a>(&'a self, out: &mut Vec<&'a str>) {
+    fn collect_text(&self, out: &mut String) {
         if let Some(t) = &self.text {
-            out.push(t);
+            out.push_str(t);
         }
+        let mut previous: Option<BlockKind> = None;
         for child in &self.content {
+            // A boundary is where a block begins or ends. Two text leaves side by side in
+            // one parent are neither, so nothing is written between them.
+            if child.kind != BlockKind::Text || previous.is_some_and(|p| p != BlockKind::Text) {
+                out.push(' ');
+            }
             child.collect_text(out);
+            previous = Some(child.kind);
         }
     }
 
@@ -203,6 +253,47 @@ mod tests {
     #[test]
     fn plain_text_concatenates_leaves_in_order() {
         assert_eq!(sample().plain_text(), "Größe und Maß Ein Satz. Noch einer.");
+    }
+
+    /// The cases `web/src/lib/blocks/render.test.ts` duplicates verbatim. The two
+    /// implementations are deliberate mirrors — `plainText` feeds the reader's outline,
+    /// its heading anchor ids and its table column labels, and this feeds the search index
+    /// and the seeder's duplicate-title check, so a disagreement puts a different heading
+    /// in the table of contents than the one the anchor points at. If they ever drift,
+    /// one of the two suites goes red, which is the whole point of duplicating them.
+    const PLAIN_TEXT_CASES: &[(&str, &str)] = &[
+        // Adjacent inline leaves of ONE paragraph are one run of prose: a mark boundary
+        // splits a sentence into leaves, and no space may appear where the split was.
+        (
+            r#"{"kind":"paragraph","content":[
+                 {"kind":"text","text":"Siehe "},
+                 {"kind":"text","text":"das Handbuch","marks":[{"kind":"link","attrs":{"href":"/h"}}]},
+                 {"kind":"text","text":"."}]}"#,
+            "Siehe das Handbuch.",
+        ),
+        (
+            r#"{"kind":"paragraph","content":[
+                 {"kind":"text","text":"Der "},
+                 {"kind":"text","text":"Darm","marks":[{"kind":"strong"}]},
+                 {"kind":"text","text":"-Trakt"}]}"#,
+            "Der Darm-Trakt",
+        ),
+        // …and a BLOCK boundary still separates, or the last word of one block fuses to
+        // the first of the next and the index holds a token nobody will ever search for.
+        (
+            r#"{"kind":"doc","content":[
+                 {"kind":"heading","content":[{"kind":"text","text":"Maß"}]},
+                 {"kind":"paragraph","content":[{"kind":"text","text":"Einheit"}]}]}"#,
+            "Maß Einheit",
+        ),
+    ];
+
+    #[test]
+    fn adjacent_inline_leaves_are_one_run_of_prose_but_blocks_stay_separated() {
+        for (json, expected) in PLAIN_TEXT_CASES {
+            let block: Block = serde_json::from_str(json).unwrap();
+            assert_eq!(&block.plain_text(), expected);
+        }
     }
 
     #[test]

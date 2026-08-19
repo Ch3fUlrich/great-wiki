@@ -12,8 +12,11 @@
 //! # What markdown can carry back, and what still cannot
 //!
 //! `Block` carries inline [`Mark`]s (bold, italic, strikethrough, inline code, and a link's
-//! `href`), so this renderer writes them back out, sorted into a fixed nesting order so two
-//! runs of the exporter always produce identical bytes for the same document. What a stored
+//! `href`), so this renderer writes them back out. A mark belongs to a *leaf* and markdown
+//! writes it around a *span*, so the two do not line up on their own: the nesting order is
+//! [`gw_core::MARK_ORDER`] — defined once, in the crate that also stamps it on import, so
+//! that neither side can be edited into disagreeing with the other — and a mark covering
+//! several leaves is opened once around the whole run rather than per leaf. What a stored
 //! document still cannot hold is an image (the importer keeps only the alt text), a link
 //! resolved to another *document* rather than a URL (`Mark::attrs`' `doc`, which only Task 7
 //! produces), and a horizontal rule — those are dropped on the way *in* (see
@@ -560,24 +563,21 @@ impl Renderer {
         }
     }
 
-    /// Every text leaf under `block`, rendered with its own marks and concatenated in order.
+    /// Every text leaf under `block`, rendered with its marks and concatenated in order.
     fn inline(&mut self, block: &Block) -> String {
-        let mut out = String::new();
-        self.collect_inline(block, &mut out);
-        out
+        let mut leaves = Vec::new();
+        self.collect_inline(block, &mut leaves);
+        self.runs(&leaves, &[])
     }
 
-    /// Walk `block`'s children, writing each `Text` leaf through [`Self::leaf`] and
-    /// recursing (with a refusal) into anything else — inline content holding a block is
-    /// not something the schema is supposed to produce, but text nested inside it must
-    /// still reach the page rather than vanish along with the refusal that names it.
-    fn collect_inline(&mut self, block: &Block, out: &mut String) {
+    /// Walk `block`'s children, collecting each `Text` leaf and recursing (with a refusal)
+    /// into anything else — inline content holding a block is not something the schema is
+    /// supposed to produce, but text nested inside it must still reach the page rather than
+    /// vanish along with the refusal that names it.
+    fn collect_inline<'a>(&mut self, block: &'a Block, out: &mut Vec<InlineLeaf<'a>>) {
         for child in &block.content {
             match child.kind {
-                BlockKind::Text => {
-                    let leaf = self.leaf(child.text.as_deref().unwrap_or(""), &child.marks);
-                    out.push_str(&leaf);
-                }
+                BlockKind::Text => out.push(InlineLeaf::of(child)),
                 other => {
                     self.problem(format!(
                         "a `{other:?}` block is nested inside inline content, where markdown \
@@ -587,6 +587,57 @@ impl Renderer {
                 }
             }
         }
+    }
+
+    /// A run of leaves, given that `applied` is already written around all of them.
+    ///
+    /// A mark is a property of a *leaf*, but markdown writes it as a delimiter *around a
+    /// span*: `*kursiv und **beides***` is two leaves — one carrying em, one carrying em
+    /// and strong — under one run of emphasis. Wrapping each leaf on its own closes the
+    /// emphasis in the middle of the run and reopens it, which is not the same document and
+    /// in general not even valid markdown (`*kursiv und ****beides***`). So each mark is
+    /// opened once, around every consecutive leaf that carries it, and the leaves inside
+    /// are rendered again with that mark taken as read.
+    fn runs(&mut self, leaves: &[InlineLeaf<'_>], applied: &[&Mark]) -> String {
+        let mut out = String::new();
+        let mut i = 0;
+        while i < leaves.len() {
+            match choose(&leaves[i..], applied) {
+                // Nothing left to open: this leaf is its own text.
+                None => {
+                    let base = self.base(&leaves[i]);
+                    out.push_str(&base);
+                    i += 1;
+                }
+                Some((mark, run)) => {
+                    let mut nested: Vec<&Mark> = applied.to_vec();
+                    nested.push(mark);
+                    let inner = self.runs(&leaves[i..i + run], &nested);
+                    out.push_str(&self.wrap(mark, inner));
+                    i += run;
+                }
+            }
+        }
+        out
+    }
+
+    /// One leaf's own text, before any mark is wrapped around it.
+    ///
+    /// `Code` is the one mark that supplies a base representation instead of a wrap: its
+    /// content is verbatim CommonMark, so it bypasses [`Self::escape`] entirely rather than
+    /// double-escaping text that is never parsed as markup in the first place — and nothing
+    /// can be nested inside it, which is why [`gw_core::MARK_ORDER`] puts it innermost.
+    fn base(&mut self, leaf: &InlineLeaf<'_>) -> String {
+        if !leaf.code {
+            return self.escape(leaf.text);
+        }
+        if leaf.text.contains('\n') || leaf.text.contains('\r') {
+            self.problem(
+                "a paragraph holds a line break, and markdown cannot carry one back inside a \
+                 paragraph — every break re-imports as a space",
+            );
+        }
+        code_span(leaf.text)
     }
 
     /// Escape every character that would otherwise re-import as markup rather than text.
@@ -604,47 +655,15 @@ impl Renderer {
         escape_inline(s)
     }
 
-    /// One text leaf, wrapped in its own marks.
-    ///
-    /// Marks are sorted into [`MARK_ORDER`] before wrapping — outermost first, innermost
-    /// last, exactly the convention [`gw_core::markdown::convert`] itself uses when it stamps
-    /// a leaf's `marks` (the tag opened first in the source ends up first in the array). A
-    /// leaf whose marks already came out of the importer in that order therefore round-trips
-    /// with the very same array; sorting rather than trusting the stored order is what makes
-    /// two exports of the same document byte-identical regardless of how it got its marks.
-    ///
-    /// `Code` supplies the base representation instead of a wrap: its content is verbatim
-    /// CommonMark, so it bypasses [`Self::escape`] entirely rather than double-escaping text
-    /// that is never parsed as markup in the first place.
-    fn leaf(&mut self, text: &str, marks: &[Mark]) -> String {
-        let mut sorted: Vec<&Mark> = marks.iter().collect();
-        sorted.sort_by_key(|m| mark_rank(m.kind));
-
-        let mut s = if sorted.iter().any(|m| m.kind == MarkKind::Code) {
-            if text.contains('\n') || text.contains('\r') {
-                self.problem(
-                    "a paragraph holds a line break, and markdown cannot carry one back \
-                     inside a paragraph — every break re-imports as a space",
-                );
-            }
-            code_span(text)
-        } else {
-            self.escape(text)
-        };
-
-        for m in sorted.iter().rev() {
-            s = self.wrap(m, s);
-        }
-        s
-    }
-
     /// One mark's markdown syntax, wrapped around its already-rendered inner content.
     fn wrap(&mut self, mark: &Mark, inner: String) -> String {
         match mark.kind {
-            MarkKind::Strong => format!("**{inner}**"),
-            MarkKind::Em => format!("*{inner}*"),
-            MarkKind::Strike => format!("~~{inner}~~"),
-            // Already applied as `leaf`'s base representation, not a wrap around it.
+            MarkKind::Strong => self.delimited("**", inner),
+            MarkKind::Em => self.delimited("*", inner),
+            MarkKind::Strike => self.delimited("~~", inner),
+            // Applied as the leaf's base representation by [`Self::base`], not as a wrap
+            // around it, and removed from a leaf's marks before any of this — so this arm
+            // is unreachable and exists only to keep the match exhaustive.
             MarkKind::Code => inner,
             MarkKind::Link => match mark.attrs.get("href").and_then(|v| v.as_str()) {
                 Some(href) => format!("[{inner}]({href})"),
@@ -670,6 +689,31 @@ impl Renderer {
                 inner
             }
         }
+    }
+
+    /// Wrap `inner` in an emphasis delimiter, refusing what markdown cannot carry.
+    ///
+    /// CommonMark only *opens* a delimiter run that is followed by a non-space and only
+    /// *closes* one that is preceded by a non-space, and an empty run is no run at all. So
+    /// `**fett **und` is not bold — it is four literal asterisks, and a document that
+    /// exported that way would come back saying something the author never wrote. Markdown
+    /// import cannot produce such a leaf (text that does not parse as emphasis never
+    /// becomes a mark in the first place), but an editor can, and a mark that cannot be
+    /// written is a refusal rather than a warning: [`Rendered::problems`] is what
+    /// [`render_file`] refuses on, and silence here would be a silent corruption.
+    fn delimited(&mut self, delimiter: &str, inner: String) -> String {
+        if inner.is_empty()
+            || inner.starts_with(char::is_whitespace)
+            || inner.ends_with(char::is_whitespace)
+        {
+            self.problem(format!(
+                "a `{delimiter}` mark covers text that begins or ends with a space (or no \
+                 text at all), and markdown cannot write one: `{delimiter}` only opens \
+                 before a non-space and only closes after one, so it would re-import as \
+                 literal punctuation"
+            ));
+        }
+        format!("{delimiter}{inner}{delimiter}")
     }
 
     /// One paragraph, on one line. Deliberately not wrapped: every wrap point would be a
@@ -955,29 +999,65 @@ fn tight(nesting: Nesting, previous: BlockKind, next: &Block) -> bool {
     }
 }
 
-/// The nesting order [`Renderer::leaf`] wraps a text leaf's marks in — outermost first,
-/// innermost last. It is the same convention `gw_core::markdown::Builder` uses when it
-/// stamps a leaf's `marks` array (the tag opened first in the source is first in the array),
-/// so a leaf already in this order round-trips with the identical array; sorting into it is
-/// what makes two exports of the same document produce identical bytes regardless of how
-/// the marks were combined on the way in.
-const MARK_ORDER: [MarkKind; 5] = [
-    MarkKind::Strong,
-    MarkKind::Em,
-    MarkKind::Strike,
-    MarkKind::Code,
-    MarkKind::Link,
-];
+/// One text leaf on its way out: its text, whether it is a code span, and the marks that
+/// have to be *written around* it.
+struct InlineLeaf<'a> {
+    text: &'a str,
+    /// Carried a `Code` mark, which is a base representation rather than a wrap — see
+    /// [`Renderer::base`]. It is therefore absent from `marks`.
+    code: bool,
+    /// Outermost first, exactly the order [`gw_core::MARK_ORDER`] defines.
+    marks: Vec<&'a Mark>,
+}
 
-/// A mark kind's position in [`MARK_ORDER`], or past the end for one this exporter does not
-/// yet know — `MarkKind` is `#[non_exhaustive]`, so a later milestone's kind still sorts
-/// somewhere (last) rather than panicking here; [`Renderer::wrap`] is what actually refuses
-/// it.
-fn mark_rank(kind: MarkKind) -> usize {
-    MARK_ORDER
-        .iter()
-        .position(|&k| k == kind)
-        .unwrap_or(usize::MAX)
+impl<'a> InlineLeaf<'a> {
+    fn of(leaf: &'a Block) -> Self {
+        let mut marks: Vec<&Mark> = leaf.marks.iter().collect();
+        // Sorted rather than taken as given. `gw_core::markdown` already stores marks in
+        // this order, so for anything imported from markdown this is a no-op — but the
+        // DATABASE is the source of truth (AGENTS.md rule 1) and a tree can reach here
+        // having been assembled some other way. [`Renderer::runs`] needs the outermost
+        // mark first to see what a run of leaves shares, and this is what guarantees it.
+        marks.sort_by_key(|m| m.kind.nesting_rank());
+        let code = marks.iter().any(|m| m.kind == MarkKind::Code);
+        marks.retain(|m| m.kind != MarkKind::Code);
+        InlineLeaf {
+            text: leaf.text.as_deref().unwrap_or(""),
+            code,
+            marks,
+        }
+    }
+
+    fn carries(&self, mark: &Mark) -> bool {
+        self.marks.contains(&mark)
+    }
+}
+
+/// The mark to open next at the start of `leaves`, and how many leaves it covers.
+///
+/// Of the marks the first leaf still carries, the one covering the longest run from here —
+/// so `[a **b**](url)`, whose two leaves share only the link, opens the link around both
+/// rather than writing the link twice. Ties go to the outermost kind by
+/// [`gw_core::MARK_ORDER`], which is what makes the choice a decision rather than an
+/// accident of iteration order, and therefore what makes two exports of one document
+/// identical.
+fn choose<'a>(leaves: &[InlineLeaf<'a>], applied: &[&Mark]) -> Option<(&'a Mark, usize)> {
+    let first = leaves.first()?;
+    let mut best: Option<(&'a Mark, usize)> = None;
+    for mark in first.marks.iter().copied().filter(|m| !applied.contains(m)) {
+        let run = leaves.iter().take_while(|l| l.carries(mark)).count();
+        let better = match best {
+            None => true,
+            Some((best_mark, best_run)) => {
+                run > best_run
+                    || (run == best_run && mark.kind.nesting_rank() < best_mark.kind.nesting_rank())
+            }
+        };
+        if better {
+            best = Some((mark, run));
+        }
+    }
+    best
 }
 
 /// An inline code span: verbatim, never escaped — CommonMark reads everything between the

@@ -24,14 +24,26 @@ export interface Heading {
   id: string;
 }
 
+// A byte-for-byte mirror of `Block::plain_text` in crates/gw-core/src/block.rs, down to
+// the rule about where a space goes. A BLOCK boundary is written as a space, or the last
+// word of one block fuses to the first of the next ("MaßEin"). Adjacent inline text leaves
+// of one parent get NOTHING between them: they are one run of prose that a mark boundary
+// happened to split, and a space there would put a full stop off the end of its word —
+// "Siehe das Handbuch ." — in this outline, in a heading's anchor id and in a table's
+// column labels. The shared cases live in both test suites; if the two drift, one goes red.
 export function plainText(block: Block): string {
-  const parts: string[] = [];
+  let out = '';
   const walk = (b: Block) => {
-    if (b.text) parts.push(b.text);
-    b.content?.forEach(walk);
+    if (b.text) out += b.text;
+    let previous: BlockKind | undefined;
+    for (const child of b.content ?? []) {
+      if (child.kind !== 'text' || (previous !== undefined && previous !== 'text')) out += ' ';
+      walk(child);
+      previous = child.kind;
+    }
   };
   walk(block);
-  return parts.join(' ').replace(/\s+/g, ' ').trim();
+  return out.replace(/\s+/g, ' ').trim();
 }
 
 export function outline(block: Block): Heading[] {

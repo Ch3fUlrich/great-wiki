@@ -10,7 +10,7 @@ pub mod frontmatter;
 pub mod markdown;
 pub mod slug;
 
-pub use block::{Block, BlockKind, Heading, Mark, MarkKind};
+pub use block::{Block, BlockKind, Heading, Mark, MarkKind, MARK_ORDER};
 pub use document::{DocumentType, Visibility};
 pub use frontmatter::{split_frontmatter, FrontmatterError, SeedMeta};
 pub use markdown::{markdown_to_blocks, Conversion, Note, Unsupported};

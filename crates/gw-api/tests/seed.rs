@@ -246,6 +246,32 @@ async fn a_body_heading_that_only_repeats_the_title_does_not_reach_the_database(
 }
 
 #[tokio::test]
+async fn a_body_heading_that_repeats_the_title_in_bold_is_still_a_repetition() {
+    // `drop_duplicate_title_heading` compares `plain_text()` against the title exactly.
+    // Emphasis inside the heading splits it into three text leaves, and a `plain_text`
+    // that separated leaves with a space would compare "Der Darm -Trakt" against the title
+    // "Der Darm-Trakt" — no longer equal, so the duplicate heading would be kept and the
+    // page would show its own title twice, on the page and in the outline. The emphasis
+    // deliberately ends mid-word: that is where a leaf boundary has no space of its own,
+    // and therefore the only place the difference is visible.
+    let dir = corpus(&[(
+        "notiz.md",
+        "---\ntitle: Der Darm-Trakt\n---\n\n# Der **Darm**-Trakt\n\nEin Satz.\n",
+    )]);
+    let (store, report) = seed(dir.path()).await;
+
+    assert!(report.is_complete(), "{report}");
+    let doc = fetch(&store, "/der-darm-trakt").await.unwrap();
+    let body: gw_core::Block = serde_json::from_str(&doc.body).unwrap();
+    assert!(
+        body.headings().is_empty(),
+        "a heading that only repeats the title is a duplicate however it is formatted: {:?}",
+        body.headings()
+    );
+    assert_eq!(body.plain_text(), "Ein Satz.");
+}
+
+#[tokio::test]
 async fn a_body_heading_that_differs_from_the_title_is_kept() {
     let dir = corpus(&[(
         "notiz.md",
@@ -816,8 +842,10 @@ async fn a_file_holding_formatting_the_database_can_now_store_is_no_longer_repor
 
     let doc = fetch(&store, "/notiz").await.unwrap();
     let body: gw_core::Block = serde_json::from_str(&doc.body).unwrap();
-    assert!(body.plain_text().contains("fettes"));
-    assert!(body.plain_text().contains("ein Verweis"));
+    // Exact, not `contains`: the marks split this sentence into five text leaves, and a
+    // substring check passes just as happily on "Ein fettes Wort und ein Verweis ." —
+    // the spelling a `plain_text` that separated inline leaves would produce.
+    assert_eq!(body.plain_text(), "Ein fettes Wort und ein Verweis.");
 }
 
 // ---------------------------------------------------------------------------------------

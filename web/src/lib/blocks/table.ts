@@ -114,9 +114,11 @@ export function isInteractive({ head, body }: TableSections): boolean {
 /**
  * The plain text of every cell, row by row. Sorting and filtering read nothing else.
  *
- * `plainText` joins nested text with a space rather than concatenating it. That is not
- * cosmetic: this repository once produced `LängeMeter` from two cells and the test for it
- * asserted `contains "Feld"`, which `FeldWert` satisfies too.
+ * `plainText` separates nested BLOCKS with a space rather than concatenating them — but
+ * not the inline leaves within one of them, which are one run of prose. That is not
+ * cosmetic in either direction: this repository once produced `LängeMeter` from two cells
+ * and the test for it asserted `contains "Feld"`, which `FeldWert` satisfies too; and a
+ * cell reading `3-5 %` must not sort as `3 -5 %` because a mark split it in two.
  */
 export function textGrid(rows: Block[]): string[][] {
   return rows.map((row) => (row.content ?? []).map((cell) => plainText(cell)));
