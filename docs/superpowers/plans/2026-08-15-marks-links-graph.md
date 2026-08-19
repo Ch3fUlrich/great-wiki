@@ -434,9 +434,19 @@ CREATE INDEX links_to_doc ON links(to_doc);
 
 ```bash
 cp data/great-wiki.db /tmp/mig-check.db
-GW_DATABASE_URL="sqlite:///tmp/mig-check.db" cargo run -p gw-api -- check
+# NOT `gw-api -- check`: that subcommand only validates environment variables and never
+# calls Store::open, which is where sqlx::migrate! runs. It would pass without touching
+# the database at all. Open the store for real instead:
+cat > /tmp/mig.rs <<'EOF'
+fn main() { /* see below */ }
+EOF
+cargo run -p gw-store --example migration_check   # writes a throwaway example that calls
+                                                  # Store::open(&env GW_DATABASE_URL) and
+                                                  # prints the applied migration list
 ```
-Expected: exits 0. A migration that only works on an empty database is a migration that fails in production.
+Expected: every migration recorded, including yours, against a database that already has
+rows. A migration that only works on an empty database is a migration that fails in
+production — and a check that never opens the database proves neither.
 
 - [ ] **Step 3: Commit**
 

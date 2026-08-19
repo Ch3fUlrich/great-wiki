@@ -17,3 +17,5 @@ Task 5 review: NOT APPROVED — C1 editor-authored AND edited markdown links bec
 Task 5 fix pass: C1/I2/I3/M4-M7 fixed (link attrs trimmed editor-side + exporter tolerates; javascript: URLs blocked at the render sink).
 Task 5: complete (5ccf305 + fix 84adf2f, re-review APPROVED). Minor 1 (overstated comment) fixed by orchestrator.
   Follow-ups: (e) comparable() reduces attrs but adjacent link leaves with differing bookkeeping still refuse; (f) safeHref allows protocol-relative //evil.example — phishing legibility, not XSS; (g) IMPORTANT pre-existing: one refusable page kills the whole export run.
+Task 6: complete (24e2866). Plan bug found: `gw-api -- check` never opens the DB, so the migration verification I specified was vacuous — corrected in the plan.
+  Note: links is the first WITHOUT ROWID table here (team_members, login_attempts are similar and do not use it).
