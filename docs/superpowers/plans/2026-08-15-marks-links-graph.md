@@ -10,6 +10,12 @@
 
 ## Global Constraints
 
+- **The test helpers below do not exist yet — write them.** `collect_text_leaves`,
+  `paragraph_with_text`, `first_text_leaf`, `fixture_with_three_pages` and
+  `body_linking_to` are named by the tests in this plan and are yours to write in the same
+  test module. They are named rather than spelled out because their bodies are obvious and
+  their names are not; keep the names exactly as written so later tasks match.
+
 - **Spec:** `docs/superpowers/specs/2026-08-15-links-topics-tasks-design.md`. Decisions D-1..D-5 are binding.
 - **D-5:** an internal link stores the target **document id**, never a path.
 - **Security:** every node, edge and backlink is filtered through `Store::document_for` and the single `can()`. Never a second authorisation path. Filtering is **per document**, not per subtree.
@@ -178,7 +184,7 @@ The converter is an event loop over `pulldown_cmark`. Marks arrive as `Start(Tag
 #[test]
 fn emphasis_and_links_survive_import_and_are_no_longer_reported_as_lost() {
     let c = convert("Ein **fetter** Satz mit [einem Link](https://example.org).");
-    let text: Vec<_> = collect_text_leaves(&c.doc); // helper already in this module's tests
+    let text: Vec<_> = collect_text_leaves(&c.doc); // you write this helper — see the note below
     let fett = text.iter().find(|b| b.text.as_deref() == Some("fetter")).unwrap();
     assert!(fett.marks.iter().any(|m| m.kind == MarkKind::Strong), "bold was dropped");
 
