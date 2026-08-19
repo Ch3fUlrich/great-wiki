@@ -9,20 +9,24 @@
 //!   not come back as the same tree is **not written at all**, is named in the report, and
 //!   fails the run — exactly as the seeder skips a file it cannot place.
 //!
-//! # What markdown cannot carry back, and why that is not this module's loss
+//! # What markdown can carry back, and what still cannot
 //!
-//! `Block` has no inline marks and no link destinations, so a stored document holds no
-//! bold, no italic, no inline code, no links and no images — they were dropped on the way
-//! *in* (see [`gw_core::markdown::Unsupported`]), long before anything reached here. An
-//! export therefore cannot contain them either. That is a true statement about the
-//! database, not a defect in this converter, and it is the one thing an operator must not
-//! discover by accident: exported markdown is **not** a replacement for hand-written source
-//! markdown. [`ExportReport`] says so on every run, and [`FIDELITY_FILE`] leaves the same
-//! sentence in the directory next to the files, where whoever opens it later will see it.
+//! `Block` carries inline [`Mark`]s (bold, italic, strikethrough, inline code, and a link's
+//! `href`), so this renderer writes them back out, sorted into a fixed nesting order so two
+//! runs of the exporter always produce identical bytes for the same document. What a stored
+//! document still cannot hold is an image (the importer keeps only the alt text), a link
+//! resolved to another *document* rather than a URL (`Mark::attrs`' `doc`, which only Task 7
+//! produces), and a horizontal rule — those are dropped on the way *in* (see
+//! [`gw_core::markdown::Unsupported`]), long before anything reaches here, so an export
+//! cannot contain them either. That is a true statement about the database, not a defect in
+//! this converter, and it is the one thing an operator must not discover by accident:
+//! exported markdown is **not** a replacement for hand-written source markdown.
+//! [`ExportReport`] says so on every run, and [`FIDELITY_FILE`] leaves the same sentence in
+//! the directory next to the files, where whoever opens it later will see it.
 
 use anyhow::{Context, Result};
 use gw_auth::{Action, Principal};
-use gw_core::{markdown, slugify, split_frontmatter, Block, BlockKind, SeedMeta};
+use gw_core::{markdown, slugify, split_frontmatter, Block, BlockKind, Mark, MarkKind, SeedMeta};
 use gw_store::Store;
 use std::collections::BTreeSet;
 use std::fmt;
@@ -86,13 +90,14 @@ impl ExportReport {
 pub const FIDELITY_WARNING: &str = "\
 FIDELITY — read this before you overwrite anything.
 
-great-wiki stores documents as a block tree, and that tree has no inline formatting:
-no bold, no italic, no inline code, no links, no images, no horizontal rules. Those
-are dropped when markdown is imported (the importer says so, page by page) and so
-they cannot come back out. Everything else — headings, paragraphs, lists and their
-nesting, blockquotes, code blocks with their language, tables with their column
-alignment, and every character of the text itself — is exported exactly and re-imports
-exactly; `export` verifies that per document and refuses to write one it cannot.
+great-wiki stores documents as a block tree. Inline formatting — bold, italic,
+strikethrough, inline code and links — now exports and re-imports exactly, the same as
+headings, paragraphs, lists and their nesting, blockquotes, code blocks with their
+language, tables with their column alignment, and every character of the text itself.
+What the tree still cannot hold is an image, an internal link resolved to another page
+rather than a URL, and a horizontal rule — those are dropped when markdown is imported
+(the importer says so, page by page) and so they cannot come back out. `export`
+verifies every other construct per document and refuses to write one it cannot.
 
 Therefore: this directory is a faithful copy of what the DATABASE holds. It is NOT a
 faithful copy of hand-written markdown that was imported into it. Do not overwrite
@@ -226,10 +231,10 @@ fn describe(principal: &Principal) -> String {
 /// Refuse to write into a directory that holds markdown this tool did not put there.
 ///
 /// The single most expensive mistake available here is exporting over the hand-written
-/// corpus the wiki was seeded from: those files hold bold, links and images the database
-/// never kept, and an export would replace them with a copy that has none. A directory
-/// carrying [`FIDELITY_FILE`] is a previous export and is fair game; anything else is
-/// somebody's writing.
+/// corpus the wiki was seeded from: those files may hold images, raw HTML or internal links
+/// the database never kept, and an export would replace them with a copy that has none. A
+/// directory carrying [`FIDELITY_FILE`] is a previous export and is fair game; anything else
+/// is somebody's writing.
 fn refuse_foreign_directory(dir: &Path) -> Result<()> {
     if dir.join(FIDELITY_FILE).exists() {
         return Ok(());
@@ -238,9 +243,9 @@ fn refuse_foreign_directory(dir: &Path) -> Result<()> {
     anyhow::ensure!(
         existing.is_empty(),
         "{} already contains {} markdown file(s) and no `{}`, so it is not a previous \
-         export — refusing to overwrite it. An export holds no bold, no links and no \
-         images, because the database holds none; writing it over hand-written source \
-         markdown destroys them. Export to an empty directory instead.",
+         export — refusing to overwrite it. An export holds no image and no raw HTML, \
+         because the database holds neither; writing it over hand-written source markdown \
+         destroys them. Export to an empty directory instead.",
         dir.display(),
         existing.len(),
         FIDELITY_FILE
@@ -555,17 +560,33 @@ impl Renderer {
         }
     }
 
+    /// Every text leaf under `block`, rendered with its own marks and concatenated in order.
     fn inline(&mut self, block: &Block) -> String {
-        let mut raw = String::new();
-        let mut unexpected = Vec::new();
-        collect_inline(block, &mut raw, &mut unexpected);
-        for kind in unexpected {
-            self.problem(format!(
-                "a `{kind:?}` block is nested inside inline content, where markdown has no \
-                 way to write one"
-            ));
+        let mut out = String::new();
+        self.collect_inline(block, &mut out);
+        out
+    }
+
+    /// Walk `block`'s children, writing each `Text` leaf through [`Self::leaf`] and
+    /// recursing (with a refusal) into anything else — inline content holding a block is
+    /// not something the schema is supposed to produce, but text nested inside it must
+    /// still reach the page rather than vanish along with the refusal that names it.
+    fn collect_inline(&mut self, block: &Block, out: &mut String) {
+        for child in &block.content {
+            match child.kind {
+                BlockKind::Text => {
+                    let leaf = self.leaf(child.text.as_deref().unwrap_or(""), &child.marks);
+                    out.push_str(&leaf);
+                }
+                other => {
+                    self.problem(format!(
+                        "a `{other:?}` block is nested inside inline content, where markdown \
+                         has no way to write one"
+                    ));
+                    self.collect_inline(child, out);
+                }
+            }
         }
-        self.escape(&raw)
     }
 
     /// Escape every character that would otherwise re-import as markup rather than text.
@@ -581,6 +602,74 @@ impl Renderer {
             );
         }
         escape_inline(s)
+    }
+
+    /// One text leaf, wrapped in its own marks.
+    ///
+    /// Marks are sorted into [`MARK_ORDER`] before wrapping — outermost first, innermost
+    /// last, exactly the convention [`gw_core::markdown::convert`] itself uses when it stamps
+    /// a leaf's `marks` (the tag opened first in the source ends up first in the array). A
+    /// leaf whose marks already came out of the importer in that order therefore round-trips
+    /// with the very same array; sorting rather than trusting the stored order is what makes
+    /// two exports of the same document byte-identical regardless of how it got its marks.
+    ///
+    /// `Code` supplies the base representation instead of a wrap: its content is verbatim
+    /// CommonMark, so it bypasses [`Self::escape`] entirely rather than double-escaping text
+    /// that is never parsed as markup in the first place.
+    fn leaf(&mut self, text: &str, marks: &[Mark]) -> String {
+        let mut sorted: Vec<&Mark> = marks.iter().collect();
+        sorted.sort_by_key(|m| mark_rank(m.kind));
+
+        let mut s = if sorted.iter().any(|m| m.kind == MarkKind::Code) {
+            if text.contains('\n') || text.contains('\r') {
+                self.problem(
+                    "a paragraph holds a line break, and markdown cannot carry one back \
+                     inside a paragraph — every break re-imports as a space",
+                );
+            }
+            code_span(text)
+        } else {
+            self.escape(text)
+        };
+
+        for m in sorted.iter().rev() {
+            s = self.wrap(m, s);
+        }
+        s
+    }
+
+    /// One mark's markdown syntax, wrapped around its already-rendered inner content.
+    fn wrap(&mut self, mark: &Mark, inner: String) -> String {
+        match mark.kind {
+            MarkKind::Strong => format!("**{inner}**"),
+            MarkKind::Em => format!("*{inner}*"),
+            MarkKind::Strike => format!("~~{inner}~~"),
+            // Already applied as `leaf`'s base representation, not a wrap around it.
+            MarkKind::Code => inner,
+            MarkKind::Link => match mark.attrs.get("href").and_then(|v| v.as_str()) {
+                Some(href) => format!("[{inner}]({href})"),
+                // `attrs` holds `doc` instead: an internal link this crate cannot resolve,
+                // because `render` has no store. Task 7 resolves `doc` ids to a path in
+                // `run`, before the tree ever reaches this renderer — nothing produces one
+                // yet, so this arm exists only to refuse loudly instead of guessing.
+                None => {
+                    self.problem(
+                        "a link has no `href` to write — an internal link is resolved to a \
+                         path by Task 7, not by this renderer",
+                    );
+                    inner
+                }
+            },
+            // `MarkKind` is `#[non_exhaustive]`: a kind added by a later milestone must
+            // refuse loudly here rather than export as nothing.
+            _ => {
+                self.problem(format!(
+                    "mark kind `{:?}` is newer than this exporter — it would be dropped",
+                    mark.kind
+                ));
+                inner
+            }
+        }
     }
 
     /// One paragraph, on one line. Deliberately not wrapped: every wrap point would be a
@@ -866,16 +955,48 @@ fn tight(nesting: Nesting, previous: BlockKind, next: &Block) -> bool {
     }
 }
 
-/// Every text leaf under `block`, in order, plus the kinds of any non-inline blocks found.
-fn collect_inline(block: &Block, out: &mut String, unexpected: &mut Vec<BlockKind>) {
-    for child in &block.content {
-        match child.kind {
-            BlockKind::Text => out.push_str(child.text.as_deref().unwrap_or("")),
-            other => {
-                unexpected.push(other);
-                collect_inline(child, out, unexpected);
-            }
-        }
+/// The nesting order [`Renderer::leaf`] wraps a text leaf's marks in — outermost first,
+/// innermost last. It is the same convention `gw_core::markdown::Builder` uses when it
+/// stamps a leaf's `marks` array (the tag opened first in the source is first in the array),
+/// so a leaf already in this order round-trips with the identical array; sorting into it is
+/// what makes two exports of the same document produce identical bytes regardless of how
+/// the marks were combined on the way in.
+const MARK_ORDER: [MarkKind; 5] = [
+    MarkKind::Strong,
+    MarkKind::Em,
+    MarkKind::Strike,
+    MarkKind::Code,
+    MarkKind::Link,
+];
+
+/// A mark kind's position in [`MARK_ORDER`], or past the end for one this exporter does not
+/// yet know — `MarkKind` is `#[non_exhaustive]`, so a later milestone's kind still sorts
+/// somewhere (last) rather than panicking here; [`Renderer::wrap`] is what actually refuses
+/// it.
+fn mark_rank(kind: MarkKind) -> usize {
+    MARK_ORDER
+        .iter()
+        .position(|&k| k == kind)
+        .unwrap_or(usize::MAX)
+}
+
+/// An inline code span: verbatim, never escaped — CommonMark reads everything between the
+/// backticks literally, so running it through [`escape_inline`] would hand the reader a
+/// backslash the source text never had. The fence must still be longer than the longest run
+/// of backticks the content contains, or the span closes early and the rest reads as prose;
+/// and content that starts or ends with a backtick — or is only spaces — gets a padding
+/// space on each side, exactly what keeps that edge character from reading as part of the
+/// fence instead of the content, per CommonMark's own rule for stripping such padding back
+/// out on the way in.
+fn code_span(text: &str) -> String {
+    let fence = "`".repeat(longest_backtick_run(text) + 1);
+    let pad = text.starts_with('`')
+        || text.ends_with('`')
+        || (!text.is_empty() && text.chars().all(|c| c == ' '));
+    if pad {
+        format!("{fence} {text} {fence}")
+    } else {
+        format!("{fence}{text}{fence}")
     }
 }
 

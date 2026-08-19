@@ -152,6 +152,27 @@ fn two_adjacent_lists_do_not_merge_into_one() {
 }
 
 #[test]
+fn marks_round_trip_through_markdown() {
+    let md = "Ein **fetter** Satz mit [einem Link](https://example.org) und `code`.";
+    let doc = gw_core::markdown::convert(md).doc;
+    let out = gw_api::export::render(&doc);
+    assert!(
+        out.markdown.contains("**fetter**"),
+        "bold was lost: {}",
+        out.markdown
+    );
+    assert!(out.markdown.contains("[einem Link](https://example.org)"));
+    assert!(out.markdown.contains("`code`"));
+
+    // The real proof: re-importing must give the same tree.
+    let again = gw_core::markdown::convert(&out.markdown).doc;
+    assert_eq!(
+        serde_json::to_value(&doc).unwrap(),
+        serde_json::to_value(&again).unwrap()
+    );
+}
+
+#[test]
 fn the_shipped_example_corpus_survives_every_file() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content-example");
     let mut checked = 0;
