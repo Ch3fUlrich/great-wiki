@@ -333,12 +333,36 @@ impl Store {
         path: &str,
         action: Action,
     ) -> Result<Option<StoredDocument>> {
+        let baseline = self.baseline_for(principal).await?;
+        self.document_for_with_baseline(principal, path, action, baseline)
+            .await
+    }
+
+    /// [`Store::document_for`], with the caller's baseline already resolved.
+    ///
+    /// The whole of `document_for` lives here, and `document_for` is one line calling it —
+    /// so this is not a second answer to the authorisation question, it is the *only* one,
+    /// reached two ways. What differs is who pays for the baseline: a caller asking about
+    /// ONE document has no reason to care, while an aggregate view over the whole corpus
+    /// does, because the baseline is a property of the caller and not of the document. It is
+    /// the same hoist [`Store::tree_for`] performs on its walk, for the same reason and with
+    /// the same consequence: re-querying it per document costs a round trip each and only
+    /// invites the answer to drift within a single response.
+    ///
+    /// `pub(crate)` deliberately. Outside this crate the accessor is `document_for`, which
+    /// cannot be handed a baseline belonging to somebody else.
+    pub(crate) async fn document_for_with_baseline(
+        &self,
+        principal: &Principal,
+        path: &str,
+        action: Action,
+        baseline: Baseline,
+    ) -> Result<Option<StoredDocument>> {
         let Some(doc) = self.document_by_path_unchecked(path).await? else {
             return Ok(None);
         };
         let visibility = Visibility::from_str(&doc.visibility).unwrap_or_default();
         let grants = self.grants_for_path(path).await?;
-        let baseline = self.baseline_for(principal).await?;
         Ok(permits(principal, action, visibility, &grants, baseline).then_some(doc))
     }
 

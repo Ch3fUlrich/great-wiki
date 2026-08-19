@@ -440,6 +440,27 @@ mutation crates/gw-store/src/links.rs killed \
   's/    sqlx::query("DELETE FROM links WHERE from_doc = ?1")/    sqlx::query("SELECT 1 FROM links WHERE from_doc = ?1")/' \
   'links: republishing replaces this page edges rather than accumulating them'
 
+# --- the graph: an edge names TWO pages, so it discloses two ---------------------------
+#
+# The whole graph is one aggregate view over every document at once, which makes it the
+# worst place in the application for the filter to be one character wrong. These two are the
+# two ways it can be:
+#
+# `&&` to `||` is the character. It keeps every edge with at least ONE readable end, so a
+# public page linking to a restricted one draws a line to it — and a line to a page is a
+# statement that the page is there, whether or not the far end carries a label.
+mutation crates/gw-store/src/links.rs killed \
+  's/readable.contains_key(from) \&\& readable.contains_key(to)/readable.contains_key(from) || readable.contains_key(to)/' \
+  'graph: an edge needs BOTH ends readable — one is a disclosure'
+# And the same swap the backlinks mutation above makes, because the conjunction being right
+# proves nothing if the thing being conjoined never asked a permission question. Same shape,
+# same types, compiles: every candidate comes back readable and the whole corpus is drawn.
+# `an_edge_needs_both_ends_readable` asserts that the privileged caller DOES see the edge, so
+# neither of these can pass by the fixture having nothing to hide.
+mutation crates/gw-store/src/links.rs killed \
+  's/                .document_for_with_baseline(principal, path, Action::Read, baseline)/                .document_by_path_unchecked(path)/' \
+  'graph: a node names only a page the caller may actually read'
+
 # --- crash recovery ------------------------------------------------------------------
 #
 # A trap does not survive SIGKILL, and a killed run leaves the mutated file in place.

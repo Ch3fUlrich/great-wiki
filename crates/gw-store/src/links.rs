@@ -31,7 +31,7 @@ use anyhow::Result;
 use gw_auth::{Action, Principal};
 use gw_core::{Block, Mark, MarkKind};
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use url::Url;
 
 /// One page that links to the page being read.
@@ -40,6 +40,28 @@ pub struct Backlink {
     pub id: String,
     pub path: String,
     pub title: String,
+}
+
+/// One page in the graph. Every field is taken from a document the caller may read.
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphNode {
+    pub id: String,
+    pub path: String,
+    pub title: String,
+}
+
+/// One link, by document id. Both ends are always present in [`Graph::nodes`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GraphEdge {
+    pub from: String,
+    pub to: String,
+}
+
+/// The pages the caller may read and the links between them (D-4).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Graph {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
 }
 
 /// Everything one body points at, before any of it is known to exist.
@@ -154,6 +176,34 @@ fn has_scheme(href: &str) -> bool {
     let mut chars = scheme.chars();
     chars.next().is_some_and(|c| c.is_ascii_alphabetic())
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// A `root` as [`Store::graph_for`] compares it: leading slash, no trailing one.
+///
+/// `/darm/`, `darm` and `/darm` all name the same subtree, and a caller who spells it the
+/// second way must not silently get an empty graph. `/` and the empty string name the whole
+/// wiki, which is what `None` already means — normalised to it rather than to a prefix
+/// everything happens to start with.
+fn normalise_root(root: &str) -> String {
+    format!("/{}", root.trim().trim_matches('/'))
+}
+
+/// Whether `path` is inside the subtree at `root`. `None` is the whole wiki.
+///
+/// The root itself is in its own subtree — asking for `/darm` and not being shown `/darm`
+/// would be a surprise — and the boundary is a SEGMENT, so `/darmspiegelung` is outside
+/// `/darm`. A bare `starts_with` would pull it in, which is the ordinary prefix bug: it
+/// would add pages nobody asked for, and if this were the permission check rather than a
+/// view narrowing it would be a disclosure. It is not the permission check; see
+/// [`Store::graph_for`].
+fn within_root(root: Option<&str>, path: &str) -> bool {
+    let Some(root) = root else {
+        return true;
+    };
+    if root == "/" {
+        return true;
+    }
+    path == root || path.starts_with(&format!("{root}/"))
 }
 
 /// The id of the live document at `path`, or `None`.
@@ -307,6 +357,113 @@ impl Store {
             });
         }
         Ok(out)
+    }
+
+    /// The pages the caller may read and the links between them (D-4), optionally narrowed
+    /// to the subtree at `root`.
+    ///
+    /// **An edge is emitted only when the caller may read BOTH ends.** An edge with one
+    /// unreadable end says that page exists, and its label would say what it is called —
+    /// which is the whole of what a restricted title was hiding. Drawing the far end as an
+    /// anonymous node is not a fix: "there is something here you may not see" is the same
+    /// disclosure with the name filed off. It is omitted entirely, and so is a node that no
+    /// surviving edge touches.
+    ///
+    /// **`root` narrows the view; it never decides anything.** A path prefix is a poor
+    /// permission answer — D-3 makes membership per document, so a project spanning two
+    /// subtrees with different grants is normal — and the two must not be confused. The
+    /// prefix is applied first because it is cheap and discloses nothing, and then every
+    /// surviving candidate is put through [`Store::document_for`], which is what actually
+    /// decides. Never the other way round.
+    ///
+    /// A `root` naming a subtree that does not exist, or one the caller may not read,
+    /// answers an empty graph rather than an error — the same closed conflation the rest of
+    /// this crate makes, and for the same reason: distinguishing them would answer "does
+    /// /geheim exist" to anybody who asks.
+    ///
+    /// **The permission question is asked once per DOCUMENT, never once per edge.** This is
+    /// [`Store::backlinks_for`]'s shape run over the whole corpus rather than over one
+    /// page's candidates, so what is a fixed cost there is N+1 here: a hub page with forty
+    /// links would otherwise be authorised forty times, and a page at both ends of forty
+    /// edges eighty. Two hoists make it once. The baseline comes out of the loop entirely —
+    /// it is a property of the caller, exactly as [`Store::tree_for`] treats it — and the
+    /// verdict per document is memoised in `readable`/`refused`, which is also what makes
+    /// the edge filter below a pair of hash lookups rather than two more queries.
+    pub async fn graph_for(&self, principal: &Principal, root: Option<&str>) -> Result<Graph> {
+        // The candidates, with the paths their ends live at. A JOIN, so that resolving forty
+        // edges to eighty paths is one round trip rather than eighty — and it discloses
+        // nothing, because nothing here is returned: `document_for` below decides what is,
+        // exactly as `backlinks_for`'s own candidate query hands paths to the same accessor.
+        // `deleted_at IS NULL` on both ends because a soft-deleted page is not in the graph;
+        // `document_for` would refuse it anyway, and dropping it here saves asking.
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT l.from_doc, f.path, l.to_doc, t.path FROM links l \
+             JOIN documents f ON f.id = l.from_doc AND f.deleted_at IS NULL \
+             JOIN documents t ON t.id = l.to_doc AND t.deleted_at IS NULL \
+             ORDER BY f.path, t.path",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let root = root.map(normalise_root);
+        // Once, for the whole walk. See `tree_for`, which hoists it for the same reason.
+        let baseline = self.baseline_for(principal).await?;
+
+        let mut readable: HashMap<String, GraphNode> = HashMap::new();
+        let mut refused: HashSet<String> = HashSet::new();
+        for (id, path) in rows
+            .iter()
+            .flat_map(|(f, f_path, t, t_path)| [(f, f_path), (t, t_path)])
+        {
+            if readable.contains_key(id) || refused.contains(id) {
+                continue;
+            }
+            if !within_root(root.as_deref(), path) {
+                refused.insert(id.clone());
+                continue;
+            }
+            match self
+                .document_for_with_baseline(principal, path, Action::Read, baseline)
+                .await?
+            {
+                Some(doc) => {
+                    readable.insert(
+                        id.clone(),
+                        GraphNode {
+                            id: doc.id,
+                            path: doc.path,
+                            title: doc.title,
+                        },
+                    );
+                }
+                None => {
+                    refused.insert(id.clone());
+                }
+            }
+        }
+
+        // BOTH ends, and `&&` is the whole property: with `||` an edge would name a page the
+        // caller cannot read at its far end.
+        let edges: Vec<GraphEdge> = rows
+            .into_iter()
+            .filter(|(from, _, to, _)| readable.contains_key(from) && readable.contains_key(to))
+            .map(|(from, _, to, _)| GraphEdge { from, to })
+            .collect();
+
+        // A node no surviving edge touches is dropped: it entered this list only because it
+        // was one end of a candidate edge, and without that edge it is not part of any
+        // connection anybody drew. Sorted by path so the answer is stable across calls —
+        // `HashMap` iteration order is not, and a graph that reshuffles itself between two
+        // identical requests looks broken.
+        let touched: HashSet<&String> = edges.iter().flat_map(|e| [&e.from, &e.to]).collect();
+        let mut nodes: Vec<GraphNode> = readable
+            .values()
+            .filter(|node| touched.contains(&node.id))
+            .cloned()
+            .collect();
+        nodes.sort_by(|a, b| a.path.cmp(&b.path));
+
+        Ok(Graph { nodes, edges })
     }
 }
 
@@ -854,5 +1011,184 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.backlinks_for(&chef, &ziel).await.unwrap().len(), 1);
+    }
+
+    // --- the graph ----------------------------------------------------------------------
+
+    /// A page with `body`, an explicit slug, and a visibility.
+    async fn page_with(
+        store: &Store,
+        title: &str,
+        slug: &str,
+        visibility: Visibility,
+        body: Block,
+    ) -> String {
+        store
+            .create_document(
+                Author::Import,
+                &NewDocument {
+                    parent_path: None,
+                    doc_type: DocumentType::Page,
+                    title: title.into(),
+                    slug: Some(slug.into()),
+                    language: "de".into(),
+                    visibility,
+                    body,
+                    sort_key: 0,
+                },
+                None,
+            )
+            .await
+            .unwrap()
+    }
+
+    /// `/oeffentlich` -> `/geheim`, with `chef` the only one who may read the target.
+    async fn graph_fixture() -> (Store, Principal, Principal) {
+        let store = store().await;
+        // The target first: an edge is only recorded to a document that already exists.
+        page_with(
+            &store,
+            "Geheim",
+            "geheim",
+            Visibility::Restricted,
+            body_linking_to(&[]),
+        )
+        .await;
+        page_with(
+            &store,
+            "Oeffentlich",
+            "oeffentlich",
+            Visibility::Public,
+            body_linking_to_hrefs(&["/geheim"]),
+        )
+        .await;
+
+        let leser = Principal::test("leser", &[], &[]);
+        let chef = Principal::test("chef", &[], &[]);
+        store
+            .add_grant(
+                "/geheim",
+                Subject::Principal(chef.id.clone()),
+                Permission::Read,
+            )
+            .await
+            .unwrap();
+
+        (store, leser, chef)
+    }
+
+    #[tokio::test]
+    async fn an_edge_needs_both_ends_readable() {
+        // /oeffentlich -> /geheim, and `leser` may read only /oeffentlich.
+        let (store, leser, chef) = graph_fixture().await;
+
+        let g = store.graph_for(&leser, None).await.unwrap();
+        assert!(
+            g.edges.is_empty(),
+            "an edge leaked a page the caller cannot read: {:?}",
+            g.edges
+        );
+        assert!(
+            !g.nodes.iter().any(|n| n.path == "/geheim"),
+            "a node leaked an unreadable title: {:?}",
+            g.nodes
+        );
+
+        // Anti-vacuity: chef sees exactly one edge, so the fixture really has one.
+        let seen = store.graph_for(&chef, None).await.unwrap();
+        assert_eq!(
+            seen.edges.len(),
+            1,
+            "the fixture never had an edge to hide: {seen:?}"
+        );
+        assert!(seen.nodes.iter().any(|n| n.path == "/geheim"));
+    }
+
+    #[test]
+    fn a_root_names_the_same_subtree_however_it_is_spelt() {
+        for spelling in ["/darm", "darm", "/darm/", " /darm "] {
+            assert_eq!(normalise_root(spelling), "/darm", "spelt as {spelling:?}");
+        }
+        // The whole wiki, which is what `None` already means.
+        assert_eq!(normalise_root("/"), "/");
+        assert_eq!(normalise_root(""), "/");
+    }
+
+    #[test]
+    fn a_subtree_boundary_is_a_segment_and_not_a_prefix() {
+        assert!(within_root(None, "/irgendwas"));
+        assert!(within_root(Some("/"), "/irgendwas"));
+        // The root is in its own subtree.
+        assert!(within_root(Some("/darm"), "/darm"));
+        assert!(within_root(Some("/darm"), "/darm/befunde"));
+        // The prefix bug: a bare `starts_with` would pull this in.
+        assert!(!within_root(Some("/darm"), "/darmspiegelung"));
+        assert!(!within_root(Some("/darm"), "/anderes"));
+    }
+
+    #[tokio::test]
+    async fn a_root_narrows_the_view_to_one_subtree() {
+        // `/darm` -> `/darm/befunde`, and a second, unrelated pair outside it.
+        let store = store().await;
+        page_with(
+            &store,
+            "Befunde",
+            "befunde",
+            Visibility::Public,
+            body_linking_to(&[]),
+        )
+        .await;
+        page_with(
+            &store,
+            "Darm",
+            "darm",
+            Visibility::Public,
+            body_linking_to_hrefs(&["/befunde"]),
+        )
+        .await;
+        // Same first four letters, a different subtree. `/darm` must not collect it.
+        page_with(
+            &store,
+            "Darmspiegelung",
+            "darmspiegelung",
+            Visibility::Public,
+            body_linking_to_hrefs(&["/befunde"]),
+        )
+        .await;
+
+        let leser = Principal::test("leser", &[], &[]);
+        let whole = store.graph_for(&leser, None).await.unwrap();
+        assert_eq!(whole.edges.len(), 2, "{whole:?}");
+
+        // Nothing beneath `/darm`, and `/darm`'s own edge leaves it, so narrowing to it
+        // keeps neither edge — the far end is outside the view.
+        let narrowed = store.graph_for(&leser, Some("/darm")).await.unwrap();
+        assert!(narrowed.edges.is_empty(), "{narrowed:?}");
+        assert!(
+            !narrowed.nodes.iter().any(|n| n.path == "/darmspiegelung"),
+            "a prefix match pulled in a page from another subtree: {narrowed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_root_that_names_nothing_answers_an_empty_graph() {
+        // Not an error and not a distinction: "no such subtree" and "none of it is yours"
+        // answer the same thing, or the answer itself would say which pages exist.
+        let (store, leser, _chef) = graph_fixture().await;
+        let g = store
+            .graph_for(&leser, Some("/gibt-es-nicht"))
+            .await
+            .unwrap();
+        assert!(g.nodes.is_empty() && g.edges.is_empty(), "{g:?}");
+    }
+
+    #[tokio::test]
+    async fn a_node_no_surviving_edge_touches_is_not_drawn() {
+        // `/oeffentlich` is readable, but its only edge points somewhere `leser` may not
+        // go. A lone node with no edges is not a page anybody connected to anything, and
+        // drawing it would say "this page links somewhere you cannot see".
+        let (store, leser, _chef) = graph_fixture().await;
+        let g = store.graph_for(&leser, None).await.unwrap();
+        assert!(g.nodes.is_empty(), "{g:?}");
     }
 }

@@ -21,3 +21,7 @@ uuid = { version = "1", features = ["v7"] }
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true }
+# For `the_permission_question_is_asked_once_per_document_not_once_per_edge`, which counts
+# the `sqlx::query` tracing events one `graph_for` emits. Already a workspace dependency
+# (gw-api uses it), so this adds nothing to the tree that was not being built anyway.
+tracing-subscriber = { workspace = true }

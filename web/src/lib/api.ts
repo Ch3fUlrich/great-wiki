@@ -20,6 +20,33 @@ export interface Backlink {
   title: string;
 }
 
+/**
+ * One page in the graph. Mirrors `gw_api::routes::links::GraphNodeView`.
+ *
+ * `path` is the identity: the API translates the store's document ids into paths on the way
+ * out, so nothing here needs a lookup table and no internal id reaches the browser.
+ */
+export interface GraphNode {
+  path: string;
+  title: string;
+}
+
+/** One link, naming both ends by path. Mirrors `gw_api::routes::links::GraphEdgeView`. */
+export interface GraphEdge {
+  from: string;
+  to: string;
+}
+
+/**
+ * `/api/links/graph`. Already filtered to what the caller may read — an edge is on the wire
+ * only when BOTH its ends are readable, and a node only when an edge survived to touch it.
+ * See `gw-store/src/links.rs`. Nothing in this interface filters it again.
+ */
+export interface Graph {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
 /** One person, as `/api/me` names them. Mirrors `gw_api::view_as::PersonRef`. */
 export interface PersonRef {
   id: string;

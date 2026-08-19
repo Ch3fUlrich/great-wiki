@@ -24,7 +24,12 @@
 <ViewAsBanner me={data.me} />
 
 <header class="no-print">
-  <a class="brand" href="/">great&#8209;wiki</a>
+  <!-- The brand and the views that are about the whole wiki rather than one page. The graph
+       is here rather than on a page because that is what it is: every page at once. -->
+  <nav class="brand-group" aria-label="Hauptbereiche">
+    <a class="brand" href="/">great&#8209;wiki</a>
+    <a class="section" href="/graph">Graph</a>
+  </nav>
   <!-- Two reading preferences, side by side, because they are the same kind of thing.
        They wrap under the brand on a narrow screen rather than squeezing it. -->
   <div class="prefs">
@@ -60,11 +65,29 @@
     gap: var(--space-2);
   }
 
+  .brand-group {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-4);
+  }
+
   .brand {
     font-weight: 650;
     letter-spacing: -0.01em;
     color: var(--ink);
     text-decoration: none;
+  }
+
+  .section {
+    color: var(--ink-muted);
+    text-decoration: none;
+    font-size: var(--text-sm);
+  }
+
+  .section:hover,
+  .section:focus-visible {
+    color: var(--ink);
+    text-decoration: underline;
   }
 
   .skip {

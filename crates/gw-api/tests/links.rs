@@ -11,6 +11,10 @@
 //! The fixture: `/ziel` is public and has no outgoing links. `/quelle` (public) and
 //! `/geheim` (restricted) both link to it, so `/ziel`'s backlinks differ by who is asking.
 //! `leser` holds no grant anywhere; `chef` is granted `read` on `/geheim`.
+//!
+//! The same fixture carries the graph, and it is the reason it was built this way: with two
+//! edges into `/ziel` of which one has an end `leser` may not read, `GET /api/links/graph`
+//! answers a different graph to each of them — one edge for `leser`, two for `chef`.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -228,4 +232,149 @@ async fn the_response_carries_exactly_a_path_and_a_title() {
             "unexpected shape for one backlink: {entry}"
         );
     }
+}
+
+// -------------------------------------------------------------------------------------
+// The graph.
+// -------------------------------------------------------------------------------------
+
+/// The paths of a graph response's nodes, and its edges as `(from, to)` path pairs.
+fn graph_of(body: &str) -> (BTreeSet<String>, BTreeSet<(String, String)>) {
+    let value: serde_json::Value = serde_json::from_str(body).expect("a JSON body");
+    let nodes = value["nodes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a `nodes` array: {body}"))
+        .iter()
+        .map(|n| n["path"].as_str().expect("a node path").to_string())
+        .collect();
+    let edges = value["edges"]
+        .as_array()
+        .unwrap_or_else(|| panic!("an `edges` array: {body}"))
+        .iter()
+        .map(|e| {
+            (
+                e["from"].as_str().expect("an edge from").to_string(),
+                e["to"].as_str().expect("an edge to").to_string(),
+            )
+        })
+        .collect();
+    (nodes, edges)
+}
+
+#[tokio::test]
+async fn the_graph_names_only_pages_the_caller_may_read() {
+    let store = fixture().await;
+
+    // `leser` may not read `/geheim`, so the edge `/geheim -> /ziel` must not appear —
+    // neither as an edge nor as an anonymous node, which would say the page is there.
+    let (status, body) = get_as(&store, "leser", "/api/links/graph").await;
+    assert_eq!(status, StatusCode::OK);
+    let (nodes, edges) = graph_of(&body);
+    assert!(
+        !nodes.contains("/geheim"),
+        "a node leaked an unreadable page: {body}"
+    );
+    assert!(
+        !edges.iter().any(|(f, t)| f == "/geheim" || t == "/geheim"),
+        "an edge leaked an unreadable page: {body}"
+    );
+    assert!(
+        edges.contains(&("/quelle".into(), "/ziel".into())),
+        "the readable edge is missing: {body}"
+    );
+
+    // Anti-vacuity: `chef` holds a read on `/geheim` and sees both edges, so the fixture
+    // really has an edge to hide rather than the filter merely finding none.
+    let (status, body) = get_as(&store, "chef", "/api/links/graph").await;
+    assert_eq!(status, StatusCode::OK);
+    let (nodes, edges) = graph_of(&body);
+    assert!(nodes.contains("/geheim"), "{body}");
+    assert!(
+        edges.contains(&("/geheim".into(), "/ziel".into())),
+        "{body}"
+    );
+    assert_eq!(edges.len(), 2, "{body}");
+}
+
+#[tokio::test]
+async fn an_anonymous_caller_gets_the_public_graph_and_nothing_more() {
+    // No account at all: the two public pages and the one edge between them.
+    let store = fixture().await;
+    let (status, body) = get_anonymous(&store, "/api/links/graph").await;
+    assert_eq!(status, StatusCode::OK);
+    let (nodes, edges) = graph_of(&body);
+    assert_eq!(
+        nodes,
+        BTreeSet::from(["/quelle".to_string(), "/ziel".to_string()]),
+        "{body}"
+    );
+    assert_eq!(edges.len(), 1, "{body}");
+}
+
+#[tokio::test]
+async fn the_root_parameter_narrows_the_graph_to_a_subtree() {
+    // `root` is a view narrowing, not a permission answer — `/geheim` is outside `/quelle`
+    // and so is `/ziel`, so `chef`, who may read everything here, still sees nothing.
+    let store = fixture().await;
+    let (status, body) = get_as(&store, "chef", "/api/links/graph?root=/quelle").await;
+    assert_eq!(status, StatusCode::OK);
+    let (nodes, edges) = graph_of(&body);
+    assert!(edges.is_empty(), "{body}");
+    assert!(nodes.is_empty(), "{body}");
+
+    // A subtree that does not exist is not an error and not a 404: answering differently
+    // would confirm which paths are there to anybody who asked.
+    let (status, body) = get_as(&store, "chef", "/api/links/graph?root=/gibt-es-nicht").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(graph_of(&body).1.len(), 0, "{body}");
+}
+
+#[tokio::test]
+async fn the_graph_carries_paths_and_titles_and_no_internal_ids() {
+    // Same contract as the backlinks response, for the same reason: the frontend reads this
+    // straight off the wire, and a document id has no reason to be on it. Edges therefore
+    // name their ends by PATH — which is also what the interface links to.
+    let store = fixture().await;
+    let (status, body) = get_as(&store, "chef", "/api/links/graph").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let keys: BTreeSet<&str> = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, BTreeSet::from(["nodes", "edges"]), "{body}");
+
+    for node in value["nodes"].as_array().unwrap() {
+        let keys: BTreeSet<&str> = node
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            BTreeSet::from(["path", "title"]),
+            "unexpected shape for one node: {node}"
+        );
+    }
+    for edge in value["edges"].as_array().unwrap() {
+        let keys: BTreeSet<&str> = edge
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            BTreeSet::from(["from", "to"]),
+            "unexpected shape for one edge: {edge}"
+        );
+    }
+    assert!(
+        body.contains("Geheim"),
+        "the fixture's titles are missing, so the shape check proved nothing: {body}"
+    );
 }
