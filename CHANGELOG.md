@@ -8,6 +8,34 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- Text can be **bold, italic, struck through, code, or a link**, and stays that way. Until
+  now `Block` — what a published revision stores — had no field for inline formatting, so
+  the CRDT carried a bold word faithfully while publishing threw it away, and the editor
+  deliberately shipped with no formatting controls rather than offer something the system
+  would discard. Marks now survive the whole chain: markdown import, the CRDT, a published
+  revision, markdown export, and the rendered page.
+- One canonical nesting order, defined once. `[**Text**](url)` and `**[Text](url)**` mean the
+  same thing and are now stored the same way, which is what lets an export re-import to the
+  identical document. Two definitions that agreed by coincidence is exactly how the two
+  halves drifted apart the first time.
+- The editor's formatting controls write the same mark names the server reads. TipTap's
+  stock names are `bold` and `italic`; this system's are `strong` and `em`. Left alone, a
+  word bolded in the browser would have been written into the shared document under a name
+  the server does not recognise and dropped on publish — with every test still green,
+  because no test crossed that boundary. The wire format is now pinned by a test that reads
+  the actual bytes.
+- A link's address is checked before it is rendered. `javascript:` and every other
+  executable scheme fall through to plain text instead of becoming a clickable anchor —
+  judged with the browser's own URL parser rather than a pattern, so the case-folded and
+  embedded-whitespace spellings resolve the same way the browser would resolve them.
+  Relative links keep working, which matters: a scheme-only rule would have silently
+  de-linked 23 working links in the existing corpus.
+- Pages record which pages they link to. Publishing a revision extracts the links from the
+  body in the same transaction that writes the revision, so a publish that fails cannot
+  leave edges behind for a version that does not exist. That table is the graph.
+- **Backlinks are filtered per document.** A page that links here but which you may not read
+  is omitted entirely — not shown as "a page you cannot see", because the fact that it
+  exists, and how many there are, is itself the disclosure.
 - In-place editing on the rendered page: TipTap over the shared CRDT, opened only when
   somebody asks to edit and only after the server has agreed to the session — so a person
   who may not write sees an honest German refusal, never an editor that discards what they
@@ -17,9 +45,10 @@ Entries describe the *effect* of a change, not the diff.
   a test, and so is every attribute `gw-core` writes: TipTap deletes an element it cannot
   name from the CRDT and drops an attribute it does not declare, which for the tables in
   this corpus would have silently destroyed column alignment one edited cell at a time.
-  Inline formatting is deliberately absent rather than offered and thrown away, because a
-  revision has nowhere to store it until M4. The page content is still server-rendered in
-  full, with the editor loaded afterwards as a separate chunk.
+  Inline formatting was deliberately absent when this shipped, because a revision had
+  nowhere to store it — see the marks entry above, which closed that and gave the editor its
+  controls. The page content is still server-rendered in full, with the editor loaded
+  afterwards as a separate chunk.
 - Collaborative editing over a WebSocket at `/api/collab/{path}`. Authorisation happens
   before the upgrade and asks for `Action::Write` through the store's one permission-checked
   accessor: reading a page is not permission to join its editing session, and an
