@@ -11,11 +11,30 @@ export type BlockKind =
   | 'table' | 'tableRow' | 'tableHeader' | 'tableCell'
   | 'text';
 
+// Mirrors `gw_core::MarkKind` — the wire name IS the Yjs attribute key `gw-collab` reads and
+// writes (`doc.rs::mark_key_of` is the server's serde `rename_all = "camelCase"` name for the
+// kind), so `strong`/`em` here, never TipTap's own `bold`/`italic`. `web/src/lib/editor/
+// extensions.ts` renames TipTap's Bold and Italic extensions for exactly this reason, and
+// pins the whole set against the server's with a test the way `SERVER_BLOCK_KINDS` is.
+export type MarkKind = 'strong' | 'em' | 'code' | 'strike' | 'link';
+
+// A link carries EITHER `doc` (internal, resolved by the server — Task 7) or `href`
+// (external). Mirrors `gw_core::Mark`.
+export interface Mark {
+  kind: MarkKind;
+  attrs?: Record<string, unknown>;
+}
+
 export interface Block {
   kind: BlockKind;
   attrs?: Record<string, unknown>;
   content?: Block[];
   text?: string;
+  // Outermost first, innermost last — the order `gw_core::MARK_ORDER` sorts a leaf's marks
+  // into and `gw-collab` preserves on read. This renderer trusts that order rather than
+  // re-deriving it: nesting a leaf's marks is just wrapping in array order, and re-sorting
+  // here would be the second ordering the server-side docs warn against maintaining.
+  marks?: Mark[];
 }
 
 export interface Heading {

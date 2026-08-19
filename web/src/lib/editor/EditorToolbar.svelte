@@ -1,17 +1,15 @@
 <!--
-  The block controls.
+  The block and mark controls.
 
-  # Why there is nothing here for bold, italic or a link
+  # Marks are here now, because a revision can finally keep them
 
-  Because the system cannot store them. `gw_core::Block` has `kind`, `attrs`, `content` and
-  `text`, and no field for inline formatting — so a bold word lives in the CRDT and is
-  dropped by `CollabDoc::to_block` at the next publish. `extensions.ts` leaves the marks out
-  of the schema entirely for that reason, and this toolbar simply has nothing to offer for
-  them: a control whose effect disappears at the next save is worse than a missing one,
-  because it is only discovered after the text has been written.
-
-  Every control below maps one-to-one onto a `BlockKind` the server can store, so pressing
-  any of them is lossless.
+  `gw_core::Block` grew a `marks` field and `gw-collab` writes and reads it, so `extensions.ts`
+  now enables exactly the five marks `MarkKind` has — and every one of those five gets a
+  control below, alongside the block controls. Every control here maps one-to-one onto
+  something the server can store, so pressing any of them is lossless — which is also why
+  there is nothing here for underline: no `MarkKind` for it, so a control would be the exact
+  control-whose-effect-disappears-at-publish problem this toolbar existed to avoid before
+  Task 5, just for a different mark.
 
   # Ark's ToggleGroup rather than a row of buttons
 
@@ -90,6 +88,57 @@
       short: 'Code',
       on: (e: Editor) => e.isActive('codeBlock'),
       run: (e: Editor) => e.chain().focus().toggleCodeBlock().run()
+    },
+    // The five marks `extensions.ts` enables, addressed by the same name everywhere: the
+    // Yjs attribute key `gw-collab` reads, the ProseMirror mark type name (`Bold`/`Italic`
+    // are renamed to these in `extensions.ts` for exactly this reason), and the id here.
+    {
+      id: 'strong',
+      label: 'Fett',
+      short: 'Fett',
+      on: (e: Editor) => e.isActive('strong'),
+      run: (e: Editor) => e.chain().focus().toggleMark('strong').run()
+    },
+    {
+      id: 'em',
+      label: 'Kursiv',
+      short: 'Kursiv',
+      on: (e: Editor) => e.isActive('em'),
+      run: (e: Editor) => e.chain().focus().toggleMark('em').run()
+    },
+    {
+      id: 'code',
+      label: 'Code',
+      short: 'Code',
+      on: (e: Editor) => e.isActive('code'),
+      run: (e: Editor) => e.chain().focus().toggleMark('code').run()
+    },
+    {
+      id: 'strike',
+      label: 'Durchgestrichen',
+      short: 'Durchgestrichen',
+      on: (e: Editor) => e.isActive('strike'),
+      run: (e: Editor) => e.chain().focus().toggleMark('strike').run()
+    },
+    {
+      id: 'link',
+      label: 'Link',
+      short: 'Link',
+      on: (e: Editor) => e.isActive('link'),
+      // The one control here that is not a bare toggle: turning a link ON needs a URL from
+      // somewhere, and every other control in this table needs nothing beyond "is it on".
+      // `window.prompt` rather than a proper dialog is the scope this task actually asked
+      // for — a toolbar toggle, not a link-editing UI — and it is revisitable without
+      // touching anything else here, since `run` is the only place that would change.
+      run: (e: Editor) => {
+        if (e.isActive('link')) {
+          e.chain().focus().unsetMark('link').run();
+          return;
+        }
+        const href = window.prompt('Adresse des Links (https://…):');
+        if (!href) return;
+        e.chain().focus().setMark('link', { href }).run();
+      }
     }
   ] as const;
 

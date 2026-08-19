@@ -934,11 +934,12 @@ await check('E4 the history warning is on screen the whole time somebody is edit
   );
 });
 
-await check('E5 the toolbar offers only what a revision can actually store', async (page) => {
-  // `gw_core::Block` has no field for inline marks, so `to_block` keeps the text and drops
-  // the emphasis. A bold button would therefore be a control whose effect disappears at the
-  // next publish — discovered only after the text has been written. Every control here maps
-  // onto a BlockKind, and this check is what stops one being added that does not.
+await check('E5 the toolbar offers exactly what a revision can actually store', async (page) => {
+  // `gw_core::Block` grew a `marks` field (Task 5) and `gw-collab` now writes and reads them,
+  // so the five marks below joined the block controls that were always here. The check keeps
+  // its original shape — an exact list, not a superset check — because that shape is what
+  // catches EITHER direction of drift: a control added for something the server cannot store,
+  // or one silently missing for something it can.
   const { region } = await loadEditor(page);
   const toolbar = region.locator('[role="toolbar"]');
   await toolbar.waitFor({ state: 'visible', timeout: 5_000 });
@@ -955,15 +956,18 @@ await check('E5 the toolbar offers only what a revision can actually store', asy
         'Aufzählung',
         'Nummerierte Liste',
         'Zitat',
-        'Codeblock'
+        'Codeblock',
+        'Fett',
+        'Kursiv',
+        'Code',
+        'Durchgestrichen',
+        'Link'
       ]),
     `the toolbar offers something the server cannot store, or lost something it can: ${JSON.stringify(labels)}`
   );
-  // The controls a person would look for and must not find, because the system would throw
-  // their effect away.
-  for (const forbidden of ['Fett', 'Kursiv', 'Link', 'Unterstrichen', 'Durchgestrichen']) {
-    assert(!labels.includes(forbidden), `the toolbar offers "${forbidden}", which publishing drops`);
-  }
+  // `MarkKind` has no `underline` — that control must still never appear, for the same
+  // reason a bold button could not before this task: publishing would throw its effect away.
+  assert(!labels.includes('Unterstrichen'), 'the toolbar offers "Unterstrichen", which publishing drops');
 });
 
 await check('E6 a control that cannot reach the document says so by being disabled', async (page) => {
@@ -985,6 +989,34 @@ await check('E6 a control that cannot reach the document says so by being disabl
       `the session says "${headline}" and yet its toolbar is operable`
     );
   }
+});
+
+await check('E7 toggling Fett on a live selection marks it up, and the toolbar agrees', async (page) => {
+  // The live counterpart to `extensions.test.ts`'s CRDT-level proof. That test calls the
+  // exact conversion `@tiptap/extension-collaboration` uses to sync into a Y.Doc directly, so
+  // it already pins the wire keys; this exercises the part it cannot reach — a real browser,
+  // a real ContentEditable, the real ProseMirror keymaps — to confirm the renamed `Strong`
+  // extension still behaves like a normal mark all the way through typing and toggling it.
+  const { region, headline } = await loadEditor(page);
+  if (!headline.includes('Verbunden')) return; // nothing to type into without a live session
+
+  const surface = region.locator('[contenteditable="true"]');
+  await surface.click();
+  await page.keyboard.type('fett');
+  await page.keyboard.press('Shift+Home');
+
+  const fettButton = region.locator('[role="toolbar"] button[aria-label="Fett"]');
+  await fettButton.click();
+  await until(
+    async () => {
+      const saw = await fettButton.getAttribute('data-state');
+      return { ok: saw === 'on', saw };
+    },
+    'the Fett button never reported itself pressed after being clicked'
+  );
+
+  const html = await surface.innerHTML();
+  assert(/<strong[^>]*>fett<\/strong>/.test(html), `expected a <strong>fett</strong> run, got: ${html}`);
 });
 
 await browser.close();

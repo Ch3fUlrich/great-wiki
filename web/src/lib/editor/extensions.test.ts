@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import { Node as PmNode } from '@tiptap/pm/model';
-import { EDITOR_NODE_NAMES, SERVER_BLOCK_KINDS, editorSchema } from './extensions';
+import * as Y from 'yjs';
+import { prosemirrorJSONToYDoc } from '@tiptap/y-tiptap';
+import {
+  CONTENT_FIELD,
+  EDITOR_MARK_NAMES,
+  EDITOR_NODE_NAMES,
+  SERVER_BLOCK_KINDS,
+  SERVER_MARK_KINDS,
+  editorSchema
+} from './extensions';
 
 /**
  * The editor's schema is a contract with `gw-core::BlockKind`, and every way of breaking it
@@ -105,13 +114,65 @@ describe('the editor schema', () => {
     expect([...SERVER_BLOCK_KINDS].sort()).toEqual([...SERVER_KINDS].sort());
   });
 
-  it('carries no marks at all, because a revision has nowhere to put one', () => {
-    // `Block` has four fields — kind, attrs, content, text — and none of them is `marks`.
-    // A bold mark lives happily in the CRDT and is dropped by `CollabDoc::to_block`, so a
-    // toolbar offering bold would be a control whose effect disappears at the next publish.
-    // Leaving the marks out of the schema is what makes the editor show the truth: what you
-    // can see here is what a revision can hold.
-    expect(Object.keys(editorSchema.marks)).toEqual([]);
+  it('offers exactly the marks the server can store', () => {
+    // Both directions matter, the same way they do for block kinds above: a mark the editor
+    // lacks can never be typed, and a mark only the editor has is written into the CRDT under
+    // a key `to_block` does not recognise and silently dropped at the next publish.
+    expect([...EDITOR_MARK_NAMES].sort()).toEqual(['code', 'em', 'link', 'strike', 'strong']);
+    expect([...SERVER_MARK_KINDS].sort()).toEqual(['code', 'em', 'link', 'strike', 'strong']);
+  });
+
+  it('writes a mark into the CRDT under gw-collab\'s key, not TipTap\'s own mark name', () => {
+    // THE risk this schema exists to close. `crates/gw-collab/src/doc.rs::mark_key_of` keys a
+    // leaf's Yjs formatting attributes by `MarkKind`'s serde name — `strong`, `em` — and reads
+    // out of `@tiptap/y-tiptap`'s installed source confirm the Yjs attribute key IS the
+    // ProseMirror mark's *type name* (`marksToAttributes`: `pattrs[mark.type.name] =
+    // mark.attrs`). TipTap's own Bold and Italic extensions are named `bold` and `italic` —
+    // verified by running exactly this conversion before `contentExtensions` renamed them,
+    // which wrote the attribute keys `bold` and `italic` onto the wire, not `strong`/`em`.
+    // `prosemirrorJSONToYDoc` is the same conversion `@tiptap/extension-collaboration` runs
+    // when a live editor syncs into a fresh Y.Doc, so this test exercises the real mechanism,
+    // not a description of it — and it is the one this whole feature can silently regress
+    // without any other test noticing, because nothing else here crosses the CRDT boundary.
+    const doc = {
+      type: 'doc',
+      content: [
+        {
+          type: 'paragraph',
+          content: [
+            { type: 'text', text: 'fett', marks: [{ type: 'strong' }] },
+            { type: 'text', text: 'kursiv', marks: [{ type: 'em' }] },
+            { type: 'text', text: 'quer', marks: [{ type: 'strike' }] },
+            { type: 'text', text: 'code', marks: [{ type: 'code' }] },
+            {
+              type: 'text',
+              text: 'link',
+              marks: [{ type: 'link', attrs: { href: 'https://example.org' } }]
+            }
+          ]
+        }
+      ]
+    };
+
+    const ydoc = prosemirrorJSONToYDoc(editorSchema, doc, CONTENT_FIELD);
+    const paragraph = ydoc.getXmlFragment(CONTENT_FIELD).get(0);
+    if (!(paragraph instanceof Y.XmlElement)) throw new Error('expected a paragraph element');
+
+    const keys = new Set<string>();
+    for (let i = 0; i < paragraph.length; i += 1) {
+      const child = paragraph.get(i);
+      if (!(child instanceof Y.XmlText)) continue;
+      for (const chunk of child.toDelta() as Array<{ attributes?: Record<string, unknown> }>) {
+        Object.keys(chunk.attributes ?? {}).forEach((key) => keys.add(key));
+      }
+    }
+
+    expect([...keys].sort()).toEqual(['code', 'em', 'link', 'strike', 'strong']);
+    // Named explicitly, not just absent-by-omission: these are the exact wrong keys a naive
+    // `Bold`/`Italic` would have written, and the failure they cause (a silently dropped mark)
+    // has no other test that would catch it.
+    expect(keys.has('bold')).toBe(false);
+    expect(keys.has('italic')).toBe(false);
   });
 
   it('drops an attribute it does not declare, which is the mechanism that loses them', () => {

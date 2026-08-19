@@ -21,22 +21,33 @@
  * can contain and still survive being opened in the editor. `extensions.test.ts` asserts it
  * against the server's kinds and against the attributes `gw-core::markdown` writes.
  *
- * # Why there are no marks
+ * # Marks, and the one thing that makes them dangerous
  *
- * `gw_core::Block` has four fields — `kind`, `attrs`, `content`, `text` — and none of them
- * holds inline formatting. Yjs *can* carry bold, italic and links; `CollabDoc::to_block`
- * keeps the text and drops the emphasis, because there is nowhere to put it (see the
- * `gw-collab` module docs, and M4, which closes this).
+ * `gw_core::Block` grew a fifth field, `marks`, and `gw-collab` now writes and reads them —
+ * see the `gw-collab` module docs and `crates/gw-core/src/block.rs::MarkKind`. So this file no
+ * longer leaves marks out of the schema; it enables exactly the five the server can store:
+ * `strong`, `em`, `code`, `strike`, `link`.
  *
- * That leaves two honest options: a toolbar with a warning, or no marks. This takes no
- * marks, because a warning is a thing a person reads once and an editor is a thing they use
- * every day — and because with the marks absent from the schema the editor is exactly as
- * expressive as a revision is. What is on screen is what will be stored. Ctrl+B does
- * nothing, pasted rich text arrives as plain text and is visibly plain immediately, and
- * nothing can be lost between typing and publishing.
+ * The part that is easy to get wrong is *silent*, the same shape as the node-tag risk above,
+ * and it was verified the same way — against the installed source, not assumed. `gw-collab`'s
+ * `mark_key_of` keys a leaf's Yjs formatting attributes by `MarkKind`'s serde name (`strong`,
+ * `em`, …). `@tiptap/y-tiptap`'s `marksToAttributes` keys the SAME attributes by the
+ * ProseMirror mark's own type name (`pattrs[mark.type.name] = mark.attrs`, read out of the
+ * installed `dist/y-tiptap.js`). TipTap's stock `Bold` and `Italic` extensions are named
+ * `bold` and `italic` — not `strong`/`em` — which was proved by actually running
+ * `prosemirrorJSONToYDoc` against the unmodified extensions before this file renamed them: it
+ * wrote the attribute keys `bold` and `italic` onto the wire. `gw-collab::kind_of_mark_key`
+ * does not recognise either one, so `attrs_to_marks` silently drops the mark and `to_block`
+ * publishes the plain text — a bold word that types as bold, syncs as bold to every other
+ * browser, and vanishes at the next publish with every test green, because nothing else
+ * crosses that boundary. `Code`, `Strike` and `Link` already carry the right names by
+ * coincidence (verified the same way); only `Bold` and `Italic` are renamed below.
+ * `extensions.test.ts` pins the wire keys directly, not just the schema's mark names, so a
+ * regression here fails loudly instead of at publish time on somebody's real edit.
  *
- * The editor still says so in words (see `Editor.svelte`), because "why is bold not
- * working" deserves an answer on the screen where it is not working.
+ * Marks NOT in this set — `underline` — stay off. `MarkKind` in `gw-core` does not have one;
+ * enabling it would repeat the exact failure this section exists to prevent, just for a mark
+ * the server can never be taught to keep.
  *
  * # Versions
  *
@@ -50,7 +61,25 @@ import { getSchema } from '@tiptap/core';
 import type { Extensions } from '@tiptap/core';
 import StarterKit from '@tiptap/starter-kit';
 import { Table, TableCell, TableHeader, TableRow } from '@tiptap/extension-table';
-import type { BlockKind } from '$lib/blocks/render';
+import { Bold } from '@tiptap/extension-bold';
+import { Italic } from '@tiptap/extension-italic';
+import { Strike } from '@tiptap/extension-strike';
+import { Code } from '@tiptap/extension-code';
+import { Link } from '@tiptap/extension-link';
+import type { BlockKind, MarkKind } from '$lib/blocks/render';
+
+/**
+ * TipTap's `Bold`/`Italic`, renamed to the Yjs attribute key `gw-collab::mark_key_of` expects.
+ *
+ * `extend({ name })` is TipTap's own supported mechanism for this — `Extendable.extend` sets
+ * `extension.name` straight from the config, and every internal use of `this.name`
+ * (`toggleBold`'s `commands.toggleMark(this.name)`, `isActive`, the schema mark-type name
+ * itself) reads the new one. Nothing else about the extension changes: `Mod-B` still works,
+ * pasted `<strong>` HTML still parses in via `parseHTML`'s own tag list, which does not
+ * depend on `this.name` at all.
+ */
+const Strong = Bold.extend({ name: 'strong' });
+const Em = Italic.extend({ name: 'em' });
 
 /**
  * The Yjs fragment the document lives in.
@@ -99,7 +128,11 @@ type _EveryKindIsNamed = AssertNever<Exclude<BlockKind, (typeof SERVER_BLOCK_KIN
  *
  * - `hardBreak`, `horizontalRule` — no `BlockKind` for either. They would live in the CRDT
  *   and be dropped by `to_block`, taking the paragraph break or the rule with them.
- * - `bold`, `italic`, `strike`, `code`, `underline`, `link` — see the module docs.
+ * - `bold`, `italic`, `strike`, `code`, `link` — StarterKit's own bundled marks stay off so
+ *   the renamed `Strong`/`Em` below and the standalone `Strike`/`Code`/`Link` are each added
+ *   exactly once, under one name, rather than StarterKit's registering `bold` a second time
+ *   alongside `Strong` and the two silently fighting over the same keyboard shortcut.
+ * - `underline` — no `MarkKind` for it. See the module docs' last paragraph.
  * - `undoRedo` — ProseMirror's own history is *wrong* under a CRDT: it would undo other
  *   people's edits along with your own. `Collaboration` installs a Yjs-aware undo manager
  *   scoped to this client, and registering both means two Ctrl+Z handlers fighting.
@@ -127,7 +160,15 @@ export function contentExtensions(): Extensions {
     Table.configure({ resizable: false }),
     TableRow,
     TableHeader,
-    TableCell
+    TableCell,
+    // The five marks the server can store, `Strong`/`Em` renamed per the module docs above;
+    // `Strike`, `Code` and `Link` keep TipTap's own names because those already agree with
+    // `MarkKind`'s serde names.
+    Strong,
+    Em,
+    Strike,
+    Code,
+    Link
   ];
 }
 
@@ -145,3 +186,23 @@ export const editorSchema = getSchema(contentExtensions());
 
 /** The node names in that schema. Compared against the server's kinds by the test. */
 export const EDITOR_NODE_NAMES: readonly string[] = Object.keys(editorSchema.nodes);
+
+/**
+ * The mark kinds `gw_core::MarkKind` serialises to — same construction as
+ * `SERVER_BLOCK_KINDS`, and the same reason: `satisfies readonly MarkKind[]` fails the type
+ * check if a kind is named here that `MarkKind` does not have, and `_EveryMarkIsNamed` below
+ * fails it in the other direction, if `MarkKind` grows one this file forgets.
+ */
+export const SERVER_MARK_KINDS = [
+  'strong',
+  'em',
+  'code',
+  'strike',
+  'link'
+] as const satisfies readonly MarkKind[];
+
+/** Compile-time only: fails if `MarkKind` holds a kind `SERVER_MARK_KINDS` does not name. */
+type _EveryMarkIsNamed = AssertNever<Exclude<MarkKind, (typeof SERVER_MARK_KINDS)[number]>>;
+
+/** The mark names in that schema. Compared against the server's kinds by the test. */
+export const EDITOR_MARK_NAMES: readonly string[] = Object.keys(editorSchema.marks);

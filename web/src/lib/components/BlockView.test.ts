@@ -1,12 +1,23 @@
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import BlockView from './BlockView.svelte';
-import type { Block } from '$lib/blocks/render';
+import type { Block, MarkKind } from '$lib/blocks/render';
 
 /// The component's markup, without the hydration markers Svelte interleaves — they are an
 /// implementation detail and would make every assertion about structure unreadable.
 function html(block: Block): string {
   return render(BlockView, { props: { block } }).body.replace(/<!--.*?-->/g, '');
+}
+
+/// A single formatted leaf, standalone: `BlockView` accepts any block kind at its root,
+/// `'text'` included, so this needs no paragraph wrapper to reach the marks-rendering path.
+function textWithMark(text: string, kind: MarkKind, attrs?: Record<string, unknown>): Block {
+  return { kind: 'text', text, marks: [{ kind, attrs }] };
+}
+
+/// A link mark carrying `href` — an external link, per `gw_core::Mark::link_to_url`.
+function linkTo(href: string): Block {
+  return textWithMark('Link', 'link', { href });
 }
 
 /// A cell as the converter produces one: block content, so the text sits in a paragraph.
@@ -140,5 +151,63 @@ describe('BlockView', () => {
   it('skips a kind it does not know rather than rendering it raw', () => {
     const unknown = { kind: 'mystery', text: '<script>' } as unknown as Block;
     expect(html(unknown).trim()).toBe('');
+  });
+
+  // --- Marks --------------------------------------------------------------------------
+  //
+  // The other half of Task 5: the editor grew a toolbar for these because gw-collab can now
+  // carry them all the way to a revision, and a reader who never sees the formatting is the
+  // failure this section exists to catch — the editor would show bold, the page would not.
+
+  it('renders a bold run as <strong>', () => {
+    expect(html(textWithMark('fett', 'strong'))).toContain('<strong>fett</strong>');
+  });
+
+  it('renders each mark kind as the tag TipTap itself parses back out of pasted HTML', () => {
+    // Not an arbitrary choice: `<em>`, `<code>` and `<s>` are literally the tags
+    // `@tiptap/extension-italic`, `-code` and `-strike`'s own `parseHTML`/`renderHTML` use
+    // (verified against the installed source), so editing and reading agree on more than
+    // just which words are marked.
+    expect(html(textWithMark('kursiv', 'em'))).toContain('<em>kursiv</em>');
+    expect(html(textWithMark('code', 'code'))).toContain('<code>code</code>');
+    expect(html(textWithMark('durch', 'strike'))).toContain('<s>durch</s>');
+  });
+
+  it('nests multiple marks on one leaf in the order the server sorted them, outermost first', () => {
+    // `gw_core::MARK_ORDER` sorts a leaf's `marks` outermost-first before it ever reaches the
+    // wire; this only has to trust that order, not re-derive it — reproducing the ordering
+    // here would be the "second ordering" the server-side docs warn against.
+    const both: Block = { kind: 'text', text: 'beides', marks: [{ kind: 'strong' }, { kind: 'em' }] };
+    expect(html(both)).toContain('<strong><em>beides</em></strong>');
+  });
+
+  it('never renders an external link without rel protection', () => {
+    expect(html(linkTo('https://example.org'))).toMatch(/rel="[^"]*noopener/);
+  });
+
+  it('renders an href link as an anchor with both noopener and noreferrer', () => {
+    // The exact pin, not just the substring match above: `noreferrer` matters just as much as
+    // `noopener` (it is what keeps the referrer header from naming this wiki to the target
+    // site) and a looser regex would not notice it going missing.
+    expect(html(linkTo('https://example.org'))).toContain(
+      '<a href="https://example.org" rel="noopener noreferrer">Link</a>'
+    );
+  });
+
+  it('renders a doc link as a non-navigating span, since resolving it is Task 7', () => {
+    // `gw_core::Mark::link_to_doc` stores the target under `doc`, an internal document id the
+    // server has not resolved to a path yet. Emitting a real `<a href>` here would need that
+    // resolution; emitting one with no `href` would be a link that does nothing when clicked,
+    // which reads as broken rather than as "not implemented yet". A `<span>` is neither: it
+    // carries the text and the id for whenever Task 7 wires the resolution in, and it does
+    // not invite a click it cannot honour.
+    const out = html(textWithMark('Zieltext', 'link', { doc: '019ff0' }));
+    expect(out).not.toContain('<a ');
+    expect(out).toContain('data-doc="019ff0"');
+    expect(out).toContain('Zieltext');
+  });
+
+  it('leaves an unmarked leaf exactly as before', () => {
+    expect(html({ kind: 'text', text: 'nichts Besonderes' })).toBe('nichts Besonderes');
   });
 });
