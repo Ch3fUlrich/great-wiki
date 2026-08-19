@@ -194,6 +194,14 @@ in SQLite, and a download path that is its own disclosure surface.
   a revision inside one transaction; extracting links joins it. A failure must take the whole
   thing back, exactly as document creation and its first revision already do.
 - **The graph's query is the one most likely to leak.** See Security.
+- **One refusable page fails the whole export, and page content is writer-controlled.**
+  `export::run` collects refusals and `main.rs` turns a non-empty list into a `bail!`, so a
+  single page the round-trip guard rejects means no backup at all. Anyone with write on one
+  page can produce such a page — a literal newline in a text leaf is enough, and the
+  collaboration socket applies raw CRDT updates without schema validation, so `attrs_to_marks`
+  will carry any object-valued attribute into a mark. Pre-existing and not introduced by piece
+  0. The fix is per-page skip or an `--allow-incomplete` flag, or validating CRDT-derived
+  blocks at the collab boundary rather than at the exporter.
 - **`render()` can still report `problems: []` for markdown it cannot express.** Found while
   building piece 0 and left open deliberately. `Renderer::delimited` implements only half of
   CommonMark's flanking rule — it handles a delimiter abutting a space but not one abutting

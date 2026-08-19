@@ -398,19 +398,33 @@ const LINK_ATTRS: [&str; 2] = ["href", "doc"];
 /// and it has to ask it about the document, not about the editor's bookkeeping. TipTap's
 /// `Link` mark declares `target`, `rel`, `class` and `title` beside `href` and ProseMirror
 /// fills every one of them in with its default, so a link that has ever been through the
-/// editor is stored as `{href, target, rel, class, title}`. Markdown has no syntax for four
-/// of those, `gw_core::markdown` never produces them and `BlockView` never reads them — it
-/// renders its own fixed `rel` and no `target` — so a byte-equal comparison refused every
-/// page containing such a link, and `export` bails on the first refusal. One link written in
-/// the editor made the entire wiki unexportable, on the one path that is the owner's backup.
+/// editor is stored as `{href, target, rel, class, title}`. `gw_core::markdown` never
+/// produces those and `BlockView` never reads them — it renders its own fixed `rel` and no
+/// `target` — so a byte-equal comparison refused every page containing such a link, and
+/// `export` bails on the first refusal. One link written in the editor made the entire wiki
+/// unexportable, on the one path that is the owner's backup.
 ///
 /// `web/src/lib/editor/extensions.ts` now declares only `href`, so nothing new arrives this
 /// way. That fix cannot reach backwards: the Y.Docs and the revisions already written hold
 /// the full set and will keep holding it, and a document that cannot be exported cannot be
 /// exported *later* either. So the exporter forgives them here, symmetrically — the same
-/// reduction is applied to both sides, so it can only ever hide a difference in the four
-/// keys it names, never in the text, the structure, or the address itself. A link with no
-/// address is still refused by [`Renderer::wrap`], loudly, before this is reached.
+/// reduction is applied to both sides, so it can never hide a difference in the text, the
+/// structure, the mark kind, or the address itself.
+///
+/// Be precise about what it CAN hide, because the obvious reading is wrong in two ways and a
+/// comment that overstates a security guarantee is how the next person widens it. This is an
+/// **allow-list**: it keeps `href` and `doc` and discards *everything else* on a `Link` mark,
+/// not merely TipTap's four. A difference in a key nobody has thought of is invisible here
+/// too. And markdown is not silent about all four — `[text](url "titel")` is link-title
+/// syntax, and `title` is one of the keys discarded. That is harmless only for as long as
+/// `gw_core::markdown` keeps throwing titles away at import, which it does today
+/// (`Tag::Link { dest_url, .. }` ignores the title) and TipTap's own `parseMarkdown` does
+/// not. The day the importer preserves a title, this reduction stops the guard noticing that
+/// an export dropped one — so that day, `title` must leave the allow-list.
+///
+/// Marks other than `Link` are compared whole; a `strong` carrying a stray attribute is
+/// still refused. A link with no address is refused by [`Renderer::wrap`], loudly, before
+/// this is reached.
 fn comparable(block: &Block) -> serde_json::Value {
     let mut copy = block.clone();
     reduce_marks(&mut copy);

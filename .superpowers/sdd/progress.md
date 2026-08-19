@@ -15,3 +15,5 @@ Task 4: complete (4fd2e67, review PASS). Minor: marks_to_attrs collapses duplica
 Task 5: implemented (5ccf305). CONFIRMED: TipTap wrote bold/italic vs Rust strong/em — real bug, fixed via .extend({name}), pinned by a wire-key test.
 Task 5 review: NOT APPROVED — C1 editor-authored AND edited markdown links become unexportable; I2 javascript: URLs reach the DOM (no scheme check, no CSP); I3 wire-key test pins keys not values; M4-M7.
 Task 5 fix pass: C1/I2/I3/M4-M7 fixed (link attrs trimmed editor-side + exporter tolerates; javascript: URLs blocked at the render sink).
+Task 5: complete (5ccf305 + fix 84adf2f, re-review APPROVED). Minor 1 (overstated comment) fixed by orchestrator.
+  Follow-ups: (e) comparable() reduces attrs but adjacent link leaves with differing bookkeeping still refuse; (f) safeHref allows protocol-relative //evil.example — phishing legibility, not XSS; (g) IMPORTANT pre-existing: one refusable page kills the whole export run.
