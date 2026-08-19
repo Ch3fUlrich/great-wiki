@@ -194,3 +194,14 @@ in SQLite, and a download path that is its own disclosure surface.
   a revision inside one transaction; extracting links joins it. A failure must take the whole
   thing back, exactly as document creation and its first revision already do.
 - **The graph's query is the one most likely to leak.** See Security.
+- **`render()` can still report `problems: []` for markdown it cannot express.** Found while
+  building piece 0 and left open deliberately. `Renderer::delimited` implements only half of
+  CommonMark's flanking rule — it handles a delimiter abutting a space but not one abutting
+  punctuation — and nothing stops two adjacent delimiter runs fusing. `**Vor-**und Nachteile`
+  is enough. Exhaustively: 364 of 2304 two-leaf paragraphs and 205 of 2744 generated sources
+  render to something that re-imports as a different document, while reporting no problem.
+  It is **pre-existing and 80% smaller** than before that pass, `render_file` re-imports and
+  refuses before writing so the export command cannot corrupt a file, and neither corpus
+  reaches it. What is wrong is the contract: `Rendered::problems`' own doc says empty means
+  the tree was fully expressible, `blocks_to_markdown` is public, and the visible symptom is
+  a page refused as "a bug in the exporter" for perfectly ordinary markdown.
