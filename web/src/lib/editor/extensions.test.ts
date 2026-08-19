@@ -158,14 +158,15 @@ describe('the editor schema', () => {
     const paragraph = ydoc.getXmlFragment(CONTENT_FIELD).get(0);
     if (!(paragraph instanceof Y.XmlElement)) throw new Error('expected a paragraph element');
 
-    const keys = new Set<string>();
+    const written: Record<string, unknown> = {};
     for (let i = 0; i < paragraph.length; i += 1) {
       const child = paragraph.get(i);
       if (!(child instanceof Y.XmlText)) continue;
       for (const chunk of child.toDelta() as Array<{ attributes?: Record<string, unknown> }>) {
-        Object.keys(chunk.attributes ?? {}).forEach((key) => keys.add(key));
+        Object.assign(written, chunk.attributes ?? {});
       }
     }
+    const keys = new Set(Object.keys(written));
 
     expect([...keys].sort()).toEqual(['code', 'em', 'link', 'strike', 'strong']);
     // Named explicitly, not just absent-by-omission: these are the exact wrong keys a naive
@@ -173,6 +174,18 @@ describe('the editor schema', () => {
     // has no other test that would catch it.
     expect(keys.has('bold')).toBe(false);
     expect(keys.has('italic')).toBe(false);
+
+    // The keys are only half the wire contract, and the half that was pinned shipped a bug
+    // in the other half. `marksToAttributes` writes `pattrs[mark.type.name] = mark.attrs` —
+    // the whole attribute set ProseMirror's `computeAttrs` produced, which is every attribute
+    // the mark DECLARES with its default filled in, not the one attribute that was set. Stock
+    // TipTap `Link` declares `target`, `rel`, `class` and `title` beside `href`, so this delta
+    // carried all five, `gw-collab::attrs_to_marks` copied them verbatim into `Mark::attrs`,
+    // and `gw-api::export::render_file` — which compares the whole serialised tree against
+    // what its own markdown re-imports as — refused every page containing a link, which fails
+    // the entire export run. `Anchor` in `extensions.ts` trims the declaration to `href`; this
+    // is what keeps it trimmed. See `crates/gw-api/tests/export.rs` for the other side.
+    expect(written.link).toEqual({ href: 'https://example.org' });
   });
 
   it('drops an attribute it does not declare, which is the mechanism that loses them', () => {

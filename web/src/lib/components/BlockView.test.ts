@@ -194,6 +194,49 @@ describe('BlockView', () => {
     );
   });
 
+  it('renders no anchor at all for a scheme a browser would execute', () => {
+    // I2. `Mark::attrs`' `href` is a plain string that reached the database from a page's
+    // markdown, from the editor's Link control (which calls ProseMirror's `setMark`
+    // directly, so TipTap's own `isAllowedUri` never sees it) or from any later writer, and
+    // NOTHING between there and here validated it. `<a href="javascript:…">` is a stored
+    // cross-site-scripting payload that runs on click, for every reader of a public wiki,
+    // written by anyone who can edit one page. There is no Content-Security-Policy to fall
+    // back on (a known gap, recorded in docs/operations/running-in-production.md), so this
+    // renderer is the only thing standing there. It is also the RIGHT place: it is the sink,
+    // and guarding it covers every producer, including ones not written yet.
+    for (const href of [
+      'javascript:alert(1)',
+      'JaVaScRiPt:alert(1)',
+      '  javascript:alert(1)',
+      'java\nscript:alert(1)', // the URL parser strips newlines, exactly as a browser does
+      'data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==',
+      'vbscript:msgbox(1)',
+      'file:///etc/passwd'
+    ]) {
+      const out = html(linkTo(href));
+      expect(out, `${href} reached the DOM as a link`).not.toContain('<a ');
+      // Refused as a link, not as content: the words are still on the page, the same way an
+      // unknown mark kind renders its text and nothing else.
+      expect(out).toContain('Link');
+    }
+  });
+
+  it('still renders the schemes a wiki actually links with', () => {
+    // The other direction of the same check. A guard that also swallowed ordinary links
+    // would be a worse bug than the one it fixed, and a silent one: the text stays, so a
+    // page reads almost right.
+    for (const href of [
+      'https://example.org/seite',
+      'http://192.168.178.159:4000/v1',
+      'mailto:jemand@example.org',
+      '/rundgang/tabellen', // relative: no scheme to abuse, resolves against this wiki
+      '../nachbar',
+      '#abschnitt'
+    ]) {
+      expect(html(linkTo(href)), `${href} lost its anchor`).toContain(`<a href="${href}"`);
+    }
+  });
+
   it('renders a doc link as a non-navigating span, since resolving it is Task 7', () => {
     // `gw_core::Mark::link_to_doc` stores the target under `doc`, an internal document id the
     // server has not resolved to a path yet. Emitting a real `<a href>` here would need that

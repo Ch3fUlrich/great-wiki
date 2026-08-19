@@ -359,7 +359,7 @@ pub fn render_file(meta: &FileMeta, body: &Block) -> Result<String, String> {
     let mut conversion = markdown::convert(reimported_body);
     crate::seed::drop_duplicate_title_heading(&mut conversion.doc, &reimported_meta.title);
 
-    if json(&conversion.doc) != json(body) {
+    if comparable(&conversion.doc) != comparable(body) {
         return Err(format!(
             "the markdown for it re-imports as a DIFFERENT document, so exporting it would \
              hand you a file that quietly changes the page when you load it back. This is a \
@@ -384,8 +384,49 @@ pub fn render_file(meta: &FileMeta, body: &Block) -> Result<String, String> {
     Ok(file)
 }
 
-fn json(block: &Block) -> serde_json::Value {
-    serde_json::to_value(block).expect("a Block always serialises")
+/// The attributes of a `Link` mark that this system can actually mean something by.
+///
+/// `href` is the address markdown writes; `doc` is the internal target Task 7 resolves into
+/// one. There is no third: `gw_core::Mark`'s own doc comment says a link carries either, and
+/// nothing in the importer, the renderer below or `BlockView` reads any other key.
+const LINK_ATTRS: [&str; 2] = ["href", "doc"];
+
+/// A `Block` reduced to what markdown could ever state about it, for [`render_file`]'s
+/// round-trip comparison.
+///
+/// The comparison asks one question — "would this file re-import as the same document?" —
+/// and it has to ask it about the document, not about the editor's bookkeeping. TipTap's
+/// `Link` mark declares `target`, `rel`, `class` and `title` beside `href` and ProseMirror
+/// fills every one of them in with its default, so a link that has ever been through the
+/// editor is stored as `{href, target, rel, class, title}`. Markdown has no syntax for four
+/// of those, `gw_core::markdown` never produces them and `BlockView` never reads them — it
+/// renders its own fixed `rel` and no `target` — so a byte-equal comparison refused every
+/// page containing such a link, and `export` bails on the first refusal. One link written in
+/// the editor made the entire wiki unexportable, on the one path that is the owner's backup.
+///
+/// `web/src/lib/editor/extensions.ts` now declares only `href`, so nothing new arrives this
+/// way. That fix cannot reach backwards: the Y.Docs and the revisions already written hold
+/// the full set and will keep holding it, and a document that cannot be exported cannot be
+/// exported *later* either. So the exporter forgives them here, symmetrically — the same
+/// reduction is applied to both sides, so it can only ever hide a difference in the four
+/// keys it names, never in the text, the structure, or the address itself. A link with no
+/// address is still refused by [`Renderer::wrap`], loudly, before this is reached.
+fn comparable(block: &Block) -> serde_json::Value {
+    let mut copy = block.clone();
+    reduce_marks(&mut copy);
+    serde_json::to_value(&copy).expect("a Block always serialises")
+}
+
+fn reduce_marks(block: &mut Block) {
+    for mark in &mut block.marks {
+        if mark.kind == MarkKind::Link {
+            mark.attrs
+                .retain(|key, _| LINK_ATTRS.contains(&key.as_str()));
+        }
+    }
+    for child in &mut block.content {
+        reduce_marks(child);
+    }
 }
 
 fn indent(s: &str) -> String {

@@ -78,8 +78,53 @@ import type { BlockKind, MarkKind } from '$lib/blocks/render';
  * pasted `<strong>` HTML still parses in via `parseHTML`'s own tag list, which does not
  * depend on `this.name` at all.
  */
+// One more thing about `extend({ name })`, inert today and destructive the day it is not:
+// `Bold`'s and `Italic`'s `parseMarkdown` hooks call `helpers.applyMark("bold")` and
+// `("italic")` — string literals, not `this.name` (verified in the installed
+// `@tiptap/extension-bold@3.30.0`; `Strike`, `Code` and `Link` hardcode names that happen to
+// still be right). Nothing imports `@tiptap/markdown`, so no code path reaches them. A later
+// task wiring TipTap's markdown pipeline in would find bold and italic silently missing from
+// every parsed document, and this rename is why. Override `parseMarkdown` alongside `name` if
+// that day comes.
 const Strong = Bold.extend({ name: 'strong' });
 const Em = Italic.extend({ name: 'em' });
+
+/**
+ * TipTap's `Link`, trimmed to the ONE attribute `gw_core::Mark` has any use for.
+ *
+ * Stock `Link.addAttributes()` declares five — `href`, plus `target` (default `_blank`),
+ * `rel` (default `noopener noreferrer nofollow`), `class` and `title` (both `null`). The
+ * module docs above explain that an attribute this schema does not declare is deleted; this
+ * is the mirror-image hazard, and it cost more: an attribute the schema DOES declare is
+ * *created*. ProseMirror's `computeAttrs` fills every declared default in,
+ * `marksToAttributes` writes `pattrs[mark.type.name] = mark.attrs` — the whole map — onto the
+ * wire, and `gw-collab::attrs_to_marks` copies the whole map verbatim into `Mark::attrs`. So a
+ * link stored `{href}` by the markdown importer becomes `{href, target, rel, class, title}`
+ * the first time anybody edits the paragraph it sits in (y-tiptap's `equalAttrs` sees 1 key
+ * against 5 and rewrites the Y.Doc).
+ *
+ * Nothing reads those four. `BlockView` renders its own fixed `rel` and no `target`, and
+ * `gw-core::markdown` has no syntax for any of them. What they did do is fail `gw-api`'s
+ * export: `render_file` compares the document against what its own markdown re-imports as,
+ * `[text](href)` comes back as `{href}` alone, the trees differ, the page is refused — and
+ * `export` bails on the first refusal, so one link made the whole wiki unexportable. That is
+ * the owner's backup path, and `FIDELITY_WARNING` promises links survive it.
+ *
+ * `Link.configure({ HTMLAttributes: {…} })` is NOT this fix and was tried: it changes what
+ * `renderHTML` puts in the editor's own DOM, while the declared attributes — the ones that
+ * reach the CRDT — stay exactly as they were. Only the declaration matters here.
+ *
+ * `parseHTML` is carried over from the stock declaration rather than left to TipTap's
+ * default, which is `fromString(element.getAttribute(name))` and would coerce an href like
+ * `"2024"` into the number 2024. `target`/`rel` are still emitted into the editor's DOM by
+ * `renderHTML`, which merges `options.HTMLAttributes` — dropping the attributes does not drop
+ * the protection on the editor's own rendered anchors.
+ */
+const Anchor = Link.extend({
+  addAttributes: () => ({
+    href: { default: null, parseHTML: (element: HTMLElement) => element.getAttribute('href') }
+  })
+});
 
 /**
  * The Yjs fragment the document lives in.
@@ -162,13 +207,15 @@ export function contentExtensions(): Extensions {
     TableHeader,
     TableCell,
     // The five marks the server can store, `Strong`/`Em` renamed per the module docs above;
-    // `Strike`, `Code` and `Link` keep TipTap's own names because those already agree with
-    // `MarkKind`'s serde names.
+    // `Strike`, `Code` and `Anchor` keep TipTap's own names because those already agree with
+    // `MarkKind`'s serde names. `Anchor` is `Link` with its attribute declaration trimmed to
+    // `href` — see its doc comment; the four it dropped are what made every page holding a
+    // link refuse to export.
     Strong,
     Em,
     Strike,
     Code,
-    Link
+    Anchor
   ];
 }
 

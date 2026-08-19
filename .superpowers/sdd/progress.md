@@ -9,3 +9,9 @@ Task 3: implemented (9e1eadf). Combined T2+T3 review: spec OK, quality NOT appro
   Minor carried to final review: (5) exporter code_span/strike/doc-refusal untested; (7) seed.rs note assertions truthful but weaker than observed; (8) href not escaped, matters at Task 7.
 Tasks 2+3: complete (commits 0832763..69cdca9, re-review APPROVED).
   Follow-ups (not blocking): (a) IMPORTANT render() returns problems:[] for some unexpressible output — pre-existing, cut ~80%, guard contains it, corpus unaffected; (b) duplicate same-kind marks on one leaf dropped (regression, degenerate input); (c) "!" before a link emits an image (pre-existing); (d) plain_text mirror differs on U+0085/U+FEFF (pre-existing).
+Task 4: implemented (4fd2e67), under review.
+Task 4: complete (4fd2e67, review PASS). Minor: marks_to_attrs collapses duplicate same-kind marks (same class as logged item b).
+  OPEN RISK for Task 5: nobody has verified TipTap writes Yjs formatting under the SAME attribute keys mark_key_of expects (serde camelCase of MarkKind). If they differ, browser-authored marks are invisible to to_block.
+Task 5: implemented (5ccf305). CONFIRMED: TipTap wrote bold/italic vs Rust strong/em — real bug, fixed via .extend({name}), pinned by a wire-key test.
+Task 5 review: NOT APPROVED — C1 editor-authored AND edited markdown links become unexportable; I2 javascript: URLs reach the DOM (no scheme check, no CSP); I3 wire-key test pins keys not values; M4-M7.
+Task 5 fix pass: C1/I2/I3/M4-M7 fixed (link attrs trimmed editor-side + exporter tolerates; javascript: URLs blocked at the render sink).

@@ -22,6 +22,7 @@
 <script lang="ts">
   import { ToggleGroup } from '@ark-ui/svelte/toggle-group';
   import type { Editor } from '@tiptap/core';
+  import { safeHref } from '$lib/blocks/render';
 
   interface Props {
     /** `null` until the session is live and the surface exists. */
@@ -85,7 +86,12 @@
     {
       id: 'codeBlock',
       label: 'Codeblock',
-      short: 'Code',
+      // Spelt out rather than shortened to "Code": the `code` MARK control sits four
+      // buttons along and its own short label is "Code", so two adjacent buttons read the
+      // same word and only a tooltip told them apart. The person using this is not a
+      // programmer, and "the one that makes a whole block" versus "the one that marks a
+      // word" is not a distinction a hover title should be carrying alone.
+      short: 'Codeblock',
       on: (e: Editor) => e.isActive('codeBlock'),
       run: (e: Editor) => e.chain().focus().toggleCodeBlock().run()
     },
@@ -116,7 +122,10 @@
     {
       id: 'strike',
       label: 'Durchgestrichen',
-      short: 'Durchgestrichen',
+      // Shorter than the full term, which was wider than every block control's own label
+      // and pushed the row into a second line on a narrow window. The accessible name stays
+      // "Durchgestrichen" and contains this word, so WCAG's label-in-name still holds.
+      short: 'Gestrichen',
       on: (e: Editor) => e.isActive('strike'),
       run: (e: Editor) => e.chain().focus().toggleMark('strike').run()
     },
@@ -130,14 +139,42 @@
       // `window.prompt` rather than a proper dialog is the scope this task actually asked
       // for — a toolbar toggle, not a link-editing UI — and it is revisitable without
       // touching anything else here, since `run` is the only place that would change.
+      //
+      // `setLink`/`unsetLink` rather than the `setMark`/`unsetMark` primitives underneath
+      // them, for two reasons that both showed up as bugs. `unsetLink` passes
+      // `extendEmptyMarkRange: true`, which is what lets a caret sitting INSIDE a link
+      // remove it — `unsetMark`'s default is `false`, so with nothing selected the command
+      // matched no range, dispatched nothing, and the button bounced straight back to
+      // pressed. Both also set `preventAutolink`, without which the Link extension's
+      // autolink plugin can put back the link that was just removed as soon as the next
+      // character is typed.
+      //
+      // Changing an existing link's address still means removing it and adding it again.
+      // That is deliberate rather than unfinished: a ToggleGroup item has two states, and
+      // "edit the address, leaving it a link" is a third one — pressing a pressed toggle and
+      // having it stay pressed is a worse lie than the small detour. It wants a link dialog,
+      // which is a control this row does not have and Task 5 did not ask for.
       run: (e: Editor) => {
         if (e.isActive('link')) {
-          e.chain().focus().unsetMark('link').run();
+          e.chain().focus().unsetLink().run();
           return;
         }
-        const href = window.prompt('Adresse des Links (https://…):');
-        if (!href) return;
-        e.chain().focus().setMark('link', { href }).run();
+        const typed = window.prompt('Adresse des Links (https://…):');
+        if (typed === null || typed.trim() === '') return;
+        // The renderer refuses to build an `<a>` for anything but http/https/mailto —
+        // `javascript:` in an href is stored XSS against every reader, and `BlockView` is
+        // where that is stopped for ALL writers, not just this one. Checking the same rule
+        // here as well is not the security boundary; it is the difference between being
+        // told and watching a link silently come out as plain text on the published page.
+        const href = safeHref(typed.trim());
+        if (href === null) {
+          window.alert(
+            'Diese Adresse wird nicht verlinkt. Erlaubt sind nur Adressen, die mit ' +
+              'http://, https:// oder mailto: beginnen.'
+          );
+          return;
+        }
+        e.chain().focus().setLink({ href }).run();
       }
     }
   ] as const;
@@ -177,6 +214,24 @@
       (control) => next.includes(control.id) !== previous.includes(control.id)
     );
     changed?.run(e);
+
+    // A press that changes nothing must not leave the button looking pressed. `run` can
+    // decline — the Link control's prompt is cancelled, or the address is refused — and a
+    // command that dispatches no transaction fires no `transaction` event, so the
+    // subscription above never corrects anything; the header's promise that the toolbar
+    // cannot disagree with the caret was exactly one `return` short of true.
+    //
+    // A microtask, not a straight call, and that is not defensive: Ark's own root runs
+    // `onValueChange(details) { props.onValueChange?.(details); if (value !== undefined)
+    // value = details.value }` (read out of the installed
+    // `@ark-ui/svelte/dist/components/toggle-group/toggle-group-root.svelte`), so it assigns
+    // the press it THINKS happened through `bind:value` the instant this function returns.
+    // Correcting `active` here would be overwritten a line later. One microtask on, that
+    // assignment has happened, and `value` is a controlled prop of the underlying machine —
+    // so writing the editor's truth into it moves the buttons.
+    queueMicrotask(() => {
+      if (editor === e) readActive(e);
+    });
   }
 </script>
 

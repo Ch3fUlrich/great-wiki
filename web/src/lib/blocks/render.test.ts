@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { outline, plainText, type Block } from './render';
+import { outline, plainText, safeHref, type Block } from './render';
 
 const doc: Block = {
   kind: 'doc',
@@ -63,3 +63,49 @@ describe('block helpers', () => {
     expect(outline(h)[0].level).toBe(1);
   });
 });
+
+describe('safeHref', () => {
+  // The renderer and the editor's Link control both ask this one function, so the rule is
+  // stated once and both sides of the wiki agree on it by construction rather than by two
+  // people remembering the same list.
+
+  it('refuses every scheme a browser would run code for', () => {
+    // A stored `href` is attacker-controlled the moment one person with write access to one
+    // page is not trusted, and this wiki is on the public internet with no CSP. The variants
+    // are not padding: the WHATWG URL parser lower-cases the scheme and removes tabs and
+    // newlines from anywhere in the string, so all four of these ARE `javascript:` to a
+    // browser, and a regex on the raw string is how that gets missed.
+    expect(safeHref('javascript:alert(1)')).toBeNull();
+    expect(safeHref('JaVaScRiPt:alert(1)')).toBeNull();
+    expect(safeHref('  javascript:alert(1)')).toBeNull();
+    expect(safeHref('java\nscript:alert(1)')).toBeNull();
+    expect(safeHref('java\tscript:alert(1)')).toBeNull();
+    expect(safeHref('data:text/html,<script>alert(1)</script>')).toBeNull();
+    expect(safeHref('vbscript:msgbox(1)')).toBeNull();
+    expect(safeHref('file:///etc/passwd')).toBeNull();
+  });
+
+  it('refuses anything that is not a usable string at all', () => {
+    expect(safeHref(undefined)).toBeNull();
+    expect(safeHref(null)).toBeNull();
+    expect(safeHref(42)).toBeNull();
+    expect(safeHref('')).toBeNull();
+    expect(safeHref('   ')).toBeNull();
+  });
+
+  it('passes the schemes a wiki links with, and gives back the address unchanged', () => {
+    // Unchanged matters: a relative link must stay relative, or every internal link in the
+    // corpus would silently start pointing at the placeholder base this function parses with.
+    for (const href of [
+      'https://example.org/seite?a=1#b',
+      'http://192.168.178.159:4000/v1',
+      'mailto:jemand@example.org',
+      '/rundgang/tabellen',
+      '../nachbar',
+      '#abschnitt'
+    ]) {
+      expect(safeHref(href), href).toBe(href);
+    }
+  });
+});
+

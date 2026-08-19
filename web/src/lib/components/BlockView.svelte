@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { Block, Mark } from '$lib/blocks/render';
   import { slugify } from '$lib/slug';
-  import { plainText } from '$lib/blocks/render';
+  import { plainText, safeHref } from '$lib/blocks/render';
   import { alignOf } from '$lib/blocks/table';
   import Self from './BlockView.svelte';
   import TableView from './TableView.svelte';
@@ -73,14 +73,19 @@
       <s>{@render marked(text, rest)}</s>
     {:else if mark.kind === 'link'}
       {@const doc = mark.attrs?.doc}
-      {@const href = mark.attrs?.href}
+      <!-- `safeHref` rather than the stored string: an `href` reaches here unvalidated from
+           the importer, from the editor's Link control and from anything written later, and
+           `javascript:` in it is stored XSS against every reader — see its doc comment for
+           why the check belongs at this sink rather than at each of those. `null` means the
+           run renders as text, the same fallthrough an unrecognised mark kind takes. -->
+      {@const href = safeHref(mark.attrs?.href)}
       {#if typeof doc === 'string'}
         <!-- Internal target, not yet resolved to a path — Task 7's job. A real `<a href>`
              needs that resolution and an `<a>` with no `href` reads as broken, so this is
              neither: the text and the target id are both here, nothing is clickable, and
              nothing claims to navigate anywhere until it actually can. -->
         <span data-doc={doc}>{@render marked(text, rest)}</span>
-      {:else if typeof href === 'string'}
+      {:else if href !== null}
         <!-- `rel="noopener noreferrer"` unconditionally, not only when `target="_blank"` is
              also set: this component never adds a `target`, but the protection costs nothing
              where it is not needed and a future change that adds one must not be the change

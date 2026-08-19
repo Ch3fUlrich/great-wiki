@@ -25,6 +25,44 @@ export interface Mark {
   attrs?: Record<string, unknown>;
 }
 
+// The schemes a stored link may become a real `<a href>` for. `mailto:` is here because a
+// wiki links to addresses; `tel:`, `ftp:` and the rest of TipTap's own allow-list are not,
+// because nothing in this corpus uses them and every scheme admitted is a scheme that has to
+// be argued about again later.
+const LINK_SCHEMES = new Set(['http:', 'https:', 'mailto:']);
+
+/**
+ * `href` if a browser may be handed it, `null` if it must be rendered as plain text instead.
+ *
+ * A link's `href` is a string that reached the database from imported markdown, from the
+ * editor's Link control, or from any writer added later; `gw_core::Mark::link_to_url` does
+ * not validate it and neither does `gw-collab`. `<a href="javascript:…">` is therefore a
+ * stored cross-site-scripting payload that anyone with write access to one page can leave for
+ * every reader of a public wiki, including an admin — and there is no Content-Security-Policy
+ * to catch it (a known gap, recorded in `docs/operations/running-in-production.md`). So the
+ * check lives at the sink, where it covers every producer at once rather than every producer
+ * having to remember.
+ *
+ * Judged by the WHATWG `URL` parser rather than by a regex on the string, because that is
+ * exactly the parser the browser will use on the value: it lower-cases the scheme, strips
+ * leading and trailing whitespace and *removes* embedded tabs and newlines, so `JaVaScRiPt:`
+ * and `java\nscript:` are the same URL to it and to this. Relative references keep working —
+ * resolved against a base, they take the base's scheme, which is the honest answer for a link
+ * that has no scheme of its own to abuse.
+ */
+export function safeHref(href: unknown): string | null {
+  if (typeof href !== 'string' || href.trim() === '') return null;
+  let scheme: string;
+  try {
+    // The base is a placeholder and never reaches the page: what is returned is the ORIGINAL
+    // string, so a relative link stays relative and resolves against the real page it is on.
+    scheme = new URL(href, 'https://wiki.invalid/').protocol;
+  } catch {
+    return null;
+  }
+  return LINK_SCHEMES.has(scheme) ? href : null;
+}
+
 export interface Block {
   kind: BlockKind;
   attrs?: Record<string, unknown>;

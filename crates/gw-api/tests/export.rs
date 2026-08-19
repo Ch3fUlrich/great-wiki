@@ -514,3 +514,61 @@ fn one_document_can_be_rendered_without_a_store_or_a_filesystem() {
         .unwrap_err()
         .contains("line break"));
 }
+
+#[test]
+fn a_link_carrying_the_editors_own_attributes_still_exports() {
+    // C1, and the reason this test is on the Rust side of a bug whose cause is in the web
+    // side: the refusal happens HERE. `web/src/lib/editor/extensions.ts` now trims the Link
+    // mark's declared attributes to `href` alone, so nothing new is written this way — but a
+    // Y.Doc and every revision filed before that trim already hold the full set, and a
+    // document the exporter refuses is a document the owner cannot back up, forever. The
+    // whole run fails on one such page (`main.rs` turns a non-empty `refused` into a
+    // `bail!`), so a single link written by the shipped editor made the entire wiki
+    // unexportable.
+    //
+    // The attribute set is TipTap `Link`'s own, read out of the installed
+    // `@tiptap/extension-link@3.30.0`'s `addAttributes()`: `target` and `rel` default to the
+    // extension's `HTMLAttributes`, `class` and `title` default to `null`. `computeAttrs`
+    // fills every one of them in, `marksToAttributes` writes the whole map onto the wire and
+    // `gw-collab::attrs_to_marks` copies it verbatim into `Mark::attrs`.
+    let meta = export::FileMeta {
+        title: "Verweise".into(),
+        doc_type: "page".into(),
+        visibility: "public".into(),
+        language: "de".into(),
+        sort_key: 0,
+        slug: "verweise".into(),
+    };
+    let body: Block = serde_json::from_str(
+        r#"{"kind":"doc","content":[{"kind":"paragraph","content":[
+             {"kind":"text","text":"Siehe "},
+             {"kind":"text","text":"die Anleitung","marks":[{"kind":"link","attrs":{
+               "href":"https://example.org","target":"_blank",
+               "rel":"noopener noreferrer nofollow","class":null,"title":null}}]},
+             {"kind":"text","text":"."}]}]}"#,
+    )
+    .unwrap();
+
+    let file = export::render_file(&meta, &body).unwrap_or_else(|e| {
+        panic!("a link written by the editor must still export, and this one did not: {e}")
+    });
+    assert!(
+        file.contains("Siehe [die Anleitung](https://example.org)."),
+        "the link must reach the file with its address intact: {file}"
+    );
+
+    // And the tolerance is exactly that wide: it forgives attributes markdown never carried
+    // in the first place, it does not forgive a link with no address to write.
+    let no_href: Block = serde_json::from_str(
+        r#"{"kind":"doc","content":[{"kind":"paragraph","content":[
+             {"kind":"text","text":"intern","marks":[{"kind":"link","attrs":{
+               "doc":"019ff0","target":"_blank"}}]}]}]}"#,
+    )
+    .unwrap();
+    assert!(
+        export::render_file(&meta, &no_href)
+            .unwrap_err()
+            .contains("href"),
+        "a link the renderer cannot address must still be refused, not exported as bare text"
+    );
+}
