@@ -17,6 +17,15 @@ pub struct Config {
     /// `None` means no identity provider is configured, which is a legitimate deployment
     /// — local accounts only. A *partly* configured one is not, and is refused at startup.
     pub oidc: Option<OidcConfig>,
+    /// This deployment's own public origin (`GW_PUBLIC_URL`), or `None` when it is not
+    /// configured — also a legitimate deployment: `gw_store::links::wiki_path` then treats
+    /// every absolute URL as external, exactly as it always has. Handed to
+    /// [`gw_store::Store::with_public_origin`] rather than read inside `gw-store` itself,
+    /// which must not touch the environment — it is a library — and must never derive this
+    /// from a request's `Host` header, which is attacker-controlled (see
+    /// `routes::admin::deliver`'s doc comment for the same reasoning applied to invite
+    /// links).
+    pub public_origin: Option<url::Url>,
 }
 
 /// The four variables that make up an OIDC client, all or nothing.
@@ -82,6 +91,26 @@ pub fn oidc_from(
             present.join(", ")
         ),
     }
+}
+
+/// The origin this deployment is publicly reachable at, or `None` when `GW_PUBLIC_URL` is
+/// unset — separated from the environment for the same reason [`oidc_from`] is: so it can be
+/// tested without mutating process globals every other test in this binary shares.
+///
+/// Unlike the OIDC group this is ONE variable, so there is no half-configured state to
+/// refuse — only "set" and parses, or "not set". A value that is set but does NOT parse as a
+/// URL is refused rather than silently treated as unset: a typo here should be loud at
+/// startup, not a feature that is permanently missing and never explains why.
+pub fn public_origin_from(raw: Option<String>) -> Result<Option<url::Url>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let origin = url::Url::parse(&raw).with_context(|| {
+        format!(
+            "GW_PUBLIC_URL must be an absolute URL, e.g. https://wiki.example.com (got `{raw}`)"
+        )
+    })?;
+    Ok(Some(origin))
 }
 
 pub fn parse_dev_identity(raw: &str) -> Result<Identity> {
@@ -161,13 +190,19 @@ impl Config {
             dev_identity,
             proxy_secret,
             oidc: read_oidc()?,
+            public_origin: public_origin_from(
+                std::env::var("GW_PUBLIC_URL")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty()),
+            )?,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{oidc_from, parse_dev_identity, validate};
+    use crate::config::{oidc_from, parse_dev_identity, public_origin_from, validate};
     use crate::identity::Identity;
     use std::net::SocketAddr;
 
@@ -223,6 +258,31 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("/auth/callback"), "{error}");
+    }
+
+    #[test]
+    fn unset_public_url_means_no_configured_origin() {
+        // The safety property: `gw_store::Store::with_public_origin(None)` is what a
+        // deployment with no `GW_PUBLIC_URL` gets, and that must behave exactly as it did
+        // before this variable existed.
+        assert!(public_origin_from(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_valid_public_url_is_parsed() {
+        let origin = public_origin_from(some("https://wiki.ohje.ooguy.com"))
+            .unwrap()
+            .expect("a valid URL must parse");
+        assert_eq!(origin.scheme(), "https");
+        assert_eq!(origin.host_str(), Some("wiki.ohje.ooguy.com"));
+    }
+
+    #[test]
+    fn an_unparseable_public_url_refuses_to_start() {
+        // Fail loud rather than silently falling back to "not configured": a typo here
+        // should be a startup error, not a feature that quietly never works.
+        let error = public_origin_from(some("not a url")).unwrap_err();
+        assert!(error.to_string().contains("GW_PUBLIC_URL"), "{error}");
     }
 
     #[test]

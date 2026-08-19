@@ -200,6 +200,7 @@ mod tests {
             dev_identity: None,
             proxy_secret: secret.map(str::to_string),
             oidc: None,
+            public_origin: None,
         }
     }
 

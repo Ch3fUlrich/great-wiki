@@ -140,7 +140,15 @@ impl Store {
         // the revision's body. The second write is the one that matters: it is what makes
         // `current_revision_id` point at a row that exists, and it keeps the "a body changes
         // only through a revision" rule true of creation as well as of editing.
-        append_revision(&mut tx, &id, author, &body, summary).await?;
+        append_revision(
+            &mut tx,
+            &id,
+            author,
+            &body,
+            summary,
+            self.public_origin.as_ref(),
+        )
+        .await?;
 
         tx.commit().await?;
         Ok(id)

@@ -77,27 +77,27 @@ struct Targets {
 ///
 /// `from` is the linking document's OWN path — the base an `href` with no leading slash is
 /// resolved against, per [`wiki_path`].
-fn collect(body: &Block, into: &mut Targets, from: &str) {
+fn collect(body: &Block, into: &mut Targets, from: &str, public_origin: Option<&Url>) {
     for mark in &body.marks {
         // A link carries EITHER `doc` or `href`, never both — `gw_core::Mark` says so — and
         // `else` rather than a second `if` keeps that true here even if one ever did.
         if let Some(doc) = mark.target_doc() {
             into.docs.insert(doc.to_string());
-        } else if let Some(path) = internal_path(mark, from) {
+        } else if let Some(path) = internal_path(mark, from, public_origin) {
             into.paths.insert(path);
         }
     }
     for child in &body.content {
-        collect(child, into, from);
+        collect(child, into, from, public_origin);
     }
 }
 
 /// The wiki path a link mark's `href` names, if it names one at all.
-fn internal_path(mark: &Mark, from: &str) -> Option<String> {
+fn internal_path(mark: &Mark, from: &str, public_origin: Option<&Url>) -> Option<String> {
     if mark.kind != MarkKind::Link {
         return None;
     }
-    wiki_path(mark.attrs.get("href")?.as_str()?, from)
+    wiki_path(mark.attrs.get("href")?.as_str()?, from, public_origin)
 }
 
 /// The document path an address names, or `None` if it does not name one in this wiki.
@@ -133,9 +133,16 @@ fn internal_path(mark: &Mark, from: &str) -> Option<String> {
 /// and `#abschnitt` are trimmed before any resolution happens — and an address that is
 /// *only* a query, a fragment, `/`, or empty names the page it is already on (or nothing),
 /// which is refused here without ever consulting `from`.
-fn wiki_path(href: &str, from: &str) -> Option<String> {
+fn wiki_path(href: &str, from: &str, public_origin: Option<&Url>) -> Option<String> {
     let href = href.trim();
-    if has_scheme(href) || href.starts_with("//") {
+    if has_scheme(href) {
+        // An address carrying a scheme is internal only when a public origin is configured
+        // AND this address's origin matches it exactly — see `internal_path_from_absolute`.
+        // With none configured this is unchanged from before that method existed: external,
+        // unconditionally, because there is nothing to compare against.
+        return public_origin.and_then(|origin| internal_path_from_absolute(href, origin));
+    }
+    if href.starts_with("//") {
         return None;
     }
     // `?` and `#` both end the path, in whichever order they turn up.
@@ -158,6 +165,39 @@ fn wiki_path(href: &str, from: &str) -> Option<String> {
         return None;
     }
     Some(resolved.to_string())
+}
+
+/// The wiki path an absolute URL names, when its origin matches `public_origin` EXACTLY —
+/// scheme, host AND port, per [`url::Url::origin`]'s equality — or `None` when it points
+/// elsewhere, or does not carry a hierarchical origin at all.
+///
+/// `href` has already passed [`has_scheme`], so [`Url::parse`] succeeds for anything RFC
+/// 3986 would call an absolute URI. A scheme this wiki has no origin for in the first place
+/// — `mailto:`, `javascript:`, `data:` — parses to [`url::Origin::Opaque`], which can never
+/// equal `public_origin`'s [`url::Origin::Tuple`], so nothing here has to name those schemes
+/// specially: the comparison itself already refuses them.
+///
+/// Both origins come out of `Url::parse`, which lower-cases a scheme and a domain host as
+/// part of parsing (WHATWG URL, not a rule stated again here) — so `HTTPS://WIKI.example/x`
+/// and `https://wiki.example` already compare equal without this function doing anything
+/// case-insensitive on purpose. `http://` and `https://` on the same host do NOT compare
+/// equal, nor does the same scheme and host on a different port: `Origin::Tuple` carries all
+/// three, and comparing by hostname alone is exactly the mistake D-5's gap analysis warns
+/// against (a public deployment terminates TLS ahead of this process; treating scheme as a
+/// don't-care here would make an internal `http://` probe indistinguishable from the public
+/// `https://` origin).
+fn internal_path_from_absolute(href: &str, public_origin: &Url) -> Option<String> {
+    let parsed = Url::parse(href).ok()?;
+    if parsed.origin() != public_origin.origin() {
+        return None;
+    }
+    // Query and fragment are already separate components of a parsed URL, unlike the
+    // relative-reference branch above, which has to split them out of a raw string by hand.
+    let path = parsed.path().trim_end_matches('/');
+    if path.is_empty() {
+        return None;
+    }
+    Some(path.to_string())
 }
 
 /// Whether an address begins with a URI scheme, as RFC 3986 defines one.
@@ -244,9 +284,10 @@ pub(crate) async fn replace_links(
     from_doc: &str,
     from_path: &str,
     body: &Block,
+    public_origin: Option<&Url>,
 ) -> Result<()> {
     let mut found = Targets::default();
-    collect(body, &mut found, from_path);
+    collect(body, &mut found, from_path, public_origin);
 
     sqlx::query("DELETE FROM links WHERE from_doc = ?1")
         .bind(from_doc)
@@ -690,7 +731,7 @@ mod tests {
             ("   ", "/von", None),
         ] {
             assert_eq!(
-                wiki_path(href, from).as_deref(),
+                wiki_path(href, from, None).as_deref(),
                 expected,
                 "the address `{href}` from `{from}` was read wrongly"
             );
@@ -713,11 +754,80 @@ mod tests {
             ("../../ziel-a", "/rundgang", Some("/ziel-a")),
         ] {
             assert_eq!(
-                wiki_path(href, from).as_deref(),
+                wiki_path(href, from, None).as_deref(),
                 expected,
                 "the address `{href}` from `{from}` did not resolve against its own page"
             );
         }
+    }
+
+    /// The gap this test closes: `wiki_path` used to treat ANY scheme-carrying address as
+    /// external, unconditionally, because `gw-store` had no idea what its own origin was —
+    /// see the module's doc comment. Once an origin IS configured, an absolute URL whose
+    /// origin matches it EXACTLY is this wiki after all; a different host, a different
+    /// scheme or a different port is still external, and `from` never matters here — an
+    /// absolute URL does not resolve against the page it was written on.
+    #[test]
+    fn an_absolute_url_at_the_configured_origin_is_internal() {
+        let origin = Url::parse("https://wiki.ohje.ooguy.com").unwrap();
+
+        for (href, expected) in [
+            // The exact shape from the report: pasted from the address bar.
+            (
+                "https://wiki.ohje.ooguy.com/darm/labor",
+                Some("/darm/labor"),
+            ),
+            // Trailing slash, query and fragment behave exactly as the relative case does.
+            (
+                "https://wiki.ohje.ooguy.com/darm/labor/",
+                Some("/darm/labor"),
+            ),
+            (
+                "https://wiki.ohje.ooguy.com/darm/labor?x=1",
+                Some("/darm/labor"),
+            ),
+            (
+                "https://wiki.ohje.ooguy.com/darm/labor#abschnitt",
+                Some("/darm/labor"),
+            ),
+            // Host AND scheme are compared case-insensitively — the URL parser lowercases
+            // both — so shouting the address bar's contents does not change the origin.
+            (
+                "HTTPS://WIKI.OHJE.OOGUY.COM/darm/labor",
+                Some("/darm/labor"),
+            ),
+            // A different host is a different origin, full stop — including one that
+            // merely CONTAINS the real host as a substring or a suffix.
+            ("https://evil.example/darm/labor", None),
+            ("https://wiki.ohje.ooguy.com.evil.example/darm/labor", None),
+            // `https://wiki.ohje.ooguy.com` and `http://wiki.ohje.ooguy.com` are different
+            // origins — that is the entire point of comparing by `url::Url::origin` rather
+            // than by hostname — even though a human would call them "the same site".
+            ("http://wiki.ohje.ooguy.com/darm/labor", None),
+            // Ditto for a non-default port.
+            ("https://wiki.ohje.ooguy.com:8443/darm/labor", None),
+            // The site root names no particular page, exactly as a bare `/` does for a
+            // relative reference.
+            ("https://wiki.ohje.ooguy.com/", None),
+            ("https://wiki.ohje.ooguy.com", None),
+        ] {
+            assert_eq!(
+                wiki_path(href, "/von", Some(&origin)).as_deref(),
+                expected,
+                "the address `{href}` against the configured origin `{origin}` was read \
+                 wrongly"
+            );
+        }
+    }
+
+    /// The safety property: unset behaves exactly as before this existed, for an address
+    /// that would otherwise have matched — and nothing here panics on `None`.
+    #[test]
+    fn with_no_origin_configured_an_absolute_url_is_still_external() {
+        assert_eq!(
+            wiki_path("https://wiki.ohje.ooguy.com/darm/labor", "/von", None),
+            None,
+        );
     }
 
     #[tokio::test]
@@ -852,6 +962,70 @@ mod tests {
             vec![],
             "an address outside is not a page"
         );
+    }
+
+    /// The end-to-end shape of the gap this closes: an absolute URL pasted from the address
+    /// bar of a deployment whose public origin IS configured must be an edge, exactly as its
+    /// relative spelling already is. This rebuilds the fixture with a configured origin
+    /// rather than reusing `fixture_with_three_pages`, to prove the configuration actually
+    /// reaches `replace_links` through `Store::publish_revision` — not merely through
+    /// `wiki_path` called directly, which `an_absolute_url_at_the_configured_origin_is_internal`
+    /// already covers on its own.
+    #[tokio::test]
+    async fn an_absolute_url_at_the_configured_origin_is_an_edge_too() {
+        let store = Store::open("sqlite::memory:")
+            .await
+            .unwrap()
+            .with_public_origin(Some(Url::parse("https://wiki.ohje.ooguy.com").unwrap()));
+        let from = page(&store, "Von", Visibility::Public).await;
+        let a = page(&store, "Ziel A", Visibility::Public).await;
+
+        let chef = Principal::test("chef", &[], &[]);
+        store
+            .add_grant(
+                "/von",
+                Subject::Principal(chef.id.clone()),
+                Permission::Write,
+            )
+            .await
+            .unwrap();
+
+        store
+            .publish_revision(
+                &chef,
+                &from,
+                &body_linking_to_hrefs(&["https://wiki.ohje.ooguy.com/ziel-a"]),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        assert_eq!(
+            edges(&store).await,
+            vec![(from, a)],
+            "an absolute URL at the configured origin must be an edge"
+        );
+    }
+
+    /// The other half of the safety property, end to end: with NO origin configured — the
+    /// default `fixture_with_three_pages` store — the very same absolute URL that the test
+    /// above records as an edge stays external, and publishing it does not panic.
+    #[tokio::test]
+    async fn without_a_configured_origin_the_same_absolute_url_stays_external() {
+        let (store, chef, from, _a, _b) = fixture_with_three_pages().await;
+        store
+            .publish_revision(
+                &chef,
+                &from,
+                &body_linking_to_hrefs(&["https://wiki.ohje.ooguy.com/ziel-a"]),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        assert_eq!(edges(&store).await, vec![]);
     }
 
     #[tokio::test]

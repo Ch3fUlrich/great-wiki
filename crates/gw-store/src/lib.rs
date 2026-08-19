@@ -28,6 +28,7 @@ use anyhow::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use std::str::FromStr;
+use url::Url;
 
 pub struct Store {
     /// Crate-private, for the same reason [`Store::tree`] is. A caller holding the pool can
@@ -36,6 +37,14 @@ pub struct Store {
     /// `gw-store` needs it: a query that does not exist here yet should become a method
     /// here, where the permission engine is already in scope.
     pub(crate) pool: SqlitePool,
+    /// This deployment's own public origin — scheme, host and port, nothing else — or
+    /// `None` when it is not configured. [`links::wiki_path`]'s doc comment explains why
+    /// `gw-store` cannot work this out on its own: inventing a hostname in the schema layer
+    /// would be worse than treating an absolute URL that happens to point back here as
+    /// external. It arrives through [`Store::with_public_origin`] rather than a second
+    /// `open` argument or an environment read in this crate — this is a library, and both
+    /// of those are the application's job.
+    pub(crate) public_origin: Option<Url>,
 }
 
 impl Store {
@@ -58,7 +67,23 @@ impl Store {
             .connect_with(opts)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            public_origin: None,
+        })
+    }
+
+    /// Configure the origin this deployment is publicly reachable at, so that an absolute
+    /// URL pasted back at this wiki (`https://wiki.example.com/darm/labor`, say) resolves to
+    /// a page instead of being recorded as an external link forever. A builder rather than a
+    /// second parameter on [`Store::open`]: dozens of existing call sites — mostly tests —
+    /// construct a `Store` with no opinion about this, and `None` is exactly what they
+    /// already mean, unchanged by this method existing. Compared by [`url::Url::origin`] —
+    /// scheme, host AND port — never by hostname alone, so `http://` and `https://` on the
+    /// same host, or the same scheme and host on two different ports, are different origins.
+    pub fn with_public_origin(mut self, origin: Option<Url>) -> Self {
+        self.public_origin = origin;
+        self
     }
 }
 

@@ -440,6 +440,19 @@ mutation crates/gw-store/src/links.rs killed \
   's/    sqlx::query("DELETE FROM links WHERE from_doc = ?1")/    sqlx::query("SELECT 1 FROM links WHERE from_doc = ?1")/' \
   'links: republishing replaces this page edges rather than accumulating them'
 
+# `gw-store` cannot name its own origin (it is a library; the hostname is the application's
+# configuration, see `Store::with_public_origin`), so an absolute URL is only ever internal
+# when it matches the CONFIGURED origin exactly. Deleting the comparison turns "matches" into
+# "an origin is configured at all" — any absolute URL becomes an edge the moment one is, which
+# is a much bigger door than the one this feature was meant to open. Only a test that
+# configures an origin and then presents a MISMATCHED absolute URL can catch it: every
+# existing test either configures no origin (so this branch never runs) or matches exactly
+# (so removing the comparison changes nothing observable) — the mismatched entries inside
+# `an_absolute_url_at_the_configured_origin_is_internal` are what is actually load-bearing.
+mutation crates/gw-store/src/links.rs killed \
+  's/if parsed.origin() != public_origin.origin() {/if false {/' \
+  'links: an absolute URL is internal only when its origin matches the configured one exactly'
+
 # --- the graph: an edge names TWO pages, so it discloses two ---------------------------
 #
 # The whole graph is one aggregate view over every document at once, which makes it the

@@ -32,6 +32,7 @@ use gw_auth::{Action, Principal};
 use gw_core::Block;
 use serde::Serialize;
 use sqlx::FromRow;
+use url::Url;
 
 /// The columns of a revision, in the order [`Revision`] declares them.
 ///
@@ -172,6 +173,7 @@ pub(crate) async fn append_revision(
     author: Author<'_>,
     body_json: &str,
     summary: Option<&str>,
+    public_origin: Option<&Url>,
 ) -> Result<String> {
     author.refuse_if_nobody()?;
 
@@ -204,7 +206,7 @@ pub(crate) async fn append_revision(
     // the price of extraction living in the ONE function every body change goes through,
     // rather than in each of its callers where a later third caller would forget it.
     let body: Block = serde_json::from_str(body_json)?;
-    crate::links::replace_links(&mut *conn, document_id, &path, &body).await?;
+    crate::links::replace_links(&mut *conn, document_id, &path, &body, public_origin).await?;
 
     sqlx::query(
         "INSERT INTO revisions \
@@ -328,6 +330,7 @@ impl Store {
             Author::Account(author),
             &json,
             summary,
+            self.public_origin.as_ref(),
         )
         .await?;
         tx.commit().await?;

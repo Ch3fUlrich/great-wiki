@@ -128,7 +128,9 @@ async fn main() -> Result<()> {
             identity: username,
             update,
         } => {
-            let store = gw_store::Store::open(&cfg.database_url).await?;
+            let store = gw_store::Store::open(&cfg.database_url)
+                .await?
+                .with_public_origin(cfg.public_origin.clone());
             let principal = match &username {
                 Some(username) => Some(identity(&store, username).await?),
                 None => None,
@@ -159,7 +161,9 @@ async fn main() -> Result<()> {
             content,
             identity: username,
         } => {
-            let store = gw_store::Store::open(&cfg.database_url).await?;
+            let store = gw_store::Store::open(&cfg.database_url)
+                .await?
+                .with_public_origin(cfg.public_origin.clone());
             let principal = identity(&store, &username).await?;
             let report = gw_api::export::run(&store, &principal, &content).await?;
             println!("exporting to {}", content.display());
@@ -178,7 +182,11 @@ async fn main() -> Result<()> {
             }
         }
         Command::Serve => {
-            let store = std::sync::Arc::new(gw_store::Store::open(&cfg.database_url).await?);
+            let store = std::sync::Arc::new(
+                gw_store::Store::open(&cfg.database_url)
+                    .await?
+                    .with_public_origin(cfg.public_origin.clone()),
+            );
             let oidc = match cfg.oidc.clone() {
                 Some(config) => {
                     tracing::info!(issuer = %config.issuer, client_id = %config.client_id,
