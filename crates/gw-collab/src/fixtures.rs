@@ -24,6 +24,7 @@ pub fn block(kind: BlockKind) -> Block {
         attrs: Map::new(),
         content: Vec::new(),
         text: None,
+        marks: Vec::new(),
     }
 }
 

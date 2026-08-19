@@ -477,6 +477,7 @@ fn empty_document() -> Block {
         attrs: serde_json::Map::new(),
         content: Vec::new(),
         text: None,
+        marks: Vec::new(),
     }
 }
 

@@ -31,6 +31,60 @@ pub enum BlockKind {
     Text,
 }
 
+/// The inline formatting marks M1 understands, shaped exactly like a ProseMirror mark.
+/// `#[non_exhaustive]` for the same reason as `BlockKind`: adding one is not a breaking
+/// change for downstream matches, which must therefore carry a wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum MarkKind {
+    Strong,
+    Em,
+    Code,
+    Strike,
+    Link,
+}
+
+/// Inline formatting on a text leaf, shaped exactly like a ProseMirror mark.
+///
+/// A link carries EITHER `doc` (an internal target, per D-5) or `href` (external, or an
+/// internal one that could not be resolved). Never both: `target_doc` reading an `href`
+/// as an id would turn a URL into a document reference.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Mark {
+    pub kind: MarkKind,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub attrs: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Mark {
+    pub fn link_to_doc(id: &str) -> Self {
+        let mut attrs = serde_json::Map::new();
+        attrs.insert("doc".into(), serde_json::Value::String(id.to_string()));
+        Mark {
+            kind: MarkKind::Link,
+            attrs,
+        }
+    }
+
+    pub fn link_to_url(url: &str) -> Self {
+        let mut attrs = serde_json::Map::new();
+        attrs.insert("href".into(), serde_json::Value::String(url.to_string()));
+        Mark {
+            kind: MarkKind::Link,
+            attrs,
+        }
+    }
+
+    /// `Some` only for a `Link` mark carrying an internal `doc` target; never reads `href`.
+    pub fn target_doc(&self) -> Option<&str> {
+        if self.kind != MarkKind::Link {
+            return None;
+        }
+        self.attrs.get("doc").and_then(|v| v.as_str())
+    }
+}
+
 /// A node in the document tree, shaped exactly like a ProseMirror node.
 ///
 /// Matching the editor's own representation means there is no translation layer between
@@ -44,6 +98,8 @@ pub struct Block {
     pub content: Vec<Block>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub marks: Vec<Mark>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,7 +174,7 @@ impl Block {
 
 #[cfg(test)]
 mod tests {
-    use crate::block::{Block, BlockKind};
+    use crate::block::{Block, BlockKind, Mark};
 
     fn sample() -> Block {
         serde_json::from_str(
@@ -213,5 +269,34 @@ mod tests {
         let again: Block = serde_json::from_str(&serde_json::to_string(&doc).unwrap()).unwrap();
         assert_eq!(again.plain_text(), doc.plain_text());
         assert_eq!(again.headings().len(), doc.headings().len());
+    }
+
+    #[test]
+    fn a_mark_round_trips_through_json_and_an_absent_marks_field_is_empty() {
+        let b: Block = serde_json::from_str(
+            r#"{"kind":"text","text":"hallo","marks":[{"kind":"strong"},
+                 {"kind":"link","attrs":{"doc":"019ff0"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(b.marks.len(), 2);
+        assert_eq!(b.marks[1].target_doc(), Some("019ff0"));
+
+        // A block written before marks existed must still parse, and must not grow a key.
+        let old: Block = serde_json::from_str(r#"{"kind":"text","text":"hallo"}"#).unwrap();
+        assert!(old.marks.is_empty());
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            r#"{"kind":"text","text":"hallo"}"#
+        );
+    }
+
+    #[test]
+    fn an_external_link_is_not_a_document_reference() {
+        let m = Mark::link_to_url("https://example.org");
+        assert_eq!(
+            m.target_doc(),
+            None,
+            "an href must never be read as a document id"
+        );
     }
 }
