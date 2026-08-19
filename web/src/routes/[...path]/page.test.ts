@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import Page from './+page.svelte';
-import { ANONYMOUS, type Me, type StoredDocument, type TreeNode } from '$lib/api';
+import { ANONYMOUS, type Backlink, type Me, type StoredDocument, type TreeNode } from '$lib/api';
 import type { Block } from '$lib/blocks/render';
 
 /**
@@ -70,9 +70,13 @@ const signedIn: Me = {
  */
 function html(
   doc: StoredDocument = container,
-  { me = ANONYMOUS, edit = false }: { me?: Me; edit?: boolean } = {}
+  {
+    me = ANONYMOUS,
+    edit = false,
+    backlinks = []
+  }: { me?: Me; edit?: boolean; backlinks?: Backlink[] } = {}
 ): string {
-  return render(Page, { props: { data: { me, doc, body, tree, edit } } }).body.replace(
+  return render(Page, { props: { data: { me, doc, body, tree, backlinks, edit } } }).body.replace(
     /<!--.*?-->/g,
     ''
   );
@@ -135,6 +139,22 @@ describe('the reader page, server-rendered', () => {
     expect(out).not.toContain('Unterseiten');
     expect(out).toMatch(/aria-label="Pfad"/);
     expect(out).toContain('Sichtbarkeit');
+  });
+
+  it('renders no backlinks section when nothing points here — the common case', () => {
+    // Most pages in this corpus legitimately have no backlinks yet; the panel must not be
+    // furniture paid for by every page that has nothing to show.
+    const out = html();
+    expect(out).not.toContain('Verweist hierher');
+  });
+
+  it('carries the backlinks panel in the first response when there is something to show', () => {
+    const out = html(container, {
+      backlinks: [{ path: '/rundgang/tabellen', title: 'Tabellen' }]
+    });
+    expect(out).toMatch(/<h2 id="gw-backlinks"[^>]*>\s*Verweist hierher\s*<\/h2>/);
+    expect(out).toContain('href="/rundgang/tabellen"');
+    expect(out).toContain('Tabellen');
   });
 });
 

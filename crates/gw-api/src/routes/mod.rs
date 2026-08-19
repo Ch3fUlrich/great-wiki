@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod collab;
 pub mod docs;
+pub mod links;
 pub mod tree;
 
 use crate::auth::{OidcClient, OidcConfig};
@@ -350,6 +351,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/tree", get(tree::get_tree))
         .route("/api/documents/{*path}", get(docs::get_document))
         .merge(collab::routes())
+        .merge(links::routes())
         .merge(admin::routes())
         .merge(crate::auth::routes())
         .merge(crate::view_as::routes())

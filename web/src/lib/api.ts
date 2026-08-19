@@ -10,6 +10,16 @@ export interface TreeNode {
   children: TreeNode[];
 }
 
+/**
+ * One page that links to the page being read. Mirrors
+ * `gw_api::routes::links::BacklinkView` — `path` and `title` only, never the linking
+ * document's id, which has no reason to leave the API.
+ */
+export interface Backlink {
+  path: string;
+  title: string;
+}
+
 /** One person, as `/api/me` names them. Mirrors `gw_api::view_as::PersonRef`. */
 export interface PersonRef {
   id: string;

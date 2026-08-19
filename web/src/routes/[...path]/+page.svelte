@@ -1,5 +1,6 @@
 <script lang="ts">
   import { browser } from '$app/environment';
+  import Backlinks from '$lib/components/Backlinks.svelte';
   import BlockView from '$lib/components/BlockView.svelte';
   import Breadcrumb from '$lib/components/Breadcrumb.svelte';
   import PageMeta from '$lib/components/PageMeta.svelte';
@@ -167,6 +168,7 @@
     {/if}
 
     <Subpages nodes={subpages} />
+    <Backlinks backlinks={data.backlinks} />
   </main>
 
   {#if headings.length > 1}
