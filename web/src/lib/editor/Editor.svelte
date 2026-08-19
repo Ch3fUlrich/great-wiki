@@ -297,7 +297,7 @@
 <section class="gw-ed" aria-label="Seite bearbeiten">
   <div class="gw-ed-bar">
     <div class="gw-ed-bar-row">
-      <EditorToolbar {editor} enabled={ready && mayType(session)} />
+      <EditorToolbar {editor} enabled={ready && mayType(session)} {path} />
 
       <div class="gw-ed-actions">
         {#if peers.length > 0}

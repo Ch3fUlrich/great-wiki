@@ -21,6 +21,7 @@ serde_yaml = "0.9"
 pulldown-cmark = { version = "0.12", default-features = false }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
+url = "2.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # The login tests generate a real RSA key rather than committing one to a public

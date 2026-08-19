@@ -178,12 +178,16 @@ pub(crate) async fn append_revision(
     let id = uuid::Uuid::now_v7().to_string();
     let size = body_json.len() as i64;
 
-    let parent: Option<String> =
-        sqlx::query_scalar("SELECT current_revision_id FROM documents WHERE id = ?1")
+    // `path` alongside `current_revision_id` in one query: extraction below needs the
+    // document's OWN path as the base a bare relative `href` resolves against (see
+    // `links::wiki_path`), and this is already the one place that reads the document row
+    // inside the transaction.
+    let (path, parent): (String, Option<String>) =
+        sqlx::query_as("SELECT path, current_revision_id FROM documents WHERE id = ?1")
             .bind(document_id)
             .fetch_optional(&mut *conn)
             .await?
-            .flatten();
+            .unwrap_or_default();
 
     // The graph is derived from the body, so it is rewritten wherever the body is — here,
     // on the caller's connection, inside the caller's transaction. Anywhere else would be
@@ -200,7 +204,7 @@ pub(crate) async fn append_revision(
     // the price of extraction living in the ONE function every body change goes through,
     // rather than in each of its callers where a later third caller would forget it.
     let body: Block = serde_json::from_str(body_json)?;
-    crate::links::replace_links(&mut *conn, document_id, &body).await?;
+    crate::links::replace_links(&mut *conn, document_id, &path, &body).await?;
 
     sqlx::query(
         "INSERT INTO revisions \

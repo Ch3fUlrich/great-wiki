@@ -23,15 +23,23 @@
   import { ToggleGroup } from '@ark-ui/svelte/toggle-group';
   import type { Editor } from '@tiptap/core';
   import { safeHref } from '$lib/blocks/render';
+  import { normalizeLinkAddress } from './linkAddress';
 
   interface Props {
     /** `null` until the session is live and the surface exists. */
     editor: Editor | null;
     /** Whether a command could reach anywhere. False in every dead-end session state. */
     enabled: boolean;
+    /**
+     * The document's own stored path, leading slash included — same value `Editor.svelte`
+     * has as its `path` prop. What the Link control resolves a relative address against
+     * (`normalizeLinkAddress`), so that what gets stored already names the page a click
+     * actually lands on rather than leaving that for `gw_store::links::wiki_path` to guess.
+     */
+    path: string;
   }
 
-  let { editor, enabled }: Props = $props();
+  let { editor, enabled, path }: Props = $props();
 
   /**
    * One entry per control: what it is called, whether it is on, and what pressing it does.
@@ -159,14 +167,31 @@
           e.chain().focus().unsetLink().run();
           return;
         }
-        const typed = window.prompt('Adresse des Links (https://…):');
+        // Leads with "a page in this wiki", not with `https://…`. The old wording told
+        // people to paste the address bar — `safeHref` accepts that, the link renders and
+        // works, and `gw_store::links::wiki_path` has no origin to compare it against, so it
+        // is always read as external: the ONE flow this prompt pointed at was the flow that
+        // recorded no edge and left the backlinks panel silently short. A relative address
+        // (this page's own path, or a page-relative reference like `../nachbar`) is what
+        // `wiki_path` can actually resolve, so it is offered first.
+        const typed = window.prompt(
+          'Wohin soll der Link führen? Seite in diesem Wiki (z. B. /darm/labor oder, von ' +
+            'hier aus, nachbar) oder vollständige Adresse (https://… oder mailto:…):'
+        );
         if (typed === null || typed.trim() === '') return;
+        // Normalised at the one moment this code still knows two things `wiki_path` on the
+        // server deliberately does not: the browser's own origin, and the path of the page
+        // this link is being written on (`linkAddress.ts`). A same-origin absolute address
+        // (paste-the-address-bar) becomes its path; a relative one is resolved against THIS
+        // page rather than left for the server to root-anchor against the site root, which
+        // named the wrong page for anything without a leading slash.
+        const normalized = normalizeLinkAddress(location.origin, path, typed);
         // The renderer refuses to build an `<a>` for anything but http/https/mailto —
         // `javascript:` in an href is stored XSS against every reader, and `BlockView` is
         // where that is stopped for ALL writers, not just this one. Checking the same rule
         // here as well is not the security boundary; it is the difference between being
         // told and watching a link silently come out as plain text on the published page.
-        const href = safeHref(typed.trim());
+        const href = safeHref(normalized);
         if (href === null) {
           window.alert(
             'Diese Adresse wird nicht verlinkt. Erlaubt sind nur Adressen, die mit ' +

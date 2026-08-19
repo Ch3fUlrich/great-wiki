@@ -1,0 +1,71 @@
+/**
+ * What the Link control in {@link EditorToolbar} does with what a person typed into the
+ * `window.prompt`, before it ever reaches {@link import('$lib/blocks/render').safeHref}.
+ *
+ * # The bug this exists to close
+ *
+ * The prompt used to read, verbatim, "Adresse des Links (https://…):" — it TOLD the person
+ * to paste an absolute URL. `safeHref` accepts one, the rendered `<a>` works, and the reader
+ * clicks through without noticing anything is wrong. But `gw_store::links::wiki_path` only
+ * turns a scheme-less, authority-less reference into a graph edge (`crates/gw-store/src/
+ * links.rs`'s module doc explains why: it has no idea which origin is its own, and guessing
+ * would mean inventing a hostname and drawing edges from it). An absolute `https://…` URL is
+ * therefore always read as external, even the ones that point straight back at this wiki —
+ * so the dominant, PROMPTED authoring flow was the one flow that recorded no edge at all.
+ * The backlinks panel and the graph both look broken, silently, for every link anyone
+ * actually pasted the way they were told to.
+ *
+ * # What this function does about it
+ *
+ * Normalises what was typed at the one moment this code still knows two things `gw-store`
+ * deliberately does not: the browser's own `location.origin`, and the path of the page the
+ * link is being written on. Neither is passed as a global read here — `location` does not
+ * exist in this project's test environment, and a function that reaches for it directly
+ * cannot be unit-tested — so both arrive as arguments, exactly as `collabTarget` in
+ * `./session.ts` takes `origin` rather than reading it.
+ *
+ * - A same-origin absolute URL (what pasting the address bar produces) becomes its path,
+ *   query and fragment — the same shape `wiki_path` already resolves.
+ * - A foreign absolute URL is returned unchanged: it addresses somewhere this wiki cannot
+ *   and must not claim an edge to, same as `wiki_path` treats it.
+ * - Anything else is a relative reference and is resolved against the CURRENT page, root-
+ *   anchored by construction (`URL.pathname` always starts with `/`) — which is what fixes
+ *   the companion bug in `wiki_path` for links written here specifically: Task 7 shipped
+ *   root-anchoring a bare relative reference instead of resolving it against its own page,
+ *   and everything typed through this control now arrives already resolved, so `wiki_path`
+ *   never has to guess for it.
+ *
+ * # What this does NOT cover
+ *
+ * Markdown imported with an absolute self-link (`[siehe](https://wiki.example.org/ziel)`
+ * baked into a file before it ever reaches this control) is untouched — this function runs
+ * at EDITOR INSERT TIME, not on every body a revision ever holds, and the importer has no
+ * origin to compare against for the same reason `gw-store` does not: the deployment host is
+ * configuration, not something either of them is handed. That gap is real and unclosed.
+ */
+export function normalizeLinkAddress(origin: string, currentPath: string, typed: string): string {
+  const trimmed = typed.trim();
+  if (trimmed === '') return trimmed;
+
+  try {
+    // Parses only when `trimmed` carries its own scheme and is therefore an ABSOLUTE
+    // reference — `new URL` with no base throws on anything relative, which is how the two
+    // cases below are told apart.
+    const asTyped = new URL(trimmed);
+    if (asTyped.origin === origin) {
+      return asTyped.pathname + asTyped.search + asTyped.hash;
+    }
+    // A foreign origin, or a non-special scheme (`mailto:`, `javascript:`, …) for which the
+    // WHATWG parser reports `origin` as the literal string `"null"` — never equal to a real
+    // `location.origin`, so it falls through here unchanged. `safeHref` is what refuses a
+    // dangerous scheme; this function's job ends at "did not touch a foreign address".
+    return trimmed;
+  } catch {
+    // Not parseable on its own, so it is relative. Resolved against the page it was typed
+    // on — exactly what a browser would do with it left in the body unresolved — which is
+    // the whole fix: this used to reach `wiki_path` un-resolved and get root-anchored
+    // instead, naming a page the link did not go to.
+    const resolved = new URL(trimmed, origin + currentPath);
+    return resolved.pathname + resolved.search + resolved.hash;
+  }
+}

@@ -32,6 +32,7 @@ use gw_auth::{Action, Principal};
 use gw_core::{Block, Mark, MarkKind};
 use serde::Serialize;
 use std::collections::BTreeSet;
+use url::Url;
 
 /// One page that links to the page being read.
 #[derive(Debug, Clone, Serialize)]
@@ -51,27 +52,30 @@ struct Targets {
 }
 
 /// Every link target in this body, deduplicated, in no particular order.
-fn collect(body: &Block, into: &mut Targets) {
+///
+/// `from` is the linking document's OWN path — the base an `href` with no leading slash is
+/// resolved against, per [`wiki_path`].
+fn collect(body: &Block, into: &mut Targets, from: &str) {
     for mark in &body.marks {
         // A link carries EITHER `doc` or `href`, never both — `gw_core::Mark` says so — and
         // `else` rather than a second `if` keeps that true here even if one ever did.
         if let Some(doc) = mark.target_doc() {
             into.docs.insert(doc.to_string());
-        } else if let Some(path) = internal_path(mark) {
+        } else if let Some(path) = internal_path(mark, from) {
             into.paths.insert(path);
         }
     }
     for child in &body.content {
-        collect(child, into);
+        collect(child, into, from);
     }
 }
 
 /// The wiki path a link mark's `href` names, if it names one at all.
-fn internal_path(mark: &Mark) -> Option<String> {
+fn internal_path(mark: &Mark, from: &str) -> Option<String> {
     if mark.kind != MarkKind::Link {
         return None;
     }
-    wiki_path(mark.attrs.get("href")?.as_str()?)
+    wiki_path(mark.attrs.get("href")?.as_str()?, from)
 }
 
 /// The document path an address names, or `None` if it does not name one in this wiki.
@@ -85,17 +89,29 @@ fn internal_path(mark: &Mark) -> Option<String> {
 /// when it happens to point back here. Guessing otherwise would mean inventing a hostname
 /// and drawing edges from it.
 ///
-/// Everything else is root-anchored: `ziel/a` and `/ziel/a` are the same page, because a
-/// document path always begins at the root and a wiki has no working directory. A query or
-/// a fragment is addressing part of a page rather than a different one, so `?x=1` and
-/// `#abschnitt` are trimmed — and an address that is *only* a fragment names the page it is
-/// already on, which is not an edge.
+/// **A reference with no leading slash is resolved against `from` — the linking document's
+/// OWN path — never against the site root.** `web/src/app.html` sets no `<base>`, so a
+/// browser resolves `href="nachbar"` written on `/rundgang/tabellen` against *that page's*
+/// URL: the click lands on `/rundgang/nachbar`, never on `/nachbar`. Root-anchoring it
+/// instead — what this function did before the review that found this — named a page the
+/// link does not go to. That is not a disclosure (both ends are still permission-filtered
+/// by [`Store::backlinks_for`]), but a backlinks panel that lists the wrong linker while
+/// omitting the real one is worse than recording nothing, and the earlier doc comment on
+/// this very function said "that is what a browser does with it too, and the graph should
+/// agree with the link" one paragraph after doing the opposite of that.
 ///
-/// Nothing here resolves `.` or `..`: they are relative to a base this function is not
-/// given, and root-anchoring them produces a path that `slugify` can never have made, so
-/// they resolve to no document and record no edge. That is the same outcome as any other
-/// link into nothing, and it is deliberately not a special case.
-fn wiki_path(href: &str) -> Option<String> {
+/// The resolution itself goes through [`url`]'s WHATWG implementation, against a
+/// placeholder origin holding `from` — the same trick `safeHref` in
+/// `web/src/lib/blocks/render.ts` plays on the client, and for the same reason: that is the
+/// actual algorithm a browser runs, so this is not a second, possibly-disagreeing one. It
+/// also makes `.` and `..` work, which is a consequence of resolving against a real base
+/// rather than a goal in itself — nothing here special-cases them.
+///
+/// A query or a fragment addresses part of a page rather than a different one, so `?x=1`
+/// and `#abschnitt` are trimmed before any resolution happens — and an address that is
+/// *only* a query, a fragment, `/`, or empty names the page it is already on (or nothing),
+/// which is refused here without ever consulting `from`.
+fn wiki_path(href: &str, from: &str) -> Option<String> {
     let href = href.trim();
     if has_scheme(href) || href.starts_with("//") {
         return None;
@@ -107,7 +123,19 @@ fn wiki_path(href: &str) -> Option<String> {
     if path.is_empty() {
         return None;
     }
-    Some(format!("/{}", path.trim_start_matches('/')))
+    if let Some(rooted) = path.strip_prefix('/') {
+        return Some(format!("/{rooted}"));
+    }
+    // No leading slash: resolve against the document this href was written on, exactly as
+    // a browser would with no `<base>` in scope. `from` always has one (`Store::create_
+    // document`'s `resolved_path` guarantees it), so this base always parses.
+    let base = Url::parse(&format!("https://wiki.invalid{from}")).ok()?;
+    let resolved = base.join(path).ok()?;
+    let resolved = resolved.path().trim_end_matches('/');
+    if resolved.is_empty() {
+        return None;
+    }
+    Some(resolved.to_string())
 }
 
 /// Whether an address begins with a URI scheme, as RFC 3986 defines one.
@@ -154,13 +182,21 @@ async fn document_with_id(conn: &mut sqlx::SqliteConnection, id: &str) -> Result
 /// which is its only caller — and the pool would not do even if the reasoning were absent,
 /// because it holds a single connection and asking it for a second one inside a transaction
 /// waits for the one the transaction is holding until it times out.
+///
+/// **This write is deliberately unfiltered.** `from_doc` may hold `links` edges to a
+/// document its own author cannot Read — nothing here asks. That is correct only because
+/// [`Store::backlinks_for`] gates on the *target* at read time; the read side carries the
+/// whole disclosure property this table has, and any later consumer of `links` (Task 9's
+/// graph, most concretely) must filter both ends rather than assume a row here already
+/// implies the author could see where it points.
 pub(crate) async fn replace_links(
     conn: &mut sqlx::SqliteConnection,
     from_doc: &str,
+    from_path: &str,
     body: &Block,
 ) -> Result<()> {
     let mut found = Targets::default();
-    collect(body, &mut found);
+    collect(body, &mut found, from_path);
 
     sqlx::query("DELETE FROM links WHERE from_doc = ?1")
         .bind(from_doc)
@@ -173,10 +209,34 @@ pub(crate) async fn replace_links(
     // `/ziel` and `ziel/` — collapse into one edge here.
     let mut edges = BTreeSet::new();
     for id in &found.docs {
-        edges.extend(document_with_id(&mut *conn, id).await?);
+        match document_with_id(&mut *conn, id).await? {
+            Some(resolved) => {
+                edges.insert(resolved);
+            }
+            // Silent otherwise: a `doc` mark naming a deleted or never-existing document is
+            // an ordinary fact about the body (see the module comment), not an error. But
+            // silent all the way to "nothing at all" leaves "why is my backlinks panel
+            // empty" with no diagnosis, so it is at least named at debug level.
+            None => tracing::debug!(
+                target: "gw_store::links",
+                %from_doc,
+                doc = %id,
+                "a `doc` mark named no live document; no edge recorded"
+            ),
+        }
     }
     for path in &found.paths {
-        edges.extend(document_at(&mut *conn, path).await?);
+        match document_at(&mut *conn, path).await? {
+            Some(resolved) => {
+                edges.insert(resolved);
+            }
+            None => tracing::debug!(
+                target: "gw_store::links",
+                %from_doc,
+                %path,
+                "an internal-looking href resolved to no live document; no edge recorded"
+            ),
+        }
     }
 
     for to_doc in edges {
@@ -439,40 +499,153 @@ mod tests {
     fn which_addresses_name_a_page_in_this_wiki() {
         // The rule itself, stated once and away from the database, because the tests below
         // can only show that a resolvable address resolved — not why an unresolvable one
-        // was never looked up.
-        for (href, expected) in [
-            ("/ziel-a", Some("/ziel-a")),
-            // Root-anchored: a document path starts at the root and a wiki has no working
-            // directory, so these are the same page.
-            ("ziel-a", Some("/ziel-a")),
-            ("/ziel/a/", Some("/ziel/a")),
-            ("/ziel-a?von=hier", Some("/ziel-a")),
-            ("/ziel-a#abschnitt", Some("/ziel-a")),
-            ("  /ziel-a  ", Some("/ziel-a")),
+        // was never looked up. `from` is the linking document's own path; most rows below
+        // use a root-level one (`/von`) because it does not matter to them, but the ones
+        // that DO care about it are the point of this test after the review that found
+        // Task 7 root-anchoring a bare relative reference instead of resolving it — see the
+        // dedicated block below the table.
+        for (href, from, expected) in [
+            ("/ziel-a", "/von", Some("/ziel-a")),
+            // A source page at the ROOT makes root-anchoring and "resolve against `from`"
+            // agree, which is exactly why this shape alone cannot tell the two apart — the
+            // block below the table is what actually exercises resolution.
+            ("ziel-a", "/von", Some("/ziel-a")),
+            ("/ziel/a/", "/von", Some("/ziel/a")),
+            ("/ziel-a?von=hier", "/von", Some("/ziel-a")),
+            ("/ziel-a#abschnitt", "/von", Some("/ziel-a")),
+            ("  /ziel-a  ", "/von", Some("/ziel-a")),
             // A colon AFTER a separator is part of the path, not a scheme.
-            ("/ziel:a", Some("/ziel:a")),
+            ("/ziel:a", "/von", Some("/ziel:a")),
             // A colon before one is a scheme, even when it looks like a slug. That is what
             // a browser does with it too, which is the only reading that matches the link.
-            ("ziel:a", None),
-            ("https://example.org/ziel-a", None),
-            ("HTTPS://example.org/ziel-a", None),
-            ("mailto:jemand@example.org", None),
-            ("javascript:alert(1)", None),
+            ("ziel:a", "/von", None),
+            ("https://example.org/ziel-a", "/von", None),
+            ("HTTPS://example.org/ziel-a", "/von", None),
+            ("mailto:jemand@example.org", "/von", None),
+            ("javascript:alert(1)", "/von", None),
             // An authority, so some other origin — even though the scheme is missing.
-            ("//example.org/ziel-a", None),
-            // Part of a page rather than a different page.
-            ("#abschnitt", None),
-            ("?von=hier", None),
-            ("/", None),
-            ("", None),
-            ("   ", None),
+            ("//example.org/ziel-a", "/von", None),
+            // Part of a page rather than a different page. None of these ever reach `from`.
+            ("#abschnitt", "/von", None),
+            ("?von=hier", "/von", None),
+            ("/", "/von", None),
+            ("", "/von", None),
+            ("   ", "/von", None),
         ] {
             assert_eq!(
-                wiki_path(href).as_deref(),
+                wiki_path(href, from).as_deref(),
                 expected,
-                "the address `{href}` was read wrongly"
+                "the address `{href}` from `{from}` was read wrongly"
             );
         }
+
+        // The property the review actually found broken: a bare relative reference — no
+        // leading slash — is resolved against the page it was WRITTEN on, not against the
+        // root. The probe that found it: `/rundgang/tabellen` linking to `nachbar` is a
+        // click to `/rundgang/nachbar`, because `web/src/app.html` sets no `<base>` and a
+        // browser resolves it against its own URL. Root-anchoring it (what this function
+        // did before this fix) would have named `/nachbar` — a page the link does not go
+        // to. `.` and `..` are exercised here too, as a consequence of resolving against a
+        // real base rather than as cases of their own.
+        for (href, from, expected) in [
+            ("nachbar", "/rundgang/tabellen", Some("/rundgang/nachbar")),
+            ("./nachbar", "/rundgang/tabellen", Some("/rundgang/nachbar")),
+            ("../ziel-a", "/rundgang/tabellen", Some("/ziel-a")),
+            // Two levels up from a page one level deep does not reach past the root; a
+            // browser resolving this treats the extra `..` as a no-op rather than an error.
+            ("../../ziel-a", "/rundgang", Some("/ziel-a")),
+        ] {
+            assert_eq!(
+                wiki_path(href, from).as_deref(),
+                expected,
+                "the address `{href}` from `{from}` did not resolve against its own page"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bare_relative_href_resolves_against_its_own_page_not_the_root() {
+        // The end-to-end shape of the probe that found this: a page at `/rundgang/tabellen`
+        // links to `nachbar` with no leading slash. A page genuinely exists at the WRONG
+        // target, `/nachbar`, so root-anchoring (what publishing used to do) would not have
+        // recorded no edge — it would have recorded a real, wrong one, to a page this link
+        // does not go to. The correct target, `/rundgang/nachbar`, also exists, so this
+        // proves resolution lands on it rather than merely failing safe onto neither.
+        let store = store().await;
+        let wrong_target = store
+            .create_document(
+                Author::Import,
+                &NewDocument {
+                    parent_path: None,
+                    doc_type: DocumentType::Page,
+                    title: "Nachbar (Wurzel)".into(),
+                    slug: Some("nachbar".into()),
+                    language: "de".into(),
+                    visibility: Visibility::Public,
+                    body: body_linking_to(&[]),
+                    sort_key: 0,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let source = store
+            .create_document(
+                Author::Import,
+                &NewDocument {
+                    parent_path: Some("/rundgang".into()),
+                    doc_type: DocumentType::Page,
+                    title: "Tabellen".into(),
+                    slug: None,
+                    language: "de".into(),
+                    visibility: Visibility::Public,
+                    body: body_linking_to(&[]),
+                    sort_key: 0,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let right_target = store
+            .create_document(
+                Author::Import,
+                &NewDocument {
+                    parent_path: Some("/rundgang".into()),
+                    doc_type: DocumentType::Page,
+                    title: "Nachbar".into(),
+                    slug: Some("nachbar".into()),
+                    language: "de".into(),
+                    visibility: Visibility::Public,
+                    body: body_linking_to(&[]),
+                    sort_key: 0,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let chef = Principal::test("chef", &[], &[]);
+        store
+            .add_grant(
+                "/rundgang/tabellen",
+                Subject::Principal(chef.id.clone()),
+                Permission::Write,
+            )
+            .await
+            .unwrap();
+
+        store
+            .publish_revision(&chef, &source, &body_linking_to_hrefs(&["nachbar"]), None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        assert_eq!(
+            edges(&store).await,
+            vec![(source, right_target)],
+            "a bare relative href must resolve against its own document's path; an edge to \
+             {wrong_target} would mean the graph named /nachbar, which the link does not go to"
+        );
     }
 
     #[tokio::test]
@@ -528,8 +701,15 @@ mod tests {
     async fn a_link_that_resolves_to_nothing_is_not_an_error() {
         // An unresolvable internal link is a fact about the body, not a reason to refuse
         // the publish — and neither is a `doc` id naming a document that has been deleted.
+        //
+        // "../ziel-a" is deliberately NOT one of these examples any more: `from` here is
+        // `/von`, a root-level page, and `..` off a root-level page's directory now
+        // resolves to `/ziel-a` — a page that exists — since bare relative references
+        // resolve against `from` rather than being root-anchored (see
+        // `which_addresses_name_a_page_in_this_wiki`). "../nirgendwo" keeps this test
+        // exercising a relative reference while still resolving to nothing.
         let (store, chef, from, _a, _b) = fixture_with_three_pages().await;
-        let mut body = body_linking_to_hrefs(&["/gibt-es-nicht", "../ziel-a"]);
+        let mut body = body_linking_to_hrefs(&["/gibt-es-nicht", "../nirgendwo"]);
         body.content
             .extend(body_linking_to(&["nicht-mal-eine-id"]).content);
 
