@@ -18,11 +18,12 @@
 //! to `gw-core` round-trips through here with no change to this file.
 
 use crate::{CollabError, Result};
-use gw_core::{Block, BlockKind};
+use gw_core::{Block, BlockKind, Mark, MarkKind};
 use serde_json::{Map, Value};
 use std::sync::Arc;
 use yrs::types::text::YChange;
 use yrs::types::xml::XmlOut;
+use yrs::types::Attrs;
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{
@@ -236,6 +237,7 @@ fn write_children(txn: &mut TransactionMut, root: &XmlFragmentRef, blocks: &[Blo
             // A text leaf's `content` has nowhere to go: ProseMirror text nodes are leaves.
             let text = parent.push_text(txn, block.text.as_deref().unwrap_or_default());
             write_attributes(txn, &text, &block.attrs);
+            write_marks(txn, &text, &block.marks);
             continue;
         }
         let element = parent.push_element(txn, &tag_of(block.kind));
@@ -251,6 +253,95 @@ fn write_attributes<X: Xml>(txn: &mut TransactionMut, node: &X, attrs: &Map<Stri
     for (key, value) in attrs {
         node.insert_attribute(txn, key.clone(), json_to_any(value));
     }
+}
+
+/// Apply a leaf's marks to the `XmlText` that holds it, as Yjs formatting over the whole
+/// range.
+///
+/// Each `Block::Text` leaf is its own, separate `XmlTextRef` — `write_children` never merges
+/// two leaves into one shared text — so "the whole range" and "this leaf's marks" are the
+/// same thing. One `format` call carries every mark at once: `insert_format` merges the
+/// attributes it is given with what is already there, so a single call and one per mark are
+/// equivalent, and one call is cheaper.
+///
+/// An empty leaf is left unformatted. Yjs formatting wraps *content*; a zero-length range
+/// has none for the attributes to attach to, so a mark on an empty leaf cannot survive this
+/// representation. Nothing in this project writes one today.
+fn write_marks(txn: &mut TransactionMut, node: &XmlTextRef, marks: &[Mark]) {
+    if marks.is_empty() {
+        return;
+    }
+    let len = node.len(txn);
+    if len == 0 {
+        return;
+    }
+    node.format(txn, 0, len, marks_to_attrs(marks));
+}
+
+/// A mark's Yjs attribute key: the *serde* name of its [`MarkKind`] — `strong`, not `Strong`
+/// — the same name a real `y-prosemirror` client would format under, so a document this
+/// crate writes and one the browser writes are shaped alike on the wire.
+fn mark_key_of(kind: MarkKind) -> String {
+    match serde_json::to_value(kind) {
+        Ok(Value::String(key)) => key,
+        // `MarkKind` is a unit-variant enum with `rename_all = "camelCase"`; it has no other
+        // serialised form. If that ever stops being true, the mark is dropped rather than
+        // panicking on a remote client's update — the same defensive shape as `tag_of`.
+        _ => "strong".to_string(),
+    }
+}
+
+/// The mark kind a Yjs attribute key names, or `None` for a key this schema has no kind for
+/// — an attribute a real editor never wrote, or one from a mark kind this crate does not yet
+/// know (`MarkKind` is `#[non_exhaustive]`).
+fn kind_of_mark_key(key: &str) -> Option<MarkKind> {
+    serde_json::from_value(Value::String(key.to_string())).ok()
+}
+
+/// A leaf's marks as one Yjs attribute map: one entry per mark, keyed by [`mark_key_of`].
+///
+/// A mark with no attrs (`Strong`, `Em`, `Code`, `Strike`) is written as `true` — there is
+/// nothing else to say. A mark that carries attrs (`Link`'s `doc` or `href`) is written as a
+/// nested map through the same [`json_to_any`] this file already uses for a block's own
+/// `attrs`, so `doc` and `href` keep their JSON type and neither is flattened away.
+fn marks_to_attrs(marks: &[Mark]) -> Attrs {
+    let mut attrs = Attrs::new();
+    for mark in marks {
+        let value = if mark.attrs.is_empty() {
+            Any::Bool(true)
+        } else {
+            json_to_any(&Value::Object(mark.attrs.clone()))
+        };
+        attrs.insert(mark_key_of(mark.kind).into(), value);
+    }
+    attrs
+}
+
+/// The inverse of [`marks_to_attrs`]: a Yjs attribute map as a leaf's `marks`, sorted into
+/// [`gw_core::MARK_ORDER`].
+///
+/// Sorted, not merely collected: `Attrs` is a `HashMap`, so the order its entries come out in
+/// is not the order they were formatted in and can change between two runs of the same
+/// process. `Block::marks` is a nesting, and the markdown exporter trusts it to already be in
+/// canonical order — an unsorted read here is a document that round-trips through the CRDT
+/// and then fails to round-trip through markdown.
+fn attrs_to_marks(attrs: Option<&Attrs>) -> Vec<Mark> {
+    let Some(attrs) = attrs else {
+        return Vec::new();
+    };
+    let mut marks: Vec<Mark> = attrs
+        .iter()
+        .filter_map(|(key, value)| {
+            let kind = kind_of_mark_key(key)?;
+            let attrs = match any_to_json(value) {
+                Value::Object(fields) => fields,
+                _ => Map::new(),
+            };
+            Some(Mark { kind, attrs })
+        })
+        .collect();
+    marks.sort_by_key(|mark| mark.kind.nesting_rank());
+    marks
 }
 
 /// A partially built block: the children still to visit, and what has been built so far.
@@ -295,13 +386,13 @@ fn read_fragment<T: ReadTxn>(txn: &T, root: &XmlFragmentRef) -> Block {
 
         match child {
             XmlOut::Text(text) => {
-                let block = read_text(txn, &text);
+                let leaves = read_text_leaves(txn, &text);
                 stack
                     .last_mut()
                     .expect("the loop only runs with a frame open")
                     .block
                     .content
-                    .push(block);
+                    .extend(leaves);
             }
             XmlOut::Element(element) => {
                 let children = element.children(txn).collect();
@@ -336,24 +427,46 @@ fn read_fragment<T: ReadTxn>(txn: &T, root: &XmlFragmentRef) -> Block {
     }
 }
 
-/// A text leaf, without its formatting.
+/// One `XmlTextRef`, as one or more `Block::Text` leaves.
+///
+/// Usually one: `write_children` gives every `Block::Text` leaf its own `XmlTextRef`, so an
+/// unformatted round trip stays one leaf in, one leaf out. It can come back as more than one
+/// leaf here, though — a browser can select a run in the *middle* of one `XmlTextRef` and
+/// format only that, which `Block` cannot express as a single leaf with a uniform `marks`.
+/// `diff` already assembles maximal runs of uniform formatting (see its doc example), so each
+/// chunk it yields becomes exactly one leaf and no further splitting or merging is needed
+/// here.
 ///
 /// Read through `diff` rather than `get_string`: `get_string` renders formatting back as
-/// pseudo-XML (`<bold>x</bold>`), so a word someone made bold in the browser would arrive
+/// pseudo-XML (`<strong>x</strong>`), so a word someone made bold in the browser would arrive
 /// in the block tree — and then in the search index — as literal markup. Taking the string
-/// chunks and ignoring the attributes drops the mark, which is exactly what M1's markdown
-/// importer already does and what `Block` can represent today.
-fn read_text<T: ReadTxn>(txn: &T, text: &XmlTextRef) -> Block {
-    let mut collected = String::new();
-    for chunk in text.diff(txn, YChange::identity) {
-        if let Out::Any(Any::String(part)) = &chunk.insert {
-            collected.push_str(part);
-        }
+/// chunks keeps the text; mapping each chunk's attributes through [`attrs_to_marks`] is what
+/// keeps the formatting too, as `Mark`s rather than markup.
+fn read_text_leaves<T: ReadTxn>(txn: &T, text: &XmlTextRef) -> Vec<Block> {
+    let attrs = read_attributes(txn, text);
+    let mut leaves: Vec<Block> = text
+        .diff(txn, YChange::identity)
+        .into_iter()
+        .filter_map(|chunk| {
+            let Out::Any(Any::String(part)) = &chunk.insert else {
+                return None;
+            };
+            let mut block = new_block(BlockKind::Text);
+            block.attrs = attrs.clone();
+            block.text = Some(part.to_string());
+            block.marks = attrs_to_marks(chunk.attributes.as_deref());
+            Some(block)
+        })
+        .collect();
+    if leaves.is_empty() {
+        // No diff chunk at all — an empty `XmlTextRef` — is the one case an absent `text`
+        // field and an empty one cannot be told apart in a Y.Text; see the test for it.
+        let mut block = new_block(BlockKind::Text);
+        block.attrs = attrs;
+        block.text = Some(String::new());
+        leaves.push(block);
     }
-    let mut block = new_block(BlockKind::Text);
-    block.attrs = read_attributes(txn, text);
-    block.text = Some(collected);
-    block
+    leaves
 }
 
 fn read_attributes<T: ReadTxn, X: Xml>(txn: &T, node: &X) -> Map<String, Value> {
@@ -448,7 +561,7 @@ fn debug_xml(doc: &CollabDoc) -> String {
 mod tests {
     use super::{debug_xml, CollabDoc, CONTENT_FIELD};
     use crate::fixtures::{self, json_of, Rng};
-    use gw_core::{Block, BlockKind};
+    use gw_core::{Block, BlockKind, Mark, MarkKind};
     use serde_json::json;
     use yrs::updates::decoder::Decode;
     use yrs::{
@@ -464,6 +577,35 @@ mod tests {
                ]}"#,
         )
         .unwrap()
+    }
+
+    /// A doc containing one paragraph containing one text leaf, for tests that need to
+    /// reach in and set marks on a single leaf directly.
+    fn paragraph_with_text(text: &str) -> Block {
+        serde_json::from_value(json!({
+            "kind": "doc",
+            "content": [{
+                "kind": "paragraph",
+                "content": [{"kind": "text", "text": text}]
+            }]
+        }))
+        .unwrap()
+    }
+
+    /// The first text leaf in document order, for tests that do not care where it sits.
+    fn first_text_leaf(block: &Block) -> &Block {
+        if block.kind == BlockKind::Text {
+            return block;
+        }
+        for child in &block.content {
+            if child.kind == BlockKind::Text {
+                return child;
+            }
+            if !child.content.is_empty() {
+                return first_text_leaf(child);
+            }
+        }
+        panic!("no text leaf found in {block:?}")
     }
 
     /// The fidelity assertion, in one place: what went in is what comes out, compared as
@@ -702,6 +844,20 @@ mod tests {
         coverage.assert_broad();
     }
 
+    #[test]
+    fn a_mark_survives_a_round_trip_through_the_crdt() {
+        let mut block = paragraph_with_text("fett");
+        block.content[0].content[0].marks = vec![Mark {
+            kind: MarkKind::Strong,
+            attrs: Default::default(),
+        }];
+        let doc = CollabDoc::from_block(&block);
+        let back = doc.to_block();
+        let leaf = first_text_leaf(&back);
+        assert_eq!(leaf.marks.len(), 1, "the CRDT dropped the mark");
+        assert_eq!(leaf.marks[0].kind, MarkKind::Strong);
+    }
+
     // ----- what a round trip cannot preserve, proven rather than assumed --------------
 
     #[test]
@@ -763,11 +919,13 @@ mod tests {
     }
 
     #[test]
-    fn an_inline_mark_from_the_browser_keeps_its_text_and_loses_its_emphasis() {
-        // The M4 gap, proven rather than assumed. A browser bolding a word writes Yjs
-        // formatting; `Block` has no field for it. The text must survive intact and the
-        // mark must vanish — *not* reappear as literal `<bold>` markup in the snapshot,
-        // which is what `XmlText::get_string` would have produced.
+    fn an_inline_mark_from_the_browser_keeps_its_text_and_its_emphasis() {
+        // The M4 gap, closed. A browser bolding a word writes Yjs formatting under the
+        // mark's canonical key (`mark_key_of`); `to_block` must now recover the same
+        // `Mark` a real editor's write would have produced. The text must survive intact
+        // and the formatted run must split into its own leaf, carrying the mark — *not*
+        // reappear as literal `<strong>` markup in a leaf's text, which is what
+        // `XmlText::get_string` would have produced.
         let doc = CollabDoc::from_block(&sample());
         {
             let mut txn = doc.doc.transact_mut();
@@ -777,8 +935,8 @@ mod tests {
                 .clone();
             let text = paragraph.push_back(&mut txn, XmlTextPrelim::new("ein fettes Wort"));
             let mut attrs = yrs::types::Attrs::new();
-            attrs.insert("bold".into(), true.into());
-            text.format(&mut txn, 4, 7, attrs);
+            attrs.insert("strong".into(), true.into());
+            text.format(&mut txn, 4, 6, attrs); // "fettes", the middle word
         }
 
         let back = doc.to_block();
@@ -792,15 +950,97 @@ mod tests {
             .join("");
         assert_eq!(recovered, "ein fettes Wort");
         assert!(
-            !recovered.contains("<bold>"),
+            !recovered.contains("<strong>"),
             "formatting leaked into the text as markup: {recovered}"
         );
-        // And the emphasis itself is gone from the snapshot, because there is nowhere in
-        // `Block` to record it. It is still in the CRDT.
-        assert!(debug_xml(&doc).contains("<bold>"), "the CRDT kept the mark");
-        assert!(!serde_json::to_string(&json_of(&back))
+        // The CRDT still holds the formatting exactly as the browser wrote it...
+        assert!(
+            debug_xml(&doc).contains("<strong>"),
+            "the CRDT lost the mark"
+        );
+        // ...and now the snapshot does too, as a `Mark` rather than markup: the formatted
+        // run is its own leaf, and that leaf carries the `Strong` mark the formatting named.
+        let bold_leaf = last
+            .content
+            .iter()
+            .find(|leaf| leaf.text.as_deref() == Some("fettes"))
+            .expect("the formatted run must split into its own leaf");
+        assert_eq!(bold_leaf.marks.len(), 1);
+        assert_eq!(bold_leaf.marks[0].kind, MarkKind::Strong);
+        assert!(serde_json::to_string(&json_of(&back))
             .unwrap()
-            .contains("bold"));
+            .contains("strong"));
+    }
+
+    #[test]
+    fn several_marks_on_one_leaf_come_back_in_mark_order_not_write_order() {
+        // The actual risk in this task: `Attrs` is a `HashMap`, so nothing about *writing*
+        // several marks in one order guarantees they come back in that order — or in any
+        // consistent order at all. Written here deliberately out of `MARK_ORDER`
+        // (`Link`, then `Em`, then `Strong`) so a read that merely preserved write order
+        // would fail this assertion instead of accidentally passing it.
+        let mut block = paragraph_with_text("fett und schräg und verlinkt");
+        block.content[0].content[0].marks = vec![
+            Mark::link_to_url("https://example.org"),
+            Mark {
+                kind: MarkKind::Em,
+                attrs: Default::default(),
+            },
+            Mark {
+                kind: MarkKind::Strong,
+                attrs: Default::default(),
+            },
+        ];
+
+        let doc = CollabDoc::from_block(&block);
+        let reloaded = CollabDoc::from_state(&doc.encode_state()).expect("its own state");
+
+        for (label, candidate) in [("in memory", &doc), ("through encoded state", &reloaded)] {
+            let back = candidate.to_block();
+            let leaf = first_text_leaf(&back);
+            let kinds: Vec<MarkKind> = leaf.marks.iter().map(|m| m.kind).collect();
+            assert_eq!(
+                kinds,
+                vec![MarkKind::Strong, MarkKind::Em, MarkKind::Link],
+                "{label}: marks were not sorted into MARK_ORDER"
+            );
+        }
+    }
+
+    #[test]
+    fn a_link_marks_doc_or_href_survives_and_the_two_are_never_confused() {
+        // A link carries EITHER an internal `doc` id or an external `href`, never both —
+        // and never flattened to a bare boolean, which is what a mark with no attrs would
+        // look like on the wire. Both shapes go in on separate leaves of one paragraph and
+        // must come back exactly as they went in, attrs and all.
+        let doc_block: Block = serde_json::from_str(
+            r#"{"kind":"doc","content":[{"kind":"paragraph","content":[
+                 {"kind":"text","text":"intern","marks":[{"kind":"link","attrs":{"doc":"019ff0"}}]},
+                 {"kind":"text","text":"extern","marks":[{"kind":"link","attrs":{"href":"https://example.org"}}]}
+               ]}]}"#,
+        )
+        .unwrap();
+
+        let back = CollabDoc::from_block(&doc_block).to_block();
+        let leaves = &back.content[0].content;
+        assert_eq!(leaves[0].marks[0].target_doc(), Some("019ff0"));
+        assert_eq!(
+            leaves[0].marks[0].attrs.get("href"),
+            None,
+            "an internal link must not gain an href"
+        );
+        assert_eq!(
+            leaves[1].marks[0]
+                .attrs
+                .get("href")
+                .and_then(|v| v.as_str()),
+            Some("https://example.org")
+        );
+        assert_eq!(
+            leaves[1].marks[0].target_doc(),
+            None,
+            "an external link must not be read as a document reference"
+        );
     }
 
     #[test]

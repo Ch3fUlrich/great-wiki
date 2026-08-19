@@ -17,10 +17,13 @@
 //! - **The fragment is the `doc` node.** Its children are the document's children, so a
 //!   `doc` block's own `attrs` and `text` have nowhere to live and are dropped. Every
 //!   other block's attrs survive with their JSON types intact.
-//! - **Inline marks live in the CRDT and not in `Block`.** A browser can bold a word or
-//!   make it a link; Yjs stores that as formatting on the text, and [`CollabDoc::to_block`]
-//!   keeps the text and drops the emphasis, because `Block` has no field to put it in.
-//!   This mirrors what M1's markdown importer already does, and closes when M4 adds marks.
+//! - **Inline marks round-trip.** A browser bolding a word or making it a link writes Yjs
+//!   formatting on the text; [`CollabDoc::from_block`] writes a leaf's `Block::marks` back as
+//!   that same formatting, and [`CollabDoc::to_block`] reads it back as `Mark`s rather than
+//!   dropping it or leaking it into the text as literal markup. A formatted run always comes
+//!   back as its own leaf — `Block` has no way to mark only part of one — and a leaf's marks
+//!   are always sorted into `gw_core::MARK_ORDER`, because Yjs holds them in an unordered
+//!   attribute map and the markdown exporter trusts the array itself to already be ordered.
 //! - **A node kind outside `BlockKind` cannot be named.** If the editor gains an image or a
 //!   horizontal rule before `gw-core` gains the kind, the element lives in the CRDT but
 //!   `to_block` cannot express it: its children are lifted into the parent so no text is
