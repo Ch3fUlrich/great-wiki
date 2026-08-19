@@ -9,9 +9,17 @@ verification commands. This file is *only* the Claude-specific delta. Start at t
 For any task touching Rust, YAML, TOML, JSON, Bash or Python in this repo, use Serena's
 semantic tools instead of reading whole files:
 
-- Discovery: `get_symbols_overview`, `find_symbol`, `find_referencing_symbols`
+- Discovery: `get_symbols_overview`, `find_symbol`
 - Edits: `replace_symbol_body`, `insert_after_symbol`/`insert_before_symbol`, `replace_content`
 - Call `initial_instructions` and `activate_project` once at session start.
+
+**`find_referencing_symbols` does not work here — use `grep` to find references.** Verified
+twice on 2026-08-19: it returns `{}` for `Block`, `BlockKind`, `Block::plain_text` and
+`Mark`, all of which have references `grep` finds immediately (`Mark` is re-exported one
+file away; `Block` is constructed in four crates). The failure is silent — an empty result
+is indistinguishable from "nothing references this", so an agent told to rely on it will
+conclude a symbol is unused and change it freely. `find_symbol`, `get_symbols_overview` and
+every edit tool work normally.
 
 **`web/` is covered too.** `typescript`, `html` and `scss` are configured and **verified
 working in this container** (2026-08-07): both started in under 0.2 s and resolved
