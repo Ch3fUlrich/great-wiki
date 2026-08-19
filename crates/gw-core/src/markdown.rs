@@ -6,7 +6,7 @@
 //! represent yet keeps its text in the nearest block that *can* hold it, and says so in
 //! `Conversion::notes` — a silent loss is the one outcome that cannot be detected later.
 
-use crate::block::{Block, BlockKind};
+use crate::block::{Block, BlockKind, Mark, MarkKind};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -152,6 +152,11 @@ struct Builder {
     code: Option<String>,
     table: Option<Table>,
     losses: BTreeMap<Unsupported, usize>,
+    /// The marks currently open, innermost last. `Start(Tag::Strong | Emphasis |
+    /// Strikethrough | Link)` pushes, the matching `End` pops, and every text leaf is
+    /// stamped with a clone of the whole stack — that is what lets `**bold *and
+    /// italic***` land on one leaf carrying both marks.
+    active: Vec<Mark>,
 }
 
 impl Builder {
@@ -164,6 +169,7 @@ impl Builder {
             code: None,
             table: None,
             losses: BTreeMap::new(),
+            active: Vec::new(),
         }
     }
 
@@ -235,7 +241,19 @@ impl Builder {
     /// A tight list item (`- eins`) emits its text with no paragraph tag at all, and
     /// ProseMirror's `list_item` requires a paragraph. Without this the text would attach
     /// directly to the list item and the tree would be unrenderable.
+    ///
+    /// Stamps a clone of the active mark stack onto the leaf. `Event::Code` is the one
+    /// caller that does not want the plain stack — it goes through [`Self::marked_text`]
+    /// instead, with `MarkKind::Code` appended.
     fn text(&mut self, s: &str) {
+        let marks = self.active.clone();
+        self.marked_text(s, marks);
+    }
+
+    /// Append inline text carrying exactly `marks`, merging into the previous leaf only
+    /// when its marks match — otherwise `**bold** plain` would fuse into one leaf and the
+    /// mark boundary would be lost along with it.
+    fn marked_text(&mut self, s: &str, marks: Vec<Mark>) {
         if let Some(code) = self.code.as_mut() {
             code.push_str(s);
             return;
@@ -244,13 +262,15 @@ impl Builder {
             self.push(block(BlockKind::Paragraph), true);
         }
         match self.top().content.last_mut() {
-            // Merge into the previous leaf so `**bold** text` is one text node, not two.
-            Some(prev) if prev.kind == BlockKind::Text => {
+            // Merge into the previous leaf so two text events for the same run of marks
+            // become one text node, not two.
+            Some(prev) if prev.kind == BlockKind::Text && marks_equal(&prev.marks, &marks) => {
                 prev.text.get_or_insert_with(String::new).push_str(s);
             }
             _ => {
                 let mut leaf = block(BlockKind::Text);
                 leaf.text = Some(s.to_string());
+                leaf.marks = marks;
                 self.top().content.push(leaf);
             }
         }
@@ -275,8 +295,12 @@ impl Builder {
             Event::End(tag) => self.end(tag),
             Event::Text(t) => self.text(&t),
             Event::Code(t) => {
-                self.note(Unsupported::InlineMarks);
-                self.text(&t);
+                // Inline code carries no `Start`/`End` pair of its own — it arrives as one
+                // leaf event — so the `Code` mark is appended here rather than pushed onto
+                // `active`. Whatever marks were already open (`**`code`**`) still apply.
+                let mut marks = self.active.clone();
+                marks.push(mark(MarkKind::Code));
+                self.marked_text(&t, marks);
             }
             // Raw HTML is kept as text rather than parsed. Parsing it here would create a
             // second, untrusted path into the block tree; dropping it would lose content.
@@ -383,8 +407,15 @@ impl Builder {
                 self.open(b);
             }
             Tag::Image { .. } => self.note(Unsupported::Image),
-            Tag::Link { .. } => self.note(Unsupported::LinkTarget),
-            Tag::Emphasis | Tag::Strong | Tag::Strikethrough => self.note(Unsupported::InlineMarks),
+            // This crate has no store, so a markdown link can never be resolved to a
+            // document id here — `[text](/darm/labor)` becomes an external href exactly
+            // like `[text](https://example.org)`, regardless of how internal it looks.
+            // Task 7 resolves internal-looking destinations against the store on publish;
+            // that resolution does not belong in this crate and must not be guessed here.
+            Tag::Link { dest_url, .. } => self.active.push(Mark::link_to_url(&dest_url)),
+            Tag::Emphasis => self.active.push(mark(MarkKind::Em)),
+            Tag::Strong => self.active.push(mark(MarkKind::Strong)),
+            Tag::Strikethrough => self.active.push(mark(MarkKind::Strike)),
             Tag::HtmlBlock => self.note(Unsupported::Html),
             // Footnotes, definition lists and metadata blocks need extensions that
             // `options` does not enable, so these are unreachable today. Their text still
@@ -420,10 +451,31 @@ impl Builder {
                 }
                 self.close();
             }
-            // Marks, images and links open no frame, so they close none.
+            TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough | TagEnd::Link => {
+                self.active.pop();
+            }
+            // Images open no frame and push no mark, so they close neither.
             _ => {}
         }
     }
+}
+
+/// A mark with no attrs — every kind but `Link`, which carries its destination instead.
+fn mark(kind: MarkKind) -> Mark {
+    Mark {
+        kind,
+        attrs: serde_json::Map::new(),
+    }
+}
+
+/// Whether two mark stacks are the same run, so [`Builder::marked_text`] knows whether the
+/// next leaf can merge into the previous one. `Mark` has no `PartialEq` of its own — `kind`
+/// and `attrs` each do, so this compares them field by field instead of deriving one.
+fn marks_equal(a: &[Mark], b: &[Mark]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x.kind == y.kind && x.attrs == y.attrs)
 }
 
 /// The `align` attribute for a column, or `None` where the table states no alignment.
@@ -452,7 +504,7 @@ fn block(kind: BlockKind) -> Block {
 
 #[cfg(test)]
 mod tests {
-    use crate::block::{Block, BlockKind};
+    use crate::block::{Block, BlockKind, MarkKind};
     use crate::markdown::{convert, markdown_to_blocks, Unsupported};
 
     fn keys(md: &str) -> Vec<&'static str> {
@@ -461,6 +513,22 @@ mod tests {
             .iter()
             .map(|n| n.construct.key())
             .collect()
+    }
+
+    /// Every `Text` leaf in document order, so a test can find one by its content without
+    /// caring which block it landed in.
+    fn collect_text_leaves(block: &Block) -> Vec<&Block> {
+        fn walk<'a>(b: &'a Block, out: &mut Vec<&'a Block>) {
+            if b.kind == BlockKind::Text {
+                out.push(b);
+            }
+            for child in &b.content {
+                walk(child, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(block, &mut out);
+        out
     }
 
     /// The kind of each child, so a row's cells can be asserted in one line.
@@ -687,14 +755,19 @@ mod tests {
     }
 
     #[test]
-    fn inline_marks_keep_their_text_and_are_counted_once() {
+    fn inline_marks_keep_their_text_and_are_no_longer_reported_as_lost() {
+        // Superseded by Task 2: bold and italic used to be flattened to plain text and
+        // counted as a loss. They now land as `Mark`s on the text leaf (see
+        // `emphasis_and_links_survive_import_and_are_no_longer_reported_as_lost` and
+        // `nested_emphasis_stamps_both_marks_on_the_inner_text` for the marks themselves),
+        // so nothing here is unsupported any more.
         let conversion = convert("Ein **fettes** und *kursives* Wort.\n");
-        assert_eq!(conversion.doc.plain_text(), "Ein fettes und kursives Wort.");
-        assert_eq!(conversion.notes.len(), 1);
-        assert_eq!(conversion.notes[0].construct, Unsupported::InlineMarks);
-        assert_eq!(
-            conversion.notes[0].count, 2,
-            "notes are counted, not listed"
+        assert!(conversion.doc.plain_text().contains("fettes"));
+        assert!(conversion.doc.plain_text().contains("kursives"));
+        assert!(
+            conversion.notes.is_empty(),
+            "emphasis is modelled now, not lost: {:?}",
+            conversion.notes
         );
     }
 
@@ -705,10 +778,28 @@ mod tests {
     }
 
     #[test]
-    fn a_link_keeps_its_text_and_reports_the_lost_destination() {
+    fn a_link_keeps_its_text_and_its_destination_and_is_no_longer_reported_as_lost() {
+        // Superseded by Task 2: the destination used to be dropped and counted as a loss.
+        // It now lands as a `Mark::link_to_url` on the link text's leaf — this crate has no
+        // store, so it cannot tell an internal destination from an external one, and Task 7
+        // is where that resolution happens (see the comment on `Tag::Link` in `start`).
         let conversion = convert("Siehe [das Handbuch](/handbuch).\n");
-        assert_eq!(conversion.doc.plain_text(), "Siehe das Handbuch.");
-        assert!(conversion
+        assert!(conversion.doc.plain_text().contains("das Handbuch"));
+        let text = collect_text_leaves(&conversion.doc);
+        let link = text
+            .iter()
+            .find(|b| b.text.as_deref() == Some("das Handbuch"))
+            .unwrap();
+        let m = link
+            .marks
+            .iter()
+            .find(|m| m.kind == MarkKind::Link)
+            .unwrap();
+        assert_eq!(
+            m.attrs.get("href").and_then(|v| v.as_str()),
+            Some("/handbuch")
+        );
+        assert!(!conversion
             .notes
             .iter()
             .any(|n| n.construct == Unsupported::LinkTarget));
@@ -768,5 +859,57 @@ mod tests {
     #[test]
     fn a_lossless_document_reports_nothing() {
         assert!(convert("# T\n\nEin Satz.\n\n- eins\n").notes.is_empty());
+    }
+
+    #[test]
+    fn emphasis_and_links_survive_import_and_are_no_longer_reported_as_lost() {
+        let c = convert("Ein **fetter** Satz mit [einem Link](https://example.org).");
+        let text: Vec<_> = collect_text_leaves(&c.doc);
+        let fett = text
+            .iter()
+            .find(|b| b.text.as_deref() == Some("fetter"))
+            .unwrap();
+        assert!(
+            fett.marks.iter().any(|m| m.kind == MarkKind::Strong),
+            "bold was dropped"
+        );
+
+        let link = text
+            .iter()
+            .find(|b| b.text.as_deref() == Some("einem Link"))
+            .unwrap();
+        let m = link
+            .marks
+            .iter()
+            .find(|m| m.kind == MarkKind::Link)
+            .unwrap();
+        assert_eq!(
+            m.attrs.get("href").and_then(|v| v.as_str()),
+            Some("https://example.org")
+        );
+
+        assert!(
+            !c.notes.iter().any(|n| matches!(
+                n.construct,
+                Unsupported::InlineMarks | Unsupported::LinkTarget
+            )),
+            "the converter still reports marks as lost: {:?}",
+            c.notes
+        );
+    }
+
+    #[test]
+    fn nested_emphasis_stamps_both_marks_on_the_inner_text() {
+        let c = convert("*kursiv und **beides***");
+        let text: Vec<_> = collect_text_leaves(&c.doc);
+        let both = text
+            .iter()
+            .find(|b| b.text.as_deref() == Some("beides"))
+            .unwrap();
+        assert_eq!(
+            both.marks.len(),
+            2,
+            "an inner leaf carries every enclosing mark"
+        );
     }
 }

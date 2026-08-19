@@ -772,11 +772,14 @@ async fn creating_a_top_level_page_under_an_account_is_refused_rather_than_guess
 }
 
 #[tokio::test]
-async fn a_file_holding_formatting_the_database_cannot_store_says_so_on_an_update_too() {
-    // The trap this whole milestone is about. A person edits an exported file, adds bold
-    // and a link, and imports it back. The text lands; the emphasis and the destination do
-    // not, because `Block` has nowhere to put them. That has to be said out loud on the way
-    // in, every time — a silent degradation is the one outcome that cannot be found later.
+async fn a_file_holding_formatting_the_database_can_now_store_is_no_longer_reported_as_lost() {
+    // Superseded by Task 2 (`crates/gw-core/src/markdown.rs`): a person edits an exported
+    // file, adds bold and a link, and imports it back. The text always landed; before this
+    // task the emphasis and the destination did not, and the importer said so on every run.
+    // `Block` now has somewhere to put them — a `Mark` on the text leaf — so the update goes
+    // through with nothing to report. This crate has no store, so the link becomes an
+    // external `href` regardless of how internal `/handbuch` looks; Task 7 is what resolves
+    // an internal-looking destination against the store, on publish.
     let store = loaded(&[(
         "notiz.md",
         "---\ntitle: Notiz\nvisibility: public\n---\nSchlicht.\n",
@@ -802,9 +805,19 @@ async fn a_file_holding_formatting_the_database_cannot_store_says_so_on_an_updat
         .map(|n| n.detail.clone())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(notes.contains("inline-marks"), "{notes}");
-    assert!(notes.contains("emphasis dropped"), "{notes}");
-    assert!(notes.contains("destination dropped"), "{notes}");
+    assert!(
+        !notes.contains("inline-marks"),
+        "emphasis is modelled now, not lost: {notes}"
+    );
+    assert!(
+        !notes.contains("destination dropped"),
+        "the link destination is modelled now, not lost: {notes}"
+    );
+
+    let doc = fetch(&store, "/notiz").await.unwrap();
+    let body: gw_core::Block = serde_json::from_str(&doc.body).unwrap();
+    assert!(body.plain_text().contains("fettes"));
+    assert!(body.plain_text().contains("ein Verweis"));
 }
 
 // ---------------------------------------------------------------------------------------
