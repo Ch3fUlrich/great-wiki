@@ -54,13 +54,22 @@ const inherited: AclView = {
   defined_here: []
 };
 
+/**
+ * `inherited_from` is the path ITSELF here, and that is not a typo in the fixture.
+ *
+ * `Store::effective_grants` walks ancestors nearest-first and a path is its own first
+ * ancestor, so any path carrying grants of its own comes back naming itself — see
+ * `a_space_admin_manages_grants_on_their_own_subtree` in `crates/gw-api/tests/admin.rs`,
+ * which asserts exactly that. A fixture with `null` there described a response the API
+ * cannot produce, and hid the fact that the panel called such grants "geerbt".
+ */
 const definedHere: AclView = {
   path: '/handbuch',
   effective: [
     { subject: { kind: 'team', id: 'redaktion' }, permission: 'write' },
     { subject: { kind: 'principal', id: 'p2' }, permission: 'read' }
   ],
-  inherited_from: null,
+  inherited_from: '/handbuch',
   defined_here: [
     { subject: { kind: 'team', id: 'redaktion' }, permission: 'write' },
     { subject: { kind: 'principal', id: 'p2' }, permission: 'read' }
@@ -97,8 +106,14 @@ describe('AccessPanel', () => {
     // Not "a disabled revoke button" — no control at all. A disabled button still reads
     // as "this is the control for this row", and revoking here would change nothing:
     // the grant lives on the ancestor and the API would refuse it.
+    //
+    // Asserted against the control and not against the bare word "Entziehen", which the
+    // explanation above the table now uses as a verb ("Entziehen lassen sie sich nur auf
+    // /handbuch") — deliberately the same word the button carries, because calling one
+    // operation two things is its own confusion.
     const out = html(props());
-    expect(out).not.toContain('Entziehen');
+    expect(out).not.toContain('gw-adm-trigger--danger');
+    expect(out).not.toMatch(/aria-haspopup="dialog"[^>]*>[^<]*<span>Entziehen<\/span>/);
     expect(out).toContain('Redaktion (redaktion)');
   });
 
@@ -178,6 +193,57 @@ describe('AccessPanel', () => {
     };
     const out = html(props({ path: orphaned.path, acl: orphaned }));
     expect(out).toContain('weg-damit');
+  });
+
+  it('says on the page itself why this page is reachable, and does not hide it in a tooltip', () => {
+    // The correction this panel owes its reader. `permits()` in `crates/gw-store/src/acl.rs`
+    // asks `can()` at `Visibility::Restricted` BEFORE it looks at the document's own
+    // visibility, so a grant on /handbuch reaches /handbuch/onboarding even though that
+    // page is marked `restricted`. Marking a page restricted does not hide it from
+    // somebody holding a grant above it — which is the opposite of what most people
+    // assume, so it has to be a sentence on screen and not a hover.
+    const out = html(props());
+    expect(out).toContain('Erreichbar über /handbuch, nicht über die Sichtbarkeit dieser Seite.');
+    expect(out).toContain(
+      'unabhängig davon, dass diese Seite als »Eingeschränkt« gekennzeichnet ist'
+    );
+    expect(out).toContain(
+      'Ein eigener Eintrag auf /handbuch/onboarding ersetzt die geerbten Rechte vollständig.'
+    );
+    // No `Tooltip.Trigger`: everything inside Ark's `Portal` is absent from the server
+    // render, so a tooltip is exactly the thing a person reading this page never sees.
+    expect(out).not.toContain('gw-adm-tip-trigger');
+  });
+
+  it('does not call a grant written on this very path an inherited one', () => {
+    // `inherited_from` naming the path itself is the API's normal answer for a path that
+    // carries grants. Rendering "Geerbt von /handbuch" on /handbuch sends somebody up the
+    // tree looking for a row that is right in front of them.
+    const out = html(props({ path: definedHere.path, acl: definedHere }));
+    expect(out).not.toContain('Geerbt von');
+    expect(out).not.toContain('Erreichbar über');
+    expect(out).toContain('Entziehen');
+  });
+
+  it('does not claim a public page would be unreachable without the inherited grant', () => {
+    // A public read is the first thing `can()` allows and it needs no grant at all, so
+    // "reachable because of /handbuch" would be false here. The inherited grant confers
+    // the extra — writing — and the sentence has to say that instead.
+    const out = html(
+      props({
+        path: '/oeffentlich/unterseite',
+        visibility: 'public',
+        acl: {
+          path: '/oeffentlich/unterseite',
+          effective: [{ subject: { kind: 'team', id: 'redaktion' }, permission: 'write' }],
+          inherited_from: '/oeffentlich',
+          defined_here: []
+        }
+      })
+    );
+    expect(out).toContain('Die Rechte unten kommen von /oeffentlich.');
+    expect(out).toContain('Lesen kann diese Seite ohnehin jede und jeder');
+    expect(out).not.toContain('nicht über die Sichtbarkeit');
   });
 
   it('says the permissions and subject kinds in German', () => {

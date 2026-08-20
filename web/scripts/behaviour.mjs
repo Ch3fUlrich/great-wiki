@@ -1325,6 +1325,84 @@ await check('G5 the API serves its own HTML with a stricter, script-free policy'
   );
 });
 
+// ---------------------------------------------------------------------------------------
+// Group H — the access panel says how far a grant reaches
+// ---------------------------------------------------------------------------------------
+//
+// These live here rather than in AccessPanel.test.ts because the sentence that matters
+// most is inside Ark's Portal, and a Portal mounts from an `$effect` — nothing in it is
+// server-rendered, so `render()` from `svelte/server` cannot see it at all. Only a
+// browser can answer "does the person making the grant actually read this?".
+//
+// The fixture is `/_behaviour/zugriff` (dev-only, static props). The real console needs
+// the `admin` baseline, which this harness deliberately does not have.
+
+/** The panel fixture, hydrated. `networkidle` for the same reason Group B needs it. */
+async function loadAccessPanel(page, fall = 'geerbt') {
+  const response = await page.goto(BASE + '/_behaviour/zugriff?fall=' + fall, {
+    waitUntil: 'networkidle'
+  });
+  assert(
+    response !== null && response.status() === 200,
+    `expected 200 from the access-panel fixture, got ${response?.status()}`
+  );
+  return await response.text();
+}
+
+await check('H1 an inherited grant is named on the page as the reason, not the visibility', async (page) => {
+  // The assumption this exists to correct: /handbuch/onboarding is `restricted` AND
+  // reachable, because /handbuch carries a grant and `permits()` consults grants before
+  // it ever looks at visibility. Asserted against the served HTML as well as the
+  // rendered page, because "you can hover it and find out" is not saying it.
+  const served = await loadAccessPanel(page);
+
+  const title = 'Erreichbar über /handbuch, nicht über die Sichtbarkeit dieser Seite.';
+  assert(served.includes(title), `the served HTML never says: ${title}`);
+
+  const wegen = 'unabhängig davon, dass diese Seite als »Eingeschränkt« gekennzeichnet ist';
+  assert(served.includes(wegen), `the served HTML never says: ${wegen}`);
+
+  const eigener =
+    'Ein eigener Eintrag auf /handbuch/onboarding ersetzt die geerbten Rechte vollständig.';
+  assert(served.includes(eigener), `the served HTML never says: ${eigener}`);
+
+  const notice = page.locator('.gw-adm-notice', { hasText: title });
+  await notice.waitFor({ state: 'visible', timeout: 5_000 });
+  assert(await notice.isVisible(), 'the explanation is in the markup but not visible');
+});
+
+await check('H2 the grant dialog states the reach of the grant before anything is granted', async (page) => {
+  await loadAccessPanel(page);
+
+  const trigger = page.getByRole('button', { name: 'Zugriff gewähren' });
+  await trigger.waitFor({ state: 'visible' });
+  await trigger.click();
+
+  const dialog = page.locator('.gw-dialog');
+  await dialog.waitFor({ state: 'visible', timeout: 5_000 });
+
+  const text = await dialog.innerText();
+  for (const sentence of [
+    'Gilt auch für alle Seiten unter /handbuch/onboarding.',
+    'Auch eine Seite mit der Sichtbarkeit »Eingeschränkt« wird dadurch erreichbar.',
+    'Einen anderen Weg, einzelne Seiten auszunehmen, gibt es hier nicht.'
+  ]) {
+    assert(text.includes(sentence), `the open dialog never says: ${sentence}`);
+  }
+});
+
+await check('H3 a path that carries its own grants is not described as inheriting them', async (page) => {
+  // `Store::effective_grants` walks ancestors NEAREST FIRST and a path is its own first
+  // ancestor, so `inherited_from` equals the path itself whenever that path has any
+  // rows. Calling that "geerbt" sends somebody looking for a grant somewhere else.
+  const served = await loadAccessPanel(page, 'eigen');
+  assert(!served.includes('Geerbt von'), 'a grant written on this very path was called inherited');
+  assert(
+    served.includes('Entziehen'),
+    'a grant written on this very path offered no revoke control'
+  );
+});
+
 await browser.close();
 
 // ---------------------------------------------------------------------------------------

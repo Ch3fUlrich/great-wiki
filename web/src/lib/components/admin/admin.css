@@ -137,6 +137,16 @@
 		color: var(--ink);
 	}
 
+	/* Not a failure and not decoration: a consequence the reader is about to cause. Mixed
+	   from `--warn` rather than written as a hex, so a theme changing that token changes
+	   this wash with it. Modifier order matches `--fail` above: same specificity, later in
+	   source, which is what a modifier needs to win. */
+	.gw-adm-notice--warn {
+		border-color: var(--warn);
+		background: color-mix(in srgb, var(--warn) 10%, transparent);
+		color: var(--ink);
+	}
+
 	.gw-adm-notice--ok {
 		border-color: var(--ok);
 		background: color-mix(in srgb, var(--ok) 8%, transparent);
@@ -685,33 +695,6 @@
 
 	.gw-adm-menu-item[data-highlighted] {
 		background: var(--accent-soft);
-	}
-
-	/* --- Tooltip (Ark, portalled) ------------------------------------------ */
-
-	.gw-adm-tip:not([hidden]) {
-		display: block;
-		max-inline-size: 22rem;
-		padding: var(--space-2) var(--space-3);
-		border: 1px solid var(--border);
-		border-radius: var(--radius-sm);
-		background: var(--bg-raised);
-		color: var(--ink);
-		box-shadow: var(--shadow);
-		font-size: var(--text-xs);
-		line-height: var(--leading-normal);
-	}
-
-	.gw-adm-tip-trigger:not([hidden]) {
-		display: inline;
-		border: 0;
-		background: none;
-		padding: 0;
-		color: inherit;
-		font: inherit;
-		text-decoration: underline dotted;
-		text-underline-offset: 0.2em;
-		cursor: help;
 	}
 
 	/* --- Confirmation dialog (Ark, portalled) ------------------------------ */

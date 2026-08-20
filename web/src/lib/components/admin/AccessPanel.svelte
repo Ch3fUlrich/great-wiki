@@ -8,16 +8,34 @@
   ONLY for the grants stored here. An inherited row gets the ancestor's path as text and
   no button at all — a disabled button would still read as "this is the control for this
   row", and a button that quietly does nothing is worse than no button.
+
+  The second belief, added later because it turned out to be the more dangerous one:
+  that marking a page `restricted` keeps it away from somebody who holds a grant above
+  it. It does not. `permits()` in `crates/gw-store/src/acl.rs` asks `can()` with the
+  document presented at `Visibility::Restricted` BEFORE it looks at the real visibility,
+  so a matching grant has already decided — "a grant decides on its own, at any
+  visibility", as that file puts it. A grant on `/handbuch` therefore reaches every page
+  under it whatever those pages say about themselves, and the only thing that stops it is
+  a grant row on a page further down, which replaces the inherited set rather than adding
+  to it. Both halves of that are now sentences on this screen: `reach.ts` holds the
+  wording, the warning sits inside the grant dialog where the decision is made, and the
+  explanation sits above the table where the consequence is already in force.
 -->
 <script lang="ts">
   import Dialog from '$lib/components/Dialog.svelte';
   import { Dialog as ArkDialog } from '@ark-ui/svelte/dialog';
   import { Menu } from '@ark-ui/svelte/menu';
-  import { Tooltip } from '@ark-ui/svelte/tooltip';
   import { Portal } from '@ark-ui/svelte/portal';
   import ComboField, { type Option } from './ComboField.svelte';
   import SelectField from './SelectField.svelte';
   import Notice from './Notice.svelte';
+  import {
+    grantConsequence,
+    grantReachText,
+    grantReachTitle,
+    inheritedReachText,
+    inheritedReachTitle
+  } from './reach.js';
   import {
     PERMISSION_LABEL,
     SUBJECT_KIND_LABEL,
@@ -83,6 +101,18 @@
         subjectKey(own.subject) === subjectKey(grant.subject) && own.permission === grant.permission
     );
   }
+
+  /**
+   * The ancestor these grants are written on — `null` when that ancestor is this page.
+   *
+   * `Store::effective_grants` walks ancestors NEAREST FIRST and a path is its own first
+   * ancestor, so `inherited_from` names the path itself whenever the path carries any
+   * grant of its own. Rendering that as "Geerbt von /handbuch" while standing on
+   * /handbuch sends somebody up the tree after a row that is already in front of them.
+   */
+  const inheritedFrom = $derived(
+    acl && acl.inherited_from && acl.inherited_from !== acl.path ? acl.inherited_from : null
+  );
 
   const rows = $derived(
     acl
@@ -151,23 +181,8 @@
         </span>
       {/if}
 
-      {#if acl.inherited_from}
-        <!-- The sentence the whole panel is built around. It is plain text, not a
-             tooltip, because it changes what the controls below mean. -->
-        <Tooltip.Root openDelay={150} closeDelay={80}>
-          <Tooltip.Trigger class="gw-adm-tip-trigger">
-            <span class="gw-adm-badge">Geerbt von {acl.inherited_from}</span>
-          </Tooltip.Trigger>
-          <Portal>
-            <Tooltip.Positioner class="gw-adm-popper">
-              <Tooltip.Content class="gw-adm-tip">
-                Diese Rechte sind auf {acl.inherited_from} eingetragen und gelten hier, weil {acl.path}
-                darunter liegt. Entziehen lassen sie sich nur dort. Ein eigener Eintrag auf {acl.path}
-                ersetzt die geerbten Rechte vollständig.
-              </Tooltip.Content>
-            </Tooltip.Positioner>
-          </Portal>
-        </Tooltip.Root>
+      {#if inheritedFrom}
+        <span class="gw-adm-badge">Geerbt von {inheritedFrom}</span>
       {/if}
 
       <!-- A real link, not a menu entry, so it can be opened in a new tab the usual way. -->
@@ -184,13 +199,13 @@
         <Portal>
           <Menu.Positioner class="gw-adm-popper">
             <Menu.Content class="gw-adm-menu">
-              {#if acl.inherited_from && acl.inherited_from !== acl.path}
+              {#if inheritedFrom}
                 <Menu.Item
                   value="quelle"
                   class="gw-adm-menu-item"
-                  onSelect={() => onSelectPath(acl.inherited_from as string)}
+                  onSelect={() => onSelectPath(inheritedFrom)}
                 >
-                  Zu {acl.inherited_from} – dort lassen sich diese Rechte entziehen
+                  Zu {inheritedFrom} – dort lassen sich diese Rechte entziehen
                 </Menu.Item>
               {/if}
               {#if parentOf(acl.path)}
@@ -202,7 +217,7 @@
                   Zur übergeordneten Seite {parentOf(acl.path)}
                 </Menu.Item>
               {/if}
-              {#if !parentOf(acl.path) && !acl.inherited_from}
+              {#if !parentOf(acl.path) && !inheritedFrom}
                 <Menu.Item value="keine" class="gw-adm-menu-item" disabled>
                   Von hier führt nichts weiter nach oben
                 </Menu.Item>
@@ -212,6 +227,26 @@
         </Portal>
       </Menu.Root>
     </div>
+
+    {#if inheritedFrom}
+      <!--
+        The sentence the whole panel is built around, and it was a tooltip until it was
+        measured: everything Ark renders through a `Portal` is absent from the server
+        render, invisible to a touch reader, and only ever seen by somebody who already
+        suspected there was something to hover. It changes what every control below
+        means, so it is body text.
+
+        What it says is the thing `crates/gw-store/src/acl.rs` puts as "a grant decides
+        on its own, at any visibility": `permits()` consults the grants BEFORE it looks
+        at the document's visibility, so this page is reached through the entry on the
+        ancestor and the `restricted` badge two lines up holds nobody back.
+      -->
+      <Notice
+        tone={visibility === 'public' ? 'info' : 'warn'}
+        title={inheritedReachTitle(inheritedFrom, visibility)}
+        text={inheritedReachText(acl.path, inheritedFrom, visibility)}
+      />
+    {/if}
 
     {#if rows.length === 0}
       <Notice
@@ -239,7 +274,7 @@
                 <td>{SUBJECT_KIND_LABEL[row.grant.subject.kind]}</td>
                 <td>{PERMISSION_LABEL[row.grant.permission]}</td>
                 <td class="gw-adm-mono">
-                  {row.own ? acl.path : (acl.inherited_from ?? acl.path)}
+                  {row.own ? acl.path : (inheritedFrom ?? acl.path)}
                 </td>
                 <td>
                   {#if row.own}
@@ -276,7 +311,7 @@
                   {:else}
                     <!-- Deliberately no control. Revoking here would change nothing, and
                          the API would refuse it. -->
-                    <span class="gw-adm-muted">Geerbt von {acl.inherited_from ?? acl.path}</span>
+                    <span class="gw-adm-muted">Geerbt von {inheritedFrom ?? acl.path}</span>
                   {/if}
                 </td>
               </tr>
@@ -297,6 +332,25 @@
           {/snippet}
           {#snippet children()}
             <div class="gw-adm-form">
+              <!--
+                Where the decision is actually made, which is why it is here and not a
+                standing paragraph on the panel: a grant is written on a path and applies
+                to the WHOLE subtree under it, and no page down there can opt out by being
+                marked `restricted`. `permits()` asks `can()` at `Visibility::Restricted`
+                before it ever consults the document's own visibility, so a matching grant
+                has already returned true by then.
+
+                The only thing that stops it is a grant row on the descendant itself — the
+                nearest ancestor with any rows wins outright and grants are never unioned
+                — and the text says so rather than gesturing at a narrowing control this
+                system does not have. It must never suggest changing a page's visibility
+                either: nothing here writes that field at all.
+              -->
+              <Notice
+                tone="warn"
+                title={grantReachTitle(acl.path)}
+                text={grantReachText(acl.path)}
+              />
               <ComboField
                 label="Wer"
                 options={subjectOptions}
@@ -311,6 +365,16 @@
                 value={newPermission}
                 onChange={(value) => (newPermission = value as Permission)}
               />
+              {#if newSubject}
+                <!-- The rule above, in the terms of this particular grant. -->
+                <p class="gw-adm-muted">
+                  {grantConsequence(
+                    acl.path,
+                    subjectLabel(parseSubjectKey(newSubject), principals, teams),
+                    PERMISSION_LABEL[newPermission]
+                  )}
+                </p>
+              {/if}
             </div>
           {/snippet}
           {#snippet footer()}

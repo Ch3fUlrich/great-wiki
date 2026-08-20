@@ -12,8 +12,15 @@
 -->
 <script lang="ts">
   interface Props {
-    /** `fail` is announced; `info` and `ok` are not, being either expected or benign. */
-    tone?: 'fail' | 'ok' | 'info';
+    /**
+     * `fail` is announced; the others are not, being either expected or benign.
+     *
+     * `warn` is not a failure — nothing went wrong — but it carries a consequence
+     * somebody is about to cause and would otherwise not expect, so it is coloured to be
+     * read rather than skimmed past. It stays `role="status"`: interrupting a screen
+     * reader for a statement of fact is what `assertive` is for, and this is not that.
+     */
+    tone?: 'fail' | 'warn' | 'ok' | 'info';
     title?: string;
     text: string;
   }
