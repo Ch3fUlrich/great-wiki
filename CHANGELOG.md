@@ -8,6 +8,24 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- **A page's visibility can now be changed, in the admin console, beside access.** Until now
+  the value arrived from frontmatter at import and nothing in the running system could write
+  it — the console showed it as a badge, which reads as settable state and was not. It is
+  one deliberate act by a person: whoever administers the page's path may do it, an
+  unrecognised value is refused rather than defaulted, and every change writes an audit row
+  recording what the page **was** as well as what it became. Who may do it and why is
+  [ADR 0008](docs/decisions/0008-who-may-change-a-page-s-visibility.md); the short answer is
+  that being able to read or write a page never widens it, and anybody who *can* do this
+  could already publish the page by writing an "Alle, auch nicht angemeldete" entry on it.
+  `seed --update` still refuses metadata changes, unchanged: a bulk file drop is not a
+  person, and a stray `visibility: public` in one of two hundred files must not publish a
+  page with nobody watching.
+- The access panel now answers its own question. Above the table it lists **every** way into
+  the page, in the order the permission engine decides them: a public share link, the page's
+  visibility, the »Verwaltung« reach that reads every page without any entry at all, and
+  then the entries. The two that reach past everybody somebody deliberately named — an
+  "Alle, auch nicht angemeldete" entry, and a public page — are marked as such, and such an
+  entry now carries "Offenes Internet" in the table so it cannot be mistaken for a team.
 - **A Content-Security-Policy**, issued by the application rather than by either proxy —
   see [ADR 0007](docs/decisions/0007-content-security-policy.md). Scripts are admitted by a
   per-response nonce with no `'unsafe-inline'`, which is what a proxy could not have done:
@@ -36,6 +54,18 @@ Entries describe the *effect* of a change, not the diff.
   no origin configured, every absolute URL stays external exactly as before.
 
 ### Changed
+
+- **The access table no longer claims to say who reaches a page; it says what is entered on
+  it.** It never showed the two ways in that need no entry — somebody with »Verwaltung«
+  reach reads every restricted page in the wiki, and an internal page is open to every group
+  with internal reach — and its empty state said "kein Zugriff eingetragen … es gilt allein
+  die Sichtbarkeit der Seite", which is true about entries and reads as "nobody else gets
+  in". That sentence is gone.
+- Revoking the **last** entry on a page now says what it does. Removing it does not close
+  the page: the nearest entry further up applies again, here and on every page below that
+  carries nothing of its own, and the dialog names that page and lists the rights that come
+  back. The old wording said inherited rights "bleiben davon unberührt" — true, and read as
+  "they stay where they are".
 
 - Between two publishes, what an editor opens and what a reader sees are allowed to differ.
   A page says what its newest revision says; the editing session is somewhere else until
