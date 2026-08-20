@@ -105,6 +105,35 @@ permission on all of them, and leave the tree half-rewritten when refused).
 snapshot, not a live pointer — consistent with the existing export, which already states that
 it is a faithful copy of the database rather than of the markdown that was imported.
 
+### D-6: Any checkbox line is a task (2026-08-20)
+
+`- [ ] Stuhlprobe einschicken` written anywhere in a page is a task, with no block to mark
+and nothing to opt into. Markdown's own syntax is the interface.
+
+Rejected: requiring an explicit task block (a concept to learn, a step to forget, and a
+to-do that never appears is the failure you notice last) and restricting it to project pages
+(makes projects a prerequisite for writing a to-do).
+
+The cost is that a throwaway checklist becomes board material. Measured before accepting it:
+the owner's 35 live pages contain **zero** checkbox lines against 232 bullet points, so
+boards start empty and fill only with what is written deliberately.
+
+### D-7: Existing checkbox lines become tasks on first import (2026-08-20)
+
+No date-dependent rule. Two identical lines in one page must not behave differently because
+of when they were written — that is impossible to explain and worse to debug. Safe here for
+the reason above: there are none to adopt.
+
+### D-8: A detached task stays on its board, marked (2026-08-20)
+
+When the line that authored a task is deleted, the record is kept (D-2's reasoning: deleting
+would silently discard a due date and assignee somebody set). It stays **on the board** with
+a marker saying its page no longer mentions it.
+
+Rejected: moving it to a separate list (a place you must remember to visit is a place nobody
+visits) and auto-archiving after a period (makes "it vanished" possible again, which is the
+outcome the detached state exists to prevent).
+
 ## Data model
 
 ```
