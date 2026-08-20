@@ -21,9 +21,8 @@ Entries describe the *effect* of a change, not the diff.
   person, and a stray `visibility: public` in one of two hundred files must not publish a
   page with nobody watching.
 - The access panel now answers its own question. Above the table it lists **every** way into
-  the page, in the order the permission engine decides them: a public share link, the page's
-  visibility, the »Verwaltung« reach that reads every page without any entry at all, and
-  then the entries. The two that reach past everybody somebody deliberately named — an
+  the page, most open first: a public share link, the page's visibility, the »Verwaltung«
+  reach that reads every page without any entry at all, and then the entries. The two that reach past everybody somebody deliberately named — an
   "Alle, auch nicht angemeldete" entry, and a public page — are marked as such, and such an
   entry now carries "Offenes Internet" in the table so it cannot be mistaken for a team.
 - **A Content-Security-Policy**, issued by the application rather than by either proxy —
