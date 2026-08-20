@@ -82,5 +82,30 @@ green is not finished — say so rather than moving on.
   by re-saving it as CRLF; a CRLF shebang makes the kernel look for `bash\r`.
 - **Commits are small, revertible and state intent.** `CHANGELOG.md` in the same change,
   ADRs in `docs/decisions/NNNN-title.md` for non-obvious choices. Both are rigid, not advisory.
+
+- **The changelog entry ships in the commit that earns it. No exceptions, and no orchestrator
+  may grant one.** This rule has been broken more than any other here, always the same way and
+  always for the same plausible reason: an orchestrator running several agents tells each of
+  them "do not edit `CHANGELOG.md`, you will conflict — put the entry in your report and I
+  will merge it". The entries then arrive in a batch days later, written by somebody who no
+  longer remembers which change earned which line, or they do not arrive at all. Three
+  separate reviews had to raise it before it was paid off, and one entry had gone stale in the
+  meantime — it still described a limitation the very work it accompanied had removed.
+
+  So:
+
+  - **If you are implementing, write the entry.** It is part of the change, like a test.
+    If an instruction tells you not to, that instruction is wrong; write it anyway and say
+    so in your report.
+  - **If you are orchestrating, do not issue that instruction.** Run implementers one at a
+    time — which you should already be doing, because concurrent agents also collide over
+    `Cargo.lock`, `scripts/mutate.sh` and each other's `cargo` builds — and the conflict you
+    were avoiding does not exist.
+  - **If agents genuinely must run in parallel**, each writes `changelog.d/<short-name>.md`
+    instead, and the assembling commit folds them in. A fragment nobody can conflict over is
+    the answer; silence is not.
+
+  Write the *effect*, not the diff, and write it for somebody who was not here. `CHANGELOG.md`
+  itself says so at the top.
 - **Compatibility.** Give each agent its native instruction file; keep adapters short.
   `CLAUDE.md` is the Claude-specific delta only — nothing here is duplicated there.

@@ -85,6 +85,33 @@ Three things that will waste your time:
   inherits its launch directory, so one cwd-relative entry serves every repo. Verify with
   `bash ~/code/agent-skills/infra/mcp-servers/scripts/linux/check-graphify-scope.sh --fix`
 
+## Omnigraph — agent memory, and what belongs in it
+
+ADR 0004 settled what this server is for: **agent memory**, not the wiki's own graph (that is
+SQLite, and `links` is the wiki's graph). So what belongs here is what a *future session* will
+wish it knew and cannot recover from the code — a decision and the alternatives it beat, a
+failure mode and its cause, a constraint discovered the hard way.
+
+**Record a change here as well as in `CHANGELOG.md`.** They are not the same audience and
+neither substitutes for the other: the changelog tells a *reader of this project* what the
+software now does, in terms of effect; Omnigraph tells the *next agent* why, so it does not
+re-derive a decision or repeat a failure. A change that is in neither is a change nobody can
+trace; a change in only the changelog leaves the reasoning to be rediscovered.
+
+Write the reasoning, not the diff — git already has the diff. In particular: what was tried
+and rejected, what the cost of the chosen option is, and what would have to change for the
+decision to be revisited.
+
+**Read `omnigraph://schema` before any query, mutation or load** — the server's own
+instructions insist on it, and writing without it produces queries that lint-fail or silently
+corrupt data. Verify a write landed: `commits_list` head before and after; identical heads
+mean the write did not land, and a 504 does not mean failure.
+
+**If the tools are absent**, the bridge is not connected to this session — the containers can
+be healthy while the MCP server is not attached. `docker ps | grep omnigraph` tells them
+apart. MCP servers load at startup, so reconnecting means restarting Claude Code; record what
+should have been written and write it then rather than dropping it.
+
 ## MCP failure modes — all four are silent
 
 | Symptom | Cause | Fix |
