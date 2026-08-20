@@ -8,6 +8,133 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- **A graph of your pages and the links between them**, at `/graph`, optionally narrowed to a
+  subtree. Nodes are pages and edges are links somebody deliberately wrote — topics are not
+  drawn, by decision, so the graph shows connections a person made rather than similarity a
+  machine inferred. An edge appears only when you may read **both** of its ends: one readable
+  end would still reveal that the other page exists, and a node label would reveal its title.
+  Drawn as plain SVG with a deterministic layout and no charting library, because a corpus of
+  tens of pages does not need one.
+- **"Verweist hierher"** on every page: which pages link to this one, filtered per document,
+  and rendered not at all when the list is empty rather than as an empty heading.
+- An absolute address pointing at this wiki now counts as an internal link. Pasting a page's
+  URL out of the address bar is the natural way to link it, and it previously produced a
+  working link that never appeared in the graph or in any backlinks panel, with nothing to
+  say why. The deployment's own origin arrives as configuration — the store cannot know it,
+  and a request's `Host` header must never be used to guess, being attacker-controlled. With
+  no origin configured, every absolute URL stays external exactly as before.
+
+### Changed
+
+- Between two publishes, what an editor opens and what a reader sees are allowed to differ.
+  A page says what its newest revision says; the editing session is somewhere else until
+  somebody publishes it. That is what "publish" means, and it is a real change from a wiki
+  that saved every thirty seconds whether you meant it or not.
+- `X-Forwarded-For` is now read, but only on a request the proxy boundary attested, and
+  only its rightmost entry — the one Caddy appended and no client can write. There was no
+  trustworthy client address in the application before this; the TCP peer is Caddy and a
+  raw header is whatever the caller typed.
+
+
+- An authenticated account no longer reaches restricted content by virtue of being signed
+  in. Reach follows the Authelia group, so an account by itself confers nothing beyond
+  public.
+
+- Identity storage: principals (from OpenID Connect or local accounts), teams and
+  memberships, path-scoped access grants that inherit down the document tree, and an audit
+  log.
+- Default reach follows the verified Authelia group, held in a `group_roles` table rather
+  than in code, so mapping a new group is a row and not a release. `admins` reach
+  restricted content, `users` reach internal, anything unmapped reaches public only —
+  expressed as the *absence* of a row, so a forgotten configuration can never widen access.
+  The admin baseline confers reads only; writing still needs an explicit grant.
+- Grants do not union up the tree: the nearest ancestor holding any grants wins outright,
+  which is what makes it possible to narrow access on a subtree rather than only widen it.
+
+- The proxy shared secret is now an enforced per-request check rather than a startup
+  assertion. Requests without it, or with a wrong value, are refused before routing — so an
+  unknown path returns 403 rather than 404 and cannot be used to probe what exists.
+  Comparison is constant-time; an empty configured secret returns 503 rather than allowing
+  through, because an unconfigured secret must never silently disable the boundary.
+- Enforcement is derived from the bind address: loopback disables it, so local development
+  needs no proxy in front, and anything public requires it.
+- `gw-auth`: the permission engine as its own crate. One `can()` decides every
+  authorisation in the system and checks authentication *before* group or team membership,
+  so a forged group on an anonymous request cannot pass. Local account credentials use
+  argon2id with Authelia's exact parameters, and a malformed stored hash denies access
+  rather than panicking.
+
+- `great-wiki seed --content <dir>` loads a folder of markdown files with YAML frontmatter
+  into the database, so there is real content to develop against before the editor exists.
+  The markdown-to-block conversion it needs is also half of the export round-trip, so this
+  is foundation rather than scaffolding.
+- Seeding refuses to guess. A missing title, absent frontmatter, a colliding path or a
+  parent document that does not exist are each reported by name with the reason, and the
+  command exits non-zero — deriving a title from a filename would silently publish a page
+  at a path nobody chose.
+- Markdown constructs the block model cannot yet represent are reported and their text
+  kept, never dropped. Emphasis is currently flattened.
+- `content-example/` makes the repository runnable straight after cloning, and gives CI
+  something real to validate.
+
+- Reader interface: layout with a skip link, dark and light themes following system
+  preference, recursive tree navigation, document pages with an on-this-page outline, and
+  error pages. Blocks render through a component that emits only the kinds it knows, so no
+  untrusted HTML is ever constructed and there is no sanitisation step to get wrong.
+
+- Document content model: a ProseMirror-shaped `Block` tree with plain-text extraction and
+  a heading outline whose anchor ids are transliterated to ASCII. `Visibility` defaults to
+  `Restricted`, so a document arriving with no stated visibility is never world-readable.
+- SQLite store with the initial schema: documents keyed by a materialised path, with
+  sibling ordering, soft delete, and a UNIQUE path so a slug collision fails loudly instead
+  of silently overwriting a page.
+- `great-wiki` binary with `serve` and `check`, and fail-closed startup validation: a
+  synthesised development identity cannot be combined with a non-loopback bind, a public
+  bind without a proxy secret is refused, and port 8090 is rejected outright because
+  `omnigraph-viewer` already owns it.
+- Read API — `/api/health`, `/api/tree`, `/api/documents/{*path}` — with visibility enforced
+  in the retriever. Restricted documents return 403 rather than a misleading 404, and
+  restricted titles are filtered out of the navigation tree entirely.
+- Integration tests that exercise the real router rather than calling handlers directly, so
+  a route registered without its permission check cannot pass the suite.
+
+- Rust workspace with `gw-core`, the pure-domain crate, and the `cargo test` /
+  `clippy -D warnings` / `fmt --check` gate that every later task must pass.
+- `slugify` with German transliteration (ä→ae, ö→oe, ü→ue, ß→ss), so German titles produce
+  readable, collision-free slugs. `Präbiotika` becomes `praebiotika`, not `pr-biotika`.
+- SvelteKit 2 / Svelte 5 application skeleton with the Node adapter, Vitest, and the
+  `npm run check` type gate. Node 24.19.0 pinned in `.nvmrc`.
+- `slugify` in TypeScript, mirroring the Rust implementation, with a test corpus shared
+  verbatim between the two so they cannot drift apart.
+
+- Repository foundations: MIT licence, public-repo-safe `.gitignore`, `.gitattributes`
+  enforcing LF on scripts and configs, and `.graphifyignore`.
+- Agent instruction files — `AGENTS.md` (hub: skills, memory, architecture rules,
+  verification commands) and `CLAUDE.md` (Claude-specific delta only).
+- MCP wiring: project-scoped `.mcp.json` pinning the Omnigraph graph to `great-wiki`, with
+  the approval gate in untracked `.claude/settings.local.json`. Graphify is deliberately
+  left to user scope; Serena is configured by `.serena/project.yml`.
+- `.serena/project.yml` with a conservative language list. TypeScript is omitted on purpose
+  until the running image is verified to carry its language server — an absent server takes
+  the entire Serena instance down rather than degrading.
+
+### Fixed
+
+- A relative link is resolved against the page it was written on, not against the root.
+  `nachbar` written on `/rundgang/tabellen` recorded an edge to `/nachbar` while clicking it
+  navigated to `/rundgang/nachbar` — so the graph named one page and the link went to
+  another.
+- Two edges could collide into one key. `/x → /y/z` and `/x/y → /z` produced the identical
+  key when the two paths were concatenated, which server-rendered fine and then failed
+  hydration of the entire page in the browser. It would have arrived silently as the wiki
+  grew.
+- The graph's screen-reader label counted differently from its visible caption, and
+  under-reported — the wrong one of the two to be wrong.
+- A subtree whose pages all link outward said "no links here", which was untrue: there were
+  links, they simply left the subtree. It now says which of the three things it means.
+- A misspelled `GW_PUBLIC_URL` is refused at startup rather than accepted and silently
+  ignored. A value like `mailto:…` parses as a valid URL but can never match a page origin,
+  so the feature would have been permanently missing with nothing to explain why.
 - Text can be **bold, italic, struck through, code, or a link**, and stays that way. Until
   now `Block` — what a published revision stores — had no field for inline formatting, so
   the CRDT carried a bold word faithfully while publishing threw it away, and the editor
@@ -312,101 +439,6 @@ Entries describe the *effect* of a change, not the diff.
 - Screenshot tooling: the reader is captured at desktop and phone widths in both themes, so
   a layout can be looked at rather than inferred from a status code.
 
-### Changed
-
-- Between two publishes, what an editor opens and what a reader sees are allowed to differ.
-  A page says what its newest revision says; the editing session is somewhere else until
-  somebody publishes it. That is what "publish" means, and it is a real change from a wiki
-  that saved every thirty seconds whether you meant it or not.
-- `X-Forwarded-For` is now read, but only on a request the proxy boundary attested, and
-  only its rightmost entry — the one Caddy appended and no client can write. There was no
-  trustworthy client address in the application before this; the TCP peer is Caddy and a
-  raw header is whatever the caller typed.
-
-
-- An authenticated account no longer reaches restricted content by virtue of being signed
-  in. Reach follows the Authelia group, so an account by itself confers nothing beyond
-  public.
-
-- Identity storage: principals (from OpenID Connect or local accounts), teams and
-  memberships, path-scoped access grants that inherit down the document tree, and an audit
-  log.
-- Default reach follows the verified Authelia group, held in a `group_roles` table rather
-  than in code, so mapping a new group is a row and not a release. `admins` reach
-  restricted content, `users` reach internal, anything unmapped reaches public only —
-  expressed as the *absence* of a row, so a forgotten configuration can never widen access.
-  The admin baseline confers reads only; writing still needs an explicit grant.
-- Grants do not union up the tree: the nearest ancestor holding any grants wins outright,
-  which is what makes it possible to narrow access on a subtree rather than only widen it.
-
-- The proxy shared secret is now an enforced per-request check rather than a startup
-  assertion. Requests without it, or with a wrong value, are refused before routing — so an
-  unknown path returns 403 rather than 404 and cannot be used to probe what exists.
-  Comparison is constant-time; an empty configured secret returns 503 rather than allowing
-  through, because an unconfigured secret must never silently disable the boundary.
-- Enforcement is derived from the bind address: loopback disables it, so local development
-  needs no proxy in front, and anything public requires it.
-- `gw-auth`: the permission engine as its own crate. One `can()` decides every
-  authorisation in the system and checks authentication *before* group or team membership,
-  so a forged group on an anonymous request cannot pass. Local account credentials use
-  argon2id with Authelia's exact parameters, and a malformed stored hash denies access
-  rather than panicking.
-
-- `great-wiki seed --content <dir>` loads a folder of markdown files with YAML frontmatter
-  into the database, so there is real content to develop against before the editor exists.
-  The markdown-to-block conversion it needs is also half of the export round-trip, so this
-  is foundation rather than scaffolding.
-- Seeding refuses to guess. A missing title, absent frontmatter, a colliding path or a
-  parent document that does not exist are each reported by name with the reason, and the
-  command exits non-zero — deriving a title from a filename would silently publish a page
-  at a path nobody chose.
-- Markdown constructs the block model cannot yet represent are reported and their text
-  kept, never dropped. Emphasis is currently flattened.
-- `content-example/` makes the repository runnable straight after cloning, and gives CI
-  something real to validate.
-
-- Reader interface: layout with a skip link, dark and light themes following system
-  preference, recursive tree navigation, document pages with an on-this-page outline, and
-  error pages. Blocks render through a component that emits only the kinds it knows, so no
-  untrusted HTML is ever constructed and there is no sanitisation step to get wrong.
-
-- Document content model: a ProseMirror-shaped `Block` tree with plain-text extraction and
-  a heading outline whose anchor ids are transliterated to ASCII. `Visibility` defaults to
-  `Restricted`, so a document arriving with no stated visibility is never world-readable.
-- SQLite store with the initial schema: documents keyed by a materialised path, with
-  sibling ordering, soft delete, and a UNIQUE path so a slug collision fails loudly instead
-  of silently overwriting a page.
-- `great-wiki` binary with `serve` and `check`, and fail-closed startup validation: a
-  synthesised development identity cannot be combined with a non-loopback bind, a public
-  bind without a proxy secret is refused, and port 8090 is rejected outright because
-  `omnigraph-viewer` already owns it.
-- Read API — `/api/health`, `/api/tree`, `/api/documents/{*path}` — with visibility enforced
-  in the retriever. Restricted documents return 403 rather than a misleading 404, and
-  restricted titles are filtered out of the navigation tree entirely.
-- Integration tests that exercise the real router rather than calling handlers directly, so
-  a route registered without its permission check cannot pass the suite.
-
-- Rust workspace with `gw-core`, the pure-domain crate, and the `cargo test` /
-  `clippy -D warnings` / `fmt --check` gate that every later task must pass.
-- `slugify` with German transliteration (ä→ae, ö→oe, ü→ue, ß→ss), so German titles produce
-  readable, collision-free slugs. `Präbiotika` becomes `praebiotika`, not `pr-biotika`.
-- SvelteKit 2 / Svelte 5 application skeleton with the Node adapter, Vitest, and the
-  `npm run check` type gate. Node 24.19.0 pinned in `.nvmrc`.
-- `slugify` in TypeScript, mirroring the Rust implementation, with a test corpus shared
-  verbatim between the two so they cannot drift apart.
-
-- Repository foundations: MIT licence, public-repo-safe `.gitignore`, `.gitattributes`
-  enforcing LF on scripts and configs, and `.graphifyignore`.
-- Agent instruction files — `AGENTS.md` (hub: skills, memory, architecture rules,
-  verification commands) and `CLAUDE.md` (Claude-specific delta only).
-- MCP wiring: project-scoped `.mcp.json` pinning the Omnigraph graph to `great-wiki`, with
-  the approval gate in untracked `.claude/settings.local.json`. Graphify is deliberately
-  left to user scope; Serena is configured by `.serena/project.yml`.
-- `.serena/project.yml` with a conservative language list. TypeScript is omitted on purpose
-  until the running image is verified to carry its language server — an absent server takes
-  the entire Serena instance down rather than degrading.
-
-### Fixed
 
 - `/api/collab/*` now works in development. Vite proxies WebSocket upgrades only for a proxy
   entry that asks for one; without `ws: true` the handshake was never forwarded and the
