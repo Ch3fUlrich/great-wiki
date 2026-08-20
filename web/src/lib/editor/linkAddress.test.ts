@@ -66,4 +66,53 @@ describe('normalizeLinkAddress', () => {
     const typed = 'mailto:jemand@example.org';
     expect(normalizeLinkAddress(ORIGIN, '/rundgang', typed)).toBe(typed);
   });
+
+  it('leaves a PROTOCOL-RELATIVE address on a foreign host alone instead of making it internal', () => {
+    // The bug: `//evil.example.com/phish` carries no scheme, so `new URL()` with no base
+    // throws and it used to fall into the relative branch — where resolving it against the
+    // current page produced `https://evil.example.com/phish`, and taking `.pathname` off
+    // that threw the HOST away. The address collapsed to `/phish`: a link the author wrote
+    // to somewhere else silently became a link to a different page of THIS wiki, and the
+    // owner would then publish it.
+    expect(normalizeLinkAddress(ORIGIN, '/rundgang', '//evil.example.com/phish')).toBe(
+      '//evil.example.com/phish'
+    );
+    // Also on a nested current page, where the old resolution would have produced a
+    // different — but equally wrong — internal path.
+    expect(normalizeLinkAddress(ORIGIN, '/rundgang/tabellen', '//evil.example.com/phish')).toBe(
+      '//evil.example.com/phish'
+    );
+    // Query and fragment go with it, untouched.
+    expect(normalizeLinkAddress(ORIGIN, '/rundgang', '//evil.example.com/p?a=1#b')).toBe(
+      '//evil.example.com/p?a=1#b'
+    );
+  });
+
+  it('still turns a protocol-relative address that names THIS origin into its path', () => {
+    // Scheme-less but not foreign. `//wiki.example.org/ziel` addresses the same origin the
+    // absolute form does, so it gets the same answer the absolute form gets — the rule is
+    // "which origin does this address", not "does it spell out a scheme".
+    expect(normalizeLinkAddress(ORIGIN, '/rundgang', '//wiki.example.org/ziel')).toBe('/ziel');
+  });
+
+  it('agrees with safeHref about protocol-relative: both treat it as an external address', () => {
+    // `safeHref` resolves against a placeholder base, so `//evil.example` takes that base's
+    // https scheme and is ALLOWED — deliberately, because an outright `https://evil.example`
+    // is allowed too and nothing is granted by the shorter spelling. The two functions have
+    // to agree on what the address MEANS, and now they do: external stays external.
+    const typed = '//evil.example/phish';
+    expect(normalizeLinkAddress(ORIGIN, '/rundgang', typed)).toBe(typed);
+    expect(safeHref(typed)).toBe(typed);
+  });
+
+  it('leaves a relative reference alone, which is what the origin comparison must not break', () => {
+    // A genuinely relative reference can never resolve to another origin, so the guard added
+    // for protocol-relative addresses is inert for every one of these.
+    expect(normalizeLinkAddress(ORIGIN, '/rundgang/tabellen', '#abschnitt')).toBe(
+      '/rundgang/tabellen#abschnitt'
+    );
+    expect(normalizeLinkAddress(ORIGIN, '/rundgang/tabellen', '?von=hier')).toBe(
+      '/rundgang/tabellen?von=hier'
+    );
+  });
 });

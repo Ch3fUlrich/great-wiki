@@ -102,7 +102,13 @@ describe('safeHref', () => {
       'mailto:jemand@example.org',
       '/rundgang/tabellen',
       '../nachbar',
-      '#abschnitt'
+      '#abschnitt',
+      // Protocol-relative, and deliberately allowed: resolved against the placeholder base it
+      // takes that base's https scheme, and an outright `https://evil.example/phish` is
+      // allowed anyway — the shorter spelling grants nothing new. `normalizeLinkAddress`
+      // agrees: since it started comparing origins, it leaves a foreign `//host/…` alone
+      // rather than collapsing it to a path of THIS wiki.
+      '//evil.example/phish'
     ]) {
       expect(safeHref(href), href).toBe(href);
     }

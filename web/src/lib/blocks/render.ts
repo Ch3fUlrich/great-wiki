@@ -49,6 +49,13 @@ const LINK_SCHEMES = new Set(['http:', 'https:', 'mailto:']);
  * and `java\nscript:` are the same URL to it and to this. Relative references keep working —
  * resolved against a base, they take the base's scheme, which is the honest answer for a link
  * that has no scheme of its own to abuse.
+ *
+ * A protocol-relative `//host/path` is therefore ALLOWED, which is deliberate rather than an
+ * oversight: it takes the base's `https:` and points off-site, and `https://host/path` spelled
+ * out in full is allowed too — refusing the shorter spelling would deny nothing an author
+ * cannot say another way. `normalizeLinkAddress` (`$lib/editor/linkAddress`) reads such an
+ * address the same way, as an address of somewhere else; it used to disagree, silently turning
+ * it into a path of this wiki.
  */
 export function safeHref(href: unknown): string | null {
   if (typeof href !== 'string' || href.trim() === '') return null;

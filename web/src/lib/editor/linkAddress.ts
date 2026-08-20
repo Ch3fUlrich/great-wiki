@@ -28,6 +28,9 @@
  *   query and fragment — the same shape `wiki_path` already resolves.
  * - A foreign absolute URL is returned unchanged: it addresses somewhere this wiki cannot
  *   and must not claim an edge to, same as `wiki_path` treats it.
+ * - A protocol-relative address (`//host/path`) is judged by the host it names, not by the
+ *   scheme it omits: pointing at this origin it becomes a path like any other same-origin
+ *   address, pointing anywhere else it is returned unchanged like any other foreign one.
  * - Anything else is a relative reference and is resolved against the CURRENT page, root-
  *   anchored by construction (`URL.pathname` always starts with `/`) — which is what fixes
  *   the companion bug in `wiki_path` for links written here specifically: Task 7 shipped
@@ -54,10 +57,11 @@
  * typed, is external, same as always.
  *
  * Two limitations remain regardless of configuration, both in `gw-store` rather than here: a
- * protocol-relative address (`//wiki.example.org/ziel`, no scheme) is always external,
- * unconditionally; and a page imported or published before `public_origin` was configured
- * keeps the edges that import produced until something re-publishes it — there is no
- * backfill.
+ * protocol-relative address (`//wiki.example.org/ziel`, no scheme) is always external to it,
+ * unconditionally — which is why this function resolves the same-origin case to a path before
+ * `gw-store` ever sees it; and a page imported or published before `public_origin` was
+ * configured keeps the edges that import produced until something re-publishes it — there is
+ * no backfill.
  */
 export function normalizeLinkAddress(origin: string, currentPath: string, typed: string): string {
   const trimmed = typed.trim();
@@ -77,11 +81,19 @@ export function normalizeLinkAddress(origin: string, currentPath: string, typed:
     // dangerous scheme; this function's job ends at "did not touch a foreign address".
     return trimmed;
   } catch {
-    // Not parseable on its own, so it is relative. Resolved against the page it was typed
-    // on — exactly what a browser would do with it left in the body unresolved — which is
-    // the whole fix: this used to reach `wiki_path` un-resolved and get root-anchored
-    // instead, naming a page the link did not go to.
+    // Not parseable on its own, so it is relative OR protocol-relative. Resolved against the
+    // page it was typed on — exactly what a browser would do with it left in the body
+    // unresolved — which is the whole fix: this used to reach `wiki_path` un-resolved and get
+    // root-anchored instead, naming a page the link did not go to.
     const resolved = new URL(trimmed, origin + currentPath);
+    // `//host/path` lands here too: it carries an AUTHORITY but no scheme, so `new URL` with
+    // no base throws on it exactly as a relative reference does. Resolving it borrows the
+    // page's scheme and REPLACES the host, so the resolved origin is the typed one, not this
+    // wiki's — and returning `.pathname` off that would throw the host away and silently turn
+    // `//evil.example/phish` into a link to this wiki's own `/phish`. Comparing origins is
+    // what tells the two cases apart; a genuinely relative reference can never change origin,
+    // so this is inert for every one of those.
+    if (resolved.origin !== origin) return trimmed;
     return resolved.pathname + resolved.search + resolved.hash;
   }
 }
