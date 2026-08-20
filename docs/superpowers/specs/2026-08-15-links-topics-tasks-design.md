@@ -134,6 +134,40 @@ Rejected: moving it to a separate list (a place you must remember to visit is a 
 visits) and auto-archiving after a period (makes "it vanished" possible again, which is the
 outcome the detached state exists to prevent).
 
+### D-9: Fixed columns — Offen, Läuft, Fertig (2026-08-20)
+
+The same three on every board, built in. A task's status is a small closed set the schema can
+enforce, every board reads the same way, and no query has to handle a status set it cannot
+know in advance.
+
+Rejected: per-project columns (a task moved between projects lands in a column that may not
+exist) and renameable labels over fixed states (a column called something else that behaves
+like `Läuft` misleads as easily as it helps). Going from fixed to configurable later is a
+contained migration; the reverse is not.
+
+### D-10: A task carries status, due date and assignee (2026-08-20)
+
+The full record. Dates matter for a treatment plan, which is what this wiki holds.
+
+**Open question this creates, to be answered in the plan, not here:** nothing in this system
+answers *who may assign whom*. Today there is one account, so any answer is untested. The
+plan must state a rule and a test for it rather than leaving assignment ungoverned.
+
+### D-11: The floor — a checkbox cannot be represented today (2026-08-20)
+
+Discovered while planning, and it changes the size of this piece. `gw_core::markdown` maps
+`Event::TaskListMarker` to `Unsupported::TaskListMarker` and **drops it**; `BlockKind` has no
+task variant. So `- [ ] etwas` imports as a plain bullet with the checkbox gone.
+
+D-6 ("any checkbox line is a task") therefore cannot be built until a checkbox survives
+import, export, the CRDT and the editor — the same five layers piece 0 needed for marks, and
+for the same reason.
+
+`Block` mirrors ProseMirror exactly, deliberately, so this follows the editor's own model:
+`taskList` and `taskItem` as block kinds, matching TipTap's extensions, rather than a
+`checked` attribute on `listItem`. A translation layer is the thing that model exists to
+avoid.
+
 ## Data model
 
 ```
