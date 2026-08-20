@@ -4,6 +4,7 @@ import {
   type AclView,
   type AdminPrincipal,
   type AuditPage,
+  type GroupRole,
   type Loaded,
   type Team
 } from '$lib/adminApi';
@@ -52,7 +53,7 @@ export const load: PageServerLoad = async ({ fetch, request, url }) => {
   const requested = Number(url.searchParams.get('anzahl') ?? DEFAULT_LIMIT);
   const limit = ALLOWED_LIMITS.includes(requested) ? requested : DEFAULT_LIMIT;
 
-  const [tree, people, teams, audit, acl] = await Promise.all([
+  const [tree, people, teams, roles, audit, acl] = await Promise.all([
     loadOne<TreeNode[]>(fetch, cookie, '/api/tree', 'Der Seitenbaum konnte nicht geladen werden'),
     loadOne<AdminPrincipal[]>(
       fetch,
@@ -61,6 +62,16 @@ export const load: PageServerLoad = async ({ fetch, request, url }) => {
       'Die Personenliste konnte nicht geladen werden'
     ),
     loadOne<Team[]>(fetch, cookie, '/api/admin/teams', 'Die Teamliste konnte nicht geladen werden'),
+    // Default reach, before any entry: the access panel cannot answer "who reaches this
+    // page" without it, because a group mapped to `admin` reads every restricted page in
+    // the corpus and no entry anywhere shows that. Instance-wide, so a space admin is
+    // refused it — which the panel says in words rather than reading as "no group has it".
+    loadOne<GroupRole[]>(
+      fetch,
+      cookie,
+      '/api/admin/roles',
+      'Die Zuordnung von Gruppen zu Reichweiten konnte nicht geladen werden'
+    ),
     loadOne<AuditPage>(
       fetch,
       cookie,
@@ -88,6 +99,7 @@ export const load: PageServerLoad = async ({ fetch, request, url }) => {
       data: teams.data ? teams.data.map((team) => ({ ...team, members: team.members ?? [] })) : null,
       error: teams.error
     } satisfies Loaded<Team[]>,
+    roles,
     audit,
     acl
   };

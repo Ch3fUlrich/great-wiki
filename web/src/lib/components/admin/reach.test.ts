@@ -3,7 +3,12 @@ import {
   grantReachText,
   grantReachTitle,
   inheritedReachText,
-  inheritedReachTitle
+  inheritedReachTitle,
+  reachRoutes,
+  revokeResumeText,
+  revokeResumeTitle,
+  visibilityChangeText,
+  visibilityConsequence
 } from './reach';
 
 /**
@@ -51,11 +56,12 @@ describe('grantReach', () => {
     expect(text).toContain('Einen anderen Weg, einzelne Seiten auszunehmen, gibt es hier nicht.');
   });
 
-  it('never tells anybody to change a page’s visibility, which nothing in this system can do', () => {
-    // No API route writes `visibility`: `/api/admin/acl` grants and revokes, and the
-    // value comes from frontmatter at import. Copy that says "set this page to
-    // restricted" would be an instruction nobody can follow — and would be wrong anyway,
-    // since a grant outranks it.
+  it('never sends anybody to the visibility control to undo a grant', () => {
+    // The control now EXISTS — `/api/admin/visibility`, added in the same change as these
+    // words — which makes this assertion more important than it was, not less. Pointing
+    // at it here would send somebody to a real control that does not do what they were
+    // told: `permits()` consults the grants before it reads the field, so lowering a page
+    // to »Eingeschränkt« closes nothing this grant has opened.
     const text = `${grantReachTitle('/handbuch')} ${grantReachText('/handbuch')}`;
     expect(text).not.toContain('Sichtbarkeit ändern');
     expect(text).not.toContain('Sichtbarkeit auf');
@@ -114,5 +120,184 @@ describe('inheritedReach', () => {
   it('passes an unrecognised visibility through instead of dropping it', () => {
     const text = inheritedReachText('/a/b', '/a', 'geheim');
     expect(text).toContain('unabhängig davon, dass diese Seite als »geheim« gekennzeichnet ist');
+  });
+});
+
+/**
+ * The panel's answer to its own question.
+ *
+ * A table of grants is not that answer, and for three years' worth of wrong assumptions
+ * it has been captioned as if it were. `permits()` in `crates/gw-store/src/acl.rs`
+ * decides in this order, and only the last of them is a grant:
+ *
+ *   1. `can()` at `Visibility::Restricted` — grants, and `Anyone` grants BEFORE the
+ *      caller is even known to be signed in.
+ *   2. `Visibility::Public` — everyone, including anonymous.
+ *   3. `Visibility::Internal` — baseline `internal` or better.
+ *   4. `Visibility::Restricted` — baseline `admin`, on READS only.
+ *
+ * So an instance admin reads every restricted page in the corpus with no row anywhere,
+ * and no grants table will ever show it. These routes are what the panel says instead.
+ */
+describe('reachRoutes', () => {
+  const base = {
+    path: '/handbuch',
+    shareLink: [] as string[],
+    hasGrants: false,
+    adminGroups: ['admins'],
+    internalGroups: ['users']
+  };
+
+  it('always names the admin baseline, which no grants table can show', () => {
+    const routes = reachRoutes({ ...base, visibility: 'restricted' });
+    const admin = routes.find((route) => route.key === 'baseline');
+    expect(admin).toBeDefined();
+    expect(admin?.title).toContain('Verwaltung');
+    expect(admin?.text).toContain('jede Seite');
+    expect(admin?.text).toContain('ohne jeden Eintrag');
+    // Read only. `permits()` returns false for every other action once no grant matches.
+    expect(admin?.text).toContain('Schreiben');
+  });
+
+  it('names the groups that carry that reach, and says who decides membership', () => {
+    const routes = reachRoutes({ ...base, visibility: 'restricted' });
+    const admin = routes.find((route) => route.key === 'baseline');
+    expect(admin?.text).toContain('»admins«');
+    expect(admin?.text).toContain('Authelia');
+  });
+
+  it('says the mapping is unknown rather than implying no group has it', () => {
+    // A space admin is refused `/api/admin/roles`, which is instance-wide. "No group is
+    // mapped" and "this console may not read the mapping" are opposite facts.
+    const routes = reachRoutes({
+      ...base,
+      visibility: 'restricted',
+      adminGroups: null,
+      internalGroups: null
+    });
+    const admin = routes.find((route) => route.key === 'baseline');
+    expect(admin?.text).toContain('zeigt diese Ansicht nicht');
+    expect(admin?.text).not.toContain('keine Gruppe');
+  });
+
+  it('distinguishes "no group is mapped" from "the mapping is unknown"', () => {
+    const routes = reachRoutes({ ...base, visibility: 'restricted', adminGroups: [] });
+    const admin = routes.find((route) => route.key === 'baseline');
+    expect(admin?.text).toContain('keine Gruppe');
+    expect(admin?.text).toContain('Einzelne Konten');
+  });
+
+  it('says a public page is readable by everyone, before any entry is consulted', () => {
+    const routes = reachRoutes({ ...base, visibility: 'public' });
+    const visibility = routes.find((route) => route.key === 'visibility');
+    expect(visibility?.tone).toBe('warn');
+    expect(visibility?.title).toContain('Öffentlich');
+    expect(visibility?.text).toContain('ohne Anmeldung');
+    expect(visibility?.text).toContain('offenen Internet');
+  });
+
+  it('names who an internal page reaches, which is not "everyone signed in"', () => {
+    // `can()` alone would give an internal read to anybody authenticated. `permits()`
+    // narrows it to baseline >= internal, which is a group question.
+    const routes = reachRoutes({ ...base, visibility: 'internal' });
+    const visibility = routes.find((route) => route.key === 'visibility');
+    expect(visibility?.text).toContain('angemeldet');
+    expect(visibility?.text).toContain('»users«');
+    // The admin baseline is >= internal, so those groups read it too.
+    expect(visibility?.text).toContain('»admins«');
+  });
+
+  it('says plainly that a restricted page lets nobody in through its visibility', () => {
+    const routes = reachRoutes({ ...base, visibility: 'restricted' });
+    const visibility = routes.find((route) => route.key === 'visibility');
+    expect(visibility?.text).toContain('niemand');
+  });
+
+  it('marks an Anyone grant as the open internet, above everything else', () => {
+    const routes = reachRoutes({
+      ...base,
+      visibility: 'restricted',
+      shareLink: ['Lesen'],
+      hasGrants: true
+    });
+    expect(routes[0].key).toBe('share');
+    expect(routes[0].tone).toBe('warn');
+    expect(routes[0].text).toContain('ohne Anmeldung');
+    expect(routes[0].text).toContain('Lesen');
+    // It is decided before authentication, so no visibility setting takes it back.
+    expect(routes[0].text).toContain('Sichtbarkeit');
+  });
+
+  it('never says that with no entries nothing else applies', () => {
+    // The sentence this whole exercise is about. "Es gilt allein die Sichtbarkeit der
+    // Seite" is true about grants and reads as "nobody else gets in" — while an
+    // administrator reads the page and an internal page is open to a whole group.
+    const routes = reachRoutes({ ...base, visibility: 'restricted', hasGrants: false });
+    const grants = routes.find((route) => route.key === 'grants');
+    expect(grants?.title).toContain('Kein Zugriffseintrag');
+    expect(grants?.text).toContain('Die übrigen Wege oben gelten weiter');
+    const all = routes.map((route) => `${route.title} ${route.text}`).join(' ');
+    expect(all).not.toContain('allein die Sichtbarkeit');
+    expect(all).not.toContain('gilt allein');
+  });
+
+  it('says the visibility is unknown rather than leaving it out silently', () => {
+    const routes = reachRoutes({ ...base, visibility: null });
+    const visibility = routes.find((route) => route.key === 'visibility');
+    expect(visibility?.text).toContain('nicht bekannt');
+  });
+});
+
+describe('revokeResume', () => {
+  it('says which ancestor resumes, and that it covers the whole subtree', () => {
+    // `grants_for_path` returns the rows of the NEAREST ancestor that has any. Removing
+    // the last row here does not remove access — it hands the page back to the ancestor,
+    // and every page below that carries nothing of its own with it.
+    expect(revokeResumeTitle('/handbuch')).toBe(
+      'Danach gelten hier wieder die Rechte von /handbuch.'
+    );
+    const text = revokeResumeText('/handbuch/onboarding', '/handbuch', [
+      'Redaktion (redaktion): Schreiben'
+    ]);
+    expect(text).toContain('letzte Zugriffseintrag auf /handbuch/onboarding');
+    expect(text).toContain('auf jeder Seite darunter');
+    expect(text).toContain('Redaktion (redaktion): Schreiben');
+    expect(text).toContain('/handbuch');
+  });
+
+  it('does not promise the change can be undone here', () => {
+    const text = revokeResumeText('/a/b', '/a', ['Team (t): Lesen']);
+    expect(text).not.toContain('rückgängig');
+    expect(text).toContain('ersetzt');
+  });
+});
+
+describe('visibilityChange', () => {
+  it('says the setting stops at this page, unlike a grant', () => {
+    const text = visibilityChangeText('/handbuch');
+    expect(text).toContain('Unterseiten behalten ihre eigene');
+    expect(text).toContain('nicht nach unten');
+  });
+
+  it('says it takes nobody’s access away, which is the belief that gets people hurt', () => {
+    // The mirror image of the grant warning. Somebody sets `restricted` believing it
+    // closes the page; `permits()` consults grants first, so a grant on an ancestor
+    // walks straight past it.
+    const text = visibilityChangeText('/handbuch');
+    expect(text).toContain('hebt keinen Zugriffseintrag auf');
+    expect(text).toContain('»Eingeschränkt«');
+    expect(text).toContain('Verwaltung');
+  });
+
+  it('spells out what each value actually does', () => {
+    expect(visibilityConsequence('/handbuch', 'public')).toContain('offenen Internet');
+    expect(visibilityConsequence('/handbuch', 'public')).toContain('ohne Anmeldung');
+    expect(visibilityConsequence('/handbuch', 'internal')).toContain('angemeldet');
+    expect(visibilityConsequence('/handbuch', 'restricted')).toContain('niemand');
+    expect(visibilityConsequence('/handbuch', 'restricted')).toContain('bleiben davon unberührt');
+  });
+
+  it('passes an unrecognised value through rather than describing the wrong one', () => {
+    expect(visibilityConsequence('/handbuch', 'geheim')).toContain('»geheim«');
   });
 });

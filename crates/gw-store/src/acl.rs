@@ -412,7 +412,35 @@ impl Store {
     /// `None` for the source means no ancestor carries any grant, so reach here is
     /// whatever the baseline confers and nothing more.
     pub async fn effective_grants(&self, path: &str) -> Result<(Option<String>, Vec<Grant>)> {
-        for candidate in ancestors(path) {
+        self.nearest_grants(ancestors(path)).await
+    }
+
+    /// The grants that would apply at `path` if `path` carried none of its own.
+    ///
+    /// The console needs this to describe a revoke honestly. Removing the LAST row on a
+    /// path is not a local change: the nearest ancestor with any rows wins outright, so
+    /// once this path has none, the ancestor's set applies here — and across every page
+    /// below that carries nothing of its own. [`Store::effective_grants`] cannot answer
+    /// it, because a path is its own first ancestor and therefore names ITSELF the moment
+    /// it holds a single row.
+    ///
+    /// It never subtracts: a grant only ever widens, so what comes back is what somebody
+    /// would REGAIN, never what they would lose.
+    pub async fn grants_above(&self, path: &str) -> Result<(Option<String>, Vec<Grant>)> {
+        // `skip(1)`, not `parent path then ancestors`: `ancestors` already stops below the
+        // root and truncates at segment boundaries, and re-deriving the parent here would
+        // be a second copy of that rule for `/darm` versus `/darmflora` to disagree over.
+        self.nearest_grants(ancestors(path).into_iter().skip(1).collect())
+            .await
+    }
+
+    /// The rows of the first candidate that has any. One walk, so `effective_grants` and
+    /// `grants_above` cannot come to disagree about what "nearest" means.
+    async fn nearest_grants(
+        &self,
+        candidates: Vec<String>,
+    ) -> Result<(Option<String>, Vec<Grant>)> {
+        for candidate in candidates {
             let rows: Vec<GrantRow> = sqlx::query_as(
                 "SELECT subject_kind, subject_id, permission FROM acl WHERE path = ?1",
             )
@@ -500,6 +528,7 @@ pub(crate) fn permission_column(permission: Permission) -> &'static str {
 mod tests {
     use super::{ancestors, Baseline};
     use crate::Store;
+    use gw_auth::{Grant, Permission, Subject};
 
     async fn store() -> Store {
         Store::open("sqlite::memory:").await.unwrap()
@@ -511,6 +540,50 @@ mod tests {
         assert_eq!(ancestors("/a"), vec!["/a"]);
         assert!(ancestors("/").is_empty());
         assert!(ancestors("").is_empty());
+    }
+
+    #[tokio::test]
+    async fn what_would_apply_here_without_this_path_s_own_grants() {
+        // The fact the revoke dialog is built on. Removing the LAST row on a path is not
+        // a local change: the nearest ancestor with any rows wins outright, so the page
+        // — and everything under it that carries nothing — falls back to that ancestor.
+        // `effective_grants` cannot say so, because a path is its own first ancestor.
+        let store = store().await;
+        store
+            .add_grant("/a", Subject::Team("oben".into()), Permission::Read)
+            .await
+            .unwrap();
+        store
+            .add_grant("/a/b", Subject::Team("hier".into()), Permission::Write)
+            .await
+            .unwrap();
+
+        let (source, grants) = store.effective_grants("/a/b").await.unwrap();
+        assert_eq!(
+            source.as_deref(),
+            Some("/a/b"),
+            "a path is its own ancestor"
+        );
+        assert_eq!(grants.len(), 1);
+
+        let (above, resuming) = store.grants_above("/a/b").await.unwrap();
+        assert_eq!(above.as_deref(), Some("/a"));
+        assert_eq!(
+            resuming,
+            vec![Grant {
+                subject: Subject::Team("oben".into()),
+                permission: Permission::Read
+            }]
+        );
+
+        // Nothing above a top-level path, and it says so rather than naming itself.
+        assert_eq!(store.grants_above("/a").await.unwrap(), (None, Vec::new()));
+
+        // Segment-based, exactly as `ancestors` is: `/ab` is not under `/a`.
+        assert_eq!(
+            store.grants_above("/ab/c").await.unwrap(),
+            (None, Vec::new())
+        );
     }
 
     #[test]

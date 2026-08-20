@@ -44,6 +44,48 @@ cd "$(dirname "$0")/.."
 MUTATIONS=()
 mutation() { MUTATIONS+=("$1"$'\x1f'"$2"$'\x1f'"$3"$'\x1f'"$4"); }
 
+# --- visibility: the one thing that publishes a page to the internet ----------------
+#
+# `documents.visibility` had no write path at all until now: the value arrived from
+# frontmatter at import, and `seed --update` compares it and REFUSES to change it,
+# precisely so a stray `visibility: public` in a bulk file drop cannot publish a page with
+# nobody watching. `/api/admin/visibility` is the deliberate single-path alternative, and
+# everything that made the refusal worth having applies to it doubled: this wiki is
+# internet-facing, `public` means the open internet, and the pages it protects are a
+# child's medical records.
+#
+# The gate is `path_admin` — admin on the page's own path — and the first mutation is the
+# one that matters. Swapped for `signed_in` it is not merely weaker, it is no
+# authorisation at all: anybody with an account could publish any page. `leser` in the
+# fixture holds `read` on `/raum` and nothing else, and `gast` is given `write` in the same
+# test, so both the read and the write case are covered by a signed-in caller who must
+# still be refused. Without those grants no subject would match anything and the test
+# would pass with the gate deleted — the vacuous shape this whole file exists to catch.
+#
+# `sed` address range rather than a bare substitution: `grant` and `revoke` carry the
+# identical gate line, and a global replacement would mutate three endpoints at once and
+# prove nothing about any of them.
+mutation crates/gw-api/src/routes/admin.rs killed \
+  '/pub async fn set_visibility/,/^}$/ s/let actor = path_admin(&state, &jar, &body.path).await?;/let actor = signed_in(\&state, \&jar).await?;/' \
+  'visibility: publishing a page needs admin on it — being able to read or write must not widen it'
+# Fail closed on a value this code does not understand. The mutation writes the tempting
+# version — parse, and fall back to the default — which is safe TODAY only because
+# `Visibility::default()` happens to be `Restricted`, and is one enum reordering away from
+# publishing a page nobody asked to publish.
+mutation crates/gw-api/src/routes/admin.rs killed \
+  's/    let Ok(visibility) = Visibility::from_str(&body.visibility) else {/    let visibility = Visibility::from_str(\&body.visibility).unwrap_or_default(); if false {/' \
+  'visibility: an unrecognised value is refused rather than quietly defaulted'
+# And the record. A visibility change with no audit row is the one administrative act in
+# this system that leaves no trace anywhere: `documents` keeps only the current value, and
+# `updated_at` is deliberately not touched, so the log is the ONLY place "who published
+# this, and what was it before" survives.
+mutation crates/gw-store/src/admin.rs killed \
+  's/            "document.visibility",/            "dokument.sichtbarkeit",/' \
+  'visibility: the change writes an audit row under the name the console reads back'
+mutation crates/gw-store/src/admin.rs killed \
+  's/&json!({ "from": from, "to": visibility.as_str() }),/\&json!({ "from": visibility.as_str(), "to": visibility.as_str() }),/' \
+  'visibility: the row records what the page WAS, not the new value twice'
+
 # --- the audit log: who may read who-did-what -------------------------------------
 mutation crates/gw-store/src/audit.rs killed \
   's/can(principal, Action::Admin, Visibility::Restricted/can(principal, Action::Read, Visibility::Restricted/' \

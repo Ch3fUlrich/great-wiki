@@ -39,13 +39,14 @@ use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
 use gw_auth::{can, Action, Grant, Permission, Principal, Subject};
 use gw_core::Visibility;
-use gw_store::admin::{ActiveOutcome, InstanceAdminOutcome};
+use gw_store::admin::{ActiveOutcome, InstanceAdminOutcome, VisibilityOutcome};
 use gw_store::principals::AdminCandidate;
 use gw_store::{
     AuditPage, Baseline, CreateInviteOutcome, InviteSummary, MembershipOutcome, NewInvite,
     RevokeInviteOutcome, TeamSummary, INVITE_TTL_SECONDS,
 };
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -66,6 +67,8 @@ pub fn routes() -> Router<AppState> {
             delete(remove_member),
         )
         .route("/api/admin/acl", get(read_acl).post(grant).delete(revoke))
+        .route("/api/admin/visibility", post(set_visibility))
+        .route("/api/admin/roles", get(list_roles))
         .route("/api/admin/audit", get(read_audit))
         .route("/api/admin/invites", get(list_invites).post(create_invite))
         .route("/api/admin/invites/{id}", delete(revoke_invite))
@@ -573,6 +576,14 @@ pub struct AclView {
     /// The grants written on this path itself. What a revoke here can actually operate
     /// on; everything else in `effective` has to be changed where it lives.
     defined_here: Vec<Grant>,
+    /// The nearest ancestor ABOVE this path that carries grants, and what they are.
+    ///
+    /// What would apply here if every grant on this path were removed — which is what
+    /// revoking the last one does, here and across every page below that carries nothing
+    /// of its own. `inherited_from` cannot answer it: a path is its own first ancestor,
+    /// so it names this path as soon as this path holds a single row.
+    ancestor_source: Option<String>,
+    ancestor_grants: Vec<Grant>,
 }
 
 #[derive(Serialize)]
@@ -622,12 +633,19 @@ pub async fn read_acl(
         .grants_defined_at(&path)
         .await
         .map_err(ApiError::Internal)?;
+    let (ancestor_source, ancestor_grants) = state
+        .store
+        .grants_above(&path)
+        .await
+        .map_err(ApiError::Internal)?;
 
     Ok(Json(AclView {
         path,
         inherited_from,
         effective,
         defined_here,
+        ancestor_source,
+        ancestor_grants,
     })
     .into_response())
 }
@@ -707,6 +725,128 @@ pub async fn revoke(
     } else {
         Err(ApiError::NotFound)
     }
+}
+
+// -------------------------------------------------------------------------------------
+// Visibility: how open a page is.
+// -------------------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct VisibilityRequest {
+    path: String,
+    /// Taken as a string and parsed here rather than deserialised into `Visibility`, so an
+    /// unrecognised value is a 400 that NAMES the accepted ones instead of serde's
+    /// "unknown variant" — and so that this handler, not the deserialiser, is visibly the
+    /// place that refuses it.
+    visibility: String,
+}
+
+/// Change how open one page is.
+///
+/// **Who may do this: whoever administers the page's own path** — `path_admin`, the same
+/// gate as a grant, and instance admins through it as everywhere. Three things decide
+/// that, and the third is the one that settles it:
+///
+///  1. `read` must never widen anything, and `write` must not either. `path_admin` asks
+///     `can()` for `Action::Admin`, which no amount of read or write satisfies — being
+///     able to edit a page is not being able to decide who may see it.
+///  2. The authority is bounded the way every other path-scoped power in this API is
+///     bounded: to a subtree somebody was deliberately given.
+///  3. Anybody who passes this gate can ALREADY publish the page to the open internet, by
+///     writing `anyone: read` on it through `/api/admin/acl` — `can()` answers an `Anyone`
+///     grant before it looks at authentication at all. A stricter gate here would withhold
+///     nothing; it would only push the same act onto the mechanism this console shows less
+///     clearly, and leave the page's badge still reading "Eingeschränkt" while the world
+///     reads it. Two doors to one room, with different locks, is not security.
+///
+/// This is emphatically NOT a relaxation of `seed --update`, which compares visibility and
+/// refuses to change it. That refusal is about a BULK FILE DROP, where a stray
+/// `visibility: public` in one of two hundred files publishes a page with nobody watching.
+/// This is one path, chosen by one person, with an audit row naming them. The refusal
+/// message in `seed.rs` has always pointed here in words; now it points somewhere.
+pub async fn set_visibility(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(body): Json<VisibilityRequest>,
+) -> Result<Json<Changed>, ApiError> {
+    // Authorisation first, then the value — for the same reason `grant` validates in that
+    // order: a caller who may not touch this page learns 403 and nothing else, not even
+    // whether a page is there.
+    let actor = path_admin(&state, &jar, &body.path).await?;
+
+    // Fail closed on a value this code does not understand — REFUSED, never defaulted.
+    // `Visibility::default()` is `Restricted`, which is the safe direction today, and that
+    // is exactly why a silent fallback would be the wrong habit: it is one reordering of
+    // an enum away from publishing a page nobody asked to publish.
+    //
+    // The parse itself is `Visibility::from_str`, the same one the store applies when it
+    // reads the column back, so nothing written here can later be read as something else.
+    // It trims and lowercases, so `"PUBLIC "` is accepted and stored canonically; a
+    // second, stricter parse in this handler would be a second definition of what counts
+    // as public.
+    let Ok(visibility) = Visibility::from_str(&body.visibility) else {
+        return Err(ApiError::Invalid(
+            "visibility must be one of `public`, `internal`, `restricted`".into(),
+        ));
+    };
+
+    match state
+        .store
+        .set_visibility_audited(&actor.id, &body.path, visibility)
+        .await
+        .map_err(ApiError::Internal)?
+    {
+        VisibilityOutcome::Changed { .. } => Ok(Json(Changed { changed: true })),
+        // Already what was asked for. Reported rather than dressed up as a change: the
+        // console disables the control for the current value, so this answer means
+        // somebody else got there first — which is worth seeing.
+        VisibilityOutcome::Unchanged => Ok(Json(Changed { changed: false })),
+        VisibilityOutcome::NoSuchDocument => Err(ApiError::NotFound),
+    }
+}
+
+// -------------------------------------------------------------------------------------
+// Default reach: which group confers what, before any grant.
+// -------------------------------------------------------------------------------------
+
+/// One row of the D-M2-1 mapping, as the console reads it.
+#[derive(Serialize)]
+pub struct GroupRoleView {
+    group: String,
+    baseline: &'static str,
+}
+
+/// The whole group-to-baseline mapping.
+///
+/// Instance-wide, and instance admins only, by the same argument as the grant index: it
+/// describes reach over the WHOLE corpus rather than over any one subtree.
+///
+/// It exists because the access panel cannot otherwise be honest. A group mapped to
+/// `admin` reads every `restricted` document in the wiki with no grant written anywhere,
+/// and a table of grants shows no trace of that; a group mapped to `internal` reads every
+/// `internal` one. The 0002 migration says this mapping "has to be inspectable in the
+/// admin console alongside everything else that decides who sees what" — this is that,
+/// and the panel is the reason it is now needed.
+///
+/// Read-only. Changing the mapping is a separate decision with a separate blast radius —
+/// one row here can hand the whole corpus to a group — and it is not this task's.
+pub async fn list_roles(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<Vec<GroupRoleView>>, ApiError> {
+    instance_admin(&state, &jar).await?;
+    let roles = state
+        .store
+        .group_roles()
+        .await
+        .map_err(ApiError::Internal)?
+        .into_iter()
+        .map(|(group, baseline)| GroupRoleView {
+            group,
+            baseline: baseline.as_str(),
+        })
+        .collect();
+    Ok(Json(roles))
 }
 
 // -------------------------------------------------------------------------------------

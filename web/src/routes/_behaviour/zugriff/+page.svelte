@@ -30,7 +30,9 @@
     path: '/handbuch/onboarding',
     effective: [{ subject: { kind: 'team', id: 'redaktion' }, permission: 'write' }],
     inherited_from: '/handbuch',
-    defined_here: []
+    defined_here: [],
+    ancestor_source: '/handbuch',
+    ancestor_grants: [{ subject: { kind: 'team', id: 'redaktion' }, permission: 'write' }]
   };
 
   // `inherited_from` is the path itself whenever that path carries any grant of its own
@@ -40,10 +42,41 @@
     path: '/handbuch',
     effective: [{ subject: { kind: 'team', id: 'redaktion' }, permission: 'write' }],
     inherited_from: '/handbuch',
-    defined_here: [{ subject: { kind: 'team', id: 'redaktion' }, permission: 'write' }]
+    defined_here: [{ subject: { kind: 'team', id: 'redaktion' }, permission: 'write' }],
+    // `/handbuch` is a top-level page, so nothing above it carries anything: revoking the
+    // one entry here brings nothing back, and the dialog must not claim otherwise.
+    ancestor_source: null,
+    ancestor_grants: []
   };
 
-  const acl = $derived(data.fall === 'eigen' ? eigen : geerbt);
+  /**
+   * The LAST entry on a path that has an ancestor carrying some.
+   *
+   * Removing it makes `/oberhalb`'s entries apply here again, and on every page below
+   * that carries nothing of its own — `grants_for_path` returns the rows of the nearest
+   * ancestor that has any. The revoke dialog said the opposite by omission until now.
+   */
+  const letzter: AclView = {
+    path: '/oberhalb/unterseite',
+    effective: [{ subject: { kind: 'principal', id: 'p1' }, permission: 'admin' }],
+    inherited_from: '/oberhalb/unterseite',
+    defined_here: [{ subject: { kind: 'principal', id: 'p1' }, permission: 'admin' }],
+    ancestor_source: '/oberhalb',
+    ancestor_grants: [{ subject: { kind: 'team', id: 'redaktion' }, permission: 'write' }]
+  };
+
+  /** A page with a public share link on it, and no entry above. */
+  const freigabe: AclView = {
+    path: '/geteilt',
+    effective: [{ subject: { kind: 'anyone' }, permission: 'read' }],
+    inherited_from: '/geteilt',
+    defined_here: [{ subject: { kind: 'anyone' }, permission: 'read' }],
+    ancestor_source: null,
+    ancestor_grants: []
+  };
+
+  const faelle: Record<string, AclView> = { geerbt, eigen, letzter, freigabe };
+  const acl = $derived(faelle[data.fall] ?? geerbt);
 </script>
 
 <AccessPanel
@@ -53,7 +86,10 @@
   error={null}
   {principals}
   {teams}
+  adminGroups={['admins']}
+  internalGroups={['users']}
   onGrant={async () => true}
   onRevoke={async () => true}
+  onSetVisibility={async () => true}
   onSelectPath={() => {}}
 />

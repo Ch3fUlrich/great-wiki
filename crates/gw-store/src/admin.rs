@@ -20,6 +20,7 @@ use crate::principals::{apply_active, apply_instance_admin, insert_local_princip
 use crate::Store;
 use anyhow::Result;
 use gw_auth::{Permission, Principal, Subject};
+use gw_core::Visibility;
 use serde_json::json;
 
 /// What a membership change actually did.
@@ -68,6 +69,24 @@ pub enum InstanceAdminOutcome {
     NoSuchPrincipal,
     /// Refused: committing would have left the instance with no active administrator.
     LastAdmin,
+}
+
+/// What a change to a document's visibility actually did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VisibilityOutcome {
+    /// The document is now at the requested visibility. Carries what it was, because
+    /// "somebody made this public" is worth little without "and before that it was
+    /// restricted" — the audit row records both, and so does the caller's answer.
+    Changed { from: String },
+    /// The document already had that visibility. Nothing written, nothing recorded.
+    Unchanged,
+    /// Nothing lives at that path.
+    ///
+    /// Not the same as a grant, and the asymmetry is deliberate: a grant may be written
+    /// on a path no document occupies, so that access can be prepared before a page
+    /// arrives. Visibility is a COLUMN on a document; with no row there is nothing to set,
+    /// and reporting success would tell an administrator they had published something.
+    NoSuchDocument,
 }
 
 /// Refuse a transaction that would leave nobody able to administer the instance.
@@ -476,13 +495,80 @@ impl Store {
         tx.commit().await?;
         Ok(true)
     }
+
+    /// Set how open a document is, recording what it was as well as what it became.
+    ///
+    /// **The only write path to `documents.visibility` in the system**, and it is
+    /// deliberately the only one. The value otherwise arrives once, from frontmatter, at
+    /// import; `seed --update` compares it and REFUSES to change it, because a stray
+    /// `visibility: public` in a bulk file drop would publish a restricted page with
+    /// nobody watching. Nothing here weakens that: this is a different act — one path,
+    /// one person, one audit row — and the refusal message in `seed.rs` has always
+    /// pointed at exactly this door.
+    ///
+    /// **Authorisation is NOT decided here**, as everywhere else in this module. The API
+    /// gate is `path_admin` on the document's own path; a store method that also had an
+    /// opinion would be a second rule to disagree with the first.
+    ///
+    /// `updated_at` is deliberately left alone. It moves only when a revision is
+    /// published, so it means "when the text last changed"; touching it here would make a
+    /// metadata change read as an edit and quietly attribute it to whoever wrote the last
+    /// revision. Where and when this happened is what the audit row is for.
+    pub async fn set_visibility_audited(
+        &self,
+        actor: &str,
+        path: &str,
+        visibility: Visibility,
+    ) -> Result<VisibilityOutcome> {
+        let mut tx = self.pool.begin().await?;
+
+        // Read and write in ONE transaction. The `from` recorded has to be the value the
+        // UPDATE actually replaced: read outside it and two administrators publishing the
+        // same page at once each record a "from" the other had already changed.
+        let existing: Option<(String,)> = sqlx::query_as(
+            "SELECT visibility FROM documents WHERE path = ?1 AND deleted_at IS NULL",
+        )
+        .bind(path)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some((from,)) = existing else {
+            tx.rollback().await?;
+            return Ok(VisibilityOutcome::NoSuchDocument);
+        };
+        if from == visibility.as_str() {
+            tx.rollback().await?;
+            return Ok(VisibilityOutcome::Unchanged);
+        }
+
+        sqlx::query("UPDATE documents SET visibility = ?1 WHERE path = ?2 AND deleted_at IS NULL")
+            .bind(visibility.as_str())
+            .bind(path)
+            .execute(&mut *tx)
+            .await?;
+
+        Self::record_audit(
+            &mut *tx,
+            Some(actor),
+            "document.visibility",
+            Some(path),
+            // Scoped to the page, not instance-wide: whoever administers this subtree is
+            // entitled to read that it happened, and 0004 is what makes that possible.
+            Some(path),
+            &json!({ "from": from, "to": visibility.as_str() }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(VisibilityOutcome::Changed { from })
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ActiveOutcome, InstanceAdminOutcome, MembershipOutcome};
-    use crate::Store;
+    use super::{ActiveOutcome, InstanceAdminOutcome, MembershipOutcome, VisibilityOutcome};
+    use crate::{Author, NewDocument, Store};
     use gw_auth::{Permission, Principal, Subject};
+    use gw_core::{Block, DocumentType, Visibility};
 
     async fn store() -> Store {
         Store::open("sqlite::memory:").await.unwrap()
@@ -889,5 +975,97 @@ mod tests {
             log[0].path, None,
             "administering the instance belongs to no subtree"
         );
+    }
+
+    /// A page at `/notiz`, at the visibility asked for.
+    async fn page(store: &Store, visibility: Visibility) {
+        let body: Block = serde_json::from_str(
+            r#"{"kind":"doc","content":[{"kind":"paragraph","content":[{"kind":"text","text":"x"}]}]}"#,
+        )
+        .unwrap();
+        store
+            .create_document(
+                Author::Import,
+                &NewDocument {
+                    parent_path: None,
+                    doc_type: DocumentType::Page,
+                    title: "Notiz".into(),
+                    slug: Some("notiz".into()),
+                    language: "de".into(),
+                    visibility,
+                    body,
+                    sort_key: 0,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn changing_a_visibility_records_what_it_was_and_what_it_became() {
+        // "Somebody made this public" is worth little six months later without "and
+        // before that it was restricted". Both go in the same transaction as the UPDATE,
+        // so a row that says it happened cannot outlive a change that did not.
+        let store = store().await;
+        page(&store, Visibility::Restricted).await;
+
+        assert_eq!(
+            store
+                .set_visibility_audited("chef", "/notiz", Visibility::Public)
+                .await
+                .unwrap(),
+            VisibilityOutcome::Changed {
+                from: "restricted".into()
+            }
+        );
+
+        let log = entries(&store).await;
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(log[0].action, "document.visibility");
+        assert_eq!(log[0].target.as_deref(), Some("/notiz"));
+        assert_eq!(
+            log[0].path.as_deref(),
+            Some("/notiz"),
+            "publishing one page concerns that page's subtree, not the whole instance"
+        );
+        let detail: serde_json::Value = serde_json::from_str(&log[0].detail).unwrap();
+        assert_eq!(detail["from"], "restricted");
+        assert_eq!(detail["to"], "public");
+    }
+
+    #[tokio::test]
+    async fn a_visibility_that_changes_nothing_records_nothing() {
+        // The same asymmetry as everywhere else in this module: the state afterwards is
+        // what the caller asked for, so it is not an error — but a no-op audit row per
+        // click buries the changes that matter.
+        let store = store().await;
+        page(&store, Visibility::Internal).await;
+
+        assert_eq!(
+            store
+                .set_visibility_audited("chef", "/notiz", Visibility::Internal)
+                .await
+                .unwrap(),
+            VisibilityOutcome::Unchanged
+        );
+        assert!(entries(&store).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_path_with_no_document_is_not_quietly_published() {
+        // A GRANT may be written on a path nothing lives at, deliberately, so access can
+        // be prepared before a page arrives. Visibility is a column on a document: with
+        // no row there is nothing to set, and an UPDATE matching nothing would report
+        // success to somebody who believes they have just published a page.
+        let store = store().await;
+        assert_eq!(
+            store
+                .set_visibility_audited("chef", "/gibt-es-nicht", Visibility::Public)
+                .await
+                .unwrap(),
+            VisibilityOutcome::NoSuchDocument
+        );
+        assert!(entries(&store).await.is_empty());
     }
 }

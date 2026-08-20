@@ -1378,7 +1378,11 @@ await check('H2 the grant dialog states the reach of the grant before anything i
   await trigger.waitFor({ state: 'visible' });
   await trigger.click();
 
-  const dialog = page.locator('.gw-dialog');
+  // By accessible name, not by `.gw-dialog`. The panel mounts several dialogs now — grant,
+  // revoke, visibility — and Ark renders each one's content into the DOM with the `hidden`
+  // attribute while it is closed, so a class selector matches all of them and Playwright
+  // refuses the ambiguity. The name is also what a screen-reader user is given.
+  const dialog = page.getByRole('dialog', { name: 'Zugriff gewähren' });
   await dialog.waitFor({ state: 'visible', timeout: 5_000 });
 
   const text = await dialog.innerText();
@@ -1401,6 +1405,90 @@ await check('H3 a path that carries its own grants is not described as inheritin
     served.includes('Entziehen'),
     'a grant written on this very path offered no revoke control'
   );
+});
+
+await check('H4 the panel names the ways in that no entry can show', async (page) => {
+  // `permits()` widens `Restricted` for `Baseline::Admin` on reads, so anybody in a group
+  // mapped to `admin` reads every restricted page in the corpus with no entry anywhere —
+  // and no row in a table of entries will ever say so. The panel used to caption that
+  // table "Wer /x erreicht" and stop there.
+  const served = await loadAccessPanel(page, 'eigen');
+
+  for (const sentence of [
+    'Reichweite »Verwaltung«: liest jede Seite, ohne Eintrag.',
+    'Sichtbarkeit »Eingeschränkt«: über die Sichtbarkeit kommt niemand herein.',
+    'Zugriffseinträge, die auf /handbuch gelten'
+  ]) {
+    assert(served.includes(sentence), `the served HTML never says: ${sentence}`);
+  }
+  // The sentence this whole group exists to remove: true about entries, and read as
+  // "nobody else gets in".
+  assert(
+    !served.includes('Es gilt allein die Sichtbarkeit'),
+    'the panel still claims that with no entry only the visibility decides'
+  );
+
+  const summary = page.locator('.gw-adm-reach');
+  await summary.waitFor({ state: 'visible', timeout: 5_000 });
+  assert(await summary.isVisible(), 'the summary is in the markup but not visible');
+});
+
+await check('H5 an Anyone entry is marked as the open internet, not as another team', async (page) => {
+  // `can()` answers an `Anyone` grant BEFORE it looks at whether the caller is signed in.
+  // It is a public share link, and it rendered exactly like a team row.
+  const served = await loadAccessPanel(page, 'freigabe');
+  for (const sentence of [
+    'Freigabelink: erreichbar aus dem offenen Internet.',
+    'Offenes Internet'
+  ]) {
+    assert(served.includes(sentence), `the served HTML never says: ${sentence}`);
+  }
+});
+
+await check('H6 revoking the last entry says the ancestor resumes across the subtree', async (page) => {
+  // The dialog is inside Ark's Portal, so only a browser can see this at all. What it has
+  // to say: removing the final row here does not close the page, it hands the page — and
+  // every page below it that carries nothing of its own — back to /oberhalb.
+  await loadAccessPanel(page, 'letzter');
+
+  const trigger = page.locator('.gw-adm-trigger--danger [data-part="trigger"]');
+  await trigger.waitFor({ state: 'visible' });
+  await trigger.click();
+
+  const dialog = page.getByRole('dialog', { name: 'Zugriff entziehen?' });
+  await dialog.waitFor({ state: 'visible', timeout: 5_000 });
+
+  const text = await dialog.innerText();
+  for (const sentence of [
+    'Danach gelten hier wieder die Rechte von /oberhalb.',
+    'Das ist der letzte Zugriffseintrag auf /oberhalb/unterseite.',
+    'auf jeder Seite darunter, die selbst nichts eingetragen hat'
+  ]) {
+    assert(text.includes(sentence), `the open revoke dialog never says: ${sentence}`);
+  }
+});
+
+await check('H7 the visibility dialog says what the change does before anything changes', async (page) => {
+  // The control the badge always implied and never had, and the two things about it that
+  // are the opposite of what people expect: it does NOT reach down the tree, and it does
+  // NOT close anything an entry has opened.
+  await loadAccessPanel(page, 'eigen');
+
+  const trigger = page.getByRole('button', { name: 'Sichtbarkeit ändern' });
+  await trigger.waitFor({ state: 'visible' });
+  await trigger.click();
+
+  const dialog = page.getByRole('dialog', { name: 'Sichtbarkeit ändern' });
+  await dialog.waitFor({ state: 'visible', timeout: 5_000 });
+
+  const text = await dialog.innerText();
+  for (const sentence of [
+    'Gilt nur für /handbuch — und nimmt niemandem den Zugriff.',
+    'Unterseiten behalten ihre eigene, anders als ein Zugriffseintrag wirkt sie nicht nach unten.',
+    'sie hebt keinen Zugriffseintrag auf'
+  ]) {
+    assert(text.includes(sentence), `the open visibility dialog never says: ${sentence}`);
+  }
 });
 
 await browser.close();

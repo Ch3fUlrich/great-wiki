@@ -11,15 +11,22 @@ import type { PageServerLoad } from './$types';
  * with no `group_roles` row) because an `admin` baseline reads every `restricted`
  * document and would quietly break the D-group checks.
  *
- * `fall` picks which of the two states the panel has to describe:
- *   `geerbt` — the grants come from an ancestor, and the page is `restricted`
- *   `eigen`  — the grants are written on this very path
+ * `fall` picks which state the panel has to describe:
+ *   `geerbt`   — the entries come from an ancestor, and the page is `restricted`
+ *   `eigen`    — the entries are written on this very path, with nothing above
+ *   `letzter`  — the LAST entry on this path, with an ancestor that carries some, so
+ *                revoking it hands the page and its subtree back to that ancestor
+ *   `freigabe` — an `anyone` entry: a share link into the open internet
  *
  * Guarded exactly as `../+page.server.ts` is: a leading underscore hides nothing from
  * SvelteKit 2's router, so `dev` is the actual gate and this route does not exist in a
  * production build.
  */
+const FAELLE = ['geerbt', 'eigen', 'letzter', 'freigabe'] as const;
+
 export const load: PageServerLoad = ({ url }) => {
   if (!dev) error(404, 'Not found');
-  return { fall: url.searchParams.get('fall') === 'eigen' ? 'eigen' : 'geerbt' } as const;
+  const asked = url.searchParams.get('fall');
+  const fall = FAELLE.find((known) => known === asked) ?? 'geerbt';
+  return { fall };
 };

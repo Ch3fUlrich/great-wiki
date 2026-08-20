@@ -416,6 +416,56 @@
 		overflow-wrap: anywhere;
 	}
 
+	/* The four ways into a page, listed above the table of entries.
+	 *
+	 * A plain <ul>, not a stack of `.gw-adm-notice`s: this is one statement in four parts,
+	 * and four `role="status"` elements would announce it four times. Nothing here is
+	 * rendered by Ark, so no rule below needs the `:not([hidden])` guard that Ark's use of
+	 * the `hidden` attribute forces elsewhere in this file — see Dialog.svelte. */
+	.gw-adm-reach {
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		background: var(--bg-raised);
+		padding: var(--space-3) var(--space-4);
+	}
+
+	.gw-adm-reach-heading {
+		font-size: var(--text-sm);
+		font-weight: 650;
+		color: var(--ink);
+		margin-block-end: var(--space-2);
+	}
+
+	.gw-adm-reach-list {
+		display: grid;
+		gap: var(--space-2);
+		list-style: none;
+		padding: 0;
+		margin: 0;
+	}
+
+	.gw-adm-reach-item {
+		border-inline-start: 3px solid var(--border);
+		padding-inline-start: var(--space-3);
+		color: var(--ink-muted);
+		font-size: var(--text-sm);
+	}
+
+	/* The two routes that reach past the people somebody deliberately named. Mixed from
+	   `--warn` rather than written as a hex, so a theme moving that token moves this with
+	   it — the same treatment `.gw-adm-notice--warn` gets, for the same reason. Modifier
+	   after the base rule at equal specificity, which is what lets it win. */
+	.gw-adm-reach-item--warn {
+		border-inline-start-color: var(--warn);
+		background: color-mix(in srgb, var(--warn) 8%, transparent);
+		color: var(--ink);
+	}
+
+	.gw-adm-reach-title {
+		font-weight: 650;
+		color: var(--ink);
+	}
+
 	/* --- Tree view (Ark) --------------------------------------------------- */
 
 	.gw-adm-tree:not([hidden]) {

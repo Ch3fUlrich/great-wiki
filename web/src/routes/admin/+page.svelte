@@ -30,7 +30,9 @@
     removeGrant,
     removeTeamMember,
     setPrincipalActive,
+    setVisibility,
     subjectLabel,
+    VISIBILITY_LABEL,
     type NewPrincipal,
     type Outcome,
     type Permission,
@@ -43,6 +45,21 @@
 
   const people = $derived(data.people.data ?? []);
   const teams = $derived(data.teams.data ?? []);
+
+  /**
+   * The groups that reach every page, and every internal page, before any entry.
+   *
+   * `null` rather than `[]` when the mapping could not be read — `/api/admin/roles` is
+   * instance-wide, so a space admin is refused it. The panel keeps the two apart: "no
+   * group has that reach" is a claim about the instance, and a console that was not
+   * allowed to look must not make it.
+   */
+  const rolesFor = (baseline: string) =>
+    data.roles.data
+      ? data.roles.data.filter((role) => role.baseline === baseline).map((role) => role.group)
+      : null;
+  const adminGroups = $derived(rolesFor('admin'));
+  const internalGroups = $derived(rolesFor('internal'));
 
   /** Which tab is showing. Not in the URL: switching tabs needs a script anyway. */
   let tab = $state('zugriff');
@@ -123,6 +140,15 @@
     return run(
       () => removeGrant(currentPath, subject, permission),
       `Zugriff auf ${currentPath} für ${subjectLabel(subject, people, teams)} entzogen.`
+    );
+  }
+
+  async function changeVisibility(visibility: string) {
+    if (!currentPath) return false;
+    const label = VISIBILITY_LABEL[visibility] ?? visibility;
+    return run(
+      () => setVisibility(currentPath, visibility),
+      `Sichtbarkeit von ${currentPath} ist jetzt »${label}«.`
     );
   }
 
@@ -209,9 +235,12 @@
           error={data.acl.error}
           principals={people}
           {teams}
+          {adminGroups}
+          {internalGroups}
           {busy}
           onGrant={grant}
           onRevoke={revoke}
+          onSetVisibility={changeVisibility}
           onSelectPath={selectPath}
         />
       </div>

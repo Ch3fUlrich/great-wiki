@@ -51,7 +51,9 @@ const inherited: AclView = {
   path: '/handbuch/onboarding',
   effective: [{ subject: { kind: 'team', id: 'redaktion' }, permission: 'write' }],
   inherited_from: '/handbuch',
-  defined_here: []
+  defined_here: [],
+  ancestor_source: '/handbuch',
+  ancestor_grants: [{ subject: { kind: 'team', id: 'redaktion' }, permission: 'write' }]
 };
 
 /**
@@ -73,7 +75,10 @@ const definedHere: AclView = {
   defined_here: [
     { subject: { kind: 'team', id: 'redaktion' }, permission: 'write' },
     { subject: { kind: 'principal', id: 'p2' }, permission: 'read' }
-  ]
+  ],
+  // Nothing above `/handbuch` carries a grant, so revoking here brings nothing back.
+  ancestor_source: null,
+  ancestor_grants: []
 };
 
 const noop = async () => true;
@@ -86,12 +91,25 @@ function props(over: Partial<Props> = {}): Props {
     error: null,
     principals,
     teams,
+    adminGroups: ['admins'],
+    internalGroups: ['users'],
     onGrant: noop,
     onRevoke: noop,
+    onSetVisibility: noop,
     onSelectPath: () => {},
     ...over
   };
 }
+
+/** A path with no grants anywhere above it — the state the old empty notice lied about. */
+const nothing: AclView = {
+  path: '/allein',
+  effective: [],
+  inherited_from: null,
+  defined_here: [],
+  ancestor_source: null,
+  ancestor_grants: []
+};
 
 describe('AccessPanel', () => {
   it('names the ancestor the grants are inherited from', () => {
@@ -99,7 +117,7 @@ describe('AccessPanel', () => {
     // page's access has no way to know that none of it is stored on that page.
     const out = html(props());
     expect(out).toContain('Geerbt von /handbuch');
-    expect(out).toContain('Wer /handbuch/onboarding erreicht');
+    expect(out).toContain('Zugriffseinträge, die auf /handbuch/onboarding gelten');
   });
 
   it('offers no revoke control for an inherited grant', () => {
@@ -162,22 +180,17 @@ describe('AccessPanel', () => {
       props({
         path: '/oeffentlich',
         visibility: 'public',
-        acl: {
-          path: '/oeffentlich',
-          effective: [],
-          inherited_from: null,
-          defined_here: []
-        }
+        acl: { ...nothing, path: '/oeffentlich' }
       })
     );
-    expect(out).toContain('kein Zugriff eingetragen');
+    expect(out).toContain('Kein Zugriffseintrag.');
     expect(out).toContain('Sichtbarkeit: Öffentlich');
     expect(out).not.toContain('nicht geladen');
   });
 
   it('gives the table a caption and a scope on every header', () => {
     const out = html(props({ path: definedHere.path, acl: definedHere }));
-    expect(out).toMatch(/<caption[^>]*>Wer \/handbuch erreicht/);
+    expect(out).toMatch(/<caption[^>]*>Zugriffseinträge, die auf \/handbuch gelten/);
     expect(out).toContain('<th scope="col">Subjekt</th>');
     expect(out).toContain('<th scope="col">Berechtigung</th>');
     expect(out).toMatch(/<th scope="row"[^>]*>\s*Redaktion \(redaktion\)/);
@@ -237,13 +250,89 @@ describe('AccessPanel', () => {
           path: '/oeffentlich/unterseite',
           effective: [{ subject: { kind: 'team', id: 'redaktion' }, permission: 'write' }],
           inherited_from: '/oeffentlich',
-          defined_here: []
+          defined_here: [],
+          ancestor_source: '/oeffentlich',
+          ancestor_grants: [{ subject: { kind: 'team', id: 'redaktion' }, permission: 'write' }]
         }
       })
     );
     expect(out).toContain('Die Rechte unten kommen von /oeffentlich.');
     expect(out).toContain('Lesen kann diese Seite ohnehin jede und jeder');
     expect(out).not.toContain('nicht über die Sichtbarkeit');
+  });
+
+  it('names the admin baseline as a way in, which the table can never show', () => {
+    // The gap this panel had. `permits()` widens `Restricted` for `Baseline::Admin` on
+    // reads: anybody in a group mapped to `admin` — or carrying a per-account promotion —
+    // reads every restricted page in the corpus with no entry anywhere. A grants table
+    // shows no trace of that, and the panel was captioned as if it were the answer.
+    const out = html(props({ path: nothing.path, acl: nothing, visibility: 'restricted' }));
+    expect(out).toContain('Reichweite »Verwaltung«: liest jede Seite, ohne Eintrag.');
+    expect(out).toContain('»admins«');
+  });
+
+  it('never says that with no entries only the visibility decides', () => {
+    // The worst sentence the panel had: true about grants, and read as "nobody else gets
+    // in" on the screen somebody uses to protect a child's medical records.
+    const out = html(props({ path: nothing.path, acl: nothing, visibility: 'restricted' }));
+    expect(out).not.toContain('Es gilt allein die Sichtbarkeit');
+    expect(out).not.toContain('kein Zugriff eingetragen');
+    expect(out).toContain('Kein Zugriffseintrag.');
+    expect(out).toContain('Die übrigen Wege oben gelten weiter');
+  });
+
+  it('says who an internal page reaches even when nothing is entered', () => {
+    const out = html(props({ path: nothing.path, acl: nothing, visibility: 'internal' }));
+    expect(out).toContain('Sichtbarkeit »Intern«');
+    expect(out).toContain('»users«');
+  });
+
+  it('marks a public share link as one, instead of rendering it like a team', () => {
+    // `Subject::Anyone` is the single grant that survives `!principal.is_authenticated()`
+    // in `can()` — it is answered BEFORE the caller is known, which is what makes it a
+    // share link. Rendered as just another row it reads like a very large team.
+    const share: AclView = {
+      path: '/geteilt',
+      effective: [{ subject: { kind: 'anyone' }, permission: 'read' }],
+      inherited_from: '/geteilt',
+      defined_here: [{ subject: { kind: 'anyone' }, permission: 'read' }],
+      ancestor_source: null,
+      ancestor_grants: []
+    };
+    const out = html(props({ path: share.path, acl: share, visibility: 'restricted' }));
+    expect(out).toContain('Freigabelink: erreichbar aus dem offenen Internet.');
+    // And on the row itself, so the table cannot be read on its own and get it wrong.
+    expect(out).toContain('Offenes Internet');
+  });
+
+  it('does not invent a share-link warning where there is no Anyone entry', () => {
+    const out = html(props());
+    expect(out).not.toContain('Freigabelink');
+    expect(out).not.toContain('Offenes Internet');
+  });
+
+  it('offers a control to change the visibility, rather than a badge that looks settable', () => {
+    // Until now the badge read "Sichtbarkeit: Eingeschränkt" and nothing in the system
+    // could change it. Somebody was always going to look for the control.
+    const out = html(props());
+    expect(out).toMatch(/aria-haspopup="dialog"[^>]*>[^<]*<span>Sichtbarkeit ändern<\/span>/);
+  });
+
+  it('offers no visibility control when this console cannot change it', () => {
+    // No handler and no known value are two different reasons, and neither is a control
+    // that quietly does nothing.
+    expect(html(props({ onSetVisibility: undefined }))).not.toContain('Sichtbarkeit ändern');
+    expect(html(props({ visibility: null }))).not.toContain('Sichtbarkeit ändern');
+  });
+
+  it('says the mapping is unknown rather than claiming no group administers', () => {
+    // A space admin is refused `/api/admin/roles`. "No group has admin reach" would be a
+    // claim about the instance made by a view that was not allowed to look.
+    const out = html(
+      props({ path: nothing.path, acl: nothing, adminGroups: null, internalGroups: null })
+    );
+    expect(out).toContain('zeigt diese Ansicht nicht');
+    expect(out).not.toContain('»admins«');
   });
 
   it('says the permissions and subject kinds in German', () => {

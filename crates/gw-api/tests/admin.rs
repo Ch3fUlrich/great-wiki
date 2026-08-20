@@ -13,7 +13,8 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use gw_auth::{Permission, Subject};
-use gw_store::{AuditEntry, Store, SESSION_TTL_SECONDS};
+use gw_core::{Block, DocumentType, Visibility};
+use gw_store::{AuditEntry, Author, NewDocument, Store, SESSION_TTL_SECONDS};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -61,9 +62,66 @@ async fn fixture() -> Arc<Store> {
         .unwrap();
     store.create_team("gaeste", "Gäste").await.unwrap();
 
+    // Two real DOCUMENTS, because visibility is a property of a document and not of a
+    // path. Everything else in this file works on the `acl` table alone, which happily
+    // holds grants for paths nothing lives at; `/api/admin/visibility` cannot, and a
+    // fixture with no documents would let its 404 branch pass for the wrong reason.
+    page(&store, None, "raum", "Raum", Visibility::Restricted).await;
+    page(
+        &store,
+        Some("/raum"),
+        "unterseite",
+        "Unterseite",
+        Visibility::Restricted,
+    )
+    .await;
+
     // `/anderer-raum` deliberately carries no grants at all: it is the path a space admin
     // must be refused on.
     Arc::new(store)
+}
+
+/// A document at a known path. The slug is given explicitly rather than derived from the
+/// title, because these paths are asserted against by name.
+async fn page(
+    store: &Store,
+    parent: Option<&str>,
+    slug: &str,
+    title: &str,
+    visibility: Visibility,
+) {
+    let body: Block = serde_json::from_str(
+        r#"{"kind":"doc","content":[{"kind":"paragraph","content":[{"kind":"text","text":"hallo"}]}]}"#,
+    )
+    .unwrap();
+    store
+        .create_document(
+            Author::Import,
+            &NewDocument {
+                parent_path: parent.map(str::to_string),
+                doc_type: DocumentType::Page,
+                title: title.into(),
+                slug: Some(slug.into()),
+                language: "de".into(),
+                visibility,
+                body,
+                sort_key: 0,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+}
+
+/// The stored visibility of a document, read straight from the store.
+async fn visibility_of(store: &Arc<Store>, path: &str) -> String {
+    let (chef, _) = store.principal_by_username("chef").await.unwrap().unwrap();
+    store
+        .document_for(&chef, path, gw_auth::Action::Read)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("`{path}` must exist in the fixture"))
+        .visibility
 }
 
 async fn id_of(store: &Arc<Store>, username: &str) -> String {
@@ -271,6 +329,15 @@ fn path_scoped_mutations() -> Vec<(Method, String, Option<Value>)> {
                 "permission": "read",
             })),
         ),
+        // How open a page is belongs to the page, so it is gated by the page's own path —
+        // the same door as the grant above. `internal` rather than `public` only because
+        // the fixture page starts `restricted` and this list needs each entry to actually
+        // change something; which value is written is not what this list is about.
+        (
+            Method::POST,
+            "/api/admin/visibility".into(),
+            Some(json!({"path": "/raum", "visibility": "internal"})),
+        ),
     ]
 }
 
@@ -293,6 +360,9 @@ fn instance_wide(principal_id: &str) -> Vec<(Method, String, Option<Value>)> {
         // Who could be promoted names every active account. Instance-wide by the same
         // argument as listing principals.
         (Method::GET, "/api/admin/admins/candidates".into(), None),
+        // The group-to-baseline mapping is instance-wide configuration: it decides reach
+        // over the WHOLE corpus, not over any one subtree.
+        (Method::GET, "/api/admin/roles".into(), None),
     ];
     all.extend(instance_wide_mutations(principal_id));
     all
@@ -408,6 +478,20 @@ async fn an_anonymous_caller_is_refused_even_where_anyone_holds_admin() {
     // and who-did-what.
     assert_eq!(
         get(&store, None, "/api/admin/audit").await.0,
+        StatusCode::FORBIDDEN
+    );
+    // And for publishing. This is the worst of the three if it were open: `visibility:
+    // public` puts the page on the open internet, and `Anyone: admin` is exactly the
+    // grant an anonymous caller passes `can()` with.
+    assert_eq!(
+        post(
+            &store,
+            None,
+            "/api/admin/visibility",
+            json!({"path": "/offen", "visibility": "public"}),
+        )
+        .await
+        .0,
         StatusCode::FORBIDDEN
     );
 
@@ -1650,6 +1734,302 @@ async fn the_grant_index_lists_every_path_that_carries_one() {
     assert_eq!(status, StatusCode::OK, "{index}");
     assert_eq!(index["paths"][0]["path"], "/raum");
     assert_eq!(index["paths"][0]["grants"], 2);
+}
+
+#[tokio::test]
+async fn the_acl_view_names_what_would_apply_if_this_path_lost_its_own_grants() {
+    // Revoking the LAST grant on a path is not a local change. `grants_for_path` returns
+    // the rows of the nearest ancestor that has ANY, so removing the final row here makes
+    // the ancestor's set apply again — here, and across every page below that has none of
+    // its own. The console cannot warn about that without being told what would resume,
+    // and it cannot work it out: `inherited_from` names this path itself as soon as this
+    // path carries anything.
+    let store = fixture().await;
+    let lektor = id_of(&store, "lektor").await;
+
+    // While the page has none of its own, what applies IS the ancestor's set, and there
+    // is nothing further up.
+    let (status, view) = get(
+        &store,
+        Some("lektor"),
+        "/api/admin/acl?path=/raum/unterseite",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["ancestor_source"], "/raum");
+    assert_eq!(view["ancestor_grants"].as_array().unwrap().len(), 2);
+
+    // Once it carries its own, `inherited_from` is the page itself — and `ancestor_source`
+    // is the only remaining evidence of what a revoke here would bring back.
+    let (status, response) = post(
+        &store,
+        Some("lektor"),
+        "/api/admin/acl",
+        json!({
+            "path": "/raum/unterseite",
+            "subject": {"kind": "principal", "id": lektor},
+            "permission": "admin",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+
+    let (_, view) = get(
+        &store,
+        Some("lektor"),
+        "/api/admin/acl?path=/raum/unterseite",
+    )
+    .await;
+    assert_eq!(view["inherited_from"], "/raum/unterseite");
+    assert_eq!(view["ancestor_source"], "/raum");
+    assert_eq!(view["ancestor_grants"].as_array().unwrap().len(), 2);
+
+    // A top-level path has nothing above it, and says so rather than naming itself.
+    let (_, view) = get(&store, Some("chef"), "/api/admin/acl?path=/raum").await;
+    assert_eq!(view["ancestor_source"], Value::Null);
+    assert!(view["ancestor_grants"].as_array().unwrap().is_empty());
+}
+
+// -------------------------------------------------------------------------------------
+// The group-to-baseline mapping: default reach over the WHOLE corpus.
+// -------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_group_baseline_mapping_says_which_groups_reach_everything() {
+    // The console's access panel claims to answer "who reaches this page". It cannot do
+    // that honestly without this: a group mapped to `admin` reads every `restricted`
+    // document in the corpus with no grant anywhere, and no row in the grants table ever
+    // shows that. The 0002 migration says the mapping "has to be inspectable in the admin
+    // console alongside everything else that decides who sees what" — this is that.
+    let store = fixture().await;
+    let (status, roles) = get(&store, Some("chef"), "/api/admin/roles").await;
+    assert_eq!(status, StatusCode::OK, "{roles}");
+
+    let rows = roles.as_array().expect("a list of mappings");
+    let admins: Vec<&str> = rows
+        .iter()
+        .filter(|row| row["baseline"] == "admin")
+        .map(|row| row["group"].as_str().unwrap())
+        .collect();
+    assert_eq!(admins, vec!["admins"]);
+
+    let internal: Vec<&str> = rows
+        .iter()
+        .filter(|row| row["baseline"] == "internal")
+        .map(|row| row["group"].as_str().unwrap())
+        .collect();
+    assert_eq!(internal, vec!["users"]);
+}
+
+// -------------------------------------------------------------------------------------
+// Visibility: how open a page is, and who gets to decide.
+// -------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn reading_a_page_is_not_being_allowed_to_publish_it() {
+    // The one refusal that matters most on this endpoint. `leser` holds `read` on `/raum`
+    // and nothing else; `public` puts the page on the open internet. Read is never a way
+    // to widen anything.
+    let store = fixture().await;
+
+    let (status, response) = post(
+        &store,
+        Some("leser"),
+        "/api/admin/visibility",
+        json!({"path": "/raum", "visibility": "public"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
+    assert_eq!(visibility_of(&store, "/raum").await, "restricted");
+    assert!(audit(&store).await.is_empty());
+
+    // Nor does writing. An editor edits the page; how open the page is, is not the page.
+    let gast = id_of(&store, "gast").await;
+    store
+        .add_grant("/raum", Subject::Principal(gast.clone()), Permission::Write)
+        .await
+        .unwrap();
+    let (status, response) = post(
+        &store,
+        Some("gast"),
+        "/api/admin/visibility",
+        json!({"path": "/raum", "visibility": "public"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
+    assert_eq!(visibility_of(&store, "/raum").await, "restricted");
+}
+
+#[tokio::test]
+async fn a_space_admin_changes_the_visibility_of_a_page_in_their_own_subtree() {
+    // The same gate as a grant, deliberately: somebody who administers `/raum` can
+    // already publish it to the open internet by writing `anyone: read` there, so a
+    // stricter gate here would not withhold the power — it would only push the act onto
+    // the mechanism this console shows LESS clearly.
+    let store = fixture().await;
+
+    let (status, response) = post(
+        &store,
+        Some("lektor"),
+        "/api/admin/visibility",
+        json!({"path": "/raum/unterseite", "visibility": "internal"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["changed"], true);
+    assert_eq!(visibility_of(&store, "/raum/unterseite").await, "internal");
+
+    // And the page above is untouched: visibility is a property of ONE document. Unlike a
+    // grant, it does not reach down the tree at all.
+    assert_eq!(visibility_of(&store, "/raum").await, "restricted");
+}
+
+#[tokio::test]
+async fn a_space_admin_cannot_publish_a_page_outside_their_own_subtree() {
+    let store = fixture().await;
+    page(
+        &store,
+        None,
+        "anderer-raum",
+        "Anderer",
+        Visibility::Restricted,
+    )
+    .await;
+
+    let (status, response) = post(
+        &store,
+        Some("lektor"),
+        "/api/admin/visibility",
+        json!({"path": "/anderer-raum", "visibility": "public"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
+    assert_eq!(visibility_of(&store, "/anderer-raum").await, "restricted");
+}
+
+#[tokio::test]
+async fn publishing_a_page_records_what_it_was_as_well_as_what_it_became() {
+    // "Somebody made this public" is worth nothing six months later without "and before
+    // that it was restricted". The row is scoped to the page, so the space admin who did
+    // it can read it back in their own log.
+    let store = fixture().await;
+    let chef = id_of(&store, "chef").await;
+
+    let (status, response) = post(
+        &store,
+        Some("chef"),
+        "/api/admin/visibility",
+        json!({"path": "/raum", "visibility": "public"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+
+    let entries = audit(&store).await;
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].action, "document.visibility");
+    assert_eq!(entries[0].target.as_deref(), Some("/raum"));
+    assert_eq!(
+        entries[0].path.as_deref(),
+        Some("/raum"),
+        "publishing one page concerns that page's subtree, not the whole instance"
+    );
+    assert_eq!(entries[0].principal_id.as_deref(), Some(chef.as_str()));
+
+    let detail: Value = serde_json::from_str(&entries[0].detail).unwrap();
+    assert_eq!(detail["from"], "restricted");
+    assert_eq!(detail["to"], "public");
+}
+
+#[tokio::test]
+async fn a_visibility_this_code_does_not_understand_is_refused_rather_than_guessed() {
+    // Fail closed. An unrecognised value must never be written, and must never fall back
+    // to a default — `Visibility::default()` is `Restricted`, which is the safe direction
+    // here, but a handler that silently substitutes a default is one rename away from
+    // being the unsafe one.
+    let store = fixture().await;
+
+    for value in ["geheim", "", "öffentlich", "admin"] {
+        let (status, response) = post(
+            &store,
+            Some("chef"),
+            "/api/admin/visibility",
+            json!({"path": "/raum", "visibility": value}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "`{value}` was accepted: {response}"
+        );
+    }
+    assert_eq!(visibility_of(&store, "/raum").await, "restricted");
+    assert!(audit(&store).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_recognised_visibility_is_canonicalised_rather_than_stored_as_typed() {
+    // `"PUBLIC "` IS accepted, and this test exists because the first version of the one
+    // above asserted it was not. Refusing it would have meant a second, stricter parse in
+    // the handler beside the one `Store::document_for_with_baseline` reads the column back
+    // with — and two spellings of "what counts as public" is precisely the shape this
+    // codebase keeps warning about. `Visibility::from_str` trims and lowercases; what is
+    // stored is always the canonical string, which is what the CHECK constraint and every
+    // later read expect.
+    let store = fixture().await;
+
+    let (status, response) = post(
+        &store,
+        Some("chef"),
+        "/api/admin/visibility",
+        json!({"path": "/raum", "visibility": "PUBLIC "}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(visibility_of(&store, "/raum").await, "public");
+
+    let entries = audit(&store).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&entries[0].detail).unwrap()["to"],
+        "public",
+        "the audit row recorded what was typed rather than what was stored"
+    );
+}
+
+#[tokio::test]
+async fn setting_the_visibility_a_page_already_has_changes_nothing_and_records_nothing() {
+    let store = fixture().await;
+
+    let (status, response) = post(
+        &store,
+        Some("chef"),
+        "/api/admin/visibility",
+        json!({"path": "/raum", "visibility": "restricted"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["changed"], false);
+    assert!(
+        audit(&store).await.is_empty(),
+        "a no-op wrote an audit row, which buries the real changes"
+    );
+}
+
+#[tokio::test]
+async fn changing_the_visibility_of_a_page_that_does_not_exist_is_not_a_success() {
+    // A grant may be written on a path nothing lives at — that is deliberate, so access
+    // can be prepared before a page arrives. Visibility cannot: there is no row to set.
+    // Reporting 200 would tell an administrator they had published something.
+    let store = fixture().await;
+
+    let (status, response) = post(
+        &store,
+        Some("chef"),
+        "/api/admin/visibility",
+        json!({"path": "/gibt-es-nicht", "visibility": "public"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{response}");
+    assert!(audit(&store).await.is_empty());
 }
 
 // -------------------------------------------------------------------------------------

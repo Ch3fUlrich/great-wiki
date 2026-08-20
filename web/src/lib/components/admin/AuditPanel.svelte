@@ -39,6 +39,7 @@
   const ACTION_LABEL: Record<string, string> = {
     'acl.grant': 'Zugriff gewährt',
     'acl.revoke': 'Zugriff entzogen',
+    'document.visibility': 'Sichtbarkeit geändert',
     'team.create': 'Team angelegt',
     'team.member.add': 'Mitglied hinzugefügt',
     'team.member.remove': 'Mitglied entfernt',

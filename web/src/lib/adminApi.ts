@@ -74,6 +74,28 @@ export interface AclView {
   effective: Grant[];
   inherited_from: string | null;
   defined_here: Grant[];
+  /**
+   * The nearest ancestor ABOVE this path that carries entries, and what they are.
+   *
+   * What would apply here if every entry on this path were removed — which is exactly
+   * what revoking the last one does, here and on every page below that carries nothing of
+   * its own. `inherited_from` cannot answer it: a path is its own first ancestor, so it
+   * names this path as soon as this path holds a single row.
+   */
+  ancestor_source: string | null;
+  ancestor_grants: Grant[];
+}
+
+/**
+ * One row of the group-to-baseline mapping (`GET /api/admin/roles`).
+ *
+ * Default reach, before any entry is consulted. A group mapped to `admin` reads every
+ * `restricted` page in the wiki with no entry written anywhere — which is the one thing a
+ * table of entries can never show, and the reason the access panel loads this.
+ */
+export interface GroupRole {
+  group: string;
+  baseline: 'public' | 'internal' | 'admin';
 }
 
 export interface AuditEntry {
@@ -193,6 +215,14 @@ export function listTeams(): Promise<Outcome<Team[]>> {
   return request('GET', '/api/admin/teams', 'Die Teamliste konnte nicht geladen werden');
 }
 
+export function listRoles(): Promise<Outcome<GroupRole[]>> {
+  return request(
+    'GET',
+    '/api/admin/roles',
+    'Die Zuordnung von Gruppen zu Reichweiten konnte nicht geladen werden'
+  );
+}
+
 export function getAcl(path: string): Promise<Outcome<AclView>> {
   return request(
     'GET',
@@ -286,6 +316,27 @@ export function removeGrant(
     subject,
     permission
   });
+}
+
+/**
+ * Change how open one page is.
+ *
+ * The only thing in the system that writes `documents.visibility`. `seed --update`
+ * deliberately refuses to — a stray `visibility: public` in a bulk file drop would
+ * publish a page with nobody watching — so this is the one deliberate, audited act, made
+ * by a person on one path.
+ *
+ * A `changed: false` answer means the page already had that value, and `request` reports
+ * it as a failure. That is right: the control is disabled for the current value, so the
+ * only way to see it is that somebody else got there first, which is worth knowing.
+ */
+export function setVisibility(path: string, visibility: string): Promise<Outcome<unknown>> {
+  return request(
+    'POST',
+    '/api/admin/visibility',
+    `Die Sichtbarkeit von ${path} konnte nicht geändert werden`,
+    { path, visibility }
+  );
 }
 
 // --- Vocabulary -----------------------------------------------------------
