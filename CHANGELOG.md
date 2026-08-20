@@ -8,6 +8,17 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- **A Content-Security-Policy**, issued by the application rather than by either proxy —
+  see [ADR 0007](docs/decisions/0007-content-security-policy.md). Scripts are admitted by a
+  per-response nonce with no `'unsafe-inline'`, which is what a proxy could not have done:
+  neither Caddy can mint a nonce, and without one the only way to keep the page working is
+  to allow every inline script on it. The API's own pages — the sign-in form and the
+  invitation page — get a second, stricter `default-src 'none'` policy of their own, because
+  `/auth/*` is routed to the API and never sees SvelteKit's headers at all.
+  One directive is loosened and it is worth knowing which: `style-src-attr 'unsafe-inline'`,
+  because Svelte renders its `style:` directive as a literal `style=` attribute and CSP has
+  no nonce or hash mechanism for attributes. It is confined to attributes — an injected
+  `<style>` element is still refused.
 - **A graph of your pages and the links between them**, at `/graph`, optionally narrowed to a
   subtree. Nodes are pages and edges are links somebody deliberately wrote — topics are not
   drawn, by decision, so the graph shows connections a person made rather than similarity a
@@ -120,6 +131,10 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Fixed
 
+- A protocol-relative link no longer becomes a page of this wiki. `//example.org/seite`
+  failed to parse without a base, fell through to the relative branch, and was resolved
+  against the page being edited — so a link meant for another site silently turned into a
+  link to a different page here, and would have been published that way.
 - A relative link is resolved against the page it was written on, not against the root.
   `nachbar` written on `/rundgang/tabellen` recorded an edge to `/nachbar` while clicking it
   navigated to `/rundgang/nachbar` — so the graph named one page and the link went to
