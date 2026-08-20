@@ -634,9 +634,12 @@ await check('C10 the header stays put while the table scrolls under it', async (
 //
 // Against the tour corpus, which has what this needs: a container page with six children,
 // a branch three levels deep, and pages that are actually `public` — so every check below
-// works for an anonymous visitor. Nothing here touches `/rundgang/nur-intern`, which is
-// `restricted` on purpose and would 403 for a developer whose `.env` sets no dev identity,
-// failing for a reason that has nothing to do with this code.
+// works for an anonymous visitor. D5 is the one check that names `/rundgang/nur-intern`,
+// and only to assert its ABSENCE from an anonymous visitor's subpage list: it is
+// `restricted` on purpose (no `visibility:` in its frontmatter — fail closed), so
+// `/rundgang` has six children in the store and five visible ones here. Nothing below
+// navigates to `/rundgang/nur-intern` itself, which would need a dev identity these
+// checks do not assume.
 //
 // The colour assertions resolve the token through a probe element rather than comparing
 // against a hex copied out of tokens.css, and they assert EQUALITY with the resolved
@@ -759,11 +762,29 @@ await check('D4 a breadcrumb ancestor and a subpage link both actually navigate'
 });
 
 await check('D5 a container page lists its children, a leaf offers no empty section', async (page) => {
+  // The tour page has SIX children in content-example, one of which — /rundgang/nur-intern
+  // — carries no `visibility:` and is therefore `restricted` by default (fail closed).
+  // An anonymous visitor correctly sees the other five: that is the permission filter
+  // working, not a bug, so the assertion has to say "five, and specifically not the
+  // restricted one" rather than a bare count that a filtering regression could still
+  // satisfy by coincidence (e.g. hiding some OTHER child instead).
   await page.goto(BASE + CONTAINER_PAGE, { waitUntil: 'domcontentloaded' });
   const list = page.locator('nav[aria-labelledby="gw-subpages"] a');
   await list.first().waitFor({ state: 'visible' });
-  const count = await list.count();
-  assert(count === 6, `the tour page has six children, the list shows ${count}`);
+
+  const hrefs = await list.evaluateAll((els) => els.map((el) => el.getAttribute('href')));
+  assert(
+    hrefs.length === 5,
+    `expected 5 visible children (six exist, one restricted), got ${hrefs.length}: ${JSON.stringify(hrefs)}`
+  );
+  assert(
+    !hrefs.includes('/rundgang/nur-intern'),
+    `the restricted child /rundgang/nur-intern must not appear to an anonymous visitor, got ${JSON.stringify(hrefs)}`
+  );
+  assert(
+    hrefs.includes(NESTED_PAGE),
+    `expected the public child ${NESTED_PAGE} in the list, got ${JSON.stringify(hrefs)}`
+  );
 
   // The one child that has a child of its own says so, and says it in German.
   const note = await page
@@ -830,15 +851,19 @@ await check('D7 no horizontal scroll at 390px with the panel and the subpage gri
 // ---------------------------------------------------------------------------------------
 // Group E — the editor (web/src/lib/editor/**)
 //
-// Everything here works for BOTH answers to "may this developer write this page", because
-// the answer depends on a grant in whatever database the dev server is pointed at, and a
-// check that only passes on a seeded-and-granted instance is a check that gets deleted.
+// E1-E6 work for BOTH answers to "may this developer write this page" on purpose: `seed`
+// creates no write grants and no migration inserts any, so a fresh, ungranted instance —
+// the state nearly every developer and every reader actually meets — is a real case this
+// suite must cover, not one it is allowed to assume away. What must be true either way is
+// that the reading page never regresses, that no editable surface exists before the server
+// has agreed to one, and that whatever the editor says about the work is not a lie.
 //
-// The refusal is the case worth the most: a fresh instance has NO write grants at all —
-// `seed` creates none and no migration inserts any — so this is what nearly every developer
-// and every reader actually meets. What must be true either way is that the reading page
-// never regresses, that no editable surface exists before the server has agreed to one, and
-// that whatever the editor says about the work is not a lie.
+// `just behaviour` provisions its own fixture (see the justfile) and that fixture grants
+// `group:editors` write on `/rundgang`, so under it EDIT_PAGE below is ALWAYS live for the
+// `GW_DEV_IDENTITY` this harness runs the server as. E1-E6 still tolerate a refused session
+// defensively — nothing here is deleted for being "the branch that never fires" — but E7
+// needs a real editing surface to type into and MUST NOT be one of the checks that quietly
+// passed for months by exiting before it asserted anything: see its own comment below.
 // ---------------------------------------------------------------------------------------
 
 const EDIT_PAGE = '/rundgang';
@@ -997,26 +1022,56 @@ await check('E7 toggling Fett on a live selection marks it up, and the toolbar a
   // it already pins the wire keys; this exercises the part it cannot reach — a real browser,
   // a real ContentEditable, the real ProseMirror keymaps — to confirm the renamed `Strong`
   // extension still behaves like a normal mark all the way through typing and toggling it.
+  //
+  // This needs a live session to type into, and — unlike E1-E6 — has nothing meaningful to
+  // assert without one. `just behaviour`'s fixture grants write on EDIT_PAGE precisely so
+  // this precondition holds; the assertion below is what used to be a silent `return` on a
+  // refused session, which is exactly the shape that let 17 failures pass unnoticed for
+  // months. A check that cannot run must fail, not exit quietly.
   const { region, headline } = await loadEditor(page);
-  if (!headline.includes('Verbunden')) return; // nothing to type into without a live session
+  assert(
+    headline.includes('Verbunden'),
+    `E7 needs a live editing session on ${EDIT_PAGE} to type into and there isn't one — ` +
+      `headline says "${headline}". Is the behaviour fixture's write grant missing (see ` +
+      `\`just behaviour\` / \`just behaviour-fixture\`)?`
+  );
 
   const surface = region.locator('[contenteditable="true"]');
   await surface.click();
-  await page.keyboard.type('fett');
-  await page.keyboard.press('Shift+Home');
+
+  // The document is cleared first, so what is typed becomes the WHOLE document rather than
+  // a run inside the seeded prose — and selecting it is then `Mod-a`, not `Shift+Home` or a
+  // count of `Shift+ArrowLeft` presses. Both of those were tried and both were genuinely
+  // flaky (confirmed over repeated runs against a freshly-seeded fixture, not an artefact of
+  // reusing one document across runs): a selection built by moving the native caret is only
+  // as current as the browser's last `selectionchange` event, which ProseMirror's view picks
+  // up asynchronously — so a command issued right after can act on the STALE selection from
+  // before the caret moved, silently doing nothing. `Mod-a` and `Mod-b` are both bound as
+  // ProseMirror commands (`prosemirror-commands`' `selectAll`, and `Strong`/`Bold`'s own
+  // keymap — see extensions.ts), which read and write `state.selection` directly inside the
+  // SAME synchronous keydown handler; neither one waits on the DOM to tell it what changed.
+  await page.keyboard.press('Control+a');
+  await page.keyboard.press('Backspace');
+
+  const marker = 'fettmarke';
+  await page.keyboard.type(marker);
+  await page.keyboard.press('Control+a');
+  await page.keyboard.press('Control+b');
 
   const fettButton = region.locator('[role="toolbar"] button[aria-label="Fett"]');
-  await fettButton.click();
   await until(
     async () => {
       const saw = await fettButton.getAttribute('data-state');
       return { ok: saw === 'on', saw };
     },
-    'the Fett button never reported itself pressed after being clicked'
+    'the toolbar never reported Fett pressed after Mod-b, so it disagrees with the editor'
   );
 
   const html = await surface.innerHTML();
-  assert(/<strong[^>]*>fett<\/strong>/.test(html), `expected a <strong>fett</strong> run, got: ${html}`);
+  assert(
+    new RegExp(`^<p><strong[^>]*>${marker}</strong></p>$`).test(html.trim()),
+    `expected the document to be exactly one bolded "${marker}" run, got: ${html}`
+  );
 });
 
 // ---------------------------------------------------------------------------------------

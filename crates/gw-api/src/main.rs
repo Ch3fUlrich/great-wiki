@@ -67,6 +67,78 @@ enum Command {
         #[arg(long = "as", value_name = "USERNAME")]
         identity: String,
     },
+    /// Add an ACL grant on a path, from the command line.
+    ///
+    /// Exists for the case `seed --as` cannot reach: bootstrapping the FIRST grant on a
+    /// fresh wiki, where no account yet holds enough permission to open the admin console
+    /// at all — a freshly seeded wiki has zero rows in `acl`, so nobody can write anything
+    /// until one of these runs. It calls the same `Store::add_grant_audited` the admin API
+    /// route does, so this is not a second, weaker path to the same state: it writes to
+    /// `audit_log` exactly as a grant made in the browser would, under `--actor` rather
+    /// than a signed-in person's id.
+    Grant {
+        /// The path the grant applies to. A grant is inherited by every descendant that
+        /// has no grants of its own (nearest ancestor wins; see
+        /// `gw_store::Store::grants_for_path`) — granting on a top-level page therefore
+        /// covers its whole subtree in one row.
+        #[arg(long)]
+        path: String,
+        /// Who the grant is for: `principal:<username-or-id>`, `team:<slug>`,
+        /// `group:<name>` (an Authelia group, matched against the verified `groups`
+        /// claim), `anyone`, or `authenticated`.
+        #[arg(long)]
+        subject: String,
+        /// What the grant confers: `read`, `comment`, `write` or `admin`. Each implies
+        /// every weaker permission (`gw_auth::Permission::satisfies`).
+        #[arg(long)]
+        permission: String,
+        /// Recorded as `audit_log.principal_id`. Not a real account — this command exists
+        /// precisely because no account can be relied on to hold one yet — so it defaults
+        /// to a value that reads as tooling, not as a person, in the audit trail.
+        #[arg(long, default_value = "cli-grant")]
+        actor: String,
+    },
+}
+
+/// Parse `--subject`. `principal:<id>` matches by id OR username (see `gw_auth::can`), so
+/// a username works here without a store lookup — deliberately: this command runs before
+/// a wiki necessarily has any grants at all, and a lookup that could itself fail for "no
+/// grant yet" reasons would be a strange way to bootstrap the first one.
+fn parse_subject(raw: &str) -> Result<gw_auth::Subject> {
+    if raw == "anyone" {
+        return Ok(gw_auth::Subject::Anyone);
+    }
+    if raw == "authenticated" {
+        return Ok(gw_auth::Subject::Authenticated);
+    }
+    let Some((kind, id)) = raw.split_once(':') else {
+        bail!(
+            "--subject `{raw}` is not understood — use `principal:<name>`, `team:<slug>`, \
+             `group:<name>`, `anyone` or `authenticated`"
+        );
+    };
+    if id.trim().is_empty() {
+        bail!("--subject `{raw}` names no id after the `:`");
+    }
+    match kind {
+        "principal" => Ok(gw_auth::Subject::Principal(id.to_string())),
+        "team" => Ok(gw_auth::Subject::Team(id.to_string())),
+        "group" => Ok(gw_auth::Subject::Group(id.to_string())),
+        other => bail!(
+            "--subject `{raw}` names an unknown kind `{other}` — use `principal`, `team` \
+             or `group`, or the bare words `anyone` / `authenticated`"
+        ),
+    }
+}
+
+fn parse_permission(raw: &str) -> Result<gw_auth::Permission> {
+    match raw {
+        "read" => Ok(gw_auth::Permission::Read),
+        "comment" => Ok(gw_auth::Permission::Comment),
+        "write" => Ok(gw_auth::Permission::Write),
+        "admin" => Ok(gw_auth::Permission::Admin),
+        other => bail!("--permission `{other}` is not one of read, comment, write, admin"),
+    }
 }
 
 /// Resolve `--as` to the principal the store holds for it.
@@ -180,6 +252,29 @@ async fn main() -> Result<()> {
                     report.refused.len()
                 )
             }
+        }
+        Command::Grant {
+            path,
+            subject,
+            permission,
+            actor,
+        } => {
+            let store = gw_store::Store::open(&cfg.database_url)
+                .await?
+                .with_public_origin(cfg.public_origin.clone());
+            let subject = parse_subject(&subject)?;
+            let permission = parse_permission(&permission)?;
+            let changed = store
+                .add_grant_audited(&actor, &path, &subject, permission)
+                .await?;
+            if changed {
+                println!("granted {permission:?} on {path} to {subject:?}");
+            } else {
+                // Idempotent success (see `gw_store::admin`'s module doc): the exact same
+                // grant already existed, so running this twice is safe in a script.
+                println!("{path} already grants {permission:?} to {subject:?} — nothing to do");
+            }
+            Ok(())
         }
         Command::Serve => {
             let store = std::sync::Arc::new(
