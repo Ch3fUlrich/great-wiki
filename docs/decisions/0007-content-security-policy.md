@@ -73,7 +73,7 @@ object-src 'none';
 script-src 'self' 'nonce-<per response>';
 style-src 'self' 'nonce-<per response>';
 style-src-attr 'unsafe-inline';
-base-uri 'self';
+base-uri 'none';
 form-action 'self';
 frame-ancestors 'self'
 ```
@@ -85,9 +85,26 @@ default-src 'none'; style-src 'unsafe-inline'; form-action 'self';
 base-uri 'none'; frame-ancestors 'self'
 ```
 
-`'self'` stays in `script-src` beside the nonce deliberately. A nonce does not propagate to
-a dynamic `import()`, and TipTap and Yjs arrive as dynamically imported chunks; the URL
-allow-list is what admits them.
+Both name `base-uri 'none'`. Nothing in this deployment emits a `<base>` element, and
+`'self'` would still have been a real loosening: SvelteKit's own bootstrap references its
+script chunks with base-relative specifiers, so an injected `<base href>` could re-point
+them within the origin under `'self'`. There was no reason found for the front end and the
+API to disagree here, so they don't.
+
+`'self'` stays in `script-src` beside the nonce deliberately. A dynamic `import()` is
+checked as an ordinary resource fetch against `script-src`'s host and scheme sources, not
+against the nonce — a nonce only ever authorises an element that carries the `nonce`
+attribute, and an `import()` call is not one. TipTap and Yjs arrive as dynamically imported
+chunks, so `'self'` — the host allow-list — is what admits them. (`'strict-dynamic'` would
+have the nonce'd bootstrap script propagate its trust to those imports instead, dropping
+the need for `'self'` entirely; tried once as a spike, with Chromium visibly ignoring
+`'self'` the moment it was present, exactly as the spec says it should. It was not adopted
+— see "Consequences" — but it is worth naming precisely because an earlier version of this
+document cited the opposite failure mode, "a nonce does not propagate to a dynamic
+`import()`", as the reason `'self'` has to stay. That claim was backwards: what does not
+propagate, absent `'strict-dynamic'`, is not the nonce failing to reach the import — it is
+that nothing was ever asking the nonce about it. Host-source matching is what dynamic
+`import()` gets by default, and `'self'` is that match.)
 
 ## What had to be loosened, and what forced it
 
@@ -97,8 +114,16 @@ literal `style="…"` attribute — `BlockView.svelte`, `TableView.svelte`, the 
 widths and colours the same way. One editor page was measured carrying 37 of them. CSP has
 no nonce or hash mechanism for attributes at all, so the choice was `'unsafe-inline'` or
 deleting a rendering feature. It is confined to `style-src-attr` rather than added to
-`style-src`, so `<style>` ELEMENTS are still refused; the residual risk is CSS-only, and
-nothing renders authored content into a style attribute.
+`style-src`, so `<style>` ELEMENTS are still refused, and that is most of why the residual
+risk here is small rather than merely bounded: the CSS-only attribute-selector techniques
+used to exfiltrate page content (`input[value^="a"] { background: url(…) }` and similar)
+need selectors to attach to, and a `style="…"` attribute holds only declarations for the
+one element that carries it — no selector can live there, so that technique needs a
+`<style>` element or a stylesheet, neither of which this loosening grants. What remains is
+a `url()` inside a declaration, and that fetch is still governed by `img-src`/`font-src`,
+which admit no remote host — so even a `url()` an attacker fully controlled would resolve
+against this origin, moving nothing off it. Nothing renders authored content into a style
+attribute either way.
 
 **`style-src 'unsafe-inline'` on the API's two HTML pages.** Both carry their stylesheet in
 a `<style>` block on purpose — a sign-in page has to render when the rest of the stack is
@@ -153,3 +178,12 @@ in production mode.
 - **The edge keeps its `X-Frame-Options: SAMEORIGIN`.** `frame-ancestors 'self'` says the
   same thing to a modern browser, but the edge's copy also covers every response that never
   reaches either policy.
+- **`'strict-dynamic'` was tried and not adopted.** Added to `script-src` as a spike, it let
+  the nonce'd bootstrap propagate trust to TipTap's and Yjs's dynamically imported chunks,
+  and the editor worked fully with no other change — Chromium's console confirmed it was
+  ignoring `'self'`, which is the documented behaviour of `'strict-dynamic'` and not a sign
+  that plain nonce-based CSP already covers dynamic `import()`. It stays out for now because
+  it buys nothing this deployment needs: `'self'` already admits exactly the chunks this
+  app ships, from the same origin the app is served from, and `'strict-dynamic'` would trade
+  a host allow-list this reviewer can read for a trust chain that has to be reasoned about
+  instead. Worth revisiting only if a legitimate need for a script from off-origin shows up.

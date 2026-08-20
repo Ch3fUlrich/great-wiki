@@ -188,10 +188,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_404_fallback_is_covered_because_the_layer_is_outside_the_router() {
-        // axum's fallback answers `text/plain`, so the assertion that matters is that the
-        // layer RAN for a path with no route rather than that it attached anything.
-        let response = app()
+    async fn a_fallback_response_is_still_inside_the_outermost_layer() {
+        // `app()`'s own 404 answers `text/plain`, which `is_html` correctly refuses
+        // regardless of whether this layer ran at all — asserting only its status, as an
+        // earlier version of this test did, passes whether or not `.layer()` wraps the
+        // fallback. What that earlier version was trying to prove is that the layer being
+        // added OUTSIDE `Router::new()` (as `build_router` does) covers routes that do not
+        // exist yet, not only the ones registered above it — and the only way to observe
+        // that is to give the fallback itself something HTML to answer with, and check
+        // that the policy lands on it exactly as it would on a matched route.
+        let fallback_app = Router::new()
+            .fallback(|| async {
+                (
+                    StatusCode::NOT_FOUND,
+                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    "<!doctype html><p>nicht gefunden",
+                )
+            })
+            .layer(axum::middleware::from_fn(attach));
+
+        let response = fallback_app
             .oneshot(
                 Request::builder()
                     .uri("/nichts")
@@ -200,6 +216,15 @@ mod tests {
             )
             .await
             .unwrap();
+
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .and_then(|value| value.to_str().ok()),
+            Some(POLICY),
+            "a route reached only through the fallback must still be inside the layer"
+        );
     }
 }

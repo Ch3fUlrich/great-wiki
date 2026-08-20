@@ -1205,7 +1205,7 @@ await check('G1 every rendered page carries a policy with a default-src of self'
       `${path}: default-src is ${JSON.stringify(policy['default-src'])}, expected ["'self'"]`
     );
     assert(policy['object-src']?.join(' ') === "'none'", `${path}: object-src is not 'none'`);
-    assert(policy['base-uri']?.join(' ') === "'self'", `${path}: base-uri is not 'self'`);
+    assert(policy['base-uri']?.join(' ') === "'none'", `${path}: base-uri is not 'none'`);
     assert(
       policy['frame-ancestors']?.join(' ') === "'self'",
       `${path}: frame-ancestors does not match the edge's X-Frame-Options: SAMEORIGIN`

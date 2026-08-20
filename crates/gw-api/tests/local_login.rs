@@ -7,7 +7,7 @@
 //! that everything *except* the thing under test is correct.
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{header, Request, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -325,6 +325,19 @@ async fn the_sign_in_page_offers_both_mechanisms() {
         response.status(),
         StatusCode::OK,
         "the login page is a page"
+    );
+    // D-0007: `/auth/login` is rendered by this crate, not by SvelteKit, so SvelteKit's
+    // policy never reaches it — `crate::csp::attach` is the only thing that can. Asserted
+    // against the real router built by `build_router`, not the synthetic one `csp.rs`'s
+    // own unit tests use, because removing `.layer(from_fn(crate::csp::attach))` from
+    // `build_router` must fail a test that actually drives this router.
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|value| value.to_str().ok()),
+        Some(gw_api::csp::POLICY),
+        "a password form on the public internet must carry the API's Content-Security-Policy"
     );
     let page = text(response).await;
 

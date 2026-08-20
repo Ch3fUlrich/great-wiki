@@ -745,7 +745,31 @@ async fn the_invite_page_names_who_invited_them_and_what_they_will_get() {
     let created = invite_to_raum(&fx, "gast").await;
     let app = browser(&fx).await;
 
-    let (status, page) = open_invite(&app, &mut Jar::default(), &created.token).await;
+    // `visit`, not `open_invite`: the header has to be read off the `Response` before its
+    // body is consumed, and `open_invite` already turns it into `String`.
+    let response = visit(
+        &app,
+        &mut Jar::default(),
+        "GET",
+        &format!("/auth/invite/{}", created.token),
+        None,
+    )
+    .await;
+    let status = response.status();
+    // D-0007: this page interpolates `invited_by_name` — content another account
+    // authored — into HTML the invitee is asked to set a password on, and `/auth/*` is
+    // rendered by this crate rather than by SvelteKit, so only `crate::csp::attach` can
+    // cover it. Asserted against the real router `browser()` builds, so removing
+    // `.layer(from_fn(crate::csp::attach))` from `build_router` fails this test.
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_SECURITY_POLICY)
+            .and_then(|value| value.to_str().ok()),
+        Some(gw_api::csp::POLICY),
+        "the invite page must carry the API's Content-Security-Policy"
+    );
+    let page = text(response).await;
     assert_eq!(status, StatusCode::OK, "{page}");
     assert!(page.contains("lang=\"de\""), "{page}");
     assert!(page.contains("Lektor"), "who invited them: {page}");

@@ -46,9 +46,14 @@ export default defineConfig({
 
 					// No 'unsafe-inline' and no 'unsafe-eval'. SvelteKit's bootstrap script and
 					// app.html's pre-paint theme script both carry the nonce; the module chunks
-					// TipTap and Yjs arrive in are `import()`ed by URL and are covered by 'self'
-					// (a nonce does not propagate to a dynamic import — the URL allow-list is
-					// what admits them, which is exactly why 'self' stays alongside the nonce).
+					// TipTap and Yjs arrive in are `import()`ed by URL. A dynamic `import()` is
+					// checked as an ordinary resource fetch against script-src's host/scheme
+					// sources rather than against the nonce — a nonce only ever authorises an
+					// element carrying the `nonce` attribute, and an `import()` is not one — so
+					// 'self' is what admits those chunks, which is why it stays alongside the
+					// nonce. (`'strict-dynamic'` would let the nonce'd bootstrap propagate trust
+					// to them instead and drop the need for 'self' — measured working, not
+					// adopted; see docs/decisions/0007-content-security-policy.md.)
 					'script-src': ['self'],
 
 					// Stylesheets are real files with real URLs, so they need nothing looser.
@@ -65,9 +70,14 @@ export default defineConfig({
 					// It is confined to `style-src-attr`, which is why it is written as its own
 					// directive rather than added to `style-src`: CSP3 splits attribute styles
 					// from `<style>` ELEMENTS, so `style-src-elem` still inherits the strict
-					// 'self' above and an injected `<style>` block is still refused. The residual
-					// risk is CSS-only — no script executes from a style attribute — and the
-					// renderer does not emit authored CSS into one.
+					// 'self' above and an injected `<style>` block is still refused — which is
+					// most of why the residual risk is small: the attribute-selector techniques
+					// used to exfiltrate page content need a selector to attach to, and a
+					// `style="…"` attribute holds only declarations for the one element that
+					// carries it, no selector, so that needs a `<style>` element regardless. A
+					// `url()` inside a declaration is still bound by img-src/font-src, which admit
+					// no remote host. No script executes from a style attribute, and the renderer
+					// does not emit authored CSS into one either way.
 					'style-src-attr': ['unsafe-inline'],
 
 					// Local font files only (static/fonts). Nothing is fetched from a CDN and
@@ -97,9 +107,13 @@ export default defineConfig({
 					// sinks that survive most other hardening.
 					'object-src': ['none'],
 
-					// Without this, one injected `<base href>` re-points every relative URL on
-					// the page — including the ones 'self' was supposed to have pinned down.
-					'base-uri': ['self'],
+					// 'none', not 'self'. There is no `<base>` element anywhere in this app —
+					// app.html has none, and nothing renders one — and SvelteKit's own bootstrap
+					// references its chunks with base-relative specifiers, so an injected
+					// `<base href>` under 'self' could still re-point them within the origin.
+					// 'none' closes that outright, and matches crates/gw-api/src/csp.rs, which
+					// had no reason to disagree with this one.
+					'base-uri': ['none'],
 
 					// Sign-out and view-as-exit both post same-origin. The OIDC hand-off to
 					// Authelia is a redirect, not a form submission, so it is unaffected.

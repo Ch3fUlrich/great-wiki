@@ -55,23 +55,23 @@ export function widenCspNonceToStyles(policy: string): string {
   const nonce = /(?:^|;)\s*script-src\s[^;]*'(nonce-[^']+)'/.exec(policy)?.[1];
   if (!nonce) return policy;
 
-  let widened = false;
+  // No `style-src` at all means the policy is relying on `default-src`, and appending a
+  // directive here would silently drop that fallback's other sources — so a `part` that
+  // does not match either guard below is returned untouched, and a policy with no
+  // `style-src` at all comes back byte-for-byte the same as it went in. There used to be a
+  // `widened` flag bookkeeping that outcome to choose between returning `parts.join(';')`
+  // and returning `policy` directly, but `policy.split(';').join(';')` reconstructs
+  // `policy` exactly, so both branches were always the same string; the flag tracked
+  // nothing the return value could see. The configuration in vite.config.ts is what
+  // decides the shape of the policy, this function only edits the parts already there.
   const parts = policy.split(';').map((part) => {
     // `style-src-attr` and `style-src-elem` are different directives and must not match:
     // the character after `style-src` has to be whitespace, not a hyphen.
     if (!/^\s*style-src\s/.test(part)) return part;
-    // Already permits inline content, so adding the nonce would take that away. Counts as
-    // handled — the caller must not then conclude there was no `style-src` to widen.
-    if (part.includes("'unsafe-inline'")) {
-      widened = true;
-      return part;
-    }
-    widened = true;
+    // Already permits inline content, so adding the nonce would take that away.
+    if (part.includes("'unsafe-inline'")) return part;
     return part.includes(`'${nonce}'`) ? part : `${part} '${nonce}'`;
   });
 
-  // No `style-src` at all means the policy is relying on `default-src`, and appending a
-  // directive here would silently drop that fallback's other sources. Leave it alone; the
-  // configuration in vite.config.ts is what decides the shape of the policy.
-  return widened ? parts.join(';') : policy;
+  return parts.join(';');
 }

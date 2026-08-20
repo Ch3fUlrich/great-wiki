@@ -6,7 +6,7 @@ import { widenCspNonceToStyles } from './csp';
 const REAL =
   "default-src 'self'; frame-src 'none'; connect-src 'self'; font-src 'self'; " +
   "img-src 'self' data:; object-src 'none'; script-src 'self' 'nonce-R2HOT7vwD6nTVUBT2SiUwA=='; " +
-  "style-src 'self'; style-src-attr 'unsafe-inline'; base-uri 'self'; form-action 'self'; " +
+  "style-src 'self'; style-src-attr 'unsafe-inline'; base-uri 'none'; form-action 'self'; " +
   "frame-ancestors 'self'";
 
 describe('widenCspNonceToStyles', () => {
@@ -29,7 +29,7 @@ describe('widenCspNonceToStyles', () => {
       "frame-src 'none'",
       "connect-src 'self'",
       "object-src 'none'",
-      "base-uri 'self'",
+      "base-uri 'none'",
       "form-action 'self'",
       "frame-ancestors 'self'",
       "script-src 'self' 'nonce-R2HOT7vwD6nTVUBT2SiUwA=='"
