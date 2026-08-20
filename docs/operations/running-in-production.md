@@ -41,9 +41,23 @@ What stands between the internet and the content:
   ground down, and a wrong username costs the attacker the same as a right one.
 - HSTS (two years, `includeSubDomains`, `preload`), `nosniff`, `SAMEORIGIN` and
   `strict-origin-when-cross-origin` come from the edge's `secure_headers` snippet.
+- A Content-Security-Policy, issued by the **application** rather than by either proxy —
+  see [ADR 0007](../decisions/0007-content-security-policy.md) for why, and for the two
+  things about it that only a browser could have told us. `script-src` is nonce-based with
+  no `'unsafe-inline'`; the API's own HTML (`/auth/login`, the invitation page) gets a
+  separate, stricter `default-src 'none'` policy from `crates/gw-api/src/csp.rs`, because
+  those pages are routed to the API and SvelteKit's policy never reaches them.
 
-**Known gap: there is no Content-Security-Policy.** For a wiki that renders authored
-content to the public internet, that is the header that matters most and it is absent.
+**What the policy does NOT cover**, so that nobody reads the line above as "done":
+
+- **Static files.** `/fonts/*`, `/_app/*` and `robots.txt` are served by adapter-node with
+  no policy. None of them is HTML, so nothing executes from them under a policy or without
+  one — but the day something serves an uploaded file, that is the gap to close first.
+- **Violation reporting.** There is no `report-to` and no `report-uri`. A policy that
+  breaks a page in production is silent unless somebody opens a browser console.
+- **`wiki-dev.ohje.ooguy.com`.** It is the Vite dev server, and SvelteKit deliberately
+  relaxes `style-src` to `'unsafe-inline'` in development so it can inject component
+  styles. The dev name is public; the policy it serves is the weaker one.
 
 ## Where the content actually is
 

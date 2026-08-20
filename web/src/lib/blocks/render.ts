@@ -38,10 +38,15 @@ const LINK_SCHEMES = new Set(['http:', 'https:', 'mailto:']);
  * editor's Link control, or from any writer added later; `gw_core::Mark::link_to_url` does
  * not validate it and neither does `gw-collab`. `<a href="javascript:…">` is therefore a
  * stored cross-site-scripting payload that anyone with write access to one page can leave for
- * every reader of a public wiki, including an admin — and there is no Content-Security-Policy
- * to catch it (a known gap, recorded in `docs/operations/running-in-production.md`). So the
- * check lives at the sink, where it covers every producer at once rather than every producer
- * having to remember.
+ * every reader of a public wiki, including an admin. So the check lives at the sink, where it
+ * covers every producer at once rather than every producer having to remember.
+ *
+ * There is a Content-Security-Policy behind this now (`kit.csp` in `web/vite.config.ts`, and
+ * `docs/decisions/0007-content-security-policy.md`), and `script-src` with no
+ * `'unsafe-inline'` would refuse a `javascript:` navigation on its own. It is the second
+ * line and not the first: this function is what makes such a link render as PLAIN TEXT,
+ * which is a page that reads correctly rather than a page with a dead control on it, and it
+ * is the only one of the two that still works wherever the policy is not in force.
  *
  * Judged by the WHATWG `URL` parser rather than by a regex on the string, because that is
  * exactly the parser the browser will use on the value: it lower-cases the scheme, strips

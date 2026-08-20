@@ -373,5 +373,11 @@ pub fn build_router(state: AppState) -> Router {
             state.proxy_guard.clone(),
             proxy_guard::enforce,
         ))
+        // Outermost of all, and only because it is the cheapest place that cannot be
+        // forgotten: it adds a Content-Security-Policy to every HTML response this crate
+        // produces, including the ones the two layers above generate themselves. `/auth/*`
+        // is served from here rather than by SvelteKit, so SvelteKit's own policy never
+        // reaches the sign-in page or the invitation page. See `crate::csp`.
+        .layer(axum::middleware::from_fn(crate::csp::attach))
         .with_state(state)
 }

@@ -1161,6 +1161,115 @@ await check('F5 the empty state renders its German sentence and no <svg>', async
   assert((await page.locator('svg').count()) === 0, 'the empty state must render no <svg> at all');
 });
 
+// ---------------------------------------------------------------------------------------
+// Group G — the Content-Security-Policy (web/vite.config.ts `kit.csp`, web/src/hooks.server.ts,
+// crates/gw-api/src/csp.rs)
+//
+// A header is a deterministic thing to assert and needs no dev server state, which is why it
+// is here rather than in vitest: the value only exists once something has actually rendered
+// a page, and half of what matters about it is whether the BROWSER honours it — a policy
+// that is sent and then quietly ignored looks identical from `curl`.
+//
+// Two of these run against `just dev`, and dev is NOT production: SvelteKit adds
+// `'unsafe-inline'` to `style-src` in development so it can inject component styles, so
+// nothing below may assert that `style-src` is strict. What is asserted is what holds in
+// both — `default-src 'self'`, a nonce in `script-src` with no `'unsafe-inline'` beside it,
+// and the directives that have no dev/prod difference at all.
+// ---------------------------------------------------------------------------------------
+
+/** The `content-security-policy` header of a plain GET, split into directive → sources. */
+async function policyOf(page, path) {
+  const response = await page.goto(BASE + path, { waitUntil: 'domcontentloaded' });
+  const header = (await response.headerValue('content-security-policy')) ?? '';
+  assert(header !== '', `${path} answered ${response.status()} with no Content-Security-Policy`);
+  return Object.fromEntries(
+    header
+      .split(';')
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .map((part) => {
+        const [name, ...sources] = part.split(/\s+/);
+        return [name.toLowerCase(), sources];
+      })
+  );
+}
+
+await check('G1 every rendered page carries a policy with a default-src of self', async (page) => {
+  // The 404 is in the list on purpose: SvelteKit renders it like any other page, and a
+  // policy that covered only the routes somebody remembered is the class of gap this whole
+  // header exists to close.
+  for (const path of ['/', '/rundgang', '/graph', '/gibt-es-nicht-xyz']) {
+    const policy = await policyOf(page, path);
+    assert(
+      policy['default-src']?.join(' ') === "'self'",
+      `${path}: default-src is ${JSON.stringify(policy['default-src'])}, expected ["'self'"]`
+    );
+    assert(policy['object-src']?.join(' ') === "'none'", `${path}: object-src is not 'none'`);
+    assert(policy['base-uri']?.join(' ') === "'self'", `${path}: base-uri is not 'self'`);
+    assert(
+      policy['frame-ancestors']?.join(' ') === "'self'",
+      `${path}: frame-ancestors does not match the edge's X-Frame-Options: SAMEORIGIN`
+    );
+  }
+});
+
+await check('G2 script-src is nonce-based and never allows unsafe-inline or eval', async (page) => {
+  // The directive the whole policy is for. `'self'` stays beside the nonce deliberately:
+  // a nonce does not propagate to a dynamic `import()`, and TipTap and Yjs arrive as
+  // dynamically imported chunks.
+  const policy = await policyOf(page, '/');
+  const sources = policy['script-src'] ?? [];
+  assert(sources.includes("'self'"), `script-src lacks 'self': ${sources.join(' ')}`);
+  assert(
+    sources.some((source) => source.startsWith("'nonce-")),
+    `script-src carries no nonce: ${sources.join(' ')}`
+  );
+  for (const forbidden of ["'unsafe-inline'", "'unsafe-eval'", "'wasm-unsafe-eval'"]) {
+    assert(!sources.includes(forbidden), `script-src allows ${forbidden}: ${sources.join(' ')}`);
+  }
+});
+
+await check('G3 the browser enforces it: an injected inline script does not run', async (page) => {
+  // Sent is not enforced. Without this check the header could be malformed in a way every
+  // browser ignores and G1 and G2 would both still pass.
+  await page.goto(BASE + '/', { waitUntil: 'networkidle' });
+  const ran = await page.evaluate(() => {
+    const script = document.createElement('script');
+    script.textContent = 'window.__gwCspProbe = true;';
+    document.head.appendChild(script);
+    return window.__gwCspProbe === true;
+  });
+  assert(!ran, 'an inline <script> injected into the page executed — the policy is not enforced');
+});
+
+await check('G4 the nonce reaches app.html, so the pre-paint theme script still runs', async (page) => {
+  // The cost of `script-src` having no `'unsafe-inline'`: app.html's theme script needs
+  // `nonce="%sveltekit.nonce%"`. Drop that attribute and this is the check that notices —
+  // the symptom otherwise is a flash of the wrong theme, which nothing else here can see.
+  await page.goto(BASE + '/', { waitUntil: 'domcontentloaded' });
+  await page.evaluate(() => localStorage.setItem('gw-theme', 'dark'));
+  await page.goto(BASE + '/', { waitUntil: 'domcontentloaded' });
+  const theme = await page.evaluate(() => document.documentElement.dataset.theme);
+  assert(theme === 'dark', `expected the inline theme script to set data-theme="dark", got "${theme}"`);
+});
+
+await check('G5 the API serves its own HTML with a stricter, script-free policy', async (page) => {
+  // `/auth/*` is routed to gw-api, not to SvelteKit, so SvelteKit's policy never reaches the
+  // sign-in page — a password form on the public internet. `crates/gw-api/src/csp.rs` is
+  // what covers it, and it can afford `default-src 'none'` because that page has no
+  // JavaScript at all.
+  const policy = await policyOf(page, '/auth/login');
+  assert(
+    policy['default-src']?.join(' ') === "'none'",
+    `/auth/login: default-src is ${JSON.stringify(policy['default-src'])}, expected ["'none'"]`
+  );
+  assert(!('script-src' in policy), '/auth/login must not name script-src at all');
+  assert(
+    policy['form-action']?.join(' ') === "'self'",
+    '/auth/login: the sign-in form must only be submittable to this origin'
+  );
+});
+
 await browser.close();
 
 // ---------------------------------------------------------------------------------------

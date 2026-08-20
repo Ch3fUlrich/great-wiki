@@ -219,6 +219,36 @@
     };
   });
 
+  /**
+   * The nonce this page's Content-Security-Policy was issued with, or `undefined` where
+   * there is no policy at all.
+   *
+   * TipTap injects the ProseMirror base stylesheet as a STYLE ELEMENT at editor
+   * construction, and `kit.csp` in vite.config.ts sends `style-src 'self'` — no
+   * `unsafe-inline` — so without a nonce that element is refused and the editing surface
+   * loses `white-space: pre-wrap`, the gap cursor and the hidden-selection rules. It is not
+   * a blank page, which is what makes it worth writing down: it looks like a styling bug,
+   * and only the console says otherwise. `style-src-attr` does NOT cover it — that
+   * directive is about `style="…"` attributes, and this is an element.
+   *
+   * (Spelled out in words rather than as markup on purpose. Svelte's parser scans the WHOLE
+   * file for the start of the style block, comments included, so a literal opening style tag
+   * anywhere in here makes `svelte-check` report `<script> was left open` at the last line
+   * of the file and nothing anywhere near the actual text.)
+   *
+   * Read off the DOM because SvelteKit gives the value to the template and not to client
+   * code: `%sveltekit.nonce%` renders into the scripts it emits, and the HTML parser then
+   * BLANKS the content attribute while keeping the real value on the IDL property. So
+   * `[nonce]` still matches as a selector, `getAttribute('nonce')` returns `""`, and
+   * `.nonce` returns the value — all three verified in Chromium against this build. Any
+   * script that could read this already runs, and a nonce only has to be unguessable to
+   * code that does not.
+   */
+  function cspNonce(): string | undefined {
+    if (typeof document === 'undefined') return undefined;
+    return document.querySelector<HTMLScriptElement>('script[nonce]')?.nonce || undefined;
+  }
+
   /** Build the editing surface. Only ever called once the session is live. */
   async function mount(doc: Y.Doc, provider: WebsocketProvider) {
     if (editor) return;
@@ -227,6 +257,9 @@
 
     editor = new Editor({
       element: host,
+      // Carried into the `data-tiptap-style` element TipTap appends to the document head.
+      // `undefined` leaves it off, which is the right answer where no policy is in force.
+      injectNonce: cspNonce(),
       extensions: [
         ...contentExtensions(),
         // `field` is the whole reason this line is spelled out. The extension's default is

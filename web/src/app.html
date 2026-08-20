@@ -30,7 +30,15 @@
 		/>
 
 		%sveltekit.head%
-		<script>
+		<!--
+			`nonce` is not decoration: `kit.csp` in vite.config.ts sends
+			`script-src 'self' 'nonce-…'` with no `unsafe-inline`, so WITHOUT this attribute
+			this script is refused and the page paints in the wrong theme and the wrong
+			typeface before Svelte corrects it — the exact flash the script exists to
+			prevent, and nothing but a console message to say why. SvelteKit substitutes
+			`%sveltekit.nonce%` with the value it put in the header for this one response.
+		-->
+		<script nonce="%sveltekit.nonce%">
 			// Resolve the theme and the typeface BEFORE first paint. Doing this in a
 			// component would mean rendering once in the defaults and again in the chosen
 			// ones — the flash of wrong theme, and of wrong font, that makes an application
