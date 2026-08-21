@@ -516,6 +516,97 @@ mutation crates/gw-store/src/links.rs killed \
   's/                .document_for_with_baseline(principal, path, Action::Read, baseline)/                .document_by_path_unchecked(path)/' \
   'graph: a node names only a page the caller may actually read'
 
+# --- tasks and boards: a card is a page's words on somebody else's screen --------------
+#
+# The design's Security section names this as the property most likely to be got wrong by
+# an aggregate query written in a hurry, and a board is worse than a backlinks panel: a
+# project is DELIBERATELY allowed to span pages with different grants (D-3), so the natural
+# thing to write — trust the subtree, it is the project — is exactly the bug. A card's title
+# is a copy of its page's own words (D-2), so a leaked card is leaked prose, not merely a
+# leaked name.
+#
+# The first mutation is the one that matters: `governing_document` is the single line every
+# task, board and project in the module is authorised through, and swapping it for the
+# unchecked accessor is the same shape, the same types, and compiles.
+mutation crates/gw-store/src/tasks.rs killed \
+  's|        self.document_for_with_baseline(principal, \&path, action, baseline)|        self.document_by_path_unchecked(\&path)|' \
+  'tasks: every card and project goes through the permission-checked accessor'
+mutation crates/gw-store/src/tasks.rs killed \
+  's|                        .document_for_with_baseline(principal, \&path, Action::Read, baseline)|                        .document_by_path_unchecked(\&path)|' \
+  'board: a card names only a page the caller may actually read'
+# Asking and then not acting on the answer. `a_board_omits_a_card_whose_page_the_caller_
+# cannot_read` asserts that the privileged caller DOES see all three cards, so neither of
+# these can pass by the fixture having nothing to hide.
+mutation crates/gw-store/src/tasks.rs killed \
+  's|            if !readable {|            if false {|' \
+  'board: the per-document verdict is acted on rather than merely computed'
+# The baseline is hoisted out of the loop because it is a property of the caller. Hoisting
+# the WRONG one — anybody's but theirs — is how that optimisation goes wrong, and it reads
+# as a tidy constant rather than as a hole.
+mutation crates/gw-store/src/tasks.rs killed \
+  '/pub async fn board_for/,/^        let mut out: Vec<Task>/ s|Action::Read, baseline)|Action::Read, Baseline::Admin)|' \
+  'board: the home page is read with the CALLERS baseline, never a borrowed one'
+# The ordinary prefix bug, in the one place it is a disclosure: `/projektierung` is not
+# inside `/projekt`, and a bare `starts_with` would put its cards on somebody else's board.
+mutation crates/gw-store/src/tasks.rs killed \
+  's|    path == root \|\| path.starts_with(\&format!("{root}/"))|    path.starts_with(root)|' \
+  'board: within() is a segment boundary, not a bare prefix'
+# The SQL says the same thing one layer down. Provably unobservable while `within` stands,
+# and recorded as equivalent rather than as a gap: the prefix in the query is what stops it
+# loading every task in the corpus, and `within` is the boundary a reader can check. Either
+# alone is correct; they are kept as a pair on purpose, so breaking one changes nothing.
+mutation crates/gw-store/src/tasks.rs equivalent \
+  's|AND (d.path = ?1 OR substr(d.path, 1, length(?1) + 1) = ?1 \|\| ./.)|AND substr(d.path, 1, length(?1)) = ?1|' \
+  'board: the candidate SQL narrows to the same subtree — defence in depth behind within()'
+mutation crates/gw-store/src/tasks.rs killed \
+  '/pub async fn task_for/,/^    }$/ s|            .is_none()|            .is_some()|' \
+  'tasks: reading one task follows the read on the page that governs it'
+mutation crates/gw-store/src/tasks.rs killed \
+  's|        if !self.may(principal, document_id, Action::Read).await? {|        if false {|' \
+  "tasks: a page's own task list follows that page's read"
+
+# --- D-10: who may assign whom, which the design left open and the plan had to answer ---
+#
+# Four clauses, and the third is the security-relevant one. Assigning somebody to a task on
+# a page they cannot open hands them an obligation they cannot see, and the card's title
+# tells them what a page they may not read is called — the board's version of the leak a
+# graph edge would be.
+mutation crates/gw-store/src/tasks.rs killed \
+  's|            .governing_document(principal, \&new.home, Action::Write, baseline)|            .governing_document(principal, \&new.home, Action::Read, baseline)|' \
+  'assignment: creating a task needs WRITE on the governing page, not read'
+mutation crates/gw-store/src/tasks.rs killed \
+  '/pub async fn update_task/,/^        let mut governing_path/ s|            .governing_document(principal, \&home, Action::Write, baseline)|            .governing_document(principal, \&home, Action::Read, baseline)|' \
+  'assignment: changing a task needs WRITE on the governing page, not read'
+mutation crates/gw-store/src/tasks.rs killed \
+  '/pub async fn delete_task/,/^    }$/ s|Action::Write, baseline|Action::Read, baseline|' \
+  'assignment: deleting a task needs WRITE on the governing page, not read'
+mutation crates/gw-store/src/tasks.rs killed \
+  '/async fn may_be_assigned/,/^    }$/ s|            .is_some())|            .is_some() \|\| true)|' \
+  'assignment: a task may not rest on somebody who may not read the page it is on'
+mutation crates/gw-store/src/tasks.rs killed \
+  '/async fn may_be_assigned/,/^    }$/ s|            return Ok(false);|            return Ok(true);|' \
+  'assignment: an id that is not an account cannot be given a task'
+# Clause 4, and it is a mutation that ADDS a check rather than removing one — which is the
+# only way to test a deliberate permission. Making the unassign path ask whether the person
+# being removed may still read the page pins a stale name to the card for ever.
+mutation crates/gw-store/src/tasks.rs killed \
+  's|            Some(chosen) => chosen.clone(),|            Some(chosen) => chosen.clone().or_else(\|\| row.assignee.clone()),|' \
+  'assignment: unassigning asks nothing about the person being removed'
+# Moving a card changes which page governs it, so both ends are asked — and the name
+# already on the card is an assignment onto the destination's page.
+mutation crates/gw-store/src/tasks.rs killed \
+  's|            None if moved_to.is_some() => row.assignee.clone(),|            None if false => row.assignee.clone(),|' \
+  'assignment: a move re-checks the assignee against the board it is going to'
+mutation crates/gw-store/src/tasks.rs killed \
+  '/if let Some(project_id) = &update.project_id/,/^            governing_path = target_page.path;$/ s|                .governing_document(principal, \&target, Action::Write, baseline)|                .governing_document(principal, \&target, Action::Read, baseline)|' \
+  'assignment: moving a card needs WRITE on the destination board, not read'
+mutation crates/gw-store/src/tasks.rs killed \
+  '/pub async fn create_project/,/^    }$/ s|Action::Write|Action::Read|' \
+  'projects: making a page a project home needs WRITE on that page'
+mutation crates/gw-store/src/tasks.rs killed \
+  '/async fn may_administer_project/,/^    }$/ s|Action::Write, baseline|Action::Read, baseline|' \
+  'projects: retagging and deleting a project need WRITE on its home page'
+
 # --- crash recovery ------------------------------------------------------------------
 #
 # A trap does not survive SIGKILL, and a killed run leaves the mutated file in place.
