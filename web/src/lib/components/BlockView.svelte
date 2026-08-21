@@ -27,6 +27,34 @@
   <ol>{#each block.content ?? [] as child, i (i)}<Self block={child} />{/each}</ol>
 {:else if block.kind === 'listItem'}
   <li>{#each block.content ?? [] as child, i (i)}<Self block={child} />{/each}</li>
+{:else if block.kind === 'taskList'}
+  <!-- A checklist. `data-type` is the attribute TipTap's own `TaskList` puts on its `<ul>`,
+       so the editor and the reader can be styled by one rule instead of two that drift. -->
+  <ul class="task-list" data-type="taskList">
+    {#each block.content ?? [] as child, i (i)}<Self block={child} />{/each}
+  </ul>
+{:else if block.kind === 'taskItem'}
+  {@const checked = block.attrs?.checked === true}
+  <!-- A real `<input type="checkbox">`, not a glyph: a native checkbox is what tells a
+       screen reader "checked"/"not checked" without any ARIA, and a ✓ or a styled span
+       conveys the state by appearance alone — invisible to anybody not looking at it.
+
+       `disabled`, and deliberately so. Per design decision D-2 the page owns the words and
+       the RECORD owns the workflow state, so ticking a box in the reading view must not be
+       possible: it would need write permission on the page for a click, and would file a
+       revision nobody typed. Real interactivity belongs to the board, and waits for the
+       board API — until then a control that looks live and does nothing is worse than one
+       that plainly is not.
+
+       Named from its own line rather than left anonymous. A page can hold many of these,
+       and "checkbox, checked" with nothing else is what a reader gets from an unnamed one
+       when moving control by control. The name is the item's FIRST child — its own text —
+       not `plainText(block)`, which for a task with a checklist under it would read out
+       every line beneath it as well. -->
+  <li class="task-item" data-type="taskItem" data-checked={checked}>
+    <input type="checkbox" {checked} disabled aria-label={plainText(block.content?.[0] ?? block)} />
+    <div>{#each block.content ?? [] as child, i (i)}<Self block={child} />{/each}</div>
+  </li>
 {:else if block.kind === 'blockquote'}
   <blockquote>{#each block.content ?? [] as child, i (i)}<Self block={child} />{/each}</blockquote>
 {:else if block.kind === 'codeBlock'}
@@ -99,3 +127,34 @@
     {/if}
   {/if}
 {/snippet}
+
+<style>
+  /* A checklist puts its own control where the bullet would be, so the marker itself would
+     be a second, meaningless one. Scoped to this component rather than added to `app.css`'s
+     `.prose` block: this markup exists nowhere else, and the reader and the editor already
+     share the `data-type` hooks TipTap emits if a page-wide rule is ever wanted. */
+  .task-list {
+    list-style: none;
+    padding-inline-start: 0;
+  }
+
+  .task-item {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+  }
+
+  /* Full opacity despite `disabled`. A greyed-out control reads as "broken" or "not yet
+     loaded"; this one is not disabled because something went wrong, but because the page is
+     not where a task's state lives (D-2). It should read as a *statement* of state. */
+  .task-item > input {
+    flex: none;
+    accent-color: var(--accent);
+    opacity: 1;
+  }
+
+  /* The line's own text and anything nested under it, kept out of the checkbox's column. */
+  .task-item > div {
+    min-width: 0;
+  }
+</style>

@@ -572,3 +572,134 @@ fn a_link_carrying_the_editors_own_attributes_still_exports() {
         "a link the renderer cannot address must still be refused, not exported as bare text"
     );
 }
+
+#[test]
+fn a_task_carrying_the_id_the_store_minted_still_exports() {
+    // The same shape of bug as `a_link_carrying_the_editors_own_attributes_still_exports`,
+    // and reached from the other end. A task block carries a uuid in `attrs` — minted by the
+    // store on publish, and by the editor when somebody types a new checkbox line — because
+    // that uuid is what ties the line to its record on the board: its status, its assignee
+    // and its due date. `gw_core::markdown` deliberately mints none, so the markdown this
+    // renderer writes re-imports as `{checked}` alone while the stored block says
+    // `{checked, id}`.
+    //
+    // Without a reduction those two trees differ and `render_file` refuses the page — and
+    // `export` fails the whole run on the first refusal, so ONE checkbox anywhere in the
+    // wiki would shut the owner's backup path permanently, for a difference that is not a
+    // difference in the document at all. The id is database identity; markdown has no
+    // spelling for it and never will.
+    let meta = export::FileMeta {
+        title: "Einkauf".into(),
+        doc_type: "page".into(),
+        visibility: "public".into(),
+        language: "de".into(),
+        sort_key: 0,
+        slug: "einkauf".into(),
+    };
+    let body: Block = serde_json::from_str(
+        r#"{"kind":"doc","content":[{"kind":"taskList","content":[
+             {"kind":"taskItem","attrs":{"checked":false,
+               "id":"0199c0de-0000-7000-8000-000000000001"},"content":[
+               {"kind":"paragraph","content":[{"kind":"text","text":"Milch kaufen"}]}]},
+             {"kind":"taskItem","attrs":{"checked":true,
+               "id":"0199c0de-0000-7000-8000-000000000002"},"content":[
+               {"kind":"paragraph","content":[{"kind":"text","text":"Brot geholt"}]}]}]}]}"#,
+    )
+    .unwrap();
+
+    let file = export::render_file(&meta, &body).unwrap_or_else(|e| {
+        panic!("a task the store has reconciled must still export, and this one did not: {e}")
+    });
+    assert!(file.contains("- [ ] Milch kaufen"), "{file}");
+    assert!(file.contains("- [x] Brot geholt"), "{file}");
+
+    // The tolerance is exactly that wide. `checked` is a difference in the DOCUMENT — an
+    // unticked box and a ticked one are two different pages — so it must still be compared,
+    // or the reduction would hide the one thing markdown does carry.
+    let mangled: Block = serde_json::from_str(
+        r#"{"kind":"doc","content":[{"kind":"taskList","content":[
+             {"kind":"taskItem","attrs":{"checked":true},"content":[
+               {"kind":"paragraph","content":[{"kind":"text","text":"a"}]},
+               {"kind":"paragraph","content":[{"kind":"text","text":"b\nc"}]}]}]}]}"#,
+    )
+    .unwrap();
+    assert!(
+        export::render_file(&meta, &mangled).is_err(),
+        "the reduction must not start forgiving real differences"
+    );
+}
+
+#[test]
+fn a_task_item_that_states_no_checked_at_all_is_refused_rather_than_guessed_at() {
+    // Pins `checked` INTO the reduction's allow-list, which the test above does not: its
+    // counter-example differs by a newline in the prose, so emptying the allow-list
+    // altogether leaves every assertion in it passing. Verified by mutation — reducing
+    // `TASK_ITEM_ATTRS` to `[]` broke nothing until this test existed.
+    //
+    // The allow-list is a safety net rather than a live code path: the renderer writes
+    // `[x]`/`[ ]` from `checked`, so the two sides normally agree by construction and no
+    // ordinary page can tell the difference. That is exactly why it needs pinning — a
+    // narrowing goes unnoticed until the day something else writes a task block, and then
+    // the round-trip check that is supposed to catch it has already been switched off.
+    //
+    // A stored task item with no `checked` is malformed: import always states one. Refusing
+    // is the rule this whole module is held to — nothing is quietly degraded — and the
+    // alternative is writing a file that says `- [ ]` about a document that never said so.
+    let meta = export::FileMeta {
+        title: "Einkauf".into(),
+        doc_type: "page".into(),
+        visibility: "public".into(),
+        language: "de".into(),
+        sort_key: 0,
+        slug: "einkauf".into(),
+    };
+    let body: Block = serde_json::from_str(
+        r#"{"kind":"doc","content":[{"kind":"taskList","content":[
+             {"kind":"taskItem","attrs":{},"content":[
+               {"kind":"paragraph","content":[{"kind":"text","text":"Milch kaufen"}]}]}]}]}"#,
+    )
+    .unwrap();
+
+    assert!(
+        export::render_file(&meta, &body).is_err(),
+        "a task item stating no `checked` must be refused, not exported as unticked"
+    );
+}
+
+#[test]
+fn a_link_whose_address_markdown_would_mangle_is_refused_rather_than_truncated() {
+    // Pins `href` INTO the reduction's allow-list, the same way the test above pins
+    // `checked`. Verified by mutation: reducing `LINK_ATTRS` to `[]` broke no test in this
+    // file until this one existed, even though it switches off the comparison that is the
+    // whole reason `render_file` re-imports its own output.
+    //
+    // A TRAILING space is the shape that pins it, and the choice is not arbitrary. An
+    // address mangled in the middle — `.../a b` — is refused anyway, because the tail
+    // falls out of the link and the two trees differ structurally; that proves nothing
+    // about the allow-list, which only ever compares a mark's attributes. A trailing space
+    // is trimmed by the parser on the way back in and changes nothing else at all, so the
+    // href is the ONLY thing left that differs. Drop `href` from the reduction and this
+    // page exports clean.
+    //
+    // Refusing is right: a link that goes somewhere else is not the same link, and this
+    // module's rule is that nothing is quietly degraded.
+    let meta = export::FileMeta {
+        title: "Quellen".into(),
+        doc_type: "page".into(),
+        visibility: "public".into(),
+        language: "de".into(),
+        sort_key: 0,
+        slug: "quellen".into(),
+    };
+    let body: Block = serde_json::from_str(
+        r#"{"kind":"doc","content":[{"kind":"paragraph","content":[
+             {"kind":"text","text":"Studie",
+              "marks":[{"kind":"link","attrs":{"href":"https://example.invalid/a "}}]}]}]}"#,
+    )
+    .unwrap();
+
+    assert!(
+        export::render_file(&meta, &body).is_err(),
+        "an address markdown cannot state must be refused, not silently truncated"
+    );
+}

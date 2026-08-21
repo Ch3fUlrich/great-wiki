@@ -4,7 +4,14 @@ import { slugify } from '$lib/slug';
 // rather than rendered raw — that is what makes an unknown block safe.
 export type BlockKind =
   | 'doc' | 'paragraph' | 'heading' | 'bulletList' | 'orderedList'
-  | 'listItem' | 'blockquote' | 'codeBlock'
+  | 'listItem'
+  // A checklist and one of its lines. Two kinds rather than a `checked` attribute on
+  // `listItem`, because that is how TipTap models it and `BlockKind` mirrors the editor
+  // exactly — see `gw_core::BlockKind::TaskList`. A `taskItem` carries `checked` and
+  // nothing else; the uuid the data model gives a task is minted by the store on publish,
+  // never by the converter.
+  | 'taskList' | 'taskItem'
+  | 'blockquote' | 'codeBlock'
   // `tableHeader` is a header *cell* (`th`), not a header row — a row is a `tableRow`
   // whichever kind of cell it holds. That is how ProseMirror models it, and it is what
   // lets the renderer choose `th` over `td` from the cell alone.

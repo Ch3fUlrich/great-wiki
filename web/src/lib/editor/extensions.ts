@@ -51,16 +51,24 @@
  *
  * # Versions
  *
- * Pinned exactly, not with a caret. Two of the things this file depends on are undocumented
- * defaults of the packages themselves — `field: 'default'` in
- * `@tiptap/extension-collaboration`, and `align` being a declared attribute of
- * `@tiptap/extension-table`'s cells — and a minor release that changed either would lose
- * content with a green test suite, because the test asserts the schema, not the version.
+ * Pinned exactly, not with a caret. Three of the things this file depends on are
+ * undocumented defaults of the packages themselves — `field: 'default'` in
+ * `@tiptap/extension-collaboration`, `align` being a declared attribute of
+ * `@tiptap/extension-table`'s cells, and `checked` being one of `@tiptap/extension-list`'s
+ * `TaskItem` — and a minor release that changed any of them would lose content with a green
+ * test suite, because the test asserts the schema, not the version.
+ *
+ * Six of the packages imported below are not named in `package.json`: `extension-bold`,
+ * `-italic`, `-strike`, `-code`, `-link` and `-list` all arrive as `@tiptap/starter-kit`'s
+ * own dependencies, pinned by it to the same exact 3.30.0 (checked in `package-lock.json`,
+ * not assumed). They are therefore as pinned as the declared ones, and adding them to
+ * `package.json` would only give the resolver a second place to disagree with itself.
  */
 import { getSchema } from '@tiptap/core';
 import type { Extensions } from '@tiptap/core';
 import StarterKit from '@tiptap/starter-kit';
 import { Table, TableCell, TableHeader, TableRow } from '@tiptap/extension-table';
+import { TaskItem, TaskList } from '@tiptap/extension-list';
 import { Bold } from '@tiptap/extension-bold';
 import { Italic } from '@tiptap/extension-italic';
 import { Strike } from '@tiptap/extension-strike';
@@ -127,6 +135,54 @@ const Anchor = Link.extend({
 });
 
 /**
+ * TipTap's `TaskItem`, taught the ONE attribute the stock extension does not know about.
+ *
+ * A task block carries a uuid in `attrs` beside `checked` — minted by the store during
+ * reconciliation on publish, or here, when somebody types a new checkbox line — and that
+ * uuid is the only thing tying the line to its record: its status, its assignee, its due
+ * date. Nothing on the page shows it, which is exactly what makes losing it invisible.
+ *
+ * Stock `TaskItem.addAttributes()` returns `{ checked }` and nothing else (read out of the
+ * installed `@tiptap/extension-list@3.30.0`). The module docs above say what happens to an
+ * attribute this schema does not declare, and it is not "ignored": `computeAttrs` never
+ * copies it into the ProseMirror node, and `updateYFragment`'s closing pass — "remove all
+ * keys that are no longer in pAttrs" — deletes it from the Y.Doc on the first edit that
+ * touches the item. The next publish would then find a block with no id, mint a fresh one,
+ * and mark the ORIGINAL task detached. The board would shed a card, carrying its due date
+ * and its assignee away with it, once per edit, in silence. This is the same mechanism that
+ * nearly destroyed table column alignment across 21 tables, with a worse blast radius,
+ * because a detached task is not visibly a bug — it is a state the design has a name for.
+ *
+ * `this.parent?.()` rather than a fresh literal, so `checked` keeps the stock declaration
+ * — its `parseHTML` reads `data-checked`, and re-stating that here would be a second copy
+ * to drift.
+ *
+ * Three deliberate choices about `id` itself:
+ *
+ * - **`default: null`.** Never a generated value. `gw_core::markdown` is a pure function
+ *   and gives an imported checkbox no id at all, because `gw_api::export` re-imports its
+ *   own output and compares the trees — an id invented per render would differ on every run
+ *   and refuse the page forever. A `null` default costs nothing on the wire either:
+ *   y-tiptap skips a null attribute when it creates an element and removes it on write-back,
+ *   so a task with no id yet writes no `id` key.
+ * - **`keepOnSplit: false`**, the same as `checked`. Pressing Enter at the end of a task
+ *   line makes a NEW task; carrying the id across would give two blocks one identity, and
+ *   reconciliation would have to pick a winner between them.
+ * - **`rendered: false`.** The id is database identity, not markup. It stays in the schema
+ *   (which is all the CRDT needs) and out of the editor's DOM, so it cannot collide with a
+ *   heading's anchor id and cannot be smuggled in by pasted HTML claiming to be a task that
+ *   already exists.
+ */
+const Task = TaskItem.extend({
+  addAttributes() {
+    return {
+      ...this.parent?.(),
+      id: { default: null, keepOnSplit: false, rendered: false }
+    };
+  }
+});
+
+/**
  * The Yjs fragment the document lives in.
  *
  * `gw-collab`'s `CONTENT_FIELD`, and NOT `@tiptap/extension-collaboration`'s default, which
@@ -150,6 +206,8 @@ export const SERVER_BLOCK_KINDS = [
   'bulletList',
   'orderedList',
   'listItem',
+  'taskList',
+  'taskItem',
   'blockquote',
   'codeBlock',
   'table',
@@ -206,6 +264,37 @@ export function contentExtensions(): Extensions {
     TableRow,
     TableHeader,
     TableCell,
+    // The checklist. `StarterKit` does not bundle these — it registers `BulletList`,
+    // `OrderedList`, `ListItem` and `ListKeymap` out of `@tiptap/extension-list` and leaves
+    // `TaskList`/`TaskItem` alone — so they are named here, out of the same package, which
+    // is already installed as `StarterKit`'s own dependency at the same pinned 3.30.0.
+    //
+    // Their node names are already `taskList` and `taskItem`, which is the whole reason
+    // `gw_core::BlockKind` spells the kinds that way: this enum mirrors the editor so that
+    // nothing has to be translated between them. No `extend({ name })` here, unlike
+    // `Bold`/`Italic` — but that is a fact to be checked rather than assumed, and
+    // `extensions.test.ts` pins both names against the server's list.
+    TaskList,
+    // `nested: true` widens `taskItem`'s content expression from `paragraph+` to
+    // `paragraph block*`, and it is not optional. `gw_core::markdown` imports
+    // `- [ ] a` / `  - [x] b` as a `taskList` INSIDE a `taskItem`, and a schema that cannot
+    // express that does not merely refuse it: `createNodeFromYElement` catches the
+    // `RangeError` from `schema.node(…)` and deletes the element from the Y.Doc, which is
+    // the same silent destruction an unknown tag causes. A checklist with a nested
+    // checklist is one keystroke away in the editor and one line away in imported markdown.
+    //
+    // `checked` is declared by the stock extension already — verified in the installed
+    // `@tiptap/extension-list@3.30.0`, where `addAttributes` returns exactly `{ checked }`
+    // and nothing else. That matters in both directions and is pinned by a test either
+    // way: undeclared, `updateYFragment` would delete it from the CRDT and every box would
+    // quietly untick itself one edited item at a time (the shape of the near-miss on table
+    // column alignment); over-declared, the extra keys would be minted into `Block::attrs`
+    // and `gw-api::export` would refuse the page, the way stock `Link`'s four extra
+    // attributes really did (see `Anchor` above).
+    //
+    // The stock declaration is exactly one attribute short, and `Task` above adds it: a
+    // task's `id`, which is what the board holds its record by. See its doc comment.
+    Task.configure({ nested: true }),
     // The five marks the server can store, `Strong`/`Em` renamed per the module docs above;
     // `Strike`, `Code` and `Anchor` keep TipTap's own names because those already agree with
     // `MarkKind`'s serde names. `Anchor` is `Link` with its attribute declaration trimmed to

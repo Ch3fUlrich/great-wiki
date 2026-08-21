@@ -562,7 +562,7 @@ mod tests {
     use super::{debug_xml, CollabDoc, CONTENT_FIELD};
     use crate::fixtures::{self, json_of, Rng};
     use gw_core::{Block, BlockKind, Mark, MarkKind};
-    use serde_json::json;
+    use serde_json::{json, Value};
     use yrs::updates::decoder::Decode;
     use yrs::{
         ReadTxn, Text, Transact, Update, WriteTxn, Xml, XmlElementPrelim, XmlFragment,
@@ -683,6 +683,51 @@ mod tests {
             .map(|row| row.content.len())
             .collect();
         assert_eq!(widths, vec![3, 2, 4]);
+    }
+
+    #[test]
+    fn a_checklist_keeps_every_box_and_the_id_that_ties_it_to_its_record() {
+        // Two attributes on one kind, and both are lost the same silent way — an attribute
+        // that does not survive this conversion simply is not there afterwards.
+        //
+        // `checked` is the state of the box. `false` is its commonest value AND the value
+        // anything reading a missing attribute would assume, so a checklist that lost it
+        // still renders, still exports, and simply reads as nothing being done yet.
+        //
+        // `id` is the uuid the store mints during reconciliation on publish. It is what
+        // ties the line to its record — status, assignee, due date — and it is invisible on
+        // the page, so losing it shows up only as a card leaving the board.
+        let list = fixtures::checklist();
+        assert_round_trips(&list);
+
+        let back = CollabDoc::from_block(&list).to_block();
+        let items = &back.content[0].content;
+        assert_eq!(
+            items
+                .iter()
+                .map(|i| i.attrs.get("checked").and_then(Value::as_bool))
+                .collect::<Vec<_>>(),
+            vec![Some(false), Some(true)],
+        );
+        assert_eq!(
+            items[0].attrs.get("id").and_then(Value::as_str),
+            Some("0199c0de-0000-7000-8000-000000000001"),
+        );
+        // The nested checklist under the first item, at its own depth rather than flattened
+        // into the one above it.
+        let nested = items[0]
+            .content
+            .iter()
+            .find(|b| b.kind == BlockKind::TaskList)
+            .expect("the nested checklist must survive as a child of its task");
+        assert_eq!(
+            nested.content[0]
+                .attrs
+                .get("checked")
+                .and_then(Value::as_bool),
+            Some(true),
+        );
+        assert_eq!(back.plain_text(), "Milch kaufen Vollmilch Brot geholt");
     }
 
     #[test]

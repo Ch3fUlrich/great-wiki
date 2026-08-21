@@ -153,6 +153,100 @@ describe('BlockView', () => {
     expect(html(unknown).trim()).toBe('');
   });
 
+  // --- Checklists ---------------------------------------------------------------------
+  //
+  // A kind this renderer does not know renders as NOTHING (the test above says so), which
+  // for `taskList` means a checklist simply disappears from the page — no gap, no marker,
+  // no way for a reader to tell that the author wrote one. These tests are what keep it
+  // visible, and what keep it read-only: per design decision D-2 the record owns a task's
+  // state and the page owns its words, so a checkbox in the READING view must never be
+  // clickable. Toggling one here would file a revision nobody typed.
+
+  /** A checklist as `gw_core::markdown` imports `- [x] Milch kaufen`. */
+  function taskList(items: [boolean, string][]): Block {
+    return {
+      kind: 'taskList',
+      content: items.map(([checked, text]) => ({
+        kind: 'taskItem',
+        attrs: { checked },
+        content: [{ kind: 'paragraph', content: [{ kind: 'text', text }] }]
+      }))
+    };
+  }
+
+  it('renders a checklist as a list, not as nothing at all', () => {
+    const out = html(taskList([[false, 'Milch kaufen']]));
+    expect(out).toContain('<ul');
+    expect(out).toContain('<li');
+    expect(out).toContain('Milch kaufen');
+  });
+
+  it('gives every line a real checkbox that reflects `checked`', () => {
+    const out = html(
+      taskList([
+        [true, 'erledigt'],
+        [false, 'offen']
+      ])
+    );
+    const inputs = out.match(/<input[^>]*>/g) ?? [];
+    expect(inputs).toHaveLength(2);
+    // The state is on the control itself, not only in a class a screen reader cannot see:
+    // a native checkbox announces "checked"/"not checked" without any ARIA of its own.
+    expect(inputs[0]).toMatch(/type="checkbox"/);
+    expect(inputs[0]).toMatch(/\bchecked\b/);
+    expect(inputs[1]).not.toMatch(/\bchecked\b/);
+  });
+
+  it('names each checkbox, so it is not an anonymous control in a list of them', () => {
+    const out = html(taskList([[true, 'Milch kaufen']]));
+    expect(out).toMatch(/<input[^>]*aria-label="Milch kaufen"/);
+  });
+
+  it('never lets a reader tick a box, because the page is not where that state lives', () => {
+    // D-2: dragging a card or ticking a box changes the RECORD. A checkbox wired up here
+    // would need write permission on the page for a click and would file a revision
+    // nobody typed. Real interactivity waits for the board API.
+    const out = html(taskList([[false, 'offen']]));
+    expect(out).toMatch(/<input[^>]*disabled/);
+    expect(out).not.toMatch(/onclick|onchange/i);
+  });
+
+  it('keeps a nested checklist nested', () => {
+    const nested: Block = {
+      kind: 'taskList',
+      content: [
+        {
+          kind: 'taskItem',
+          attrs: { checked: false },
+          content: [
+            { kind: 'paragraph', content: [{ kind: 'text', text: 'Einkauf' }] },
+            taskList([[true, 'Milch']])
+          ]
+        }
+      ]
+    };
+    const out = html(nested);
+    expect(out.match(/<ul/g)).toHaveLength(2);
+    expect(out.match(/<input/g)).toHaveLength(2);
+    // The outer item's name is its own line, not its line plus everything under it.
+    expect(out).toMatch(/aria-label="Einkauf"/);
+    expect(out).toMatch(/aria-label="Milch"/);
+  });
+
+  it('treats a missing `checked` as unticked rather than as ticked', () => {
+    // `gw_core` always writes `checked`, but the database is the source of truth and a
+    // tree can reach here from anywhere. Nothing may invent a completed task.
+    const out = html({
+      kind: 'taskList',
+      content: [
+        { kind: 'taskItem', content: [{ kind: 'paragraph', content: [{ kind: 'text', text: 'x' }] }] }
+      ]
+    });
+    const inputs = out.match(/<input[^>]*>/g) ?? [];
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0]).not.toMatch(/\bchecked\b/);
+  });
+
   // --- Marks --------------------------------------------------------------------------
   //
   // The other half of Task 5: the editor grew a toolbar for these because gw-collab can now

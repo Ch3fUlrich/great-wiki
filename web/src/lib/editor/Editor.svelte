@@ -681,4 +681,38 @@
   :global(.gw-ed-surface .selectedCell) {
     position: relative;
   }
+
+  /* --- Checklists ---------------------------------------------------------
+     TipTap's `TaskItem` renders `<li data-type="taskItem"><label><input …></label><div>`,
+     so without these the surface shows a bullet AND a checkbox on every line. The note at
+     the top of this section warns against restating a `.prose` rule here, and this is the
+     one place it has to be done rather than avoided: `BlockView.svelte` hides the marker on
+     the reading side, so NOT overriding `.prose ul`'s indent here is what would make the
+     two surfaces drift. The values are the same on both sides for that reason — if one
+     changes, change the other.
+
+     A checklist's own markup is the only thing selected, by the `data-type` TipTap emits;
+     ordinary `ul`s and `li`s on this surface are untouched. */
+  :global(.gw-ed-surface ul[data-type='taskList']) {
+    list-style: none;
+    padding-inline-start: 0;
+  }
+
+  :global(.gw-ed-surface li[data-type='taskItem']) {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+  }
+
+  :global(.gw-ed-surface li[data-type='taskItem'] > label) {
+    flex: none;
+  }
+
+  :global(.gw-ed-surface li[data-type='taskItem'] input[type='checkbox']) {
+    accent-color: var(--accent);
+  }
+
+  :global(.gw-ed-surface li[data-type='taskItem'] > div) {
+    min-width: 0;
+  }
 </style>

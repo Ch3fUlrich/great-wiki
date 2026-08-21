@@ -97,6 +97,8 @@ pub fn one_per_kind() -> Vec<(&'static str, Block)> {
     ordered.content.push(item);
     cases.push(("orderedList", doc(vec![ordered])));
 
+    cases.push(("taskList / taskItem", checklist()));
+
     let mut quote = block(BlockKind::Blockquote);
     quote.content.push(paragraph("Zitat."));
     quote.content.push(paragraph("Noch eins."));
@@ -109,6 +111,49 @@ pub fn one_per_kind() -> Vec<(&'static str, Block)> {
     cases.push(("table / row / header / cell", aligned_table()));
 
     cases
+}
+
+/// A checklist: an unticked line with a ticked one nested under it, then a ticked line.
+///
+/// Shaped around the two attributes whose loss is invisible rather than around the markup.
+///
+/// `checked` is written on every item including when it is `false`, because an unticked box
+/// and no box at all are different documents — and `false` is both the commonest value and
+/// what anything reading a missing attribute would assume, so a checklist that lost it
+/// still renders and simply reads as nothing being done yet.
+///
+/// `id` is the uuid the *store* mints during reconciliation on publish (`gw_core::markdown`
+/// mints none, and must not: the exporter re-imports its own output and compares). It is
+/// what ties the line to its record — status, assignee, due date — and it appears nowhere
+/// on the page, so losing it through this conversion would show up only as a card silently
+/// leaving its board. One item carries one and the other does not, which is the honest
+/// state of a document holding both an imported line and a reconciled one.
+pub fn checklist() -> Block {
+    fn task(checked: bool, id: Option<&str>, text: &str, nested: Vec<Block>) -> Block {
+        let mut item = with_attr(block(BlockKind::TaskItem), "checked", Value::from(checked));
+        if let Some(id) = id {
+            item = with_attr(item, "id", Value::from(id));
+        }
+        item.content.push(paragraph(text));
+        item.content.extend(nested);
+        item
+    }
+
+    let inner = {
+        let mut list = block(BlockKind::TaskList);
+        list.content.push(task(true, None, "Vollmilch", Vec::new()));
+        list
+    };
+    let mut list = block(BlockKind::TaskList);
+    list.content.push(task(
+        false,
+        Some("0199c0de-0000-7000-8000-000000000001"),
+        "Milch kaufen",
+        vec![inner],
+    ));
+    list.content
+        .push(task(true, None, "Brot geholt", Vec::new()));
+    doc(vec![list])
 }
 
 fn cell(kind: BlockKind, align: Option<&str>, body: Option<&str>) -> Block {
@@ -277,6 +322,8 @@ const ELEMENT_KINDS: &[BlockKind] = &[
     BlockKind::BulletList,
     BlockKind::OrderedList,
     BlockKind::ListItem,
+    BlockKind::TaskList,
+    BlockKind::TaskItem,
     BlockKind::Blockquote,
     BlockKind::CodeBlock,
     BlockKind::Table,
@@ -403,7 +450,15 @@ impl Coverage {
             "kinds generated: {:?}",
             self.kinds
         );
-        for expected in ["table", "tablerow", "tableheader", "tablecell", "text"] {
+        for expected in [
+            "table",
+            "tablerow",
+            "tableheader",
+            "tablecell",
+            "tasklist",
+            "taskitem",
+            "text",
+        ] {
             assert!(self.kinds.contains(expected), "never generated {expected}");
         }
         for expected in [

@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { Node as PmNode } from '@tiptap/pm/model';
 import * as Y from 'yjs';
-import { prosemirrorJSONToYDoc } from '@tiptap/y-tiptap';
+import {
+  initProseMirrorDoc,
+  prosemirrorJSONToYDoc,
+  updateYFragment,
+  yXmlFragmentToProseMirrorRootNode
+} from '@tiptap/y-tiptap';
 import {
   CONTENT_FIELD,
   EDITOR_MARK_NAMES,
@@ -38,7 +43,8 @@ import {
  * XML element tag `gw-collab` writes (`doc.rs::tag_of` derives the tag from serde), and
  * therefore exactly the node name TipTap will look up in this schema.
  *
- * Thirteen, not the nine the M3 plan's sample lists: the plan predates the table kinds.
+ * Fifteen, not the nine the M3 plan's sample lists: the plan predates the table kinds, and
+ * `taskList`/`taskItem` arrived with piece 3's checkbox.
  */
 const SERVER_KINDS = [
   'doc',
@@ -47,6 +53,8 @@ const SERVER_KINDS = [
   'bulletList',
   'orderedList',
   'listItem',
+  'taskList',
+  'taskItem',
   'blockquote',
   'codeBlock',
   'table',
@@ -73,6 +81,30 @@ const ONE_PER_KIND = {
       attrs: { start: 3 },
       content: [
         { type: 'listItem', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'b' }] }] }
+      ]
+    },
+    {
+      // Nested, because that is what `- [ ] a` / `  - [x] b` imports as and a `taskItem`
+      // whose content expression is the stock `paragraph+` cannot hold it.
+      type: 'taskList',
+      content: [
+        {
+          type: 'taskItem',
+          attrs: { checked: false },
+          content: [
+            { type: 'paragraph', content: [{ type: 'text', text: 'Milch kaufen' }] },
+            {
+              type: 'taskList',
+              content: [
+                {
+                  type: 'taskItem',
+                  attrs: { checked: true },
+                  content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Vollmilch' }] }]
+                }
+              ]
+            }
+          ]
+        }
       ]
     },
     { type: 'blockquote', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'zitat' }] }] },
@@ -210,6 +242,12 @@ describe('the editor schema', () => {
     expect(kept('orderedList', { start: 7 }).start).toBe(7);
     expect(kept('tableCell', { align: 'right' }).align).toBe('right');
     expect(kept('tableHeader', { align: 'center' }).align).toBe('center');
+    // `checked` is the whole state of a checkbox, and it is the one attribute in this list
+    // whose loss is invisible: a task item stripped of it still renders, still exports, and
+    // simply reads as not done. `gw_core::BlockKind::TaskItem` writes it even when false
+    // for the same reason.
+    expect(kept('taskItem', { checked: true }).checked).toBe(true);
+    expect(kept('taskItem', { checked: false }).checked).toBe(false);
   });
 
   it('accepts a document holding one of every kind, nesting included', () => {
@@ -220,5 +258,176 @@ describe('the editor schema', () => {
     const doc = PmNode.fromJSON(editorSchema, ONE_PER_KIND);
     expect(() => doc.check()).not.toThrow();
     expect(doc.textBetween(0, doc.content.size, ' ')).toContain('Größe');
+  });
+
+  // --- The deletion path, exercised rather than described -------------------------------
+  //
+  // Every test above asserts the SCHEMA. None of them opens a Y.Doc the server wrote, which
+  // is the thing that actually destroys a page: `createNodeFromYElement` looks the element
+  // tag up in the schema and, in its `catch`, deletes the element from the CRDT. The two
+  // tests below drive that function with a document `gw-collab` really could have written,
+  // so a kind missing from the schema fails here as an emptied Y.Doc — the same shape as
+  // the loss, not a restatement of the rule.
+
+  /**
+   * A Y.Doc built the way `gw-collab::doc.rs::write_children` builds one: an element per
+   * block, tagged with the serde name of its `BlockKind`, its `attrs` set as XML attributes
+   * with their JSON types intact, and a text leaf as an `XmlText`.
+   */
+  function serverWrittenChecklist(attrs: Record<string, unknown> = { checked: true }): Y.Doc {
+    const ydoc = new Y.Doc();
+    const paragraph = new Y.XmlElement('paragraph');
+    const leaf = new Y.XmlText();
+    leaf.insert(0, 'Milch kaufen');
+    paragraph.insert(0, [leaf]);
+
+    const item = new Y.XmlElement('taskItem');
+    // Real JSON values, not strings: `insert_attribute` on the Rust side writes `Any::Bool`
+    // for a boolean, and `getAttributes()` hands JavaScript the boolean back.
+    for (const [key, value] of Object.entries(attrs)) {
+      item.setAttribute(key, value as string);
+    }
+    item.insert(0, [paragraph]);
+
+    const list = new Y.XmlElement('taskList');
+    list.insert(0, [item]);
+    ydoc.getXmlFragment(CONTENT_FIELD).insert(0, [list]);
+    return ydoc;
+  }
+
+  it('does not delete a checklist from the CRDT when the editor opens the page', () => {
+    // THE data-loss test. Before `taskList`/`taskItem` were in this schema, opening a page
+    // holding a checkbox ran `schema.node('taskList', …)`, threw, and deleted the element
+    // — broadcast to every other editor, snapshotted into a revision by the next sweep.
+    // Nothing threw, nothing was logged, and the page came back one list shorter.
+    const ydoc = serverWrittenChecklist();
+    const fragment = ydoc.getXmlFragment(CONTENT_FIELD);
+
+    const doc = yXmlFragmentToProseMirrorRootNode(fragment, editorSchema);
+
+    // The Y.Doc still holds what the server put in it.
+    expect(fragment.length).toBe(1);
+    expect((fragment.get(0) as Y.XmlElement).nodeName).toBe('taskList');
+    // And the editor really built the node, rather than skipping it into nothing.
+    expect(doc.childCount).toBe(1);
+    expect(doc.firstChild?.type.name).toBe('taskList');
+    expect(doc.firstChild?.firstChild?.type.name).toBe('taskItem');
+    expect(doc.firstChild?.firstChild?.attrs.checked).toBe(true);
+    expect(doc.textBetween(0, doc.content.size, ' ')).toContain('Milch kaufen');
+  });
+
+  it("writes a task item's `checked` back to the CRDT under that name and nothing beside it", () => {
+    // The other half of the wire contract, and the half the `Link` mark got wrong: a task
+    // item's attributes travel to `gw_core::Block::attrs` verbatim, so an attribute TipTap
+    // declares that `gw-core` never writes would be minted into every stored task the first
+    // time somebody edited it, and `gw_api::export::render_file` — which compares the tree
+    // against what its own markdown re-imports as — would refuse the page. `{checked}` is
+    // exactly what `gw_core::markdown` writes, so `{checked}` is all this may carry.
+    const doc = {
+      type: 'doc',
+      content: [
+        {
+          type: 'taskList',
+          content: [
+            {
+              type: 'taskItem',
+              attrs: { checked: true },
+              content: [{ type: 'paragraph', content: [{ type: 'text', text: 'erledigt' }] }]
+            }
+          ]
+        }
+      ]
+    };
+
+    const ydoc = prosemirrorJSONToYDoc(editorSchema, doc, CONTENT_FIELD);
+    const list = ydoc.getXmlFragment(CONTENT_FIELD).get(0);
+    if (!(list instanceof Y.XmlElement)) throw new Error('expected a taskList element');
+    expect(list.nodeName).toBe('taskList');
+    // `gw_core::markdown` gives a task list no attributes at all, so neither may this.
+    expect(list.getAttributes()).toEqual({});
+
+    const item = list.get(0);
+    if (!(item instanceof Y.XmlElement)) throw new Error('expected a taskItem element');
+    expect(item.nodeName).toBe('taskItem');
+    expect(item.getAttributes()).toEqual({ checked: true });
+  });
+
+  it('keeps an unticked box unticked rather than letting it fall back to a default', () => {
+    // `false` is the attribute's default, and a default is exactly what a round trip can
+    // lose without anybody noticing — the page still renders, the box is simply empty. It
+    // is also the direction that cannot be spotted by eye, because an unticked box is what
+    // most boxes look like.
+    const doc = {
+      type: 'doc',
+      content: [
+        {
+          type: 'taskList',
+          content: [
+            {
+              type: 'taskItem',
+              attrs: { checked: false },
+              content: [{ type: 'paragraph', content: [{ type: 'text', text: 'offen' }] }]
+            }
+          ]
+        }
+      ]
+    };
+    const ydoc = prosemirrorJSONToYDoc(editorSchema, doc, CONTENT_FIELD);
+    const fragment = ydoc.getXmlFragment(CONTENT_FIELD);
+    const item = (fragment.get(0) as Y.XmlElement).get(0) as Y.XmlElement;
+    expect(item.getAttributes()).toEqual({ checked: false });
+
+    // …and back out again, which is the direction the reader and the exporter see.
+    const back = yXmlFragmentToProseMirrorRootNode(fragment, editorSchema);
+    expect(back.firstChild?.firstChild?.attrs.checked).toBe(false);
+  });
+
+  it("keeps a task's id through an edit, so the board does not shed the card", () => {
+    // The attribute whose loss costs the most, and the one nothing on the page would show.
+    // A task block carries a uuid in `attrs` — minted by the store during reconciliation on
+    // publish, or by the editor when somebody types a new checkbox line — and that uuid is
+    // the ONLY thing tying the line to its record: its status, its assignee, its due date.
+    //
+    // Stock `TaskItem` declares `checked` and nothing else. So an undeclared `id` takes the
+    // documented path: `computeAttrs` never copies it into the ProseMirror node, and
+    // `updateYFragment`'s closing pass — "remove all keys that are no longer in pAttrs" —
+    // deletes it from the CRDT on the first edit that touches the item. The next publish
+    // then sees a block with no id, mints a fresh one, and marks the ORIGINAL task
+    // detached: the card leaves the board carrying its due date and its assignee with it,
+    // once per edit, silently. This is the table-alignment near-miss again, with a worse
+    // blast radius.
+    const id = '0199c0de-0000-7000-8000-000000000001';
+    const ydoc = serverWrittenChecklist({ checked: true, id });
+    const fragment = ydoc.getXmlFragment(CONTENT_FIELD);
+
+    const { doc, meta } = initProseMirrorDoc(fragment, editorSchema);
+    expect(doc.firstChild?.firstChild?.attrs.id).toBe(id);
+
+    // The edit. `updateYFragment` is what `@tiptap/extension-collaboration`'s sync plugin
+    // runs on every transaction, so this is the real write-back and not a stand-in for one.
+    const json = doc.toJSON();
+    json.content[0].content[0].content[0].content[0].text = 'Milch und Brot kaufen';
+    const edited = PmNode.fromJSON(editorSchema, json);
+    ydoc.transact(() => updateYFragment(ydoc, fragment, edited, meta));
+
+    const item = (fragment.get(0) as Y.XmlElement).get(0) as Y.XmlElement;
+    expect(item.getAttributes()).toEqual({ checked: true, id });
+    expect(fragment.toString()).toContain('Milch und Brot kaufen');
+  });
+
+  it('mints no id of its own for a task that has none yet', () => {
+    // The other direction, and it matters just as much: `gw_core::markdown` is a pure
+    // function and gives an imported checkbox no id at all, because `gw_api::export`
+    // re-imports its own output and compares — a randomly minted id would differ on every
+    // run and refuse the page forever. An `id` DEFAULT that was anything but `null` would
+    // put that same invented value on every task the editor touched.
+    const ydoc = serverWrittenChecklist({ checked: false });
+    const fragment = ydoc.getXmlFragment(CONTENT_FIELD);
+    const { doc, meta } = initProseMirrorDoc(fragment, editorSchema);
+    expect(doc.firstChild?.firstChild?.attrs.id).toBeNull();
+
+    ydoc.transact(() => updateYFragment(ydoc, fragment, doc, meta));
+    const item = (fragment.get(0) as Y.XmlElement).get(0) as Y.XmlElement;
+    expect(item.getAttributes()).toEqual({ checked: false });
   });
 });

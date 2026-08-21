@@ -391,6 +391,15 @@ pub fn render_file(meta: &FileMeta, body: &Block) -> Result<String, String> {
 /// nothing in the importer, the renderer below or `BlockView` reads any other key.
 const LINK_ATTRS: [&str; 2] = ["href", "doc"];
 
+/// The attributes of a `taskItem` that markdown has a spelling for.
+///
+/// Exactly one. `[x]` and `[ ]` say `checked` and say nothing else, and every other key a
+/// task block carries is database identity rather than document content — the uuid that
+/// ties the line to its record on the board, minted by the store during reconciliation on
+/// publish and by the editor when somebody types a new checkbox line, never by
+/// `gw_core::markdown`, which is a pure function and must stay one.
+const TASK_ITEM_ATTRS: [&str; 1] = ["checked"];
+
 /// A `Block` reduced to what markdown could ever state about it, for [`render_file`]'s
 /// round-trip comparison.
 ///
@@ -425,13 +434,36 @@ const LINK_ATTRS: [&str; 2] = ["href", "doc"];
 /// Marks other than `Link` are compared whole; a `strong` carrying a stray attribute is
 /// still refused. A link with no address is refused by [`Renderer::wrap`], loudly, before
 /// this is reached.
+///
+/// # The same argument, for a task's identity
+///
+/// A `taskItem` gets the identical treatment and for the identical reason, arrived at from
+/// the other end. Its `checked` is a real difference in the document — an unticked box and a
+/// ticked one are two different pages — but the uuid beside it is not: it is what ties the
+/// line to its record on the board, and markdown has no syntax for it and never will. The
+/// converter is a pure function and mints none, so an exported checklist re-imports as
+/// `{checked}` while the stored one says `{checked, id}`, and without this reduction every
+/// page holding a reconciled task would be refused — permanently, since a document that
+/// cannot be exported cannot be exported later either, and `export` fails the whole run on
+/// the first refusal.
+///
+/// The same care about what it hides applies: this is an allow-list keeping `checked` and
+/// discarding everything else, so a key nobody has thought of is invisible here too. That
+/// is the right trade only while `checked` stays the sole thing GFM's `[x]` states. Block
+/// kinds other than `taskItem` are compared with their attributes whole — a `heading` that
+/// has grown a stray key is still refused.
 fn comparable(block: &Block) -> serde_json::Value {
     let mut copy = block.clone();
-    reduce_marks(&mut copy);
+    reduce(&mut copy);
     serde_json::to_value(&copy).expect("a Block always serialises")
 }
 
-fn reduce_marks(block: &mut Block) {
+fn reduce(block: &mut Block) {
+    if block.kind == BlockKind::TaskItem {
+        block
+            .attrs
+            .retain(|key, _| TASK_ITEM_ATTRS.contains(&key.as_str()));
+    }
     for mark in &mut block.marks {
         if mark.kind == MarkKind::Link {
             mark.attrs
@@ -439,7 +471,7 @@ fn reduce_marks(block: &mut Block) {
         }
     }
     for child in &mut block.content {
-        reduce_marks(child);
+        reduce(child);
     }
 }
 
@@ -562,6 +594,15 @@ impl Renderer {
             match (previous, block.kind) {
                 (Some(BlockKind::BulletList), BlockKind::BulletList) => bullet ^= 1,
                 (Some(BlockKind::OrderedList), BlockKind::OrderedList) => delimiter ^= 1,
+                // A checklist is written with the same bullet characters, and shares the
+                // counter with `BulletList` on purpose. Two checklists in a row must be
+                // separated the same way two bullet lists are, or they come back as one —
+                // but a checklist NEXT TO a bullet list must NOT change marker, because the
+                // importer's own split (`gw_core::markdown::split_task_runs`) is what puts
+                // those two back apart, and it can only do that if they arrive as one
+                // markdown list. `- [ ] a` / `- plain` is one list on the way in and has to
+                // be one list on the way out.
+                (Some(BlockKind::TaskList), BlockKind::TaskList) => bullet ^= 1,
                 _ => {}
             }
             if let Some(previous) = previous {
@@ -585,10 +626,11 @@ impl Renderer {
             BlockKind::Heading => self.heading(block),
             BlockKind::BulletList => self.bullet_list(block, bullet),
             BlockKind::OrderedList => self.ordered_list(block, delimiter),
+            BlockKind::TaskList => self.task_list(block, bullet),
             BlockKind::Blockquote => self.blockquote(block),
             BlockKind::CodeBlock => self.code(block),
             BlockKind::Table => self.table(block),
-            BlockKind::ListItem => {
+            BlockKind::ListItem | BlockKind::TaskItem => {
                 self.problem("a list item is outside any list");
                 self.blocks(&block.content, Nesting::Item)
             }
@@ -808,7 +850,11 @@ impl Renderer {
         let items: Vec<String> = block
             .content
             .iter()
-            .map(|item| self.item(item, &format!("{bullet} ")))
+            .map(|item| {
+                let marker = format!("{bullet} ");
+                let width = marker.chars().count();
+                self.item(item, &marker, width, BlockKind::ListItem)
+            })
             .collect();
         items.join("\n")
     }
@@ -825,23 +871,68 @@ impl Renderer {
             .enumerate()
             .map(|(i, item)| {
                 let number = start.saturating_add(i as u64);
-                self.item(item, &format!("{number}{delimiter} "))
+                let marker = format!("{number}{delimiter} ");
+                let width = marker.chars().count();
+                self.item(item, &marker, width, BlockKind::ListItem)
             })
             .collect();
         items.join("\n")
     }
 
-    /// One list item: its first line carries the marker, every later line the same width in
+    /// A checklist: a bullet list whose every item states a box.
+    ///
+    /// `[x]` / `[ ]` is GFM's task-list syntax and it belongs to the item's *content*, not
+    /// to its marker — which is the whole reason the continuation width below is 2 and not
+    /// 6. A checklist carries no `start` and no numbering: markdown has no numbered
+    /// checklist, which is what `gw_core::markdown::Unsupported::OrderedTaskList` reports
+    /// on the way in, so there is nothing here to lose that was not already lost.
+    ///
+    /// `checked` is read as a boolean and anything else is read as unticked. Nothing here
+    /// may invent a completed task out of an attribute it could not parse.
+    fn task_list(&mut self, block: &Block, bullet: char) -> String {
+        let items: Vec<String> = block
+            .content
+            .iter()
+            .map(|item| {
+                let ticked = item
+                    .attrs
+                    .get("checked")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let marker = format!("{bullet} [{}] ", if ticked { 'x' } else { ' ' });
+                // TWO, not `marker.chars().count()`. A task item's content column is the
+                // one after `- `; the brackets are the first characters of its first
+                // paragraph. Indenting a continuation by the marker's six columns puts it
+                // four past the content, which CommonMark reads as an indented code block —
+                // so a nested checklist would come back as literal text inside a fence, and
+                // a second paragraph as code. Verified against the importer, not reasoned
+                // about: `crates/gw-api/tests/export_markdown.rs` round-trips both.
+                self.item(item, &marker, 2, BlockKind::TaskItem)
+            })
+            .collect();
+        items.join("\n")
+    }
+
+    /// One list item: its first line carries the marker, every later line `continuation`
     /// spaces, so a continuation stays inside the item instead of ending the list.
-    fn item(&mut self, item: &Block, marker: &str) -> String {
-        if item.kind != BlockKind::ListItem {
+    ///
+    /// `continuation` is passed rather than derived from the marker's width because for a
+    /// task item the two differ — see [`Self::task_list`].
+    fn item(
+        &mut self,
+        item: &Block,
+        marker: &str,
+        continuation: usize,
+        expected: BlockKind,
+    ) -> String {
+        if item.kind != expected {
             self.problem(format!(
-                "a list holds a `{:?}` where only list items may go",
+                "a list holds a `{:?}` where only `{expected:?}`s may go",
                 item.kind
             ));
         }
         let body = self.blocks(&item.content, Nesting::Item);
-        let indent = " ".repeat(marker.chars().count());
+        let indent = " ".repeat(continuation);
         let mut out = String::new();
         for (i, line) in body.lines().enumerate() {
             if i > 0 {
@@ -1042,7 +1133,9 @@ fn tight(nesting: Nesting, previous: BlockKind, next: &Block) -> bool {
         return false;
     }
     match next.kind {
-        BlockKind::BulletList => true,
+        // A checklist is written with a bullet marker and carries no `start`, so it
+        // interrupts a paragraph exactly as a bullet list does.
+        BlockKind::BulletList | BlockKind::TaskList => true,
         BlockKind::OrderedList => {
             next.attrs
                 .get("start")
