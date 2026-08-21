@@ -1,4 +1,5 @@
 import type { GraphEdge, GraphNode } from '$lib/api';
+import { placeLabels, separate, type PlacedLabel } from './labels';
 
 /**
  * A force-directed layout, written out rather than installed.
@@ -22,11 +23,22 @@ import type { GraphEdge, GraphNode } from '$lib/api';
  * together, and a falling temperature caps how far anything may move per step so the whole
  * thing settles instead of oscillating. It is O(n² · iterations) — 40 nodes is about 400 000
  * distance calculations, a few milliseconds, once per request.
+ *
+ * **A node is a point; its name is not.** Fruchterman–Reingold alone produced a graph whose
+ * labels were unreadable at the size this wiki is actually used at — thirty-five pages whose
+ * titles average forty-five characters gave forty-four overlapping pairs of labels, and
+ * seventeen of the thirty-five ran off the edge of the frame and were cut mid-word by the
+ * viewport. Neither is a fault in the force loop: it has no idea the pages have names. So two
+ * further passes run after it, both in `labels.ts` and both as deterministic as it is —
+ * `separate` opens up the room each label needs by pushing footprints apart, and
+ * `placeLabels` chooses where each label sits in the room it has.
  */
 
 export interface Placed extends GraphNode {
   x: number;
   y: number;
+  /** Where this node's title is drawn, and what of it. See `labels.ts`. */
+  label: PlacedLabel;
 }
 
 /**
@@ -93,12 +105,39 @@ export interface LayoutOptions {
   padding?: number;
 }
 
+/**
+ * How big the drawing is, and why it is no longer one fixed rectangle.
+ *
+ * **Width is fixed and height grows with the corpus**, which is the opposite of what a
+ * "bigger canvas" instinct suggests and follows from how the SVG is displayed. The graph
+ * route sets `inline-size: 100%; block-size: auto`, so the picture is scaled to the width of
+ * the column and the height follows: making the viewBox WIDER shrinks every label on screen,
+ * while making it TALLER does not shrink anything, it just makes the picture longer. 1100 is
+ * as wide as the viewBox can be before it starts shrinking text, because the column it is
+ * drawn in is 72rem wide less its padding — about 1100 CSS pixels — so at this width one
+ * layout unit is one CSS pixel and a 13-unit label is a 13-pixel label.
+ *
+ * 20 000 square units per node is measured, not chosen. Squeezed, the two label passes hold
+ * out until about 12 500 units a node and then start dropping labels on each other: the real
+ * corpus is clean in 1100×480 and collides in 1100×400, and eighty pages are clean in
+ * 1100×1100 and collide in 1100×900. 20 000 is half again as much room as the last frame that
+ * still worked, which is the margin that stops a corpus this has never seen from being the
+ * one that breaks it. Much more than that and the graph is mostly white space to scroll past.
+ *
+ * The floor keeps a three-page graph from being drawn as a letterbox.
+ */
 const DEFAULTS = {
-  width: 800,
-  height: 560,
+  width: 1100,
+  minHeight: 560,
+  areaPerNode: 20000,
   iterations: 260,
   padding: 60
 };
+
+/** The height a graph of this many nodes needs, at this width. */
+export function frameHeight(count: number, width = DEFAULTS.width): number {
+  return Math.max(DEFAULTS.minHeight, Math.round((count * DEFAULTS.areaPerNode) / width));
+}
 
 /** The golden angle, in radians. */
 const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
@@ -130,7 +169,7 @@ export function layout(
   options: LayoutOptions = {}
 ): LayoutResult {
   const width = options.width ?? DEFAULTS.width;
-  const height = options.height ?? DEFAULTS.height;
+  const height = options.height ?? frameHeight(nodes.length, width);
   const iterations = options.iterations ?? DEFAULTS.iterations;
   const padding = options.padding ?? DEFAULTS.padding;
 
@@ -230,13 +269,22 @@ export function layout(
     temperature -= cooling;
   }
 
+  // The two label passes. Both are deterministic functions of what the force loop produced,
+  // so the whole of `layout` still is — see the note at the top of this file.
+  const spread = separate(
+    nodes.map((node, i) => ({ ...node, x: positions[i].x, y: positions[i].y })),
+    { width, height, radius: NODE_RADIUS, margin: padding }
+  );
+  const labels = placeLabels(spread, { width, height, radius: NODE_RADIUS });
+
   return {
-    nodes: nodes.map((node, i) => ({
+    nodes: spread.map((node, i) => ({
       ...node,
       // Rounded, because the coordinates end up in markup: full doubles would put 17
       // significant figures into every attribute for a precision no screen has.
-      x: Math.round(positions[i].x * 100) / 100,
-      y: Math.round(positions[i].y * 100) / 100
+      x: Math.round(node.x * 100) / 100,
+      y: Math.round(node.y * 100) / 100,
+      label: labels[i]
     })),
     width,
     height

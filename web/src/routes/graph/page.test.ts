@@ -3,6 +3,7 @@ import { render } from 'svelte/server';
 import Page from './+page.svelte';
 import { edgeKey, layout } from '$lib/graph/layout';
 import { ANONYMOUS, type Graph } from '$lib/api';
+import { CORPUS } from '$lib/graph/corpus.fixture';
 
 /**
  * The graph screen, rendered exactly as the server renders it.
@@ -158,30 +159,94 @@ describe('the graph page', () => {
 });
 
 describe('the accessible edge count', () => {
-  it('states the true edge count in aria-label even when close nodes trim a line from the drawing', () => {
-    // `edgeLine` returns null — no line left to draw — for two nodes closer together than
-    // its trim distance (21 units). A chain of 35 nodes is a deterministic, reproducible
-    // fixture (found by running the pure `layout`/`edgeLine` functions directly) where the
-    // force layout happens to land node 33 and node 34 inside that trim, so `lines` drops
-    // one entry: 33 <line> elements for 34 real edges. The edge still exists — it is a real
-    // link between two real pages, just an unlucky one in this particular layout — so
-    // `aria-label` must report `data.graph.edges.length` (34), matching the sighted
-    // `<figcaption>`, not `lines.length` (33), which would tell a screen-reader user this
-    // graph has one fewer connection than the caption right next to it says.
-    const n = 35;
-    const nodes = Array.from({ length: n }, (_, i) => ({ path: `/n${i}`, title: `N${i}` }));
-    const edges = Array.from({ length: n - 1 }, (_, i) => ({ from: `/n${i}`, to: `/n${i + 1}` }));
-    const chain: Graph = { nodes, edges };
+  it('states the true edge count in aria-label even when an edge has no line to draw', () => {
+    // `edgeLine` returns null — no line left to draw — for two ends closer together than its
+    // trim distance (21 units). A page that links to ITSELF is that case in its purest form:
+    // both ends are the same point, so there is no line at all, and it is a real link a real
+    // author can write, since `wiki_path` refuses only an empty or fragment-only address and
+    // `[so](/a)` written on `/a` resolves to `/a` like any other absolute path.
+    //
+    // So `lines` drops an entry: one <line> for two real edges. `aria-label` must report
+    // `data.graph.edges.length` (2), matching the sighted `<figcaption>`, not `lines.length`
+    // (1), which would tell a screen-reader user this graph has one fewer connection than
+    // the caption right next to it says.
+    //
+    // This used to be a chain of 35 nodes where the force layout happened to land two of
+    // them inside the trim. That fixture stopped trimming anything when `separate` (see
+    // `$lib/graph/labels.ts`) began holding every node a label's width apart from every
+    // other — as its own comment demanded, it has been replaced with one that still proves
+    // the point, and this one cannot be undone by a layout change because it does not depend
+    // on the layout at all.
+    const selfLink: Graph = {
+      nodes: [
+        { path: '/a', title: 'A' },
+        { path: '/b', title: 'B' }
+      ],
+      edges: [
+        { from: '/a', to: '/a' },
+        { from: '/a', to: '/b' }
+      ]
+    };
 
-    const out = html(chain);
+    const out = html(selfLink);
     const drawnLines = out.match(/<line /g)?.length ?? 0;
-    // Sanity check on the fixture itself: if the layout algorithm ever changes and this no
-    // longer trims a line, this test proves nothing and must be replaced with one that does.
-    expect(drawnLines).toBeLessThan(edges.length);
+    // Sanity check on the fixture itself: if this ever stops dropping a line, the test proves
+    // nothing and must be replaced with one that does.
+    expect(drawnLines).toBeLessThan(selfLink.edges.length);
 
     const label = out.match(/aria-label="([^"]*)"/)?.[1] ?? '';
-    expect(label).toContain(`${edges.length} Verbindungen`);
-    expect(out).toContain(`${edges.length} Verweise`);
+    expect(label).toContain(`${selfLink.edges.length} Verbindungen`);
+    expect(out).toContain(`${selfLink.edges.length} Verweise`);
+  });
+});
+
+describe('the graph page at the size this wiki is actually used at', () => {
+  // Thirty-five pages with the owner's real titles. See `$lib/graph/corpus.fixture`.
+  const out = html(CORPUS);
+  // These titles contain `&` — »Quellen & Referenzen« — and the markup being searched is
+  // markup, where that is `&amp;`.
+  const markup = (text: string) => text.replace(/&/g, '&amp;');
+
+  it('draws every page, and names every one of them', () => {
+    expect(out.match(/<circle /g)).toHaveLength(CORPUS.nodes.length);
+    expect(out.match(/<text /g)).toHaveLength(CORPUS.nodes.length);
+    for (const text of out.match(/<text [^>]*>\s*([^<]*)/g) ?? []) {
+      expect(text.split('>')[1].trim().length).toBeGreaterThan(0);
+    }
+  });
+
+  it('keeps the whole title in the markup even where the drawn label is shortened', () => {
+    // The label a reader SEES may be cut — twenty-seven of these thirty-five titles are too
+    // wide to draw whole — but the title itself is never lost. It is in the `<title>` that
+    // gives the link its accessible name and a pointer its tooltip, and again in the text
+    // twin below the drawing. Losing it in either place would be the one thing the placement
+    // is forbidden to do: hide which page a node is.
+    for (const node of CORPUS.nodes) {
+      expect(out).toContain(`<title>${markup(node.title)}</title>`);
+    }
+  });
+
+  it('does shorten what it cannot draw, and says so with an ellipsis', () => {
+    // Not decoration: without this the label was drawn at full width anyway and cut by the
+    // edge of the frame, mid-word and with nothing to say it had been cut.
+    expect(out).toContain('…');
+  });
+
+  it('keeps the text twin naming both ends of every edge, in full', () => {
+    // ADR 0005's twin, and the reason the drawing may shorten a label at all. It must name
+    // pages by their WHOLE titles — this is what the graph is to somebody who cannot see it.
+    expect(out.match(/<li>/g)).toHaveLength(CORPUS.edges.length);
+    const titles = new Map(CORPUS.nodes.map((node) => [node.path, node.title]));
+    const flat = out.replace(/\s+/g, ' ');
+    for (const edge of CORPUS.edges) {
+      expect(flat).toContain(
+        markup(`${titles.get(edge.from)} verweist auf ${titles.get(edge.to)}`)
+      );
+    }
+  });
+
+  it('renders identically twice at this size too', () => {
+    expect(html(CORPUS)).toBe(out);
   });
 });
 

@@ -117,10 +117,17 @@
         <g class="nodes">
           {#each placed.nodes as node (node.path)}
             <a href={node.path}>
+              <!-- The WHOLE title, always: `label.text` is shortened when the title is too
+                   wide to draw (see `$lib/graph/labels.ts`), and this is both the accessible
+                   name of the link and the tooltip a pointer gets, so nothing here may be the
+                   short form. The twin list below keeps the whole title too. -->
               <title>{node.title}</title>
               <circle cx={node.x} cy={node.y} r={NODE_RADIUS} />
-              <text x={node.x} y={node.y + NODE_RADIUS + 14} text-anchor="middle">
-                {node.title}
+              <!-- Placed rather than assumed: the label used to be centred below the node
+                   unconditionally, which at thirty-five pages drew forty-four pairs of labels
+                   on top of each other. -->
+              <text x={node.label.x} y={node.label.y} text-anchor={node.label.anchor}>
+                {node.label.text}
               </text>
             </a>
           {/each}
