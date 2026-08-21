@@ -168,6 +168,19 @@ for the same reason.
 `checked` attribute on `listItem`. A translation layer is the thing that model exists to
 avoid.
 
+**Import closed, 2026-08-21 — and the diagnosis above was one step off.** The
+`Unsupported::TaskListMarker` arm was never reached: `Options::ENABLE_TASKLISTS` was off, so
+pulldown-cmark emitted no marker at all and the brackets arrived as ordinary text. `- [ ] etwas` did not
+import as a plain bullet — it imported as a bullet whose *words were* "[ ] etwas", in the
+page, in the search index and in every anchor derived from it. The converter now enables the
+extension, `BlockKind` has `TaskList` and `TaskItem`, and a mixed list splits into a task run
+and a plain run rather than fabricating `checked: false` on a line nobody marked. The variant
+is gone; a numbered list holding checkboxes reports `ordered-task-list` instead, because a
+task list is unordered and those lines lose their numbers.
+
+Four layers of the floor remain: export (`gw_api::export` refuses a `taskList` today), the
+store's reconciliation, the CRDT and the editor.
+
 ## Data model
 
 ```

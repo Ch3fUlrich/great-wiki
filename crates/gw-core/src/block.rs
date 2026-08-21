@@ -13,6 +13,32 @@ pub enum BlockKind {
     BulletList,
     OrderedList,
     ListItem,
+    /// A checklist: `TaskItem` children and nothing else.
+    ///
+    /// A kind of its own rather than a `checked` attribute on `ListItem`, because that is
+    /// how the editor models it — TipTap ships `taskList` and `taskItem` as two extensions
+    /// — and this enum mirrors the editor exactly so that nothing has to be translated
+    /// between what is edited and what is stored.
+    ///
+    /// It is also what lets a mixed markdown list stay honest. `- [ ] a` followed by
+    /// `- plain` imports as a task list *and* a bullet list, not as one list whose second
+    /// line acquired `checked: false`. A checkbox line is a to-do (D-6), so inventing one
+    /// on a line nobody marked would put a task on somebody's board that they never wrote.
+    TaskList,
+    /// A checklist line, carrying `checked`.
+    ///
+    /// `checked` is always written, including when it is `false`: an unticked box and no
+    /// box at all are different documents, and an attribute that disappears at its default
+    /// makes them the same one.
+    ///
+    /// Holds block content like a `ListItem` does — a paragraph, not bare text — so a task
+    /// can grow a second paragraph or a nested list without changing kind.
+    ///
+    /// It carries no id. The data model gives a task a uuid, and the *store* mints it
+    /// during reconciliation on publish; the markdown converter is a pure function of its
+    /// input and must stay one, because the exporter re-imports its own output and
+    /// compares it against the stored document.
+    TaskItem,
     Blockquote,
     CodeBlock,
     /// A table: `TableRow` children and nothing else.

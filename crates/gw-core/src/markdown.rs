@@ -29,8 +29,15 @@ pub enum Unsupported {
     HorizontalRule,
     /// Raw HTML, inline or block. Kept verbatim as text rather than parsed or dropped.
     Html,
-    /// A checkbox in a task list.
-    TaskListMarker,
+    /// A numbered list holding checkboxes (`1. [ ] etwas`). The checkboxes survive as a
+    /// task list; the numbers do not, because a task list is unordered — TipTap's
+    /// `taskList` has no `start` and renders a box where the number would be.
+    ///
+    /// Reported rather than silently accepted: a plan whose steps were numbered comes back
+    /// as an unnumbered checklist, which is a visible change to the page. The plain lines
+    /// of such a list keep their numbering (they stay an ordered list of their own), so
+    /// what is lost is exactly the position of the ticked lines.
+    OrderedTaskList,
     /// An event this converter was not written against — future-proofing, not a known gap.
     Unrecognised,
 }
@@ -45,7 +52,7 @@ impl Unsupported {
             Unsupported::InlineMarks => "inline-marks",
             Unsupported::HorizontalRule => "horizontal-rule",
             Unsupported::Html => "html",
-            Unsupported::TaskListMarker => "task-list-marker",
+            Unsupported::OrderedTaskList => "ordered-task-list",
             Unsupported::Unrecognised => "unrecognised",
         }
     }
@@ -58,8 +65,8 @@ impl Unsupported {
             Unsupported::InlineMarks => "text kept, emphasis dropped — M4 adds inline marks",
             Unsupported::HorizontalRule => "dropped; it carries no text — M4 adds the rule block",
             Unsupported::Html => "kept verbatim as text, never parsed — M4 decides its fate",
-            Unsupported::TaskListMarker => {
-                "checkbox state dropped, item text kept — M4 adds task lists"
+            Unsupported::OrderedTaskList => {
+                "checkboxes kept as a task list, the numbering of those lines dropped"
             }
             Unsupported::Unrecognised => {
                 "skipped by a converter that predates it — report this, it is a bug"
@@ -113,12 +120,18 @@ pub fn convert(md: &str) -> Conversion {
     builder.finish()
 }
 
-/// Tables and strikethrough are enabled deliberately. Tables have block kinds of their
-/// own; strikethrough does not, but parsing it means its text is *seen* and can be
-/// preserved, whereas leaving the extension off makes a `~~word~~` keep its tildes.
-/// Seeing more than we can model is recoverable; not seeing it is not.
+/// Tables, strikethrough and task lists are enabled deliberately. Tables and task lists
+/// have block kinds of their own; strikethrough does not, but parsing it means its text is
+/// *seen* and can be preserved, whereas leaving the extension off makes a `~~word~~` keep
+/// its tildes. Seeing more than we can model is recoverable; not seeing it is not.
+///
+/// Task lists are the case that proves the point. Without the extension pulldown-cmark
+/// never emits `Event::TaskListMarker` at all — it emits the brackets as ordinary text —
+/// so `- [ ] Stuhlprobe` imported as a bullet whose *words were* "[ ] Stuhlprobe", in the
+/// page, in the search index and in every anchor derived from it. The converter's
+/// `Unsupported::TaskListMarker` arm was unreachable and nothing said so.
 fn options() -> Options {
-    Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH
+    Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS
 }
 
 /// A frame on the open-block stack.
@@ -285,6 +298,66 @@ impl Builder {
         }
     }
 
+    /// Turn the open list item into a task item carrying `checked`.
+    ///
+    /// The checkbox arrives *after* the item it belongs to: pulldown-cmark emits
+    /// `Start(Item)` — and, in a loose list, `Start(Paragraph)` as well — before
+    /// `TaskListMarker`. So the item is already on the stack and the change is retroactive.
+    /// The frame to change is therefore the innermost `ListItem`, which is not necessarily
+    /// the top of the stack; reading the top alone would leave a loose list's checkboxes on
+    /// the paragraph, where nothing looks for them.
+    ///
+    /// The enclosing list becomes a `TaskList` only once it closes, in [`Self::close_list`],
+    /// because a list does not know until then whether *all* of its items were ticked.
+    fn check_open_item(&mut self, checked: bool) {
+        let Some(item) = self
+            .stack
+            .iter()
+            .rposition(|f| f.block.kind == BlockKind::ListItem)
+        else {
+            // Unreachable: pulldown-cmark only emits the marker for a list item's first
+            // inline. Noted rather than ignored, because a checkbox with no line to sit on
+            // is a parser change, not a document.
+            self.note(Unsupported::Unrecognised);
+            return;
+        };
+        let item = &mut self.stack[item].block;
+        item.kind = BlockKind::TaskItem;
+        // Written even when false: an unticked box and no box at all are different
+        // documents, and an attribute that vanishes at its default makes them one.
+        item.attrs
+            .insert("checked".into(), serde_json::Value::Bool(checked));
+    }
+
+    /// Close a list, splitting it wherever checkbox items and plain items meet.
+    ///
+    /// `- [ ] a` followed by `- plain` is one markdown list and two different things: a
+    /// run of consecutive checkbox items becomes a `TaskList`, a run of plain items stays
+    /// the list it was. The alternative — upgrading the whole list and stamping
+    /// `checked: false` on the plain line — would put a to-do on somebody's board that
+    /// nobody wrote, because in this system a checkbox line *is* a task (D-6).
+    ///
+    /// The split survives a round trip without needing the exporter's help: two adjacent
+    /// lists re-import as the same two runs, and so does the single list they came from.
+    fn close_list(&mut self) {
+        self.close_implicit();
+        if self.stack.len() == 1 {
+            return; // never pop the doc
+        }
+        let list = self.stack.pop().expect("length checked above").block;
+        if !list.content.iter().any(|c| c.kind == BlockKind::TaskItem) {
+            self.top().content.push(list);
+            return;
+        }
+        if list.kind == BlockKind::OrderedList {
+            // Once per list, not once per checkbox: what was lost is one list's numbering.
+            self.note(Unsupported::OrderedTaskList);
+        }
+        for run in split_task_runs(list) {
+            self.top().content.push(run);
+        }
+    }
+
     /// Open a table row, remembering whether its cells are header cells and restarting the
     /// column count — alignment is per column, so a row that miscounts bends the table.
     fn open_row(&mut self, in_head: bool) {
@@ -334,7 +407,7 @@ impl Builder {
                 self.close_implicit();
                 self.note(Unsupported::HorizontalRule);
             }
-            Event::TaskListMarker(_) => self.note(Unsupported::TaskListMarker),
+            Event::TaskListMarker(checked) => self.check_open_item(checked),
         }
     }
 
@@ -438,11 +511,13 @@ impl Builder {
             TagEnd::Paragraph
             | TagEnd::Heading(_)
             | TagEnd::BlockQuote(_)
-            | TagEnd::List(_)
             | TagEnd::Item
             | TagEnd::TableHead
             | TagEnd::TableRow
             | TagEnd::TableCell => self.close(),
+            // A list is the one frame that can close as more than one block: see
+            // `close_list`, which splits a mixed list into task and plain runs.
+            TagEnd::List(_) => self.close_list(),
             TagEnd::Table => {
                 self.table = None;
                 self.close();
@@ -467,6 +542,50 @@ impl Builder {
             _ => {}
         }
     }
+}
+
+/// One list in, one list per run of like items out.
+///
+/// Only called for a list that holds at least one `TaskItem`. A list with none returns from
+/// [`Builder::close_list`] untouched, which is what keeps every list already in the wiki
+/// byte-identical to what it was.
+///
+/// A plain run of a *numbered* list keeps the number it had. Splitting renumbers otherwise:
+/// `1. [ ] a` / `2. plain` would come back reading "1. plain", a change to the page nobody
+/// asked for and that no note explains, because what [`Builder::close_list`] reports is the
+/// numbering of the *checkbox* lines — the ones that have no number left to keep.
+fn split_task_runs(list: Block) -> Vec<Block> {
+    let first = list
+        .attrs
+        .get("start")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
+
+    let mut runs: Vec<Block> = Vec::new();
+    for (index, item) in list.content.into_iter().enumerate() {
+        let kind = if item.kind == BlockKind::TaskItem {
+            BlockKind::TaskList
+        } else {
+            list.kind
+        };
+        match runs.last_mut() {
+            Some(run) if run.kind == kind => run.content.push(item),
+            _ => {
+                let mut run = block(kind);
+                // The same rule the importer follows for a list as a whole: a run starting
+                // at 1 states no `start`, so the common case grows no attrs and the JSON
+                // stays comparable across importers.
+                let number = first + index as u64;
+                if kind == BlockKind::OrderedList && number != 1 {
+                    run.attrs
+                        .insert("start".into(), serde_json::Value::from(number));
+                }
+                run.content.push(item);
+                runs.push(run);
+            }
+        }
+    }
+    runs
 }
 
 /// A mark with no attrs — every kind but `Link`, which carries its destination instead.
@@ -900,6 +1019,320 @@ mod tests {
             "the converter still reports marks as lost: {:?}",
             c.notes
         );
+    }
+
+    /// One list item: its kind, and what it says about its checkbox.
+    ///
+    /// `None` means the item states no `checked` at all, which is the distinction the whole
+    /// split exists to keep: a plain line must not come back carrying `checked: false`,
+    /// because in this system a checkbox line *is* a task and a fabricated `false` is a
+    /// to-do nobody wrote.
+    type Item = (BlockKind, Option<bool>);
+    /// One list: its kind and its items.
+    type List = (BlockKind, Vec<Item>);
+
+    /// The doc's top-level lists — the whole shape a split is about, in one comparable value.
+    fn lists_of(doc: &Block) -> Vec<List> {
+        doc.content
+            .iter()
+            .map(|list| {
+                let items = list
+                    .content
+                    .iter()
+                    .map(|i| (i.kind, i.attrs.get("checked").and_then(|v| v.as_bool())))
+                    .collect();
+                (list.kind, items)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_checkbox_line_becomes_a_task_item_that_remembers_it_is_unticked() {
+        let conversion = convert("- [ ] Stuhlprobe einschicken\n");
+
+        let list = &conversion.doc.content[0];
+        assert_eq!(list.kind, BlockKind::TaskList);
+        let item = &list.content[0];
+        assert_eq!(item.kind, BlockKind::TaskItem);
+        assert_eq!(
+            item.attrs.get("checked"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        // Block content, not bare text: a task can grow a second paragraph or a nested
+        // list without changing kind, exactly as a list item can.
+        assert_eq!(item.content[0].kind, BlockKind::Paragraph);
+
+        // The brackets are syntax, not text. While the task-list extension was off they
+        // arrived as literal text and the line read "[ ] Stuhlprobe einschicken" — in the
+        // page, in the search index and in every heading anchor derived from it.
+        assert_eq!(conversion.doc.plain_text(), "Stuhlprobe einschicken");
+        assert!(
+            conversion.notes.is_empty(),
+            "a checkbox is modelled now, not lost: {:?}",
+            conversion.notes
+        );
+    }
+
+    #[test]
+    fn a_checkbox_line_followed_by_a_plain_one_splits_into_two_lists() {
+        assert_eq!(
+            lists_of(&markdown_to_blocks("- [ ] a\n- plain\n")),
+            vec![
+                (
+                    BlockKind::TaskList,
+                    vec![(BlockKind::TaskItem, Some(false))]
+                ),
+                (BlockKind::BulletList, vec![(BlockKind::ListItem, None)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_plain_line_followed_by_a_checkbox_one_splits_into_two_lists() {
+        assert_eq!(
+            lists_of(&markdown_to_blocks("- plain\n- [x] a\n")),
+            vec![
+                (BlockKind::BulletList, vec![(BlockKind::ListItem, None)]),
+                (BlockKind::TaskList, vec![(BlockKind::TaskItem, Some(true))]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_plain_line_between_two_checkboxes_splits_the_list_into_three() {
+        // The case that decides it: upgrading the whole list would put "plain" on a board
+        // as an open task, which is exactly the cost D-6 was accepted on the grounds that
+        // it does not happen.
+        assert_eq!(
+            lists_of(&markdown_to_blocks("- [ ] a\n- plain\n- [x] b\n")),
+            vec![
+                (
+                    BlockKind::TaskList,
+                    vec![(BlockKind::TaskItem, Some(false))]
+                ),
+                (BlockKind::BulletList, vec![(BlockKind::ListItem, None)]),
+                (BlockKind::TaskList, vec![(BlockKind::TaskItem, Some(true))]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_list_of_nothing_but_checkboxes_stays_one_task_list() {
+        assert_eq!(
+            lists_of(&markdown_to_blocks("- [ ] a\n- [x] b\n")),
+            vec![(
+                BlockKind::TaskList,
+                vec![
+                    (BlockKind::TaskItem, Some(false)),
+                    (BlockKind::TaskItem, Some(true)),
+                ]
+            )]
+        );
+    }
+
+    #[test]
+    fn a_list_with_no_checkbox_at_all_is_untouched() {
+        // The regression guard for every list already in the wiki: nothing about the split
+        // may reach a list that has no task in it.
+        assert_eq!(
+            lists_of(&markdown_to_blocks("- eins\n- zwei\n")),
+            vec![(
+                BlockKind::BulletList,
+                vec![(BlockKind::ListItem, None), (BlockKind::ListItem, None)]
+            )]
+        );
+    }
+
+    #[test]
+    fn an_ordered_list_of_checkboxes_becomes_a_task_list() {
+        // `1. [ ] a` is a checkbox line, and D-6 makes every checkbox line a task. A task
+        // list is unordered — TipTap's `taskList` renders a box where the number was — so
+        // the numbering is what gives way, not the checkbox.
+        assert_eq!(
+            lists_of(&markdown_to_blocks("1. [ ] a\n2. [x] b\n")),
+            vec![(
+                BlockKind::TaskList,
+                vec![
+                    (BlockKind::TaskItem, Some(false)),
+                    (BlockKind::TaskItem, Some(true)),
+                ]
+            )]
+        );
+    }
+
+    #[test]
+    fn a_numbered_list_that_held_checkboxes_reports_its_lost_numbering() {
+        let conversion = convert("1. [ ] a\n2. [x] b\n");
+        assert_eq!(
+            conversion
+                .notes
+                .iter()
+                .map(|n| (n.construct.key(), n.count))
+                .collect::<Vec<_>>(),
+            vec![("ordered-task-list", 1)],
+            "once per list, not once per checkbox: one list's numbering was lost"
+        );
+        // A bulleted task list loses nothing, so it must stay silent — a report that cries
+        // wolf on the common case is a report nobody reads.
+        assert!(convert("- [ ] a\n").notes.is_empty());
+    }
+
+    #[test]
+    fn the_plain_run_of_a_split_numbered_list_keeps_the_number_it_had() {
+        // Splitting must not renumber: without this the second line comes back as "1.
+        // plain", a visible change to the page that no note explains, because what the
+        // report names is the *checkbox* lines' numbering.
+        let doc = markdown_to_blocks("1. [ ] a\n2. plain\n");
+        assert_eq!(
+            lists_of(&doc),
+            vec![
+                (
+                    BlockKind::TaskList,
+                    vec![(BlockKind::TaskItem, Some(false))]
+                ),
+                (BlockKind::OrderedList, vec![(BlockKind::ListItem, None)]),
+            ]
+        );
+        assert_eq!(
+            doc.content[1].attrs.get("start").and_then(|v| v.as_u64()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn every_plain_run_of_a_split_numbered_list_counts_from_where_the_list_began() {
+        // A list that does not start at 1, split into four runs. Each plain run has to know
+        // its own position in the original numbering, not merely that it is not the first —
+        // the arithmetic is where a split silently renumbers a page.
+        let doc = markdown_to_blocks("5. [ ] a\n6. plain\n7. [x] b\n8. p2\n");
+        let starts: Vec<Option<u64>> = doc
+            .content
+            .iter()
+            .map(|b| b.attrs.get("start").and_then(|v| v.as_u64()))
+            .collect();
+        assert_eq!(starts, vec![None, Some(6), None, Some(8)]);
+    }
+
+    /// A source spelling and the markdown a split list is written back out as.
+    ///
+    /// The rendering half of the round trip lives in `gw_api::export`, which depends on
+    /// this crate and therefore cannot be called from it. So the exported form is written
+    /// here literally — `- [ ] ` / `- [x] ` for a task line, a blank line between the two
+    /// lists the split produced — and the assertion is the one that matters either way:
+    /// what the exporter writes must come back as the tree it was written from.
+    ///
+    /// Both bullet spellings of the join are listed on purpose. `- [ ] a` and `- plain`
+    /// separated by a blank line are ONE loose list to every CommonMark parser, and `* plain`
+    /// makes it two — so the pair proves the round trip survives whichever the exporter
+    /// picks, and that the split is not quietly relying on the marker alternation.
+    const TASK_ROUND_TRIPS: &[(&str, &[&str])] = &[
+        (
+            "- [ ] a\n- plain\n",
+            &["- [ ] a\n\n- plain\n", "- [ ] a\n\n* plain\n"],
+        ),
+        (
+            "- plain\n- [x] a\n",
+            &["- plain\n\n- [x] a\n", "* plain\n\n- [x] a\n"],
+        ),
+        (
+            "- [ ] a\n- plain\n- [x] b\n",
+            &[
+                "- [ ] a\n\n- plain\n\n- [x] b\n",
+                "- [ ] a\n\n* plain\n\n- [x] b\n",
+            ],
+        ),
+        ("- [ ] a\n- [x] b\n", &["- [ ] a\n- [x] b\n"]),
+        // A numbered list that held checkboxes exports as a task list beside a numbered one
+        // that kept its number. The loss was reported once, at the first import; the file
+        // written from it no longer has anything left to lose, so re-importing it reports
+        // nothing and must still land on the same tree.
+        ("1. [ ] a\n2. plain\n", &["- [ ] a\n\n2. plain\n"]),
+    ];
+
+    #[test]
+    fn a_split_list_re_imports_from_its_exported_form_as_the_very_same_tree() {
+        for (source, exports) in TASK_ROUND_TRIPS {
+            let imported = json(&markdown_to_blocks(source));
+            for exported in *exports {
+                assert_eq!(
+                    json(&markdown_to_blocks(exported)),
+                    imported,
+                    "`{exported:?}` does not re-import as what `{source:?}` imported as"
+                );
+            }
+        }
+    }
+
+    /// A tree as JSON. `Block` has no `PartialEq`, and this is the comparison
+    /// `gw_api::export::render_file` makes on every export anyway.
+    fn json(block: &Block) -> serde_json::Value {
+        serde_json::to_value(block).unwrap()
+    }
+
+    #[test]
+    fn a_task_item_carries_nothing_but_checked_because_the_store_mints_the_id() {
+        // The data model gives a task a uuid, and the store mints it during reconciliation
+        // on publish. Minting one here would break every export forever: `render_file`
+        // re-imports its own output and compares it with the stored document, and a fresh
+        // random id would differ every time. So this converter stays a pure function.
+        let doc = markdown_to_blocks("- [ ] a\n- [x] b\n");
+        for item in &doc.content[0].content {
+            assert_eq!(
+                item.attrs.keys().collect::<Vec<_>>(),
+                vec!["checked"],
+                "a task item grew an attribute this converter has no business minting"
+            );
+        }
+        assert_eq!(
+            json(&markdown_to_blocks("- [ ] a\n")),
+            json(&markdown_to_blocks("- [ ] a\n")),
+            "two conversions of one document must be the same document"
+        );
+    }
+
+    #[test]
+    fn a_task_list_serialises_under_the_editors_own_names() {
+        // The editor and `web/src/lib/blocks/render.ts` mirror this enum and cannot see it,
+        // so the wire names are pinned here: TipTap's extensions are `taskList`/`taskItem`.
+        let doc = markdown_to_blocks("- [x] a\n");
+        let json = serde_json::to_string(&doc).unwrap();
+        assert!(json.contains(r#""kind":"taskList""#), "{json}");
+        assert!(json.contains(r#""kind":"taskItem""#), "{json}");
+        assert!(json.contains(r#""checked":true"#), "{json}");
+
+        let again: Block = serde_json::from_str(&json).unwrap();
+        assert_eq!(again.content[0].kind, BlockKind::TaskList);
+        assert_eq!(again.content[0].content[0].kind, BlockKind::TaskItem);
+    }
+
+    #[test]
+    fn a_checkbox_nested_under_a_checkbox_is_a_task_list_inside_a_task_item() {
+        let doc = markdown_to_blocks("- [ ] a\n  - [x] b\n");
+        let outer = &doc.content[0].content[0];
+        assert_eq!(outer.kind, BlockKind::TaskItem);
+        let inner = outer
+            .content
+            .iter()
+            .find(|b| b.kind == BlockKind::TaskList)
+            .expect("the nested checklist must be a child of the outer task");
+        assert_eq!(inner.content[0].kind, BlockKind::TaskItem);
+        assert_eq!(doc.plain_text(), "a b");
+    }
+
+    #[test]
+    fn a_loose_checkbox_line_keeps_its_checkbox_and_its_second_paragraph() {
+        // In a loose list the checkbox arrives *inside* the item's paragraph, one frame
+        // deeper than in a tight one. Reading the top of the stack alone would leave the
+        // `checked` attribute on the paragraph, where nothing looks for it.
+        let doc = markdown_to_blocks("- [ ] a\n\n  noch etwas\n");
+        let item = &doc.content[0].content[0];
+        assert_eq!(item.kind, BlockKind::TaskItem);
+        assert_eq!(
+            item.attrs.get("checked"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        assert_eq!(kinds_of(item), vec![BlockKind::Paragraph; 2]);
+        assert_eq!(doc.plain_text(), "a noch etwas");
     }
 
     /// The kinds on the leaf whose text is `text`, in stored order.
