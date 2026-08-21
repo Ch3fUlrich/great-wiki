@@ -281,6 +281,17 @@ describe('AccessPanel', () => {
     expect(out).toContain('Die übrigen Wege oben gelten weiter');
   });
 
+  it('never says "Kein Zugriffseintrag" when a grant is inherited from an ancestor', () => {
+    // I2. `hasGrants` is `acl.effective.length > 0`, not `acl.defined_here.length > 0` —
+    // the `inherited` fixture has entries only through `effective` (nothing of its own in
+    // `defined_here`), which is exactly the shape that mutation cannot tell apart from
+    // "no ancestor carries anything either". Under that mutation this test fails: the
+    // panel would render "Kein Zugriffseintrag. Weder auf /handbuch/onboarding noch auf
+    // einer übergeordneten Seite ist etwas eingetragen." on a page that plainly has one.
+    const out = html(props());
+    expect(out).not.toContain('Kein Zugriffseintrag');
+  });
+
   it('says who an internal page reaches even when nothing is entered', () => {
     const out = html(props({ path: nothing.path, acl: nothing, visibility: 'internal' }));
     expect(out).toContain('Sichtbarkeit »Intern«');

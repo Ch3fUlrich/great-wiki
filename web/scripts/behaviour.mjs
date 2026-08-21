@@ -1491,6 +1491,163 @@ await check('H7 the visibility dialog says what the change does before anything 
   }
 });
 
+// ---------------------------------------------------------------------------------------
+// H8-H9 — I1: a picked-but-unconfirmed choice must not survive a page change
+// ---------------------------------------------------------------------------------------
+//
+// `pickedVisibility` (and the grant dialog's `newSubject`/`newPermission`) were
+// component-local `$state`, cleared only on a SUCCESSFUL change — and the admin console
+// keeps AccessPanel mounted across a page change (`selectPath` calls `goto()`, not a
+// fresh mount), with nothing keying the component on `path`. So a value picked on one
+// page and left unconfirmed rode along onto the next. `AccessPanel.test.ts` cannot see
+// this at all: it renders once, statically, via `svelte/server`, which never runs an
+// `$effect` and cannot simulate a client-side navigation between two mounted states of
+// the same instance — only a browser can drive that, which is why `../_behaviour/zugriff`
+// now carries real `?fall=` links for these two checks to click.
+
+await check('H8 a picked-but-unconfirmed visibility does not survive navigating to another page', async (page) => {
+  await loadAccessPanel(page, 'eigen');
+
+  let trigger = page.getByRole('button', { name: 'Sichtbarkeit ändern' });
+  await trigger.waitFor({ state: 'visible' });
+  await trigger.click();
+
+  let dialog = page.getByRole('dialog', { name: 'Sichtbarkeit ändern' });
+  await dialog.waitFor({ state: 'visible', timeout: 5_000 });
+
+  await dialog.locator('.gw-adm-select-trigger').click();
+  const option = page.locator('.gw-adm-option', { hasText: 'Öffentlich' });
+  await option.waitFor({ state: 'visible', timeout: 5_000 });
+  await option.click();
+
+  const confirm = dialog.getByRole('button', { name: 'Sichtbarkeit setzen' });
+  assert(await confirm.isEnabled(), 'picking "Öffentlich" never reached the option');
+
+  // Cancel, not confirm — the choice must not survive BECAUSE it was never applied.
+  await dialog.getByRole('button', { name: 'Abbrechen' }).click();
+  await dialog.waitFor({ state: 'hidden', timeout: 5_000 }).catch(() => {});
+
+  // A real link click — a client-side navigation that keeps the panel mounted, not
+  // `page.goto()`, which would reload the page and could not exercise this bug even
+  // with the fix reverted.
+  await page.getByRole('link', { name: 'geerbt' }).click();
+  await page.waitForURL(/fall=geerbt/);
+
+  trigger = page.getByRole('button', { name: 'Sichtbarkeit ändern' });
+  await trigger.waitFor({ state: 'visible' });
+  await trigger.click();
+  dialog = page.getByRole('dialog', { name: 'Sichtbarkeit ändern' });
+  await dialog.waitFor({ state: 'visible', timeout: 5_000 });
+
+  const confirmAfter = dialog.getByRole('button', { name: 'Sichtbarkeit setzen' });
+  assert(
+    await confirmAfter.isDisabled(),
+    'the visibility dialog on the new page opened with a stale, unconfirmed choice still live — ' +
+      'the confirm button should be disabled for the unchanged value'
+  );
+});
+
+await check('H9 a picked-but-ungranted subject does not survive navigating to another page', async (page) => {
+  // `newSubject`/`newPermission` are the grant dialog's counterpart to `pickedVisibility`
+  // — identical shape, identical missing reset.
+  await loadAccessPanel(page, 'eigen');
+
+  let trigger = page.getByRole('button', { name: 'Zugriff gewähren' });
+  await trigger.waitFor({ state: 'visible' });
+  await trigger.click();
+
+  let dialog = page.getByRole('dialog', { name: 'Zugriff gewähren' });
+  await dialog.waitFor({ state: 'visible', timeout: 5_000 });
+
+  await dialog.locator('.gw-adm-combo-trigger').click();
+  const option = page.locator('.gw-adm-option', { hasText: 'Sergej Maul' });
+  await option.waitFor({ state: 'visible', timeout: 5_000 });
+  await option.click();
+
+  const confirm = dialog.getByRole('button', { name: 'Gewähren' });
+  assert(await confirm.isEnabled(), 'picking a subject never reached the option');
+
+  await dialog.getByRole('button', { name: 'Abbrechen' }).click();
+  await dialog.waitFor({ state: 'hidden', timeout: 5_000 }).catch(() => {});
+
+  await page.getByRole('link', { name: 'geerbt' }).click();
+  await page.waitForURL(/fall=geerbt/);
+
+  trigger = page.getByRole('button', { name: 'Zugriff gewähren' });
+  await trigger.waitFor({ state: 'visible' });
+  await trigger.click();
+  dialog = page.getByRole('dialog', { name: 'Zugriff gewähren' });
+  await dialog.waitFor({ state: 'visible', timeout: 5_000 });
+
+  const confirmAfter = dialog.getByRole('button', { name: 'Gewähren' });
+  assert(
+    await confirmAfter.isDisabled(),
+    'the grant dialog on the new page opened with a stale, unconfirmed subject still chosen — ' +
+      'the "Gewähren" button should be disabled with nobody picked'
+  );
+});
+
+// ---------------------------------------------------------------------------------------
+// H10-H11 — I3: a Select opened from inside a Dialog must be operable with the mouse
+// ---------------------------------------------------------------------------------------
+//
+// Ark's Select/Combobox/Menu write an inline `z-index: var(--z-index)` on their
+// positioner; `@zag-js/popper` populates `--z-index` from the positioner's own first
+// child (`.gw-adm-listbox` / `.gw-adm-menu`), which carried no real `z-index` of its own
+// — so it mirrored `auto`, and the dropdown rendered UNDER the dialog that contains it
+// (root cause and fix live in admin.css, on `.gw-adm-popper`). Keyboard selection
+// (ArrowDown/Enter) never touches hit-testing and would pass regardless of this bug —
+// which is exactly how it shipped unnoticed. Only a real mouse click, with Playwright's
+// actionability check left on (it refuses to click an element another element is
+// currently painted over, and retries until it can or times out saying so), proves it.
+
+await check('H10 the visibility select inside its dialog is operable with the mouse, not just the keyboard', async (page) => {
+  await loadAccessPanel(page, 'eigen');
+
+  const trigger = page.getByRole('button', { name: 'Sichtbarkeit ändern' });
+  await trigger.waitFor({ state: 'visible' });
+  await trigger.click();
+
+  const dialog = page.getByRole('dialog', { name: 'Sichtbarkeit ändern' });
+  await dialog.waitFor({ state: 'visible', timeout: 5_000 });
+
+  await dialog.locator('.gw-adm-select-trigger').click();
+  const option = page.locator('.gw-adm-option', { hasText: 'Öffentlich' });
+  await option.waitFor({ state: 'visible', timeout: 5_000 });
+  await option.click({ timeout: 5_000 });
+
+  const confirm = dialog.getByRole('button', { name: 'Sichtbarkeit setzen' });
+  assert(
+    await confirm.isEnabled(),
+    'clicking "Öffentlich" never reached the option — the confirm button is still disabled for the unchanged value'
+  );
+});
+
+await check("H11 the grant dialog's permission select is likewise operable with the mouse", async (page) => {
+  // The identical, pre-existing defect on a second Select that shares the same CSS
+  // classes (`.gw-adm-popper`, `.gw-adm-listbox`) and the same nested-in-a-dialog shape.
+  await loadAccessPanel(page, 'eigen');
+
+  const trigger = page.getByRole('button', { name: 'Zugriff gewähren' });
+  await trigger.waitFor({ state: 'visible' });
+  await trigger.click();
+
+  const dialog = page.getByRole('dialog', { name: 'Zugriff gewähren' });
+  await dialog.waitFor({ state: 'visible', timeout: 5_000 });
+
+  const select = dialog.locator('.gw-adm-select-trigger');
+  await select.click();
+  const option = page.locator('.gw-adm-option', { hasText: 'Schreiben' });
+  await option.waitFor({ state: 'visible', timeout: 5_000 });
+  await option.click({ timeout: 5_000 });
+
+  const chosen = (await select.innerText()).trim();
+  assert(
+    chosen.includes('Schreiben'),
+    `clicking "Schreiben" never reached the option, the trigger still reads "${chosen}"`
+  );
+});
+
 await browser.close();
 
 // ---------------------------------------------------------------------------------------

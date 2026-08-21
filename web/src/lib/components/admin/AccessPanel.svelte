@@ -277,6 +277,27 @@
     // control falls back to whatever the reloaded page now says.
     if (changed) pickedVisibility = null;
   }
+
+  /**
+   * Clears every half-made choice when the panel moves to a different page.
+   *
+   * The admin console keeps this component mounted across a page change: `selectPath` in
+   * `routes/admin/+page.svelte` calls `goto()`, not a fresh mount, and nothing here keyed
+   * the component on `path`. Without this, a value picked and left unconfirmed on one
+   * page followed the panel onto the next — open page A's dialog, pick `Öffentlich`,
+   * cancel, navigate to page B, and B's dialog opened pre-set to `Öffentlich` with the
+   * confirm button already live. `pickedVisibility` is the dangerous one, since it is
+   * what puts the confirm button on `/api/admin/visibility` live for a page nobody chose
+   * it for; `newSubject` and `newPermission` in the grant dialog have the identical shape.
+   */
+  $effect(() => {
+    // Reading `path` is what makes this re-run on every page change — the assignments
+    // below do not otherwise depend on its value.
+    void path;
+    pickedVisibility = null;
+    newSubject = null;
+    newPermission = 'read';
+  });
 </script>
 
 <div class="gw-adm-section">

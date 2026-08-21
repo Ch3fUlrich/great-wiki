@@ -79,6 +79,22 @@
   const acl = $derived(faelle[data.fall] ?? geerbt);
 </script>
 
+<!--
+  Real links, so `behaviour.mjs` can drive an actual client-side navigation between two
+  mounted states of the SAME AccessPanel instance — exactly what `routes/admin/+page.svelte`
+  does via `selectPath`'s `goto()`, and exactly the transition I1 needs a browser to prove:
+  a same-origin `?fall=` link is intercepted by SvelteKit's router, which re-runs this
+  route's load and updates `data.fall` in place, never remounting the component below.
+  `page.goto()` in Playwright would instead be a hard navigation and could not expose the
+  bug even if the fix were reverted, so behaviour.mjs must click one of these rather than
+  navigate the address bar directly.
+-->
+<nav aria-label="Testfälle">
+  {#each Object.keys(faelle) as fall (fall)}
+    <a href="?fall={fall}">{fall}</a>
+  {/each}
+</nav>
+
 <AccessPanel
   path={acl.path}
   {acl}

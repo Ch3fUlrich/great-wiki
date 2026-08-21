@@ -75,9 +75,23 @@ export function grantConsequence(
   return `${subjectName} erhält »${permissionLabel}« auf ${path} und auf jeder Seite darunter.`;
 }
 
-/** The heading over grants that are in force here but written on `source`. */
+/**
+ * The heading over grants that are in force here but written on `source`.
+ *
+ * `public` and `internal` both earn their own sentence for the same reason: on either,
+ * this page's OWN visibility genuinely does grant reach, so "nicht über die Sichtbarkeit
+ * dieser Seite" would be false — not merely incomplete. `restricted`, and the case where
+ * this view was not told a visibility at all, are the only ones where the ancestor grant
+ * really is the only route in, which is what the generic sentence claims.
+ */
 export function inheritedReachTitle(source: string, visibility?: string | null): string {
   if (visibility === 'public') return `Die Rechte unten kommen von ${source}.`;
+  if (visibility === 'internal') {
+    return (
+      `Die Rechte unten kommen von ${source} — zusätzlich zur Sichtbarkeit »Intern« ` +
+      'dieser Seite, die für sich schon reicht.'
+    );
+  }
   return `Erreichbar über ${source}, nicht über die Sichtbarkeit dieser Seite.`;
 }
 
@@ -174,14 +188,27 @@ function atLeastInternal(input: ReachInput): string[] | null {
   return [...new Set([...input.internalGroups, ...input.adminGroups])].sort();
 }
 
-/** The sentence that names the groups behind a baseline, or says why it cannot. */
-function groupClause(groups: string[] | null, none: string): string {
+/**
+ * The sentence that names the groups behind a baseline, or says why it cannot.
+ *
+ * `also`, when given, is appended to WHICHEVER branch fires — not only the empty one.
+ * `baseline_on` in `crates/gw-store/src/acl.rs` checks the `instance_admins` promotion
+ * BEFORE it ever looks at a group, so a promoted account carries the reach regardless of
+ * whether any group is mapped to it. That fact does not become less true once a group
+ * IS mapped, and saying it only in the empty branch reads as "only these groups", which
+ * `baseline_on`'s ordering never claimed.
+ */
+function groupClause(groups: string[] | null, none: string, also?: string): string {
   if (groups === null) {
     return 'Welche Gruppen das sind, zeigt diese Ansicht nicht — dafür fehlen ihr die Rechte.';
   }
-  if (groups.length === 0) return none;
+  const suffix = also ? ` ${also}` : '';
+  if (groups.length === 0) return `${none}${suffix}`;
   const plural = groups.length === 1 ? 'die Gruppe' : 'die Gruppen';
-  return `Zurzeit betrifft das ${plural} ${quotedList(groups)}; wer darin ist, entscheidet Authelia und nicht diese Seite.`;
+  return (
+    `Zurzeit betrifft das ${plural} ${quotedList(groups)}; wer darin ist, entscheidet Authelia ` +
+    `und nicht diese Seite.${suffix}`
+  );
 }
 
 function shareLinkRoute(input: ReachInput): ReachRoute | null {
@@ -236,7 +263,13 @@ function visibilityRoute(input: ReachInput): ReachRoute {
         'liest diese Seite ohne jeden Eintrag unten. ' +
         `${groupClause(
           atLeastInternal(input),
-          'Zurzeit ist dafür keine Gruppe eingetragen, also erreicht so niemand die Seite.'
+          'Zurzeit ist dafür keine Gruppe eingetragen.',
+          // `baseline_on` checks the per-account promotion before any group, and Admin
+          // sits above Internal in the ordering (`Baseline::Admin > Baseline::Internal`),
+          // so a promoted account reaches an internal page whether or not a group does.
+          // "also erreicht so niemand die Seite" was false whenever that promotion exists.
+          'Wer einzeln die Reichweite »Verwaltung« trägt, erreicht die Seite trotzdem — ' +
+            'diese Reichweite schließt »Intern« ein.'
         )} ` +
         'Lesen ist alles, was das mitbringt.'
     };
@@ -277,8 +310,12 @@ function baselineRoute(input: ReachInput): ReachRoute {
       'der Sichtbarkeit »Eingeschränkt«, und ohne jeden Eintrag unten. ' +
       `${groupClause(
         input.adminGroups,
-        'Zurzeit ist dafür keine Gruppe eingetragen. Einzelne Konten können die Reichweite ' +
-          'trotzdem tragen: sie lässt sich auch pro Person vergeben.'
+        'Zurzeit ist dafür keine Gruppe eingetragen.',
+        // True whether or not a group IS mapped — `baseline_on` reads the per-account
+        // promotion before it ever looks at groups — so this belongs in both branches of
+        // `groupClause`, not only the one that used to carry it.
+        'Einzelne Konten können die Reichweite trotzdem tragen: sie lässt sich auch pro ' +
+          'Person vergeben.'
       )} ` +
       'Lesen ist alles, was das mitbringt — Schreiben braucht auch dort einen Eintrag.'
   };

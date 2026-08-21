@@ -108,6 +108,17 @@ describe('inheritedReach', () => {
     expect(text).not.toContain('nicht über die Sichtbarkeit');
   });
 
+  it('does not claim an internal page is unreachable through its own visibility', () => {
+    // M3. `permits()` gives an `internal` page's own visibility real reach — baseline >=
+    // internal — exactly as a `public` page's visibility does, and for the same reason
+    // `public` earned its own sentence above: "nicht über die Sichtbarkeit dieser Seite"
+    // would be false here, not merely incomplete.
+    const title = inheritedReachTitle('/handbuch', 'internal');
+    expect(title).not.toContain('nicht über die Sichtbarkeit');
+    expect(title).toContain('/handbuch');
+    expect(title).toContain('Intern');
+  });
+
   it('drops the visibility clause rather than guessing when the visibility is unknown', () => {
     // The panel takes `visibility` as an optional prop and the ACL endpoint does not
     // carry it. Missing must read as missing — never as `restricted`, which is what the
@@ -187,6 +198,19 @@ describe('reachRoutes', () => {
     expect(admin?.text).toContain('Einzelne Konten');
   });
 
+  it('names the individual-promotion route even once a group already carries the reach', () => {
+    // M1. `baseline_on` in crates/gw-store/src/acl.rs checks the `instance_admins`
+    // promotion BEFORE it ever looks at a group, so a promoted account holds
+    // `Baseline::Admin` whatever the groups say. The empty branch above already says so;
+    // dropping the clause once a group IS mapped reads as "only this group decides it",
+    // which `baseline_on`'s ordering never claimed.
+    const routes = reachRoutes({ ...base, visibility: 'restricted', adminGroups: ['admins'] });
+    const admin = routes.find((route) => route.key === 'baseline');
+    expect(admin?.text).toContain('»admins«');
+    expect(admin?.text).toContain('Einzelne Konten');
+    expect(admin?.text).toContain('pro Person vergeben');
+  });
+
   it('says a public page is readable by everyone, before any entry is consulted', () => {
     const routes = reachRoutes({ ...base, visibility: 'public' });
     const visibility = routes.find((route) => route.key === 'visibility');
@@ -205,6 +229,22 @@ describe('reachRoutes', () => {
     expect(visibility?.text).toContain('»users«');
     // The admin baseline is >= internal, so those groups read it too.
     expect(visibility?.text).toContain('»admins«');
+  });
+
+  it('does not claim nobody reaches an internal page when no group is mapped', () => {
+    // M2. The claim this text used to make — "also erreicht so niemand die Seite" — is
+    // false whenever a per-account promotion (0006) exists: `baseline_on` checks it
+    // before any group, and `Baseline::Admin > Baseline::Internal`, so a promoted account
+    // reaches an internal page with zero groups mapped to it.
+    const routes = reachRoutes({
+      ...base,
+      visibility: 'internal',
+      adminGroups: [],
+      internalGroups: []
+    });
+    const visibility = routes.find((route) => route.key === 'visibility');
+    expect(visibility?.text).not.toContain('niemand');
+    expect(visibility?.text).toContain('Verwaltung');
   });
 
   it('says plainly that a restricted page lets nobody in through its visibility', () => {

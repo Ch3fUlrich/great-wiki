@@ -160,6 +160,22 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Fixed
 
+- The visibility and permission dropdowns can be operated with a mouse. Both are portalled
+  out of their dialog, and `@zag-js/popper` writes `z-index: var(--z-index)` on them inline —
+  a variable it fills by mirroring a child's computed `z-index`, which was never set, so it
+  mirrored `auto` and the dialog covered the open list. Every check drove them with the
+  keyboard, which worked throughout, so nothing noticed that the mouse route was dead.
+- A visibility or subject picked on one page and then abandoned no longer follows you to the
+  next one. The choice lived in component state that a client-side navigation does not reset,
+  so opening another page's dialog offered the previous page's answer with the confirm button
+  already live — on the one control that publishes to the open internet, and against that
+  code's own stated reason for putting »Öffentlich« last in the list.
+- The panel no longer claims "Kein Zugriffseintrag" for a page that is reached through an
+  ancestor's entry. That sentence was the exact under-statement this screen was rewritten to
+  remove, and it could be reintroduced with every one of the 298 tests still passing — the
+  derivation behind it had no test at all.
+- Two routes into a page were described by group where an individual promotion also carries
+  them, so the copy credited Authelia with a decision it does not make.
 - A protocol-relative link no longer becomes a page of this wiki. `//example.org/seite`
   failed to parse without a base, fell through to the relative branch, and was resolved
   against the page being edited — so a link meant for another site silently turned into a

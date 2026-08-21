@@ -674,11 +674,28 @@
 	}
 
 	/* Both dropdowns are rendered into a portal at the end of <body>, outside every
-	   stacking context on the page, so they need an explicit z-index above the sticky
-	   header (z-index 10) and below the dialog layer (50–51). */
+	   stacking context on the page — and when the field sits inside a dialog, as the
+	   visibility and permission selects both do, that portal is a SIBLING of the
+	   dialog's own portalled positioner, not a descendant of it. "Below the dialog
+	   layer (50–51)" was therefore the wrong target from the start: opened from inside
+	   a dialog, the dropdown needs to sit ABOVE it, or the dialog paints over its own
+	   dropdown and nothing in the list can be clicked — confirmed with a real mouse in a
+	   real browser; a keyboard-driven test never touches hit-testing and passed regardless.
+	 *
+	 * `z-index` on THIS rule cannot fix it and never did: `@zag-js/popper` (which Ark's
+	 * Select, Combobox and Menu all use) writes an inline `style="z-index: var(--z-index)"`
+	 * on the positioner itself, and an inline declaration always outranks a stylesheet
+	 * rule for the same element and property — layer and specificity never get a vote.
+	 * `--z-index` is populated by that same library, by reading `getComputedStyle()` of
+	 * the positioner's OWN FIRST CHILD (the content box below — `.gw-adm-listbox` or
+	 * `.gw-adm-menu`) and mirroring it up (`get-placement.mjs`'s `updatePosition`). With
+	 * no real `z-index` ever set on that child, the mirrored value was `auto`, `var()`
+	 * had nothing to resolve to, and the positioner's inline z-index computed to its
+	 * initial value — `auto` — no matter what this rule said. The fix has to live on the
+	 * CONTENT rules below; this rule only established the stacking context now that a
+	 * child's z-index has to land somewhere positioned. */
 	.gw-adm-popper:not([hidden]) {
 		position: relative;
-		z-index: 30;
 	}
 
 	.gw-adm-listbox:not([hidden]) {
@@ -691,6 +708,11 @@
 		border-radius: var(--radius);
 		background: var(--bg-raised);
 		box-shadow: var(--shadow);
+		/* The real fix (see `.gw-adm-popper` above): this is the positioner's first
+		   child, so `@zag-js/popper` reads THIS z-index and mirrors it onto the
+		   positioner's own inline style. Above the dialog layer (50–51) deliberately —
+		   both selects that use this class are opened from inside a dialog. */
+		z-index: 60;
 	}
 
 	.gw-adm-option:not([hidden]) {
@@ -731,6 +753,9 @@
 		border-radius: var(--radius);
 		background: var(--bg-raised);
 		box-shadow: var(--shadow);
+		/* Same mechanism as `.gw-adm-listbox`, same reason: this is `.gw-adm-popper`'s
+		   first child, and `@zag-js/popper` mirrors ITS z-index onto the positioner. */
+		z-index: 60;
 	}
 
 	.gw-adm-menu-item:not([hidden]) {
