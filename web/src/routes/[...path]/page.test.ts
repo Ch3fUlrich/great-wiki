@@ -158,6 +158,20 @@ describe('the reader page, server-rendered', () => {
   });
 });
 
+describe('reaching the history', () => {
+  it('links to the page history, for a reader as well as for somebody signed in', () => {
+    // Reading the history follows reading the page (D-M3-5), so this is not an editing
+    // affordance and is not hidden behind one. A history nothing links to is a history
+    // nobody finds, which is the complaint this whole feature answers.
+    expect(html()).toContain('href="/rundgang/import-export/history"');
+    expect(html(container, { me: signedIn })).toContain('href="/rundgang/import-export/history"');
+  });
+
+  it('calls it Verlauf, in the interface language', () => {
+    expect(html()).toContain('Verlauf');
+  });
+});
+
 describe('offering the editor', () => {
   it('offers nothing to somebody who is not signed in', () => {
     // Nobody anonymous can write anything in this deployment: write comes only from an

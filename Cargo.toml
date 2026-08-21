@@ -20,6 +20,10 @@ serde_yaml = "0.9"
 # from the event stream and must never grow a second, HTML-shaped rendering path.
 pulldown-cmark = { version = "0.12", default-features = false }
 tokio = { version = "1", features = ["full"] }
+# Myers diffing for the revision history. `gw-core` turns two block trees into three
+# kinds of change list with it; nothing else in the workspace diffs anything.
+similar = "2"
+
 tracing = "0.1"
 url = "2.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

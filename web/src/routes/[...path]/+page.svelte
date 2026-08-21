@@ -105,19 +105,28 @@
       docType={data.doc.doc_type}
     />
 
-    <!-- Offered only to somebody signed in, and it is a LINK: before hydration it navigates
-         to `?edit=1`, which renders the same page with the editor asked for. A button would
-         be a control that looks live and does nothing until the bundle arrives. -->
-    {#if mayOfferEditing && !editing}
+    <!-- Bearbeiten is offered only to somebody signed in, and it is a LINK: before hydration
+         it navigates to `?edit=1`, which renders the same page with the editor asked for. A
+         button would be a control that looks live and does nothing until the bundle arrives.
+
+         Verlauf is offered to EVERYBODY who can see the page, which is the whole difference
+         between the two: reading the history follows reading the page (D-M3-5), while
+         editing needs an explicit grant nothing here can check. And it has to be offered
+         somewhere — a history nothing links to is a history nobody finds, which is the
+         complaint this feature exists to answer. -->
+    {#if !editing}
       <p class="editbar no-print">
-        <a
-          class="edit-start"
-          href="?edit=1"
-          onclick={(event) => {
-            event.preventDefault();
-            toggled = true;
-          }}>Bearbeiten</a
-        >
+        {#if mayOfferEditing}
+          <a
+            class="edit-start"
+            href="?edit=1"
+            onclick={(event) => {
+              event.preventDefault();
+              toggled = true;
+            }}>Bearbeiten</a
+          >
+        {/if}
+        <a class="edit-start" href="{data.doc.path}/history">Verlauf</a>
       </p>
     {/if}
 
@@ -286,6 +295,11 @@
      would otherwise put a full --space-6 between two rows of chrome. */
   .editbar {
     margin-block-start: var(--space-3);
+    /* Two controls now, and a flex row rather than inline text so the gap between them is
+       stated rather than inherited from a newline in the markup. */
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
   }
 
   .edit-start {
