@@ -15,7 +15,20 @@
 <script lang="ts">
   import type { Backlink } from '$lib/api';
 
-  let { backlinks }: { backlinks: Backlink[] } = $props();
+  interface Props {
+    backlinks: Backlink[];
+    /**
+     * What a page's entry links to, when that is not simply the page's path.
+     *
+     * The reader page passes one so a link here keeps the open workspace: following it
+     * navigates the ACTIVE tab instead of collapsing the strip to one. Optional and the
+     * identity by default, so this component is unchanged wherever no workspace surrounds
+     * it — and so every test of it stays a test of plain page addresses.
+     */
+    hrefFor?: (path: string) => string;
+  }
+
+  let { backlinks, hrefFor }: Props = $props();
 </script>
 
 {#if backlinks.length > 0}
@@ -23,7 +36,7 @@
     <h2 id="gw-backlinks">Verweist hierher</h2>
     <ul>
       {#each backlinks as link (link.path)}
-        <li><a href={link.path}>{link.title}</a></li>
+        <li><a href={hrefFor ? hrefFor(link.path) : link.path}>{link.title}</a></li>
       {/each}
     </ul>
   </nav>

@@ -19,9 +19,23 @@
   import type { TreeNode } from '$lib/api';
   import { subpageCount } from '$lib/pagemeta';
 
-  /** Named `nodes` rather than `children`: in Svelte 5 `children` is the default snippet,
-      and a prop of that name is a collision waiting to be debugged by somebody else. */
-  let { nodes }: { nodes: TreeNode[] } = $props();
+  interface Props {
+    /** Named `nodes` rather than `children`: in Svelte 5 `children` is the default
+        snippet, and a prop of that name is a collision waiting to be debugged by
+        somebody else. */
+    nodes: TreeNode[];
+    /**
+     * What a page's entry links to, when that is not simply the page's path.
+     *
+     * The reader page passes one so a link here keeps the open workspace: following it
+     * navigates the ACTIVE tab instead of collapsing the strip to one. Optional and the
+     * identity by default, so this component is unchanged wherever no workspace surrounds
+     * it — and so every test of it stays a test of plain page addresses.
+     */
+    hrefFor?: (path: string) => string;
+  }
+
+  let { nodes, hrefFor }: Props = $props();
 </script>
 
 {#if nodes.length > 0}
@@ -30,7 +44,7 @@
     <ul>
       {#each nodes as child (child.path)}
         <li>
-          <a href={child.path}>{child.title}</a>
+          <a href={hrefFor ? hrefFor(child.path) : child.path}>{child.title}</a>
           <!-- The tree already knows how deep this goes, so saying it costs nothing and
                saves a click into a page whose only content is more pages. -->
           {#if child.children.length > 0}

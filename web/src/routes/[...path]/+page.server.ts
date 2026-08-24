@@ -1,5 +1,5 @@
 import { error } from '@sveltejs/kit';
-import { apiGet, parseBody, type Backlink, type StoredDocument, type TreeNode } from '$lib/api';
+import { apiGet, parseBody, type Backlink, type StoredDocument } from '$lib/api';
 import { boardPath, describeEmbeddedBoard, noticeFor, type BoardResponse } from '$lib/board';
 import type { PageServerLoad } from './$types';
 
@@ -13,8 +13,6 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
 
   if (status === 403) error(403, 'You do not have access to this page.');
   if (!data) error(404, 'Page not found.');
-
-  const { data: tree } = await apiGet<TreeNode[]>(fetch, '/api/tree', cookie);
 
   // Own endpoint, own prefix (`/api/links/backlinks/{*path}`, not a suffix under
   // `/api/documents`) — see `gw-api/src/routes/links.rs` for why. Already filtered to what
@@ -76,7 +74,10 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
   return {
     doc: data,
     body: parseBody(data),
-    tree: tree ?? [],
+    // The tree is NOT fetched here any more: the shell renders it on every view, so
+    // `+layout.server.ts` asks for it once and this page reads the same answer through the
+    // merged `data`. Two requests for one filtered tree was two chances for the breadcrumb
+    // and the sidebar to disagree about which pages exist.
     backlinks: backlinks?.backlinks ?? [],
     edit: url.searchParams.get('edit') === '1',
     board,

@@ -2,17 +2,38 @@
   import type { TreeNode } from '$lib/api';
   import Self from './Tree.svelte';
 
-  let { nodes, current }: { nodes: TreeNode[]; current?: string } = $props();
+  interface Props {
+    nodes: TreeNode[];
+    current?: string;
+    /**
+     * What address a page's entry links to, when that is not simply the page's path.
+     *
+     * The shell passes one so a tree link keeps the open workspace: following it navigates
+     * the ACTIVE tab rather than closing every other one. Optional, and the identity by
+     * default, so every other use of this component — and every existing test — is
+     * untouched, and so a tree rendered anywhere with no workspace around it stays exactly
+     * the list of plain page addresses it always was.
+     *
+     * `aria-current` still compares PATHS, never these addresses: which page you are on is
+     * a fact about the page, not about how the link to it was spelled.
+     */
+    hrefFor?: (path: string) => string;
+  }
+
+  let { nodes, current, hrefFor }: Props = $props();
 </script>
 
 {#if nodes.length}
   <ul>
     {#each nodes as node (node.path)}
       <li>
-        <a href={node.path} aria-current={node.path === current ? 'page' : undefined}>
+        <a
+          href={hrefFor ? hrefFor(node.path) : node.path}
+          aria-current={node.path === current ? 'page' : undefined}
+        >
           {node.title}
         </a>
-        <Self nodes={node.children} {current} />
+        <Self nodes={node.children} {current} {hrefFor} />
       </li>
     {/each}
   </ul>

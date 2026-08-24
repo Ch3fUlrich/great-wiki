@@ -39,6 +39,7 @@ function task(over: Partial<BoardTask> = {}): BoardTask {
     title: 'Kabel bestellen',
     status: 'Offen',
     assignee: null,
+    assignee_name: null,
     due_at: null,
     position: 0,
     anchored: true,
@@ -84,6 +85,12 @@ function html(options: Options = {}): string {
     props: {
       data: {
         me: options.me ?? signedIn,
+        // The shell's own data, merged in from the root layout: the page tree the
+        // sidebar draws, and the workspace the address named. This view reads none of it,
+        // but it is part of `PageData` and the type says so — the same reason `me` is here.
+        tree: [],
+        tabHrefs: [],
+        hier: '/aufgaben',
         board: options.board ?? board,
         projects: options.projects ?? projects,
         projekteFehler: options.projekteFehler ?? null,

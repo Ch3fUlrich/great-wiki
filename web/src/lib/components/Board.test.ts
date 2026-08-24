@@ -40,6 +40,7 @@ function task(over: Partial<BoardTask> = {}): BoardTask {
     title: 'Kabel bestellen',
     status: 'Offen',
     assignee: null,
+    assignee_name: null,
     due_at: null,
     position: 0,
     anchored: true,
@@ -174,9 +175,28 @@ describe('a card', () => {
   });
 
   it('names the person it rests on when there is one', () => {
-    const out = html({ tasks: [task({ assignee: 'pr-7' })] });
+    const out = html({ tasks: [task({ assignee: 'pr-7', assignee_name: 'Petra Reuter' })] });
+    expect(out).toContain('Zuständig');
+    expect(out).toContain('Petra Reuter');
+  });
+
+  it('falls back to the id when the viewer may not learn who that is', () => {
+    // `assignee_name` being null is NOT an error and NOT a missing account: it means this
+    // viewer may not be told who the person is — they may no longer read the page the card
+    // is governed by, or the account is suspended. The id is what the card carried before
+    // any name existed, and it stays, because a card that forgot its assignee would leave
+    // nothing for anybody to clear.
+    const out = html({ tasks: [task({ assignee: 'pr-7', assignee_name: null })] });
     expect(out).toContain('Zuständig');
     expect(out).toContain('pr-7');
+    // No invented stand-in. "Unbekannt" would be a claim about the account rather than
+    // about what this viewer may be told.
+    expect(out).not.toContain('Unbekannt');
+  });
+
+  it('says nothing at all about an assignee when the card rests on nobody', () => {
+    const out = html({ tasks: [task({ assignee: null, assignee_name: null })] });
+    expect(out).not.toContain('Zuständig');
   });
 });
 

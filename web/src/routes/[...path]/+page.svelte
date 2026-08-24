@@ -6,12 +6,31 @@
   import Breadcrumb from '$lib/components/Breadcrumb.svelte';
   import PageMeta from '$lib/components/PageMeta.svelte';
   import Subpages from '$lib/components/Subpages.svelte';
-  import Tree from '$lib/components/Tree.svelte';
   import { outline } from '$lib/blocks/render';
   import { breadcrumb, childrenOf } from '$lib/pagemeta';
+  import { navigateHref, resolveTabs } from '$lib/tabs';
 
   let { data } = $props();
   const headings = $derived(outline(data.body));
+
+  /**
+   * Where a link in this page's CHROME goes: the same workspace, with the active tab
+   * pointed at the new address.
+   *
+   * The chrome is the breadcrumb, the subpage list, the backlinks and the two controls
+   * above the article — every link this file puts on the page. The links inside the
+   * DOCUMENT are deliberately not touched: those are what somebody wrote, they are plain
+   * addresses, and rewriting them would be a lie about the text. Following one lands on an
+   * address with no workspace in it, which the shell restores from storage — see the
+   * effect in `+layout.svelte` for why that is the honest split rather than a gap.
+   *
+   * With one tab open this returns the address unchanged, so nothing about a wiki nobody
+   * has opened a second tab in looks any different.
+   */
+  const workspace = $derived(resolveTabs(data.tabHrefs ?? [], data.hier ?? data.doc.path));
+  function gehZu(target: string): string {
+    return navigateHref(target, workspace.hrefs, workspace.active);
+  }
 
   /**
    * Whether to offer editing at all, and why the answer is this crude.
@@ -77,11 +96,24 @@
 
 <svelte:head><title>{data.doc.title} — great-wiki</title></svelte:head>
 
-<div class="shell">
-  <nav class="sidebar no-print" aria-label="Seitenbaum">
-    <Tree nodes={data.tree} current={data.doc.path} />
-  </nav>
+<!--
+  Two columns, and the division between them is the whole layout decision.
 
+  LEFT: the document, and things that ARE the document — its title, the board of the
+  project homed here. The prose inside is still capped at the measure (`.prose` in
+  app.css), because a 200-character line on a wide monitor is genuinely harder to read;
+  the COLUMN is not capped, so a table or a board can use the room the screen actually
+  has. That is the difference between filling a screen and stretching text across it.
+
+  RIGHT: things that are true ABOUT the document — where it sits, who may read it, what
+  is under it, what points at it, what is in it. Every one of these used to be stacked
+  underneath the prose, which put "Verweist hierher" below however many thousand words
+  the page happened to contain. Beside it, they are visible at the moment they are useful.
+
+  The page tree is in neither: the shell draws it now, on every view rather than only on a
+  document. See `+layout.svelte`.
+-->
+<div class="ansicht">
   <!-- `.prose` moved off `<main>` and onto the article, and `lang` with it. Both were
        right while `<main>` held nothing but the document, and both became wrong the
        moment it grew chrome around one.
@@ -98,13 +130,8 @@
        announced "Sichtbarkeit" with English phonemes; the document's language belongs on
        the document. -->
   <main id="content" class="page">
-    <Breadcrumb {crumbs} />
+    <Breadcrumb {crumbs} hrefFor={gehZu} />
     <h1>{data.doc.title}</h1>
-    <PageMeta
-      visibility={data.doc.visibility}
-      language={data.doc.language}
-      docType={data.doc.doc_type}
-    />
 
     <!-- Bearbeiten is offered only to somebody signed in, and it is a LINK: before hydration
          it navigates to `?edit=1`, which renders the same page with the editor asked for. A
@@ -120,14 +147,14 @@
         {#if mayOfferEditing}
           <a
             class="edit-start"
-            href="?edit=1"
+            href={gehZu(`${data.doc.path}?edit=1`)}
             onclick={(event) => {
               event.preventDefault();
               toggled = true;
             }}>Bearbeiten</a
           >
         {/if}
-        <a class="edit-start" href="{data.doc.path}/history">Verlauf</a>
+        <a class="edit-start" href={gehZu(`${data.doc.path}/history`)}>Verlauf</a>
       </p>
     {/if}
 
@@ -206,61 +233,129 @@
       <p class="tafel-fehler" role="alert">{data.boardFehler}</p>
     {/if}
 
-    <Subpages nodes={subpages} />
-    <Backlinks backlinks={data.backlinks} />
   </main>
 
-  {#if headings.length > 1}
-    <nav class="outline no-print" aria-label="Auf dieser Seite">
-      <p class="outline-title">Auf dieser Seite</p>
-      <ul>
-        {#each headings as h (h.id)}
-          <li style:padding-inline-start={`${(h.level - 2) * 0.7}rem`}>
-            <a href={`#${h.id}`}>{h.text}</a>
-          </li>
-        {/each}
-      </ul>
-    </nav>
-  {/if}
+  <!-- A plain `<div>`, not an `<aside>`. Everything in it is already its own landmark with
+       its own name — the outline is a `nav`, the metadata panel is a labelled `aside`, the
+       subpage list and the backlinks are labelled `nav`s — and wrapping four named
+       landmarks in a fifth adds a level to walk through and no information at all.
+
+       The outline comes first because it is about the document you are reading right now;
+       the rest are about the document's place in the wiki, and you want those when you are
+       finished with it. -->
+  <div class="kontext no-print">
+    {#if headings.length > 1}
+      <nav class="outline" aria-label="Auf dieser Seite">
+        <p class="kontext-titel">Auf dieser Seite</p>
+        <ul>
+          {#each headings as h (h.id)}
+            <li style:padding-inline-start={`${(h.level - 2) * 0.7}rem`}>
+              <a href={`#${h.id}`}>{h.text}</a>
+            </li>
+          {/each}
+        </ul>
+      </nav>
+    {/if}
+
+    <PageMeta
+      visibility={data.doc.visibility}
+      language={data.doc.language}
+      docType={data.doc.doc_type}
+    />
+
+    <Subpages nodes={subpages} hrefFor={gehZu} />
+    <Backlinks backlinks={data.backlinks} hrefFor={gehZu} />
+  </div>
 </div>
 
 <style>
-  .shell {
+  .ansicht {
     display: grid;
     gap: var(--space-8) var(--space-12);
     padding: var(--space-8) var(--space-6);
-    /* The centre column is sized to the measure rather than to leftover space.
-       With `1fr` the column stretched to the viewport while the text inside stayed
-       capped at 68 characters, so on a wide screen the prose hugged the left edge
-       with a band of dead space beside it — which reads as a bug, because it is one. */
-    grid-template-columns:
-      minmax(11rem, 15rem)
-      minmax(0, var(--measure))
-      minmax(9rem, 13rem);
-    justify-content: center;
-    max-width: 100rem;
-    margin-inline: auto;
-    align-items: start;
+    /* The reading column takes the room that is there; the PROSE inside it is what stays
+       capped, by `.prose` in app.css. That distinction is the whole point: the column had
+       to be `minmax(0, var(--measure))` while the tree and the outline were in this grid
+       and the whole thing was centred in the viewport, and it meant a table or a board was
+       squeezed to 58 characters too. The shell owns the frame now, so this can stop
+       pretending to be one. */
+    grid-template-columns: minmax(0, 1fr) minmax(0, 19rem);
+    /* Deliberately NOT `align-items: start`. The context column has to be as tall as the
+       row for the outline inside it to stick for the whole of a long document — a sticky
+       element only travels within its own containing block, and a column sized to its
+       contents gives it a few hundred pixels to travel in. Both columns stretch; the
+       content inside each still starts at the top. */
   }
 
-  /* Both side columns stick, so navigation stays reachable in a long document.
-     Offset by the sticky header's height so nothing hides underneath it. */
-  .sidebar,
-  .outline {
-    position: sticky;
-    top: calc(var(--space-12) + var(--space-2));
-    max-block-size: calc(100vh - var(--space-12) * 2);
-    overflow-y: auto;
+  /* The reading column is a query container so that something genuinely wide — a table —
+     can ask for the column's width rather than the prose's. `100cqi` below is that ask,
+     and it is the one way a child escapes its parent's `max-width` without negative
+     margins or a second grid inside the article. */
+  .page {
+    container-type: inline-size;
+    min-inline-size: 0;
+  }
+
+  /* The one exception to the reading measure, and the reason it is stated here rather than
+     in `.prose` itself: a table is data, not a sentence. Widening `.prose` would widen the
+     paragraphs with it, and turning `.prose` into a grid would apply grid layout to the
+     EDITOR's surface too — `Editor.svelte` puts `.prose` on the contenteditable element,
+     and re-laying-out a ProseMirror document is not a change to make blind.
+
+     The table still scrolls inside its own box (`TableView.css`), so this widens the box
+     and never the page: a document that scrolls sideways is unreadable, which is what that
+     box exists to prevent. */
+  .page :global(article.prose > .gw-tbl) {
+    inline-size: 100cqi;
+    max-inline-size: 100cqi;
+    /* Recentred on the reading rail's own axis. The rail is centred in the column (see
+       below), so a child that is `100cqi` wide would otherwise start at the rail's left
+       edge and hang off the right of the column. Half the difference, negative, puts the
+       two on one centre line — and resolves to zero on a narrow screen, where the rail is
+       already as wide as the column. */
+    margin-inline-start: calc((100% - 100cqi) / 2);
+  }
+
+  /* The column of facts about the page.
+     NOT sticky itself, and that is a correction rather than an omission: it was, capped at
+     `max-block-size: 100%`, and a percentage there resolves against the grid ROW — so on a
+     page with a long list of backlinks the column could be taller than the screen, stick at
+     the top, and put its own bottom permanently out of reach. Only the outline sticks now
+     (below), which is the part that is short by nature and the part you actually want to
+     keep. */
+  .kontext {
+    min-inline-size: 0;
     font-size: var(--text-sm);
+    /* `gap` rather than `> * + *`: three of the four children are components whose roots
+       Svelte's CSS pruning cannot see through, and the sibling rule was dropped as unused.
+       A gap is also simply right here — a panel that renders nothing (no subpages, no
+       backlinks; the common case) then contributes no space either, where a margin on the
+       next sibling would have been the wrong one to blame. */
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-6);
   }
 
-  .outline-title {
+  .kontext-titel {
     margin-block-end: var(--space-2);
     color: var(--ink-faint);
     font-size: var(--text-xs);
     font-weight: 650;
     text-transform: uppercase;
     letter-spacing: 0.06em;
+  }
+
+  /* The outline alone travels with the reader. Capped in viewport units rather than in
+     percent, for the reason above — and approximate on purpose: it is a cap, nothing is
+     laid out against it, and the chrome it is subtracting is a header whose height depends
+     on how far the preferences have wrapped. The same approximation this file has always
+     made about its sticky columns. */
+  .outline {
+    position: sticky;
+    top: 0;
+    max-block-size: calc(100dvh - var(--space-12) * 2);
+    overflow-y: auto;
+    overscroll-behavior: contain;
   }
 
   .outline ul {
@@ -316,13 +411,29 @@
     text-wrap: balance;
   }
 
-  .page > :global(.subpages) {
-    margin-block-start: var(--space-12);
+  /* The reading rail: the parts of this column that are SENTENCES, held to the measure so
+     that a wide screen widens the room rather than the lines. The board below is
+     deliberately not in this list — a three-column board squeezed into 58 characters was
+     the layout bug this whole change is about. */
+  .page > :global(.crumbs),
+  .page > h1,
+  .page > .editbar,
+  .page > .editor-loading,
+  .page > .tafel-fehler,
+  .page > :global(article.prose) {
+    max-inline-size: var(--measure);
+    /* CENTRED in the column, not flush left. This file already recorded the reason, about
+       the layout that came before this one: prose capped at the measure inside a column
+       sized to the viewport "hugged the left edge with a band of dead space beside it —
+       which reads as a bug, because it is one". The rail is centred and the wide things —
+       a board, a table — span the whole column around the same axis, which is what makes
+       one line down the middle of the view instead of two ragged edges. */
+    margin-inline: auto;
   }
 
-  /* Tight to the metadata panel above it rather than a block of its own: it is a thing you
-     can do to this page, like the panel is a thing that is true of it. `.page > * + *`
-     would otherwise put a full --space-6 between two rows of chrome. */
+  /* Tight to the title above it rather than a block of its own: it is a thing you can do
+     to this page. `.page > * + *` would otherwise put a full --space-6 between two rows of
+     chrome. */
   .editbar {
     margin-block-start: var(--space-3);
     /* Two controls now, and a flex row rather than inline text so the gap between them is
@@ -362,35 +473,51 @@
     max-width: var(--measure);
   }
 
-  /* One column below 64rem.
-     Ordering matters more than it looks. Putting both navigations above the text
-     means scrolling past two blocks of links to reach the article — on a phone that
-     is most of a screen of nothing you came for. So: the outline first, because it
-     is short and is the fastest way through a long document; then the article; then
-     the site tree, which you only want when you are leaving this page anyway. */
+  /* One column below 64rem, and the context column moves BELOW the document rather than
+     above it. That is a deliberate change from what this file used to do: the outline used
+     to be hoisted above the article on a narrow screen, on the reasoning that it is the
+     fastest way through a long document. It shares a column with three other panels now,
+     and hoisting the whole group would put the metadata, the subpages and the backlinks
+     between the title and the first sentence — most of a phone screen of things you did
+     not come for. The outline alone was worth the hoist; the group is not. */
   @media (max-width: 64rem) {
-    .shell {
+    .ansicht {
       grid-template-columns: minmax(0, 1fr);
       gap: var(--space-6);
       padding: var(--space-6) var(--space-4);
     }
 
-    .sidebar,
+    .kontext {
+      padding-block-start: var(--space-6);
+      border-block-start: 1px solid var(--border);
+    }
+
+    /* Nothing sticks on a phone: the page itself is the scrollport there, and an outline
+       pinned to the top of it would sit on the text. */
     .outline {
       position: static;
       max-block-size: none;
+      overflow: visible;
+    }
+  }
+
+  /* Printing is the document, not the room it was read in. The context column is already
+     `.no-print`; this is the grid that would otherwise leave a column's worth of blank
+     paper down the right-hand side of every page. */
+  @media print {
+    .ansicht {
+      display: block;
+      padding: 0;
     }
 
-    .outline {
-      order: -1;
-      padding-block-end: var(--space-4);
-      border-block-end: 1px solid var(--border);
-    }
-
-    .sidebar {
-      order: 1;
-      padding-block-start: var(--space-6);
-      border-block-start: 1px solid var(--border);
+    /* app.css's print block lifts the measure off `.prose` — on paper the column width is
+       the paper, and there is no screen to be too wide for. That rule is unlayered but its
+       specificity is one class; the centring rule above is scoped by Svelte and outranks
+       it, so the cap has to be lifted here too or a printed page would keep a 58-character
+       column with white paper either side of it. */
+    .page > :global(article.prose) {
+      max-inline-size: none;
+      margin-inline: 0;
     }
   }
 </style>

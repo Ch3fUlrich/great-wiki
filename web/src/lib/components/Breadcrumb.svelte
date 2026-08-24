@@ -20,15 +20,30 @@
 <script lang="ts">
   import type { Crumb } from '$lib/pagemeta';
 
-  let { crumbs }: { crumbs: Crumb[] } = $props();
+  interface Props {
+    crumbs: Crumb[];
+    /**
+     * What a crumb links to, when that is not simply the page's path.
+     *
+     * The reader page passes one so a crumb keeps the open workspace: following it
+     * navigates the ACTIVE tab instead of collapsing the strip to one. Optional and the
+     * identity by default, so this component is unchanged wherever no workspace surrounds
+     * it — and so every test of it stays a test of plain page addresses.
+     */
+    hrefFor?: (path: string) => string;
+  }
+
+  let { crumbs, hrefFor }: Props = $props();
+
+  const at = (path: string) => (hrefFor ? hrefFor(path) : path);
 </script>
 
 <nav class="crumbs" aria-label="Pfad">
   <ol>
-    <li><a href="/">Start</a></li>
+    <li><a href={at('/')}>Start</a></li>
     {#each crumbs as crumb, i (crumb.path)}
       <li>
-        <a href={crumb.path} aria-current={i === crumbs.length - 1 ? 'page' : undefined}>
+        <a href={at(crumb.path)} aria-current={i === crumbs.length - 1 ? 'page' : undefined}>
           {crumb.title}
         </a>
       </li>

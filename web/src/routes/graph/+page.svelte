@@ -166,8 +166,6 @@
   @layer components {
     main {
       padding: var(--space-6);
-      max-width: 72rem;
-      margin-inline: auto;
     }
 
     h1 {
@@ -225,8 +223,17 @@
       max-width: var(--measure);
     }
 
+    /* THE ONE VIEW THAT IS NOT WIDENED, and it is deliberate. `$lib/graph/layout` fixes
+       the viewBox at 1100 units precisely so that one unit is about one CSS pixel in a
+       72rem column — that is what makes the 13px labels 13px on screen. Letting the
+       drawing stretch to a 3440px monitor would scale every label with it and make the
+       picture proportionally taller, which is not "more graph", it is the same graph
+       further away. The heading, the lede and the filter above fill the view like every
+       other one; the drawing keeps its scale and centres in the room. */
     figure {
       margin: 0;
+      max-inline-size: 72rem;
+      margin-inline: auto;
     }
 
     svg {

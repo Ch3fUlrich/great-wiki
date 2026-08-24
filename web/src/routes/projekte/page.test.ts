@@ -59,6 +59,12 @@ function html(options: Options = {}): string {
     props: {
       data: {
         me: options.me ?? signedIn,
+        // The shell's own data, merged in from the root layout: the page tree the
+        // sidebar draws, and the workspace the address named. This view reads none of it,
+        // but it is part of `PageData` and the type says so — the same reason `me` is here.
+        tree: [],
+        tabHrefs: [],
+        hier: '/projekte',
         projects: options.list ?? projects,
         error: options.error ?? null,
         confirming: options.confirming ?? null,

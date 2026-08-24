@@ -83,9 +83,11 @@
 </main>
 
 <style>
+  /* No max-width and no centring any more. A board is not prose: three columns of cards
+     held to 78rem on a wide monitor left most of the screen empty and every card narrower
+     than it needed to be. The lede and the notices below are still capped at the measure —
+     those ARE sentences. */
   .page {
-    max-width: 78rem;
-    margin-inline: auto;
     padding: var(--space-8) var(--space-6);
   }
 

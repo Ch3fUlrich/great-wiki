@@ -23,7 +23,18 @@ function html(graph: Graph, extra: { root?: string | null; error?: string | null
     // `me` comes from the root layout's load and this page does not read it, but it is part
     // of `PageData` and the type says so.
     props: {
-      data: { me: ANONYMOUS, graph, root: extra.root ?? null, error: extra.error ?? null }
+      data: {
+        me: ANONYMOUS,
+        // The shell's own data, merged in from the root layout: the page tree the
+        // sidebar draws, and the workspace the address named. This view reads none of it,
+        // but it is part of `PageData` and the type says so — the same reason `me` is here.
+        tree: [],
+        tabHrefs: [],
+        hier: '/graph',
+        graph,
+        root: extra.root ?? null,
+        error: extra.error ?? null
+      }
     }
   }).body.replace(/<!--.*?-->/g, '');
 }

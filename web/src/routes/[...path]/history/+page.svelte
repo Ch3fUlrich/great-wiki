@@ -367,9 +367,9 @@
 </main>
 
 <style>
+  /* The revision list and the design diff are tables, and a diff read in a 68rem column
+     wraps where it should not. The lede, the hints and the notices stay at the measure. */
   .page {
-    max-width: 68rem;
-    margin-inline: auto;
     padding: var(--space-8) var(--space-6);
   }
 

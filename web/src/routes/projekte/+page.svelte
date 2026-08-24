@@ -203,9 +203,9 @@
 </main>
 
 <style>
+  /* The list is a table, and a table wants the room. The lede, the hint and every notice
+     below stay capped at the measure, because those are sentences. */
   .page {
-    max-width: 68rem;
-    margin-inline: auto;
     padding: var(--space-8) var(--space-6);
   }
 

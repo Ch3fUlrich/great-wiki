@@ -77,8 +77,19 @@ export interface BoardTask {
   id: string;
   title: string;
   status: TaskStatus;
-  /** The principal this card rests on, **by id**. The API resolves no display name. */
+  /** The principal this card rests on, **by id**. Always present when somebody has it. */
   assignee: string | null;
+  /**
+   * That principal's display name, when this caller may be told it.
+   *
+   * **`null` beside a set `assignee` is not an error and not a missing account.** It means
+   * the name is not this viewer's to learn — the account may no longer read the page the
+   * card is governed by, or may be suspended — and the id stays as the fallback, because
+   * the id is what the card carried before any name existed and is what somebody would use
+   * to clear it. Never a stand-in like "Unbekannt": that would be a claim about the
+   * account, when the only fact available is about what this viewer may be told.
+   */
+  assignee_name: string | null;
   due_at: string | null;
   position: number;
   anchored: boolean;

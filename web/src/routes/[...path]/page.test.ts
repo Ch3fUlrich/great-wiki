@@ -91,6 +91,10 @@ function html(
     props: {
       data: {
         me,
+        // From the root layout, like `me`: the workspace the address named. This view
+        // renders no strip of its own — the shell does — but it is part of `PageData`.
+        tabHrefs: [],
+        hier: doc.path,
         doc,
         body,
         tree,
@@ -116,6 +120,7 @@ function boardFor(over: Partial<BoardTask> = {}): BoardResponse {
     title: 'Kabel bestellen',
     status: 'Offen',
     assignee: null,
+    assignee_name: null,
     due_at: null,
     position: 0,
     anchored: true,
@@ -245,7 +250,12 @@ describe('offering the editor', () => {
     // as long as the JavaScript takes to arrive.
     const out = html(container, { me: signedIn });
     expect(out).toContain('Bearbeiten');
-    expect(out).toMatch(/<a[^>]*href="\?edit=1"/);
+    // Absolute rather than the bare `?edit=1` it used to be, for the reason
+    // `history/+page.svelte` gives about its own links: a link is then the same string
+    // wherever it is rendered. It has to be absolute here anyway — the workspace is
+    // appended to it, and appending a tab set to a relative query string would produce an
+    // address that means something different depending on where the browser thinks it is.
+    expect(out).toMatch(/<a[^>]*href="\/rundgang\/import-export\?edit=1"/);
   });
 
   it('is honest that the offer is not the answer', () => {
@@ -334,5 +344,45 @@ describe('the board embedded in a project home page', () => {
     expect(out).toContain('Falls zu dieser Seite');
     expect(out).toMatch(/role="alert"/);
     expect(out).not.toContain('>Offen<');
+  });
+});
+
+/**
+ * The reader page inside the workspace shell.
+ *
+ * The shell (`+layout.svelte`) now owns the page tree and the tab strip, so this view owns
+ * exactly two things: the reading column, and the column of facts about the page beside
+ * it. What is pinned here is the division — anything this file draws that the shell also
+ * draws is a duplicate landmark and a second answer to the same question.
+ */
+describe('the reader page, as a view inside the shell', () => {
+  it('draws no page tree of its own: the shell has one, on every view', () => {
+    // Two `nav[aria-label="Seitenbaum"]` on one page is two landmarks with one name, and
+    // the second copy of a filtered tree is a second thing that can be wrong about it.
+    expect(html()).not.toContain('Seitenbaum');
+  });
+
+  it('puts what is true ABOUT the page beside it rather than stacked under it', () => {
+    const out = html(container, { backlinks: [{ path: '/rundgang', title: 'Rundgang' }] });
+    const kontext = out.match(/<div class="[^"]*kontext[\s\S]*$/)?.[0] ?? '';
+    expect(kontext).toContain('Angaben zu dieser Seite');
+    expect(kontext).toContain('Unterseiten');
+    expect(kontext).toContain('Verweist hierher');
+  });
+
+  it('keeps the document itself, and the board, in the reading column', () => {
+    const out = html(container, { board: boardFor() });
+    const main = out.match(/<main[\s\S]*?<\/main>/)?.[0] ?? '';
+    expect(main).toMatch(/<article[^>]*class="prose/);
+    expect(main).toContain('Kabel bestellen');
+  });
+
+  it('still carries everything in the first response, wherever it now sits', () => {
+    const out = html(container, { backlinks: [{ path: '/rundgang', title: 'Rundgang' }] });
+    expect(out).not.toContain('<script');
+    expect(out).toMatch(/aria-label="Pfad"/);
+    expect(out).toMatch(/aria-label="Angaben zu dieser Seite"/);
+    expect(out).toMatch(/aria-labelledby="gw-subpages"/);
+    expect(out).toMatch(/aria-labelledby="gw-backlinks"/);
   });
 });

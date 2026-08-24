@@ -48,6 +48,7 @@ function task(over: Partial<BoardTask> = {}): BoardTask {
     title: 'Kabel bestellen',
     status: 'Offen',
     assignee: null,
+    assignee_name: null,
     due_at: null,
     position: 0,
     anchored: true,

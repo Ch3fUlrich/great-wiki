@@ -201,10 +201,23 @@
                   {/if}
 
                   {#if task.assignee}
-                    <!-- The API answers an id and resolves no display name, deliberately: it
-                         would be a lookup per card. Shown as the id rather than dropped,
-                         because "somebody has this" is the fact that matters on a board. -->
-                    <p class="wer">Zuständig: <code>{task.assignee}</code></p>
+                    <!-- The name when the API resolved one, the id when it did not — and the
+                         id is not a failure state. `assignee_name` is null when this viewer
+                         may not be told who the person is (they may no longer read the page
+                         this card is governed by, or the account is suspended), and the id is
+                         what the card carried before names existed. Dropping the row, or
+                         printing "Unbekannt" in it, would both destroy the one fact that
+                         matters on a board — that somebody has this — and leave nothing for
+                         anybody to clear. The `<code>` is kept for the id, because an id is a
+                         handle you type somewhere; a name is not. -->
+                    <p class="wer">
+                      Zuständig:
+                      {#if task.assignee_name}
+                        {task.assignee_name}
+                      {:else}
+                        <code>{task.assignee}</code>
+                      {/if}
+                    </p>
                   {/if}
 
                   {#if task.detached}
