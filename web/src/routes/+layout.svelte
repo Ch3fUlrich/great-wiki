@@ -25,9 +25,13 @@
 
 <header class="no-print">
   <!-- The brand and the views that are about the whole wiki rather than one page. The graph
-       is here rather than on a page because that is what it is: every page at once. -->
+       is here rather than on a page because that is what it is: every page at once. Projects
+       are here for the same reason and for one more: D-13 put the list of projects on a page
+       of its own precisely so that "what projects exist" has somewhere to be asked, and a
+       page nothing links to is a page nobody finds. -->
   <nav class="brand-group" aria-label="Hauptbereiche">
     <a class="brand" href="/">great&#8209;wiki</a>
+    <a class="section" href="/projekte">Projekte</a>
     <a class="section" href="/graph">Graph</a>
   </nav>
   <!-- Two reading preferences, side by side, because they are the same kind of thing.

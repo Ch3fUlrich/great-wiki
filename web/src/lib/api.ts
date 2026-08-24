@@ -171,6 +171,74 @@ export async function apiGet<T>(
   return { status: res.status, data: (await res.json()) as T };
 }
 
+/**
+ * What a refused write said about itself.
+ *
+ * `gw_api::error::ApiError` renders every refusal as `{"error": "…"}`, and dropping that
+ * string is how a 409 that names a way out becomes a bare "Fehler". Callers that have their
+ * own wording for a status ignore it; callers that do not append it rather than lose it.
+ */
+export interface ApiFailure {
+  status: number;
+  message: string | null;
+}
+
+/**
+ * The writing half of {@link apiGet}: a server-side POST, PATCH or DELETE, carrying the same
+ * cookie and the same proxy attestation.
+ *
+ * It shares `base()` and `proxySecret()` with `apiGet` deliberately and must go on doing so.
+ * A second spelling of the attestation is precisely the defect `api.test.ts` was written
+ * about — every server-side call refused with 403, every page rendering as "nobody signed
+ * in", and nothing in any log a reader would see to say why.
+ *
+ * Used from **form actions**, where it is the whole point: a form that posts to the server
+ * works before hydration, and the browser's own submission is what carries the cookie.
+ */
+export async function apiSend<T>(
+  fetchFn: typeof fetch,
+  method: 'POST' | 'PATCH' | 'DELETE',
+  path: string,
+  cookie: string | null,
+  body?: unknown
+): Promise<{ status: number; data: T | null; failure: ApiFailure | null }> {
+  const headers: Record<string, string> = {};
+  if (cookie) headers.cookie = cookie;
+  const secret = proxySecret();
+  if (secret) headers['X-GW-Proxy'] = secret;
+  if (body !== undefined) headers['content-type'] = 'application/json';
+
+  let res: Response;
+  try {
+    res = await fetchFn(`${base()}${path}`, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body)
+    });
+  } catch {
+    // Status 0 is "no answer at all" — offline, DNS, a dead proxy. Kept apart from 5xx
+    // because "not reachable" and "answered with 500" send somebody to different places,
+    // the same split `$lib/adminApi` makes.
+    return { status: 0, data: null, failure: { status: 0, message: null } };
+  }
+
+  const text = await res.text();
+  if (!res.ok) {
+    let message: string | null = null;
+    try {
+      message = (JSON.parse(text) as { error?: string }).error ?? null;
+    } catch {
+      // A refusal that is not JSON says nothing this can use, and inventing one would be
+      // worse than the status code on its own.
+    }
+    return { status: res.status, data: null, failure: { status: res.status, message } };
+  }
+
+  // A 204 and an empty body are both legitimate for a DELETE.
+  const data = text ? (JSON.parse(text) as T) : null;
+  return { status: res.status, data, failure: null };
+}
+
 export function parseBody(doc: StoredDocument): Block {
   return JSON.parse(doc.body) as Block;
 }
