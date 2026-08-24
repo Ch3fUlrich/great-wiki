@@ -76,20 +76,46 @@ cargo run -p gw-api -- seed --content content-example    # loads content; exits 
 Every task ends green on all of the above before it is committed. A task that cannot end
 green is not finished — say so rather than moving on.
 
-**If you verified in an isolated worktree, delete its target directory when you are done.**
-A separate `CARGO_TARGET_DIR` costs **5–6 GB**, it is not cleaned up by anything, and it does
-not live in the repo where anyone would look for it. Three of them plus Docker's build cache
-took this machine from 100 GB to **1.4 GB free** on 2026-08-24, and nothing reported it — it
-surfaced only because an unrelated 2 GB pull would not fit. The failure that was coming next
-is a build dying with an error that says nothing about disk. So:
+**Building in a worktree? Run `just agent-ci`, not `just ci`.** It is the same gate, pointed
+at the main checkout's target directory with incremental off — not as an optimisation, but as
+the thing that stops this filling the disk. If you need the exports by hand:
 
 ```bash
-rm -rf <your scratchpad>/*target*
-git worktree remove <path> --force && git worktree prune
-docker builder prune -f        # only if you built an image
+export CARGO_TARGET_DIR="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/target"
+export CARGO_INCREMENTAL=0
 ```
 
-`crates/target` in the repo is legitimately ~25 GB and must **not** be deleted while anything
+`--git-common-dir` resolves to the MAIN checkout's `.git` even from a worktree, so nothing is
+hardcoded per machine.
+
+A worktree that builds into its own target costs **5–6 GB**, nothing cleans it up, and it
+lives in the session scratchpad rather than in the repo where anyone would look. Three of
+them, plus a 9.6 GB incremental cache and Docker's build layers, took this machine from
+100 GB to **1.4 GB free** on 2026-08-24. Nothing reported it: it surfaced only because an
+unrelated 2 GB image pull would not fit, and the next symptom would have been a build dying
+with an error that says nothing about disk.
+
+Sharing the directory has a second effect worth knowing, and it is a feature here: cargo
+locks it, so two agents cannot build at once. They serialise instead of duplicating — which
+is already the rule `scripts/mutate.sh` enforces for its own reasons. The cost is that a
+worktree at a *different commit* invalidates artifacts the other one just built, so keep
+worktrees at or near `HEAD`; if you genuinely need an old commit, take the 6 GB deliberately
+and delete it afterwards.
+
+`CARGO_INCREMENTAL=0` is set for agent builds only, not committed to `.cargo/config.toml`:
+incremental is what makes an interactive edit-rebuild loop fast, and a person working in this
+repo should keep it. An agent runs a handful of full builds and never benefits from it.
+
+If a target directory has already been left behind:
+
+```bash
+rm -rf <scratchpad>/*target*
+git worktree remove <path> --force && git worktree prune
+docker builder prune -f        # only if you built an image
+rm -rf target/debug/incremental # safe any time nothing is building; it is pure cache
+```
+
+The repo's own `target/` is legitimately ~15–25 GB and must **not** be deleted while anything
 is building. `df -h /` before you conclude a strange failure is something cleverer.
 
 ## Hard rules

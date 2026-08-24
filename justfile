@@ -222,6 +222,40 @@ mutate:
 # The full gate. Every task must end with this passing.
 ci: lint test build
 
+# The full gate, from a git worktree, WITHOUT duplicating the target directory.
+#
+# A worktree that builds into its own target costs 5-6 GB and nothing cleans it up. Three of
+# them, an incremental cache and Docker's layers took this machine from 100 GB to 1.4 GB free
+# on 2026-08-24, and nothing reported it — it surfaced because an unrelated image pull would
+# not fit, and the next symptom would have been a build failing with an error that says
+# nothing about disk.
+#
+# `--git-common-dir` is what makes this portable: from a worktree it resolves to the MAIN
+# checkout's `.git`, so its parent is the one target directory every worktree should share.
+# No path is hardcoded and nothing needs configuring per machine.
+#
+# Cargo locks that directory, so two agents cannot build at once. That is a feature here —
+# they serialise instead of duplicating, which is already the rule `scripts/mutate.sh`
+# enforces. The cost: a worktree at a DIFFERENT commit invalidates artifacts the other just
+# built, so keep worktrees at or near HEAD. If you truly need an old commit, take the 6 GB
+# deliberately and delete it afterwards.
+#
+# Incremental is off because an agent runs a handful of full builds and never benefits from
+# it. It stays ON for people — that is what makes an interactive edit-rebuild loop fast — which
+# is why this lives here and not in a committed `.cargo/config.toml`.
+#
+# The full gate from a worktree, sharing the main checkout's target directory.
+agent-ci:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    main="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
+    export CARGO_TARGET_DIR="$main/target"
+    export CARGO_INCREMENTAL=0
+    echo "building into $CARGO_TARGET_DIR (shared; incremental off)"
+    just lint
+    just test
+    just build
+
 # Rebuild the Graphify CODE graph. Seconds, no key, no network.
 # --user is REQUIRED: without it the container writes root-owned files that the next
 # rebuild cannot overwrite.
