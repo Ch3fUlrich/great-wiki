@@ -195,11 +195,12 @@ describe('a card you may see but not move', () => {
   });
 
   it('honours an explicit refusal from the API over the offer', () => {
-    // `movable: false` is not on the committed wire. It is honoured if it ever arrives, so
-    // that the per-card read-only marking has one place to become true rather than a new
-    // one; until then the offer can be false and the move itself cannot.
-    expect(readOnly(task({ movable: false }), signedIn)).toBe('schreibrecht');
-    expect(readOnly(task({ movable: true }), signedIn)).toBeNull();
+    // `may_write` is the same verdict that decided this card could be seen at all — the
+    // store asks `permits` for the read and for Write off one resolution of the row and its
+    // grants. So a card marked movable here and a move the API refuses cannot come apart,
+    // and the API's answer is believed over the offer.
+    expect(readOnly(task({ may_write: false }), signedIn)).toBe('schreibrecht');
+    expect(readOnly(task({ may_write: true }), signedIn)).toBeNull();
   });
 
   it('says why in words, both ways', () => {

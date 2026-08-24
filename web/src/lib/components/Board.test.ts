@@ -239,7 +239,7 @@ describe('a card you may see but not move', () => {
     // Per card, not per board: the day the endpoint answers "may I write this", one card
     // being read-only must not take the board's controls away from the rest.
     const out = html({
-      tasks: [task({ id: 'a', title: 'Gesperrt', movable: false }), task({ id: 'b', title: 'Frei' })]
+      tasks: [task({ id: 'a', title: 'Gesperrt', may_write: false }), task({ id: 'b', title: 'Frei' })]
     });
     expect(out).toContain('Gesperrt');
     expect(out).toContain('Nur lesbar');

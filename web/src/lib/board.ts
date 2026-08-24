@@ -99,15 +99,17 @@ export interface BoardTask {
   created_at: string;
   updated_at: string;
   /**
-   * Whether the caller may move this card — **not on the committed wire.**
+   * Whether the caller may write the page that governs this card, and therefore move it.
    *
-   * There is no field on `/api/board` today that says "may I write the page that governs
-   * this card", the same one bit `[...path]/+page.svelte` and `/projekte` both record as
-   * missing. It is declared here, optional, so that the per-card read-only marking has one
-   * place to become true the day the endpoint answers it, rather than a new one. Absent, the
-   * offer is made to whoever is signed in and the true answer arrives when it is used.
+   * The same `may_write` a document and a project carry, from the same verdict: the store
+   * asks `permits` for the caller's action and for `Action::Write` off one resolution of the
+   * row and its grants, so this cannot disagree with the refusal a move would actually get.
+   *
+   * Optional because a response from an older API has no such field. Absent, the offer is
+   * made to whoever is signed in and the true answer arrives when it is used — which is how
+   * every card behaved before the wire could say.
    */
-  movable?: boolean;
+  may_write?: boolean;
 }
 
 /** One of D-9's three columns, as the API answers it. */
@@ -297,20 +299,18 @@ export type ReadOnlyReason = 'anmelden' | 'schreibrecht';
  * on, so hiding the card would not hide anything, and a task that silently vanishes from a
  * board is the failure this whole design exists to prevent.
  *
- * The answer is as crude as the wire allows, and the crudeness is recorded rather than
- * hidden. Moving a card needs Write on the page that governs it; nothing on `/api/board`
- * says whether the caller has it, `/api/me` reports groups and a baseline, and D-M2-8 is
- * explicit that no baseline confers write. So: somebody who is not signed in cannot write
- * anything here (nothing in this deployment grants write to `anyone`) and every card is
- * marked read-only for them; for anybody else the control is offered and the true answer
- * arrives the moment it is used, as a sentence rather than a silent nothing. `movable`,
- * should the endpoint ever send it, is believed over the offer.
+ * The answer used to be as crude as the wire allowed: nothing said whether the caller could
+ * write the page a card rests on, so the control was offered to anybody signed in and the
+ * refusal arrived only after they pressed. `may_write` closes that. It comes from the same
+ * resolution of the row and its grants that decided the card could be *seen*, so a card
+ * marked movable here and a move refused by the API cannot come apart.
  *
- * It is the same arrangement — and the same missing bit — as the edit link on a page and the
- * create form on `/projekte`. The offer can be false; the move cannot.
+ * The signed-in check stays underneath it, and is not redundant: an older API sends no bit
+ * at all, and D-M2-8 is explicit that no baseline confers write, so nobody unauthenticated
+ * can move anything regardless of what a response does or does not say.
  */
 export function readOnly(task: BoardTask, me: Me | null | undefined): ReadOnlyReason | null {
-  if (task.movable === false) return 'schreibrecht';
+  if (task.may_write === false) return 'schreibrecht';
   if (me?.authenticated !== true) return 'anmelden';
   return null;
 }
