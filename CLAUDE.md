@@ -107,6 +107,14 @@ instructions insist on it, and writing without it produces queries that lint-fai
 corrupt data. Verify a write landed: `commits_list` head before and after; identical heads
 mean the write did not land, and a 504 does not mean failure.
 
+**There is no way to delete a single edge.** `delete <Edge> where …` and
+`delete <Edge> { from:, to: }` are both parse errors — the `.gq` dialect deletes nodes only.
+To remove one wrong edge, delete the node it hangs off (`delete Decision where slug = …`,
+which cascades to every edge touching it, and reports how many) and insert the node and its
+correct edges again. Deletes cannot share a mutation with inserts, so that is two calls.
+Worth knowing before writing an edge you are not sure about: getting one wrong costs a
+rebuild, not an undo.
+
 **If the tools are absent**, the bridge is not connected to this session — the containers can
 be healthy while the MCP server is not attached. `docker ps | grep omnigraph` tells them
 apart. MCP servers load at startup, so reconnecting means restarting Claude Code; record what
