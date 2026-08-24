@@ -8,6 +8,153 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- **Aufgaben**, at `/aufgaben` and in the header beside »Projekte« and »Graph«: every to-do
+  you may see, in three columns — **Offen, Läuft, Fertig** — narrowable to one project. The
+  columns are fixed and the same everywhere, so a card's column means the same thing on
+  whichever board you meet it. The same board also sits on a project's own home page, below
+  the page and above its subpages, because that is where you look when you are thinking about
+  that project, and being sent elsewhere to see its tasks breaks exactly that. The two are
+  **one board with a filter, not two boards**: one request, one rendering, one way to move a
+  card. Two implementations would be two answers to "which tasks exist", and since a card
+  says that a page exists and what somebody wrote on it, a second answer is a second chance
+  to disclose one. The global board is the only place a to-do belonging to no project appears
+  at all, and that is why both exist: a card used to be findable only on the board of the
+  project it was filed under, which left one written on a page nobody had claimed with nowhere
+  at all to appear — exactly how a to-do goes missing. Narrowing the
+  board to a page that is nobody's home gives an **empty** board rather than the whole
+  wiki's: that is what an ordinary page's board is, and it is the answer a page has to be
+  able to give without knowing in advance whether it is a project's home.
+- **A card can be moved without a pointer.** Every card carries a named button for each of
+  the two columns it is not in — "»Kabel bestellen« nach Läuft verschieben", not
+  "Verschieben" repeated down a column — and pressing one is an ordinary form submission to
+  the server. It works with JavaScript switched off, and afterwards the page comes back to
+  the board the card was moved on, filter and all, with the cursor placed on a sentence
+  saying what happened, so the move is read out rather than merely drawn. Dragging a card
+  presses the same button: an addition, never the only way in. The move changes the card and
+  nothing else — no page is rewritten, no version is filed, and nobody needs permission to
+  *write* a page in order to move a card that came from it. The page owns the words; the
+  record owns the state.
+- **A card says which page it was written on, and says so when no page holds it.** A card
+  written as a line in a page names that page and links there; one created on a board says it
+  was made there and belongs to no page. Both are facts about the card and neither is a
+  blank — "where did I write this?" is the first question anybody asks of a board, and naming
+  the project's home page for a card no page ever held would claim a line exists somewhere
+  that never did. The name is looked up when the board is read rather than
+  copied onto the card when it is made, so renaming or moving a page does not leave boards
+  saying what it used to be called; that is the rule a link between pages already follows. A
+  card whose line has been deleted stays, marked »Abgelöst«, and the marker says what is
+  still true of it: the page no longer holds the words, and the due date and the person it
+  rests on are still somebody's.
+- **A card you may see but may not move is shown, and says so.** Hiding it would hide nothing
+  — if it came from a page, its checkbox is on that page for anyone who may read it — and a
+  to-do that quietly vanishes from a board is the failure this whole design exists to
+  prevent.
+- **Due dates are shown, and an overdue one says "Überfällig seit …" in words.** Colour is
+  the second channel, never the only one, which is the line this project already holds in the
+  diff views and the sortable tables. A date with no time is a whole day, so a task due today
+  is due today until the day ends rather than overdue from one second past midnight.
+- **Projekte**, at `/projekte` and beside »Aufgaben« in the header: every project you may
+  see, and the form that starts a new one. A project is made by naming the page it belongs to
+  — its Startseite — and that is the whole of it; there is no separate object to fill in,
+  because a project *is* a page and the pages beneath it, and its board is that subtree's
+  to-dos together with the loose cards filed on it directly. Whoever may write that page may
+  make it a project's home. The path may be typed with or without its leading slash, or
+  pasted whole out of the address bar, which is how people actually say "this page".
+  **The list is the page, deliberately.** A »zu einem Projekt machen« button on each page
+  would have been cheaper and would have buried the one place you go to ask *which projects
+  exist*; putting it in the admin console would have made a project something you ask an
+  administrator for, which is how a thing meant to be used every week ends up used twice a
+  year.
+- **Creating and deleting a project work with JavaScript switched off, and a refusal is a
+  sentence rather than a number.** Both are ordinary form submissions; creating comes back as
+  a redirect, so reloading the list does not offer to make the same project a second time.
+  Naming a page that is already another project's home says exactly that and says which of
+  the two ways out to take, with the project it collides with on the list right there; a page
+  you may not edit says the write right is missing, not that "ein Fehler" occurred; a page
+  that does not exist is named, so a typo is visible as a typo. Deleting asks first, names
+  the project, and says what goes with it — the cards made on its board, and neither the
+  pages nor the to-dos written as lines in them. Every control names what it acts on rather
+  than repeating "Löschen" down a column, a failed field is announced in words as well as
+  outlined in red, and a project with no tag says so instead of leaving a cell blank.
+- **A checkbox written in a page is a to-do, all the way through.** `- [ ] Stuhlprobe
+  einschicken` used to come back as an ordinary bullet whose *words* were "[ ] Stuhlprobe
+  einschicken": the brackets sat on the page, went into the search index, and would have gone
+  into the anchor of any heading written that way. A checkbox line now imports as a checklist,
+  ticked or unticked exactly as written; the reader draws a real checkbox for each line, so
+  its state is announced as "checked" or "not checked" rather than left to whoever can see the
+  tick; and `great-wiki export` writes it back out as `- [ ] ` and `- [x] ` and it comes back
+  the same document — mixed lists stay split, a numbered list's plain runs keep the numbers
+  they had, nesting keeps its depth, and a bullet whose words merely *look* like `[ ] etwas`
+  stays a bullet rather than turning into somebody's new to-do. Export had been naming and
+  skipping every page holding a checkbox, and one refusal fails the whole run, so a single
+  checkbox anywhere would have shut the backup path for the entire wiki.
+  The boxes are **deliberately not clickable while reading**. A to-do's state belongs to its
+  record and not to the words on the page: a checkbox wired up here would mean needing
+  permission to *edit* the page in order to tick something off, and would file a revision
+  nobody typed. Ticking is done on the board.
+- **Publishing a page reconciles its checklist against the to-dos.** A line nobody has a
+  record for gets one, a line whose words changed updates its record's title, and a line that
+  is gone leaves its record behind, marked. It happens inside the same transaction that
+  writes the revision, so there is no moment where the page says one thing and the board says
+  another, and a publish that fails leaves neither. The words come from the page and nothing
+  else: status, assignee, due date and the card's place in its column live on the record and
+  are never written by a publish — which is what lets a card be dragged without filing a
+  revision nobody typed, and stops the next save from quietly undoing the drag. A ticked box
+  is read exactly once, when the record is created, so a checklist imported from markdown
+  arrives with its finished lines finished; after that the record decides, and the page's own
+  box is a stale copy that publishing ignores.
+- **Identity is minted by the store, once.** A checklist line acquires an invisible id the
+  first time its page is published and that id is stored with the page, so publishing the
+  same page again finds the same to-dos rather than a fresh set. A line arriving with no id —
+  everything imported from markdown does, and `seed --update` re-converts the same file on
+  every run — adopts the record for its words rather than minting a second one. Without that,
+  every save would shed every card on the page, with its dates and its assignments, and
+  nothing would have gone wrong loudly enough to notice. Two lines reading the same words
+  keep two records, and a checklist copied and pasted in the editor becomes a to-do of its
+  own. Retyping a deleted line makes a *new* to-do and leaves the old one visibly detached
+  rather than one task quietly turning into another; putting the same line back — an undo, or
+  restoring an older version of the page — re-attaches the card it had, with its state.
+  One rough edge, and it needs its own fix rather than time: `seed --update` decides whether
+  a file changed anything by comparing the stored block tree against the freshly converted
+  one, and a markdown file cannot carry those ids. So a page holding a checkbox looks changed
+  on every run and gets a revision that says nothing — the thing that comparison exists to
+  prevent. The cards themselves are unharmed, being found again by their words, and pages
+  without checkboxes are untouched. The fix is for the comparison to ignore a task item's id
+  the way `export` already does.
+- **To-dos and boards have somewhere to live, and can be reached over the API.** A task is
+  one record with an optional anchor to the line in a page that authored it, so a to-do
+  written while planning and a card created on a board are the same kind of thing rather than
+  two that have to be kept in step. Over the API a card can be created on a board, moved,
+  given a due date, handed to somebody, and thrown away. The three columns are built in and
+  the database itself refuses a fourth, so a status this software does not understand cannot
+  be written by anything, including a repair script. A board answers with all three even when
+  two are empty, because "nichts läuft gerade" is something a board has to be able to say,
+  and a status that is not one of the three is refused by name rather than quietly filed as
+  *Offen*, which would silently reopen something somebody had finished.
+- **Every page now has a history you can read, compare and restore from.** »Verlauf«, beside
+  »Bearbeiten«, lists every published Fassung of the page — newest first, with who wrote it,
+  how long ago, what they said they were doing, and how much the page grew or shrank. Until
+  now the wiki had thirty-four versions of some pages and no way to look at a single one of
+  them.
+- **Two versions can be compared three ways, and three is the point.** A **Prosa** diff shows
+  which words changed; a **Struktur** diff shows which blocks were added, removed, moved or
+  rewritten in place; a **Design** diff shows what changed about how the page looks — a
+  heading's level, a table column's alignment, a sentence somebody made bold. A word-level
+  diff on its own answers "keine Änderungen" for a page that was plainly restyled or
+  reordered, and a history that says nothing changed is worse than no history, because it is
+  believed. A block that moved is reported as **one** change rather than as a deletion plus
+  an addition, so tidying a page does not read like rewriting it. Additions and removals are
+  marked with a word and a symbol as well as a colour, so the diff is legible without colour
+  vision, in print, and in a black-and-white screenshot.
+- **Any version can be read as a whole file**, in the same three files an export writes: the
+  markdown, the metadata, and the block tree the database actually holds. When a version
+  cannot be written as markdown faithfully — an image, a link the tree cannot express — it
+  says so rather than showing a quietly lossy file.
+- **Restoring publishes the old version as a new one and deletes nothing.** What you restored
+  past is still in the history afterwards, so the restore is itself undoable — by restoring
+  the other one. It asks first, and the question names the version and says what happens to
+  the current one.
+
 - **A page's visibility can now be changed, in the admin console, beside access.** Until now
   the value arrived from frontmatter at import and nothing in the running system could write
   it — the console showed it as a badge, which reads as settable state and was not. It is
@@ -53,6 +200,30 @@ Entries describe the *effect* of a change, not the diff.
   no origin configured, every absolute URL stays external exactly as before.
 
 ### Changed
+
+- **A list that mixes checkbox lines with plain ones stays mixed.** It comes back as a
+  checklist and an ordinary list side by side, in the order written, rather than as one list
+  with every line turned into a to-do. In this wiki a checkbox line *is* a to-do, so an
+  unticked box invented on a line nobody marked would put an item on a board that nobody
+  wrote — the one cost this design was weighed against, and accepted on the grounds that it
+  does not happen. A **numbered** list holding checkboxes keeps the checkboxes and loses the
+  numbering on those lines, because a checklist has no numbers; that is reported with
+  everything else an import could not carry rather than changing the page quietly, and the
+  list's plain lines keep the number they had, so nothing renumbers behind your back.
+- **The graph is readable at the size this wiki is actually used at.** Thirty-five pages with
+  titles like »Table 4: Foods & Nutrients for Microbiota/SCFA Balance + Neurotransmitter
+  Precursors« used to be drawn with every name centred under its node whatever was already
+  there — forty-four pairs of names printed on top of one another, and seventeen of the
+  thirty-five running off the side of the picture, where the frame cut them mid-word with
+  nothing to say they had been cut. Now none of them overlap. Pages are spaced by how wide
+  their names are rather than as bare points, each name goes in the first free place around
+  its node — underneath it, as before, wherever there is still room — and a name too wide to
+  draw is shortened with an ellipsis instead of running past the edge. **No page is ever left
+  unnamed**: a name that cannot be placed cleanly is drawn anyway, because a nameless node
+  hides that the page exists at all. The whole title is never lost either — it is still what
+  a pointer shows and what the text list under the drawing says, which is what makes the
+  graph usable without seeing it and is unchanged. The frame is wider now and grows downwards
+  as pages are added, so a wiki twice this size still gets a diagram rather than a thicket.
 
 - **The access table no longer claims to say who reaches a page; it says what is entered on
   it.** It never showed the two ways in that need no entry — somebody with »Verwaltung«
@@ -113,7 +284,8 @@ Entries describe the *effect* of a change, not the diff.
   command exits non-zero — deriving a title from a filename would silently publish a page
   at a path nobody chose.
 - Markdown constructs the block model cannot yet represent are reported and their text
-  kept, never dropped. Emphasis is currently flattened.
+  kept, never dropped. Emphasis and link destinations survive; an image keeps only its alt
+  text, and a horizontal rule is dropped.
 - `content-example/` makes the repository runnable straight after cloning, and gives CI
   something real to validate.
 
@@ -159,6 +331,22 @@ Entries describe the *effect* of a change, not the diff.
   the entire Serena instance down rather than degrading.
 
 ### Fixed
+
+- **Opening a page that contains a checkbox no longer destroys it.** This was the serious
+  one. The editor builds the document by looking each block up by name, and a name it did not
+  know was not skipped — it was **deleted from the shared document**, sent to everyone else
+  editing, and saved into the next revision, with nothing shown and nothing logged. So from
+  the moment a checkbox could be written, the first person to open that page for editing
+  would have silently removed the checklist from it. The editor now knows checklists, keeps
+  each box as it was, and keeps the identity a to-do is tracked by, so nothing is lost by
+  opening a page and nothing is lost by editing one. Nothing already written was affected:
+  there is not one checkbox line in the content this wiki was seeded from, and the editor
+  learned this before any content with a checkbox reached it.
+- A failed request for the tasks is never reported as a board with nothing on it. On the
+  global board it says so plainly; on an ordinary page it says only that *if* a board belongs
+  here it could not be loaded — because a request that failed cannot tell a project's home
+  page from any of the other pages in the wiki, and claiming one either way would be
+  inventing the half it never learnt.
 
 - The visibility and permission dropdowns can be operated with a mouse. Both are portalled
   out of their dialog, and `@zag-js/popper` writes `z-index: var(--z-index)` on them inline —
@@ -269,10 +457,11 @@ Entries describe the *effect* of a change, not the diff.
   reads as a page somebody forgot to write. Its children *are* its content, and they were
   previously visible only in the sidebar tree — which on a phone sits at the very bottom of
   the document.
-- **Not** shown, and deliberately not faked: when a page was last edited and by whom. There
-  is no revisions endpoint yet. The row is written, styled and tested, and renders nothing
-  at all until real data is passed — a dash or an "unbekannt" beside three genuine facts
-  would be read as a fourth.
+- **Not** shown, and deliberately not faked: when a page was last edited and by whom.
+  `/api/documents/{path}` still returns no revision fields, so the row is written, styled and
+  tested and renders nothing at all until real data is passed — a dash or an "unbekannt"
+  beside three genuine facts would be read as a fourth. »Verlauf«, above, is where a page's
+  history lives in the meantime.
 - An import creates the page **and** publishes its first revision, in one transaction.
   Creating a document used to write the body straight into `documents` and record no
   revision at all, so every seeded page began with an empty history: the first edit anybody
@@ -357,9 +546,9 @@ Entries describe the *effect* of a change, not the diff.
   rejected update is never relayed to the other editors. `Rooms::join` returns one room per
   document under a single lock, so two connections arriving together cannot end up editing
   two copies of one page.
-  Known and tested limit: inline marks and link destinations live in the CRDT but have no
-  field in `Block`, so a published snapshot keeps the text and drops the emphasis until M4
-  adds marks.
+  This was written when inline marks and link destinations lived in the CRDT but had no
+  field in `Block`, so publishing kept the text and dropped the emphasis. `Block` carries
+  marks now, and a published snapshot keeps them.
 
 
 - Invitations: a single-use link that creates an account and gives it access in the same
@@ -559,4 +748,65 @@ Entries describe the *effect* of a change, not the diff.
   deactivating an account takes effect on the next click rather than at the next sign-in.
 - The development identity now drives the real engine rather than bypassing it: its groups
   determine its reach, so local work exercises the same rules production does.
+
+### Security
+
+- **A board card is a disclosure, and every view of one is filtered like a page read.** A
+  card says that a page exists, what it is called, and — because a card's words are the
+  page's own — what somebody wrote on it. So every card, every project in a listing and every
+  task read back on its own goes through the same permission-checked accessor a page read
+  goes through, **per document, never once for the whole subtree**: a project deliberately
+  spans pages with different access, and a board that trusted the subtree would hand over the
+  very words a restricted page was keeping. A card on a page you may not read is not shown,
+  not greyed out and not counted. The page a card *names* is filtered by the same answer
+  rather than by a second lookup made after the card survived filtering — the page a card
+  names is the page the permission check handed back, so there is no version of this code
+  that shows a card without having asked whether you may read what it is called. Asking twice
+  is how two answers start to disagree, and the second one is always the one that gets it
+  wrong.
+- **The widest view in the wiki is the narrowest one's own query with the project left
+  unnamed.** A view over every task there is would be the easiest place in the system to lose
+  that filtering, so it is not a second query that could lose it. One consequence is worth
+  stating, because it is the thing that would have been got wrong: a card created **on a
+  board** belongs to no page, and a board bound to a single project already knew the answer
+  for all of them, having been let in at that home page a moment earlier. A board bound to
+  nothing spans every project and can assume nothing, so it asks about each. Keeping the
+  shortcut would have handed over the loose cards of every project whose home page you may
+  not open, and it would have looked correct, because for one project it is.
+- **Nothing counts what was left out.** No total, no "und 3 weitere", no identifier for a card
+  or a project that was filtered away; a board or a project you may not see answers exactly
+  what one that does not exist answers. A wiki with no tasks and a wiki whose every task is
+  somebody else's read the same, and the conflation is the point, because a count is a fact
+  about pages you are not allowed to read.
+- **Who may assign whom is answered rather than left open.** You may create or change a task,
+  including putting somebody's name on it, if you may **write** the page that governs it —
+  its own page, or its project's home page. You may only assign it to somebody who may
+  **read** that page: assigning a colleague to a task on a page they cannot open would create
+  an obligation they can never see, and would tell them what a page they may not read is
+  called. The refusal says so, says what to do about it, and names nobody. Clearing a name
+  needs only the write, so somebody who has since lost their access can be taken off a card
+  rather than pinned to it for ever. Moving a card to another board is governed by both
+  boards and refuses to carry an assignee onto a page they may not read. Creating a to-do by
+  publishing a page needs exactly what publishing needs and nothing weaker: reconciliation
+  runs behind the write check publishing has always made and asks no second question of its
+  own, so a reader whose publish is refused creates no records at all — and it keeps its
+  hands off every record it did not write itself, since only a to-do that came from a line is
+  one a line can disappear from under.
+- **Purging a page destroys its cards with it**, the same way it already destroys its history
+  and its editing state. A card holds a copy of the page's words; leaving it behind would
+  keep restricted text on a board after the page and the access rules protecting it were
+  gone. Deleting the *line* is a different matter and keeps the record — that is what
+  »Abgelöst« is for.
+- **Reading a page's history needs exactly the right that reading the page needs, and nothing
+  more; restoring needs write, which is never implied by being able to read.** A history is
+  not metadata about a page — it says the page exists, who works on it and what every earlier
+  draft said — so every one of those answers goes through the same permission-checked
+  accessor as well.
+- A project id typed into the address bar is matched against the projects you were actually
+  shown before it is used as a filter, so the address bar cannot become a second way to ask
+  whether a project exists; an id matching nothing shows the whole board and says the filter
+  was not applied, without confirming or denying anything about it. After a card is moved the
+  browser is sent back to where the move was made and only ever to a page of this wiki: the
+  address is carried in the form, so it is whatever anybody put there, and anything that is
+  not a path here is refused rather than repaired.
 

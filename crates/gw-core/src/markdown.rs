@@ -21,9 +21,18 @@ use std::fmt;
 pub enum Unsupported {
     /// An image. The alt text survives as text; the source URL does not.
     Image,
-    /// A link. The link text survives; the destination does not.
+    /// A link whose destination could not be carried.
+    ///
+    /// **Never produced any more, and kept on purpose.** `Block` gained marks, so a link's
+    /// destination survives import. The variant stays because two tests assert this
+    /// converter does *not* report one — a guard that needs something to name. Deleting it
+    /// would delete the only statement that emphasis and link destinations are no longer
+    /// lost; the day something starts emitting it again, those tests fail and say so.
     LinkTarget,
-    /// Bold, italic, strikethrough or inline code. The text survives; the emphasis does not.
+    /// Bold, italic, strikethrough or inline code that could not be carried.
+    ///
+    /// Never produced any more, for the same reason and kept for the same guard as
+    /// [`Unsupported::LinkTarget`].
     InlineMarks,
     /// A thematic break (`---`). Carries no text.
     HorizontalRule,
@@ -57,12 +66,15 @@ impl Unsupported {
         }
     }
 
-    /// What happened to the construct's content, and which milestone closes the gap.
+    /// What happened to the construct's content, and where the gap gets closed.
+    ///
+    /// Two of these can no longer be reached at all — see [`Unsupported::LinkTarget`] — and
+    /// say so rather than describing a loss that stopped happening.
     pub fn disposition(self) -> &'static str {
         match self {
             Unsupported::Image => "alt text kept, source URL dropped — M6 adds image blocks",
-            Unsupported::LinkTarget => "link text kept, destination dropped — M4 adds inline marks",
-            Unsupported::InlineMarks => "text kept, emphasis dropped — M4 adds inline marks",
+            Unsupported::LinkTarget => "NEVER REPORTED: link destinations survive as marks",
+            Unsupported::InlineMarks => "NEVER REPORTED: emphasis survives as marks",
             Unsupported::HorizontalRule => "dropped; it carries no text — M4 adds the rule block",
             Unsupported::Html => "kept verbatim as text, never parsed — M4 decides its fate",
             Unsupported::OrderedTaskList => {
