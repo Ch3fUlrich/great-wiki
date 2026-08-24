@@ -76,6 +76,22 @@ cargo run -p gw-api -- seed --content content-example    # loads content; exits 
 Every task ends green on all of the above before it is committed. A task that cannot end
 green is not finished — say so rather than moving on.
 
+**If you verified in an isolated worktree, delete its target directory when you are done.**
+A separate `CARGO_TARGET_DIR` costs **5–6 GB**, it is not cleaned up by anything, and it does
+not live in the repo where anyone would look for it. Three of them plus Docker's build cache
+took this machine from 100 GB to **1.4 GB free** on 2026-08-24, and nothing reported it — it
+surfaced only because an unrelated 2 GB pull would not fit. The failure that was coming next
+is a build dying with an error that says nothing about disk. So:
+
+```bash
+rm -rf <your scratchpad>/*target*
+git worktree remove <path> --force && git worktree prune
+docker builder prune -f        # only if you built an image
+```
+
+`crates/target` in the repo is legitimately ~25 GB and must **not** be deleted while anything
+is building. `df -h /` before you conclude a strange failure is something cleverer.
+
 ## Hard rules
 
 - **Line endings.** `.gitattributes` forces LF on scripts and configs. Never "fix" a script
