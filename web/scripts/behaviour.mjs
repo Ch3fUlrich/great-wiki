@@ -899,8 +899,16 @@ await check('E1 asking to edit still serves the whole document in the first resp
   assert(/<article[^>]*class="prose/.test(html), 'the document is not in the server-rendered HTML');
   assert(/<nav[^>]*aria-label="Pfad"/.test(html), 'the breadcrumb went missing while editing');
   // And nothing editable, because the server has not been asked yet whether this caller may.
-  assert(!html.includes('contenteditable'), 'the SSR HTML contains an editable surface');
-  assert(!html.includes('role="textbox"'), 'the SSR HTML claims an editing surface exists');
+  //
+  // The ATTRIBUTE, not the word. This ran against `html.includes('contenteditable')` until a
+  // CSS comment explaining which element carries `.prose` said "contenteditable" in prose —
+  // and this harness drives the DEV server, where Vite inlines the stylesheet, comments and
+  // all. It failed for a page that had no editable surface at all, which is the worst kind
+  // of check: one that is loud, correct-looking and about the wrong thing. A real surface is
+  // always `contenteditable="true"`, so requiring the `=` loses nothing and stops the next
+  // person having to word a comment around a test.
+  assert(!/contenteditable\s*=/.test(html), 'the SSR HTML contains an editable surface');
+  assert(!/role\s*=\s*"textbox"/.test(html), 'the SSR HTML claims an editing surface exists');
 });
 
 await check('E2 the editor never both refuses and offers a place to type', async (page) => {
