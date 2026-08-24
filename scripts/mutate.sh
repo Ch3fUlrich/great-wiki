@@ -359,6 +359,23 @@ mutation crates/gw-store/src/acl.rs killed \
   's/Visibility::Restricted => baseline >= Baseline::Admin,/Visibility::Restricted => true,/' \
   'acl: restricted documents are not readable by everyone'
 
+# --- reading a page by its id, which is what every aggregate view actually holds --------
+#
+# `document_for` is keyed by a PATH because a path is what grants hang off. Everything that
+# aggregates holds an id instead — a board card knows its `doc_id`, a revision knows its
+# `document_id` — and for a while there was no id-keyed accessor at all, so each of them had
+# to resolve the id itself and hope it remembered to ask. `document_for_id` is that one
+# resolution, and it must stay a way IN to `document_for` rather than a second answer beside
+# it: the mutation is the whole difference, and it is one word wide.
+#
+# It cannot pass vacuously. `a_document_asked_for_by_id_answers_exactly_what_its_path_answers`
+# asserts the equivalence in both directions over three callers and two actions, and counts
+# the permitted answers, so a fixture that refused everybody — or permitted everybody —
+# fails it before the mutation is even made.
+mutation crates/gw-store/src/acl.rs killed \
+  '/pub(crate) async fn document_for_id_with_baseline/,/^    }$/ s@        self.document_for_with_baseline(principal, \&path, action, baseline)@        self.document_by_path_unchecked(\&path)@' \
+  'documents: reading a page by its id asks exactly what reading it by path asks'
+
 # --- revisions: the append-only history under every page -----------------------------
 #
 # Two different kinds of wrong answer live here, and both are below.
@@ -538,14 +555,27 @@ mutation crates/gw-store/src/links.rs killed \
 mutation crates/gw-store/src/tasks.rs killed \
   's|        self.document_for_with_baseline(principal, \&path, action, baseline)|        self.document_by_path_unchecked(\&path)|' \
   'tasks: every card and project goes through the permission-checked accessor'
+#
+# This is also the mutation that stands behind the card's PAGE. An anchored card carries the
+# path and the title of the page its line was written on, and both come from the document
+# THIS call answered with — never from a second lookup keyed by the card's `doc_id`, which
+# is the tempting version and is safe only for as long as the filtering a few lines up stays
+# right. Swap the accessor for the unchecked one and the name leaks with the card:
+# `a_card_names_its_page_only_to_somebody_who_may_read_that_page` in `gw-api`'s
+# `tests/tasks.rs` greps the whole response body for the secret page's path and title, and
+# asserts the privileged caller gets both.
 mutation crates/gw-store/src/tasks.rs killed \
   's|                        .document_for_with_baseline(principal, \&path, Action::Read, baseline)|                        .document_by_path_unchecked(\&path)|' \
   'board: a card names only a page the caller may actually read'
-# Asking and then not acting on the answer. `a_board_omits_a_card_whose_page_the_caller_
-# cannot_read` asserts that the privileged caller DOES see all three cards, so neither of
-# these can pass by the fixture having nothing to hide.
+# Asking and then not acting on the answer. The memo now holds the PAGE the accessor
+# answered with rather than a boolean about it, so "not acting on it" has to be written as a
+# fallback: an unreadable page becomes an empty name and the card is emitted anyway. That is
+# not a contrived shape — it is exactly what "the card was already filtered, so I can fill
+# the name in myself" produces. `a_board_omits_a_card_whose_page_the_caller_cannot_read`
+# asserts that the privileged caller DOES see all three cards, so neither of these can pass
+# by the fixture having nothing to hide.
 mutation crates/gw-store/src/tasks.rs killed \
-  's|            if !readable {|            if false {|' \
+  's@            let Some(page) = known else {@            let page = known.unwrap_or(TaskPage { path: path.clone(), title: String::new() }); if false {@' \
   'board: the per-document verdict is acted on rather than merely computed'
 # The baseline is hoisted out of the loop because it is a property of the caller. Hoisting
 # the WRONG one — anybody's but theirs — is how that optimisation goes wrong, and it reads
@@ -565,11 +595,19 @@ mutation crates/gw-store/src/tasks.rs killed \
 mutation crates/gw-store/src/tasks.rs equivalent \
   's|AND (d.path = ?1 OR substr(d.path, 1, length(?1) + 1) = ?1 \|\| ./.)|AND substr(d.path, 1, length(?1)) = ?1|' \
   'board: the candidate SQL narrows to the same subtree — defence in depth behind within()'
+# Both of these read a document and then decide, in one `match`, whether there is anything
+# to return AND what the card names its page. The refusal is the arm that is mutated: with
+# it gone the caller is handed the card anyway, which is the leak, and the compiler is happy
+# because the other arm's type is all the arm has to produce.
+#
+# That shape is deliberate and it is why neither of these gates can be *deleted* rather than
+# mutated: the value that authorises the read is the value that names the page, so a version
+# that skipped the check would have nothing to build the name out of and would not compile.
 mutation crates/gw-store/src/tasks.rs killed \
-  '/pub async fn task_for/,/^    }$/ s|            .is_none()|            .is_some()|' \
+  '/pub async fn task_for/,/^    }$/ s@            None => return Ok(None),@            None => None,@' \
   'tasks: reading one task follows the read on the page that governs it'
 mutation crates/gw-store/src/tasks.rs killed \
-  's|        if !self.may(principal, document_id, Action::Read).await? {|        if false {|' \
+  's@            None => return Ok(Vec::new()),@            None => TaskPage { path: String::new(), title: String::new() },@' \
   "tasks: a page's own task list follows that page's read"
 
 # --- D-10: who may assign whom, which the design left open and the plan had to answer ---
@@ -809,7 +847,15 @@ note_drift() {
   [ "$now" = "$(cat "$TREE_STATE")" ] && return 0
   echo "           WARNING: the repository changed while this was being scored. If a test"
   echo "                    reads what changed, this verdict means nothing. Re-run it alone."
-  diff <(cat "$TREE_STATE") <(echo "$now") | grep '^[<>]' | sed 's/^/                    /'
+  # `|| true`, and it is load-bearing rather than tidy. `diff` exits 1 when it finds a
+  # difference — which is the only reason this line runs at all — and under `set -euo
+  # pipefail` that status is the pipeline's, so the warning KILLED the run: five verdicts,
+  # one drift warning, exit 1, and no summary at all. The comment above this function says
+  # in as many words that this warns and does not fail; for one run it did the opposite of
+  # what it documented, and the tell was an exit code with nothing after it. Found on
+  # 2026-08-24, with another agent saving Svelte files while the suite ran — the exact
+  # scenario the paragraph above was written for.
+  diff <(cat "$TREE_STATE") <(echo "$now") | grep '^[<>]' | sed 's/^/                    /' || true
   printf '%s' "$now" > "$TREE_STATE"
   drifted=$((drifted + 1))
   drifted_at+=("$description")

@@ -178,6 +178,35 @@ impl Store {
         Ok(row)
     }
 
+    /// The path a document id names, with NO permission check whatsoever.
+    ///
+    /// Crate-private and named so the danger is unmissable, exactly as
+    /// [`Store::document_by_path_unchecked`] is. It is the id half of the same chicken-and-
+    /// egg the rest of this crate resolves the same way: authorising a document means
+    /// knowing which path it lives at, because a path is what the grants hang off, so the
+    /// path is read first and refused afterwards.
+    ///
+    /// Both callers put the answer straight into a permission-checked accessor:
+    /// [`Store::document_for_id_with_baseline`], which is how everything in this crate that
+    /// holds a document id authorises it, and `tasks::governing_path`, which asks the same
+    /// question about a card's anchor page. Neither the id nor the path it resolves to is
+    /// an answer about who may see anything.
+    ///
+    /// Soft-deleted rows are included deliberately: filtering them here would make this
+    /// answer "which path may be read", which is not its question.
+    /// [`Store::document_by_path_unchecked`] refuses a page in the trash, so the accessor
+    /// built on the two of them does too.
+    pub(crate) async fn document_path_unchecked(
+        &self,
+        document_id: &str,
+    ) -> Result<Option<String>> {
+        let path: Option<String> = sqlx::query_scalar("SELECT path FROM documents WHERE id = ?1")
+            .bind(document_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(path)
+    }
+
     /// Whether anything lives at `path`. Public because it is the *only* thing a caller
     /// outside this crate is allowed to learn without a principal.
     ///

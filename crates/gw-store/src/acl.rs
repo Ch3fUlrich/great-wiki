@@ -338,6 +338,62 @@ impl Store {
             .await
     }
 
+    /// Fetch a document by its **id**, only if `principal` may perform `action` on it.
+    ///
+    /// [`Store::document_for`] reached by an id, and deliberately nothing more: the id is
+    /// resolved to a path and the path is put through the same accessor, so there is one
+    /// authorisation answer in this crate and two ways in rather than two answers. Deciding
+    /// it here would be the second one, and the second one is always the one that gets it
+    /// wrong — it is the one nobody remembers when the rules change.
+    ///
+    /// **Why an id-keyed accessor exists at all.** Aggregate views hold ids, not paths: a
+    /// board card knows its `doc_id`, a revision knows its `document_id`, a link knows both
+    /// ends by id. Without this they had two options and both were bad — make the caller
+    /// supply a path and hope it names the same document, or resolve the page unchecked on
+    /// the grounds that the row was already filtered somewhere else. The second is the one
+    /// that rots: it is true today and it makes the safety of one query a property of a
+    /// different query, maintained in another module.
+    ///
+    /// Returning `None` for "no such document" and for "not permitted" alike is the same
+    /// closed conflation [`Store::document_for`] makes, and for the same reason: this layer
+    /// does not decide whether existence may be revealed.
+    ///
+    /// The round trip cannot land on a different document: `documents.path` is UNIQUE
+    /// across every row including soft-deleted ones. A page in the trash is refused here
+    /// exactly as it is there, because [`Store::document_by_path_unchecked`] will not
+    /// resolve it.
+    pub async fn document_for_id(
+        &self,
+        principal: &Principal,
+        document_id: &str,
+        action: Action,
+    ) -> Result<Option<StoredDocument>> {
+        let baseline = self.baseline_for(principal).await?;
+        self.document_for_id_with_baseline(principal, document_id, action, baseline)
+            .await
+    }
+
+    /// [`Store::document_for_id`], with the caller's baseline already resolved.
+    ///
+    /// The same hoist [`Store::document_for_with_baseline`] exists for, for the same
+    /// reason and with the same warning attached: the baseline is a property of the caller,
+    /// so an aggregate view asking about forty documents resolves it once — and a baseline
+    /// belonging to somebody else is a hole that reads like an optimisation. `pub(crate)`
+    /// deliberately, so it cannot be handed one from outside.
+    pub(crate) async fn document_for_id_with_baseline(
+        &self,
+        principal: &Principal,
+        document_id: &str,
+        action: Action,
+        baseline: Baseline,
+    ) -> Result<Option<StoredDocument>> {
+        let Some(path) = self.document_path_unchecked(document_id).await? else {
+            return Ok(None);
+        };
+        self.document_for_with_baseline(principal, &path, action, baseline)
+            .await
+    }
+
     /// [`Store::document_for`], with the caller's baseline already resolved.
     ///
     /// The whole of `document_for` lives here, and `document_for` is one line calling it —
@@ -723,5 +779,103 @@ mod tests {
         // cannot revoke an Authelia group, and must not pretend it can.
         store.set_instance_admin(&by_both.id, false).await.unwrap();
         assert_eq!(store.baseline_for(&by_both).await.unwrap(), Baseline::Admin);
+    }
+
+    // --- the same accessor, reached by an id ------------------------------------------
+
+    /// [`Store::document_for_id`] is [`Store::document_for`] reached by an id, and must
+    /// never be a second answer to the same question.
+    ///
+    /// Asserted as an **equivalence** over every caller and every action rather than as a
+    /// handful of cases. A second implementation can satisfy a list of examples and still
+    /// drift on the one nobody listed, and the reason this accessor exists is that the
+    /// alternative — an aggregate view resolving its pages by id, unchecked, because the
+    /// rows were already filtered somewhere else — is safe only for as long as that
+    /// somewhere else stays right.
+    #[tokio::test]
+    async fn a_document_asked_for_by_id_answers_exactly_what_its_path_answers() {
+        use crate::{Author, NewDocument};
+        use gw_auth::Action;
+        use gw_core::{Block, DocumentType, Visibility};
+
+        let store = store().await;
+        let body: Block = serde_json::from_str(r#"{"kind":"doc"}"#).unwrap();
+        let id = store
+            .create_document(
+                Author::Import,
+                &NewDocument {
+                    parent_path: None,
+                    doc_type: DocumentType::Page,
+                    title: "Befunde".into(),
+                    slug: None,
+                    language: "de".into(),
+                    visibility: Visibility::Restricted,
+                    body,
+                    sort_key: 0,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut accounts = Vec::new();
+        for username in ["fremder", "leser", "chefin"] {
+            accounts.push(
+                store
+                    .create_local_principal(username, username, None, "x")
+                    .await
+                    .unwrap(),
+            );
+        }
+        let [fremder, leser, chefin] = <[_; 3]>::try_from(accounts).unwrap();
+        store
+            .add_grant(
+                "/befunde",
+                Subject::Principal(leser.id.clone()),
+                Permission::Read,
+            )
+            .await
+            .unwrap();
+        store
+            .add_grant(
+                "/befunde",
+                Subject::Principal(chefin.id.clone()),
+                Permission::Write,
+            )
+            .await
+            .unwrap();
+
+        let mut permitted = 0;
+        for who in [&fremder, &leser, &chefin] {
+            for action in [Action::Read, Action::Write] {
+                let by_path = store.document_for(who, "/befunde", action).await.unwrap();
+                let by_id = store.document_for_id(who, &id, action).await.unwrap();
+                assert_eq!(
+                    by_path.map(|doc| doc.id),
+                    by_id.as_ref().map(|doc| doc.id.clone()),
+                    "{} asking to {action:?} the page by id got a different answer than \
+                     the same question asked by path",
+                    who.username
+                );
+                permitted += usize::from(by_id.is_some());
+            }
+        }
+        assert_eq!(
+            permitted, 3,
+            "the fixture must permit some of these and refuse others, or the equivalence \
+             above holds vacuously"
+        );
+
+        // An id nothing names is `None`, exactly as a path nothing occupies is — and not
+        // an error, because this layer does not decide whether existence may be revealed.
+        assert!(store
+            .document_for_id(
+                &chefin,
+                "0192f000-0000-7000-8000-000000000000",
+                Action::Read
+            )
+            .await
+            .unwrap()
+            .is_none());
     }
 }

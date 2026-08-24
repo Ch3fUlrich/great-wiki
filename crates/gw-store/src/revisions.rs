@@ -264,35 +264,32 @@ pub(crate) async fn append_revision(
 impl Store {
     /// Whether `principal` may `action` the document that `document_id` names.
     ///
-    /// Resolves the id to a path and then asks [`Store::document_for`], which is the one
-    /// permission-checked document accessor in this crate. Deciding it here instead would
-    /// be a second authorisation path, and the second one is always the one that gets it
-    /// wrong — it is the one nobody remembers when the rules change.
+    /// One line over [`Store::document_for_id`], which is the id-keyed spelling of
+    /// [`Store::document_for`] — so this is not a second authorisation path, it is the
+    /// answer with the document thrown away. It used to resolve the id to a path itself
+    /// and that duplication is exactly what the accessor removed: two copies of "which page
+    /// does this id name" are two places for the answer to drift.
     ///
     /// `false` covers "no such document" as well as "not permitted", exactly as
     /// `document_for` returns `None` for both: this layer does not decide whether existence
-    /// may be revealed, the HTTP layer does. The round trip cannot land on a different
-    /// document, because `documents.path` is UNIQUE across every row including soft-deleted
-    /// ones — and a soft-deleted document is refused here for the same reason it is refused
-    /// there, since `document_for` will not resolve it.
+    /// may be revealed, the HTTP layer does. A soft-deleted document is refused here for
+    /// the same reason it is refused there.
+    ///
     /// `pub(crate)` and not private, so that [`crate::crdt`] asks this same question rather
     /// than spelling out a second one. It stays out of the public surface: outside this
-    /// crate the answer is [`Store::document_for`], which hands back the document it
-    /// authorised instead of a boolean somebody has to remember to act on.
+    /// crate the answer is [`Store::document_for`] or [`Store::document_for_id`], which
+    /// hand back the document they authorised instead of a boolean somebody has to
+    /// remember to act on.
     pub(crate) async fn may(
         &self,
         principal: &Principal,
         document_id: &str,
         action: Action,
     ) -> Result<bool> {
-        let path: Option<String> = sqlx::query_scalar("SELECT path FROM documents WHERE id = ?1")
-            .bind(document_id)
-            .fetch_optional(&self.pool)
-            .await?;
-        let Some(path) = path else {
-            return Ok(false);
-        };
-        Ok(self.document_for(principal, &path, action).await?.is_some())
+        Ok(self
+            .document_for_id(principal, document_id, action)
+            .await?
+            .is_some())
     }
 
     /// A revision with NO permission check whatsoever.

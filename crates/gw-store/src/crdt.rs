@@ -26,11 +26,11 @@
 //! the first is the one that decided it:
 //!
 //! - **Everything public in this crate is checked; everything unchecked is `pub(crate)` and
-//!   says so in its name** — `document_by_path_unchecked`, `revision_unchecked`, `tree`,
-//!   and the pool itself. `gw-api` has to call this, so it has to be `pub`, so a `pub`
-//!   accessor that wrote page content with no permission check would be the first hole in
-//!   that invariant — and it is the second authorisation path, the one nobody remembers
-//!   when the rules change, that always gets it wrong.
+//!   says so in its name** — `document_by_path_unchecked`, `document_path_unchecked`,
+//!   `revision_unchecked`, `tree`, and the pool itself. `gw-api` has to call this, so it
+//!   has to be `pub`, so a `pub` accessor that wrote page content with no permission check
+//!   would be the first hole in that invariant — and it is the second authorisation path,
+//!   the one nobody remembers when the rules change, that always gets it wrong.
 //! - **There is one answer in this crate to "who may change this page's content"**, and it
 //!   is `Action::Write` resolved through `document_for`. A persistence path with its own,
 //!   weaker answer would mean the question had two.

@@ -367,6 +367,77 @@ async fn a_board_discloses_no_card_whose_page_the_caller_may_not_read() {
     );
 }
 
+/// **The card's page, and who is allowed to learn it.** A card that cannot say where its
+/// line was written is much less useful — "where did I write this?" is the first question
+/// anybody asks of a board — and the answer is a page's path and its title, which is
+/// precisely what a restricted page was keeping to itself.
+///
+/// So this is the same property as the test above, one field deeper: `leser` must not learn
+/// `/projekt/geheim` or what it is called, through a card or through anything else in the
+/// response. Grepping the raw body rather than walking the JSON is deliberate — a leak that
+/// arrives in a field nobody thought to check is still a leak.
+///
+/// The anti-vacuity half is the reason this feature exists at all: `chef` DOES get the path
+/// and the title of every anchored card's page, including the secret one, so the assertions
+/// above cannot pass by the board naming nobody's page.
+#[tokio::test]
+async fn a_card_names_its_page_only_to_somebody_who_may_read_that_page() {
+    let f = fixture().await;
+    let uri = format!("/api/projects/{}/board", f.project);
+
+    let (status, text) = raw(&f.store, Some("leser"), Method::GET, &uri, None).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let board: Value = serde_json::from_str(&text).unwrap();
+
+    // What `leser` IS entitled to: the page behind the card they may read, so the board can
+    // link to it. Named by path and by title, because a link needs the first and a person
+    // needs the second.
+    let named: Vec<(String, Value)> = cards(&board)
+        .iter()
+        .map(|card| {
+            (
+                card["title"].as_str().unwrap().to_string(),
+                card["page"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        named,
+        vec![
+            ("Lose Karte".to_string(), json!(null)),
+            (
+                "Harmlos".to_string(),
+                json!({"path": "/projekt/offen", "title": "Offen"})
+            ),
+        ],
+        "a loose card named a page, or a card written on one did not name it: {board}"
+    );
+
+    assert!(
+        !text.contains("/projekt/geheim"),
+        "the hidden page's PATH is in the response, which says the page exists: {text}"
+    );
+    assert!(
+        !text.contains("Geheim"),
+        "the hidden page's TITLE is in the response, which is what its restriction was \
+         hiding: {text}"
+    );
+
+    // Anti-vacuity, and the feature itself: somebody who may read the page is told which
+    // page it is.
+    let (status, all) = get(&f.store, Some("chef"), &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    let hidden = cards(&all)
+        .into_iter()
+        .find(|card| card["title"] == json!("Befund besprechen"))
+        .unwrap_or_else(|| panic!("the fixture never had a card to hide: {all}"));
+    assert_eq!(
+        hidden["page"],
+        json!({"path": "/projekt/geheim", "title": "Geheim"}),
+        "the card did not name the page it was written on: {all}"
+    );
+}
+
 /// The other half of the same property, and the one an aggregate query loses by *adding* to
 /// its answer rather than by asking the wrong question. A total, a "3 cards" badge or an
 /// `omitted` count would each say that something was filtered out, and how much — which is
@@ -1181,6 +1252,7 @@ async fn a_card_carries_no_internal_identifier() {
                 "detached",
                 "due_at",
                 "id",
+                "page",
                 "position",
                 "status",
                 "title",
@@ -1188,6 +1260,16 @@ async fn a_card_carries_no_internal_identifier() {
             ],
             "the card's fields are not the ones the wire promises: {card}"
         );
+        // The page a card names is a path and a title — what an interface links to and
+        // shows — and never the document's id, which is the identifier this test is about.
+        if let Some(page) = card["page"].as_object() {
+            let keys: Vec<&str> = page.keys().map(String::as_str).collect();
+            assert_eq!(
+                keys,
+                vec!["path", "title"],
+                "the page named on a card grew a field: {card}"
+            );
+        }
     }
     let (_, text) = raw(
         &f.store,

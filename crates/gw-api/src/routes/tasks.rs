@@ -24,6 +24,13 @@
 //! span pages with different grants *by design*, so the filtering is per document and the
 //! natural thing to write ("trust the subtree, it is the project") is exactly the bug.
 //!
+//! An anchored card names the page it was written on — its path and its title, so a board
+//! can link to it — and that name is *itself* the disclosure the filtering is about. It is
+//! not looked up here: `gw_store::Task` carries it, resolved from the same document the
+//! store's permission-checked accessor answered with. A lookup in this handler would be
+//! the second answer the paragraph above rules out, and it would be tempting to make it an
+//! unchecked one on the grounds that the card had already been filtered.
+//!
 //! The way this layer loses that property is not by asking the wrong question but by
 //! **adding to the answer**. A total, a count of what was omitted, an id for a card that was
 //! filtered out, a status code that differs — each says that something is there. So a board
@@ -69,11 +76,6 @@
 //!   for "an anchored card's project follows its page" (D-3) — and this layer cannot tell
 //!   those apart without inventing a second answer to a question the store already answers.
 //!   Left out until the store distinguishes them.
-//! - **A card's page.** A board card would like to link to the page it was written on, and
-//!   cannot: `gw-store` exposes no permission-checked document accessor keyed by **id**
-//!   (`document_for` takes a path), and `revisions.rs` recorded the same gap — inventing one
-//!   is `gw-store`'s decision to take, not this crate's. A card says whether it is
-//!   `anchored`, which is what a board needs to render it, and names no document.
 //! - **A single-card read.** Every card the caller may see is already on a board or on its
 //!   page, and both endpoints return the whole card, so a third way to fetch one adds
 //!   surface and answers nothing new.
@@ -86,10 +88,31 @@ use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
 use gw_auth::{Action, Principal};
-use gw_store::{NewTask, Project, Task, TaskHome, TaskOutcome, TaskStatus, TaskUpdate};
+use gw_store::{NewTask, Project, Task, TaskHome, TaskOutcome, TaskPage, TaskStatus, TaskUpdate};
 use serde::{Deserialize, Deserializer, Serialize};
 
 // --- what goes on the wire ---------------------------------------------------------------
+
+/// The page a card's line was written on: somewhere to link to, and something to call it.
+///
+/// Declared here rather than serialising `gw_store::TaskPage` straight out, for the reason
+/// [`ProjectView`] is: the wire shape is this crate's to decide, and a field added to the
+/// store's type must not appear on the API by itself. The *values* are the store's — that
+/// type can only be built from a document its permission-checked accessor answered with.
+#[derive(Debug, Clone, Serialize)]
+pub struct PageView {
+    pub path: String,
+    pub title: String,
+}
+
+impl From<&TaskPage> for PageView {
+    fn from(page: &TaskPage) -> Self {
+        Self {
+            path: page.path.clone(),
+            title: page.title.clone(),
+        }
+    }
+}
 
 /// One card.
 ///
@@ -111,8 +134,15 @@ pub struct TaskView {
     pub due_at: Option<String>,
     pub position: i64,
     /// Whether this card was written as a line in a page, as against created on the board.
-    /// Says nothing about *which* page — see the module comment.
     pub anchored: bool,
+    /// The page that line was written on, or `null` for a card that lives in no page.
+    ///
+    /// Never `null` for an anchored card the caller is being shown: a card is on this board
+    /// only because the store resolved its page through the accessor, and that document is
+    /// where this comes from. "There is a page here you may not see" is not a state this
+    /// can express, which is deliberate — it would be the disclosure with the name filed
+    /// off.
+    pub page: Option<PageView>,
     /// D-8: the page no longer mentions the line that authored this card. Carried rather
     /// than hidden, because a card that looks live but is written nowhere is worse than one
     /// that says so.
@@ -131,6 +161,7 @@ impl From<&Task> for TaskView {
             due_at: task.due_at.clone(),
             position: task.position,
             anchored: task.doc_id.is_some(),
+            page: task.page.as_ref().map(PageView::from),
             detached: task.detached,
             created_at: task.created_at.clone(),
             updated_at: task.updated_at.clone(),

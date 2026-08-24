@@ -24,7 +24,7 @@ pub use login_attempts::{LoginScope, LOGIN_FAILURE_LIMIT, LOGIN_LOCKOUT_SECONDS}
 pub use principals::TeamSummary;
 pub use revisions::{Author, Revision, IMPORT_AUTHOR_ID, IMPORT_AUTHOR_NAME};
 pub use sessions::SESSION_TTL_SECONDS;
-pub use tasks::{NewTask, Project, Task, TaskHome, TaskOutcome, TaskStatus, TaskUpdate};
+pub use tasks::{NewTask, Project, Task, TaskHome, TaskOutcome, TaskPage, TaskStatus, TaskUpdate};
 
 use anyhow::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};

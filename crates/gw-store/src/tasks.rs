@@ -17,6 +17,13 @@
 //!   of D-3 the question is asked **per document**, not per subtree: a project's home
 //!   subtree narrows *which* candidates are considered and decides nothing, exactly as
 //!   `root` does in [`Store::graph_for`].
+//! - **What a card may say about its page** is decided by the same call and no other. An
+//!   anchored card carries [`TaskPage`] — the path and title of the page its line was
+//!   written on — and that value can only be built from a [`StoredDocument`], which is what
+//!   the accessor hands back. So there is no way to name a page without having asked
+//!   whether the caller may read it, and the tempting shortcut (the card was filtered
+//!   already, so look its page up by `doc_id` unchecked) is not merely discouraged here,
+//!   it has nothing to construct.
 //! - **Who may change a card**, including who may set its assignee, is whoever may Write
 //!   that same page.
 //! - **Who may be assigned** is anybody who may Read it. This is the answer to D-10's open
@@ -108,6 +115,46 @@ pub enum TaskHome {
     Standalone { project_id: String },
 }
 
+/// The page an anchored card's line was written on, as a board needs to name it: somewhere
+/// to link to, and something to call it.
+///
+/// **Constructed only from a [`StoredDocument`] that has been through the permission-checked
+/// accessor**, which is why this carries no document id and cannot be built from one. That
+/// is the whole point of the type. The tempting alternative — a card is already filtered, so
+/// look its page up unchecked — is safe only for as long as the filtering somewhere else
+/// stays right, and it makes the safety of one query a property of another.
+///
+/// The path and the title are resolved when the board is read rather than copied onto the
+/// record when the card is made, for D-5's reason: renaming or moving a page must not leave
+/// a board saying what it used to be called.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskPage {
+    pub path: String,
+    pub title: String,
+}
+
+impl From<&StoredDocument> for TaskPage {
+    fn from(doc: &StoredDocument) -> Self {
+        Self {
+            path: doc.path.clone(),
+            title: doc.title.clone(),
+        }
+    }
+}
+
+/// The page a card names, given the document that governs it.
+///
+/// `None` for a **standalone** card, and that is not a gap: no page holds it — that is what
+/// standalone means — and naming its project's home would say a line exists on a page that
+/// never held one. `anchored` and `page` therefore agree by construction rather than by
+/// two separate decisions that could disagree.
+fn page_of(home: &TaskHome, governing: &StoredDocument) -> Option<TaskPage> {
+    match home {
+        TaskHome::Anchored { .. } => Some(TaskPage::from(governing)),
+        TaskHome::Standalone { .. } => None,
+    }
+}
+
 /// A task record. The workflow state lives here; for an anchored task the words live in the
 /// page (D-2) and `title` is the copy the board renders.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -126,6 +173,10 @@ pub struct Task {
     /// D-8: the page no longer mentions the line that authored this task. The card stays on
     /// the board, marked, rather than vanishing with a due date somebody set.
     pub detached: bool,
+    /// The page this card's line was written on, or `None` for a card that was created on
+    /// a board and lives in no page. Always the page that was just authorised — see
+    /// [`TaskPage`], which cannot be built from anything else.
+    pub page: Option<TaskPage>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -243,7 +294,13 @@ fn home_of(row: &TaskRow) -> Result<TaskHome> {
     }
 }
 
-fn row_to_task(row: TaskRow) -> Result<Task> {
+/// A row, plus the page it names.
+///
+/// `page` is a parameter rather than something this function looks up, and that is the
+/// design: a `TaskRow` carries a `doc_id`, so a lookup here would be one line away and
+/// would be unchecked. Every caller therefore has to have asked the accessor already, and
+/// hands in what it answered.
+fn row_to_task(row: TaskRow, page: Option<TaskPage>) -> Result<Task> {
     let Some(status) = TaskStatus::from_stored(&row.status) else {
         bail!(
             "task {} carries the status {:?}, which is not one of D-9's three",
@@ -262,6 +319,7 @@ fn row_to_task(row: TaskRow) -> Result<Task> {
         project_id: row.project_id,
         position: row.position,
         detached: row.detached != 0,
+        page,
         created_at: row.created_at,
         updated_at: row.updated_at,
     })
@@ -316,17 +374,17 @@ impl Store {
 
     /// The PATH of a task's governing page, with no permission check at all.
     ///
-    /// Crate-private and unexported. It answers "which page decides?", never "may you"; the
-    /// only callers are [`Store::governing_document`] and [`Store::board_for`], both of
-    /// which put the path straight into `document_for`.
+    /// Crate-private and unexported. It answers "which page decides?", never "may you", and
+    /// its one caller is [`Store::governing_document`], which puts the path straight into
+    /// `document_for`.
+    ///
+    /// The anchored arm is [`Store::document_path_unchecked`] rather than the same SELECT
+    /// written again: "which path does this id name" has one answer in this crate, and two
+    /// copies of it are two places for it to drift. The standalone arm is a different
+    /// question — which page is this *project* homed on — and stays a JOIN.
     async fn governing_path(&self, home: &TaskHome) -> Result<Option<String>> {
         Ok(match home {
-            TaskHome::Anchored { doc_id, .. } => {
-                sqlx::query_scalar("SELECT path FROM documents WHERE id = ?1")
-                    .bind(doc_id)
-                    .fetch_optional(&self.pool)
-                    .await?
-            }
+            TaskHome::Anchored { doc_id, .. } => self.document_path_unchecked(doc_id).await?,
             TaskHome::Standalone { project_id } => {
                 sqlx::query_scalar(
                     "SELECT d.path FROM projects p JOIN documents d ON d.id = p.home_doc \
@@ -404,7 +462,7 @@ impl Store {
     /// not writable by the caller — the same conflation [`Store::document_for`] makes.
     pub async fn create_task(&self, principal: &Principal, new: &NewTask) -> Result<TaskOutcome> {
         let baseline = self.baseline_for(principal).await?;
-        let Some(page) = self
+        let Some(governing) = self
             .governing_document(principal, &new.home, Action::Write, baseline)
             .await?
         else {
@@ -412,7 +470,7 @@ impl Store {
         };
 
         if let Some(assignee) = &new.assignee {
-            if !self.may_be_assigned(assignee, &page.path).await? {
+            if !self.may_be_assigned(assignee, &governing.path).await? {
                 return Ok(TaskOutcome::AssigneeMayNotRead);
             }
         }
@@ -444,7 +502,10 @@ impl Store {
         let Some(row) = self.task_row_unchecked(&id).await? else {
             bail!("task {id} vanished immediately after being inserted");
         };
-        Ok(TaskOutcome::Done(Box::new(row_to_task(row)?)))
+        // The page named on the card is the document that just authorised the write, not a
+        // second lookup by the `doc_id` two lines above.
+        let page = page_of(&new.home, &governing);
+        Ok(TaskOutcome::Done(Box::new(row_to_task(row, page)?)))
     }
 
     /// One task, if the caller may Read its governing page.
@@ -457,14 +518,16 @@ impl Store {
         };
         let home = home_of(&row)?;
         let baseline = self.baseline_for(principal).await?;
-        if self
+        // What authorises the read is what names the page: one answer, and no way to reach
+        // the second line without having acted on the first.
+        let page = match self
             .governing_document(principal, &home, Action::Read, baseline)
             .await?
-            .is_none()
         {
-            return Ok(None);
-        }
-        Ok(Some(row_to_task(row)?))
+            Some(governing) => page_of(&home, &governing),
+            None => return Ok(None),
+        };
+        Ok(Some(row_to_task(row, page)?))
     }
 
     /// Change a task. Rule 2 of [`Store::create_task`] decides whether it happens at all.
@@ -493,15 +556,18 @@ impl Store {
         };
         let home = home_of(&row)?;
         let baseline = self.baseline_for(principal).await?;
-        let Some(page) = self
+        let Some(governing) = self
             .governing_document(principal, &home, Action::Write, baseline)
             .await?
         else {
             return Ok(TaskOutcome::Refused);
         };
 
+        // Named from the document that authorised the change. A move cannot change it: only
+        // a standalone card moves, and a standalone card names no page either side of one.
+        let page = page_of(&home, &governing);
         // Where the card will be governed from once this update lands.
-        let mut governing_path = page.path;
+        let mut governing_path = governing.path;
         let mut moved_to = None;
         if let Some(project_id) = &update.project_id {
             if !matches!(home, TaskHome::Standalone { .. }) {
@@ -571,7 +637,7 @@ impl Store {
         let Some(row) = self.task_row_unchecked(task_id).await? else {
             bail!("task {task_id} vanished immediately after being updated");
         };
-        Ok(TaskOutcome::Done(Box::new(row_to_task(row)?)))
+        Ok(TaskOutcome::Done(Box::new(row_to_task(row, page)?)))
     }
 
     /// Delete a task. `false` for "no such task" and for "not permitted" alike.
@@ -603,14 +669,23 @@ impl Store {
     /// Every task here shares one governing page — the document itself — so the question is
     /// asked once and the rows follow. An empty list is the answer both for "no tasks" and
     /// for "not for you", the same closed conflation the rest of this crate makes.
+    ///
+    /// [`Store::document_for_id`] rather than [`Store::may`], because the answer is needed
+    /// twice: once to decide whether there is anything to return, and once to name the page
+    /// on every card. A boolean would have thrown away the document and left the name to be
+    /// fetched again, unchecked, from the id right there in the signature.
     pub async fn tasks_for_document(
         &self,
         principal: &Principal,
         document_id: &str,
     ) -> Result<Vec<Task>> {
-        if !self.may(principal, document_id, Action::Read).await? {
-            return Ok(Vec::new());
-        }
+        let page = match self
+            .document_for_id(principal, document_id, Action::Read)
+            .await?
+        {
+            Some(doc) => TaskPage::from(&doc),
+            None => return Ok(Vec::new()),
+        };
         let rows = sqlx::query_as::<_, TaskRow>(&format!(
             "SELECT {TASK_COLUMNS} FROM tasks WHERE doc_id = ?1"
         ))
@@ -618,9 +693,11 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
 
+        // Every row here is anchored to `document_id` — that is what the WHERE says — so
+        // they all name the one page that was just authorised.
         let mut out = rows
             .into_iter()
-            .map(row_to_task)
+            .map(|row| row_to_task(row, Some(page.clone())))
             .collect::<Result<Vec<_>>>()?;
         in_board_order(&mut out);
         Ok(out)
@@ -657,7 +734,8 @@ impl Store {
         };
 
         // The standalone cards. Their governing page is the home page, which the caller has
-        // just been authorised for, so no second question arises for these.
+        // just been authorised for, so no second question arises for these — and they name
+        // no page, because no page holds them.
         let mut out: Vec<Task> = sqlx::query_as::<_, TaskRow>(&format!(
             "SELECT {TASK_COLUMNS} FROM tasks WHERE project_id = ?1"
         ))
@@ -665,7 +743,7 @@ impl Store {
         .fetch_all(&self.pool)
         .await?
         .into_iter()
-        .map(row_to_task)
+        .map(|row| row_to_task(row, None))
         .collect::<Result<Vec<_>>>()?;
 
         // The anchored ones, with the path of the page each is written in. A JOIN, so that
@@ -685,31 +763,36 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut verdict: HashMap<String, bool> = HashMap::new();
+        // The memo holds the PAGE the accessor answered with, not a boolean about it. The
+        // verdict and the name are then one value: a card is emitted exactly when its page
+        // came back, and what it is called is that page's own title. Storing a boolean and
+        // fetching the name afterwards would be the same code with an unchecked lookup in
+        // the middle, correct only for as long as the loop above stays right.
+        let mut pages: HashMap<String, Option<TaskPage>> = HashMap::new();
         for (task_id, path) in anchored {
             // Defence in depth against the SQL above: the prefix narrows, `within` is the
             // same boundary stated where a human can read it, and neither decides.
             if !within(&home_page.path, &path) {
                 continue;
             }
-            let readable = match verdict.get(&path) {
-                Some(known) => *known,
+            let known = match pages.get(&path) {
+                Some(known) => known.clone(),
                 None => {
                     let known = self
                         .document_for_with_baseline(principal, &path, Action::Read, baseline)
                         .await?
-                        .is_some();
-                    verdict.insert(path.clone(), known);
+                        .map(|doc| TaskPage::from(&doc));
+                    pages.insert(path.clone(), known.clone());
                     known
                 }
             };
-            if !readable {
+            let Some(page) = known else {
                 continue;
-            }
+            };
             let Some(row) = self.task_row_unchecked(&task_id).await? else {
                 continue;
             };
-            out.push(row_to_task(row)?);
+            out.push(row_to_task(row, Some(page))?);
         }
 
         in_board_order(&mut out);
@@ -1754,6 +1837,96 @@ mod tests {
             all.len(),
             3,
             "the fixture never had a card to hide: {all:?}"
+        );
+    }
+
+    /// A card that cannot say where its line was written is much less useful: "where did
+    /// I write this?" is the first question anybody asks of a board.
+    ///
+    /// The page is the one the permission-checked accessor handed back — its own `path`
+    /// and `title`, taken off the document that was authorised, never a second lookup keyed
+    /// by the card's `doc_id`. The tempting version of that lookup is safe TODAY only because
+    /// the card was filtered a few lines earlier, which makes the safety of one query a
+    /// property of another one.
+    ///
+    /// A **loose** card names no page, and that is not a missing feature: no page holds it,
+    /// and naming its project's home — the page that governs it — would say a line exists
+    /// somewhere that never held one.
+    #[tokio::test]
+    async fn a_card_names_the_page_its_line_was_written_on_and_a_loose_card_names_none() {
+        let (store, chef, project) = project_fixture().await;
+        let befunde = page(&store, Some("/projekt"), "Befunde", Visibility::Restricted).await;
+        grant(&store, "/projekt/befunde", &chef, Permission::Write).await;
+
+        done(
+            store
+                .create_task(&chef, &new_task(anchored(&befunde), "Zeile"))
+                .await
+                .unwrap(),
+        );
+        done(
+            store
+                .create_task(&chef, &new_task(standalone(&project), "Lose Karte"))
+                .await
+                .unwrap(),
+        );
+
+        let board = store.board_for(&chef, &project).await.unwrap();
+        let named: Vec<(&str, Option<(&str, &str)>)> = board
+            .iter()
+            .map(|task| {
+                (
+                    task.title.as_str(),
+                    task.page
+                        .as_ref()
+                        .map(|page| (page.path.as_str(), page.title.as_str())),
+                )
+            })
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                ("Zeile", Some(("/projekt/befunde", "Befunde"))),
+                ("Lose Karte", None),
+            ],
+            "a card did not name the page its line was written on, or a loose card named \
+             one that never held it"
+        );
+
+        // The same card, read on its own and read on its page: one answer, three ways in.
+        let one = store.task_for(&chef, &board[0].id).await.unwrap().unwrap();
+        assert_eq!(one.page, board[0].page);
+        let on_the_page = store.tasks_for_document(&chef, &befunde).await.unwrap();
+        assert_eq!(on_the_page[0].page, board[0].page);
+    }
+
+    /// The page is resolved when the board is read, never copied onto the record when the
+    /// card is made — D-5's rule for a link, which holds for a card for the same reason.
+    /// Renaming a page must not leave a board saying what it used to be called.
+    #[tokio::test]
+    async fn a_renamed_page_is_named_on_the_board_by_what_it_is_called_now() {
+        let (store, chef, project) = project_fixture().await;
+        let befunde = page(&store, Some("/projekt"), "Befunde", Visibility::Restricted).await;
+        grant(&store, "/projekt/befunde", &chef, Permission::Write).await;
+        done(
+            store
+                .create_task(&chef, &new_task(anchored(&befunde), "Zeile"))
+                .await
+                .unwrap(),
+        );
+
+        sqlx::query("UPDATE documents SET title = ?2 WHERE id = ?1")
+            .bind(&befunde)
+            .bind("Laborbefunde")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let board = store.board_for(&chef, &project).await.unwrap();
+        assert_eq!(
+            board[0].page.as_ref().map(|page| page.title.as_str()),
+            Some("Laborbefunde"),
+            "the board named the page by a title it no longer has"
         );
     }
 

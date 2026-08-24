@@ -142,14 +142,21 @@ pub struct DiffResponse {
 /// three that can never lose anything.
 ///
 /// **Why this endpoint asks for the page's path as well as the revision's id.** Building the
-/// frontmatter needs the document's title, type, visibility, language, slug and sort key,
-/// and `gw-store` exposes exactly one permission-checked document accessor —
-/// [`gw_store::Store::document_for`], which is keyed by **path**. There is no
-/// `document_by_id_for`, and inventing one is `gw-store`'s decision to take, not this
-/// crate's. So the caller names the page it is asking about, the path is resolved as this
-/// principal like any page read, and the revision must belong to the document that comes
-/// back or the answer is 404. Nothing is authorised by the id, in either direction: the path
-/// decides what may be read, and the id must agree with it.
+/// frontmatter needs the document's title, type, visibility, language, slug and sort key.
+/// When this was written, `gw-store` had exactly one permission-checked document accessor —
+/// [`gw_store::Store::document_for`], keyed by **path** — and inventing an id-keyed one was
+/// `gw-store`'s decision to take rather than this crate's. It has since taken it:
+/// [`gw_store::Store::document_for_id`] exists, and it is checked, so that sentence is no
+/// longer a reason.
+///
+/// The shape stays anyway, and on its own merits. The caller names the page it is asking
+/// about, that path is resolved as this principal like any page read, and the revision must
+/// belong to the document that comes back or the answer is 404. **Nothing is authorised by
+/// the id, in either direction**: the path decides what may be read, and the id must agree
+/// with it. Switching to the id-keyed accessor would authorise by a value the caller can
+/// guess at but cannot see in any link, and would drop the agreement check that catches a
+/// revision id paired with the wrong page. Two locks that must both open is worth more here
+/// than one fewer parameter.
 ///
 /// **The metadata is the page's, the body is the revision's.** A revision stores a body and
 /// nothing else — title, visibility and slug live on the document and are not versioned —
