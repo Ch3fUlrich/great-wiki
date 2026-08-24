@@ -178,6 +178,24 @@ and a plain run rather than fabricating `checked: false` on a line nobody marked
 is gone; a numbered list holding checkboxes reports `ordered-task-list` instead, because a
 task list is unordered and those lines lose their numbers.
 
+**The whole floor closed later the same day, and one of the four remaining layers was
+destroying data rather than merely dropping it.** `BlockKind` is `#[non_exhaustive]`, so
+adding the two variants broke no build anywhere and three hand-maintained mirrors of the enum
+went silently out of step. The editor's was the dangerous one: TipTap deletes an element whose
+node name it does not know, broadcasts the deletion to every connected client, and the janitor
+files the result as a revision — so a page holding a checkbox was destroyed the first time
+anybody opened it. Nothing in the corpus held one, so nothing was lost, which is the only
+reason this reads as a near miss rather than an incident.
+
+Two things the plan did not anticipate and that anyone touching this again needs: `taskItem`
+must declare `id` as well as `checked`, or TipTap strips the identity and reconciliation mints
+a new one on every save, shedding the card and the due date somebody set; and a task item's
+continuation indents **two** columns rather than the marker's six, because six is four past
+the content column, which markdown reads as an indented code block.
+
+D-11 is therefore closed. The heading is left as it was written, because it records what was
+true on 2026-08-20.
+
 Four layers of the floor remain: export (`gw_api::export` refuses a `taskList` today), the
 store's reconciliation, the CRDT and the editor.
 
