@@ -445,14 +445,20 @@ impl Store {
     }
 }
 
-/// The name a revision is filed under: the display name, falling back to the username.
+/// What this wiki calls a person: the display name, falling back to the username.
 ///
 /// The fallback is not decoration. `author_name` is `NOT NULL` and is what the timeline
 /// renders, so a principal that somehow reached here with an empty display name would
 /// produce a byline of nothing at all — a revision that looks unattributed while being
 /// perfectly attributable. The username always exists, because
 /// [`Principal::is_authenticated`] requires it.
-fn byline(author: &Principal) -> &str {
+///
+/// `pub(crate)` because a revision's byline is not the only place a person is named to a
+/// reader of a page: [`crate::tasks`] puts the same string on a board card, for whoever
+/// the card rests on. One answer to "what do we call them", so a timeline and a board
+/// cannot disagree about the same account — and one fallback, so neither renders a blank
+/// where somebody's name should be.
+pub(crate) fn byline(author: &Principal) -> &str {
     let name = author.display_name.trim();
     if name.is_empty() {
         &author.username

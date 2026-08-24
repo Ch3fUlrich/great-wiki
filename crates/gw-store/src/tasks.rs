@@ -28,6 +28,46 @@
 //!   that same page.
 //! - **Who may be assigned** is anybody who may Read it. This is the answer to D-10's open
 //!   question, and [`Store::create_task`] states it in full.
+//! - **What a card may say about the person it rests on** is decided by that same rule,
+//!   asked again at read time. See below.
+//!
+//! # Naming the person a card rests on
+//!
+//! A card carries its assignee as a principal id, which names nobody — an interface
+//! rendering it says `Zuständig: 0199c0de-…`. A display name is the legible half, and it is
+//! also the more identifying one, so who may learn it is a decision rather than a
+//! convenience. Three things settled it, and it is written up in full as
+//! `docs/decisions/0009-who-may-learn-a-board-card-s-assignee.md`.
+//!
+//! **Who may learn that an account exists and what it is called.** Enumerating accounts is
+//! an instance administrator's privilege — [`Store::list_principals`] takes no principal at
+//! all and `gw_api::routes::admin` gates it behind `instance_admin`, which is the whole of
+//! the answer to "who may read the directory". That gate cannot be reused here: it lives a
+//! layer up, and reaching for it would mean a board card names nobody unless an
+//! administrator is looking, which is not a board. But a card is not the directory. It
+//! names ONE account, chosen deliberately by somebody who may Write the page, and only ever
+//! an account D-10 clause 3 had already established may READ that page — so the person
+//! named and the person reading the card are both readers of the same page. That is the
+//! relation that makes the name safe, and it is already this crate's answer to a person's
+//! name being shown to a page's readers: [`crate::revisions`] puts `author_name` — the same
+//! [`crate::revisions::byline`] string — in front of everybody who may Read the page.
+//!
+//! **So the gate is D-10 clause 3, asked again when the card is read**, by the one function
+//! that answers it — [`Store::assignee_named`]. Not a second permission answer, and not the
+//! stored fact: clause 3 held when the assignment was made, and access can be revoked
+//! afterwards. Re-asking is what makes revocation take a name off every board, rather than
+//! pinning it there until somebody happens to clear the card.
+//!
+//! **What a card says when it may not name them: the id it already carried, and no name.**
+//! Not a placeholder — inventing a word for somebody is this layer's business least of all —
+//! and not a card that quietly forgets its assignee, because D-10 clause 4 exists precisely
+//! so a stale name can be cleared, and there is nothing to clear on a card that says it
+//! rests on nobody. The absent name **is not an oracle for "does this account exist"**: the
+//! foreign key on `tasks.assignee` means every id on a card is already an account, so there
+//! is no non-existent account for the answer to be about; and the same empty answer covers
+//! an account that may not read the page and one that has been suspended, which is the
+//! conflation [`Store::assignee_named`] makes on purpose and the same one the refusal on
+//! the write path already makes.
 //!
 //! Reconciling a page's task blocks against these rows on publish — minting a task for a
 //! new checkbox line and marking one [`Task::detached`] when its line disappears (D-6, D-8)
@@ -36,6 +76,7 @@
 //! the blocks were read out of.
 
 use crate::acl::Baseline;
+use crate::revisions::byline;
 use crate::{Store, StoredDocument};
 use anyhow::{bail, Result};
 use gw_auth::{Action, Principal};
@@ -167,6 +208,15 @@ pub struct Task {
     /// The principal id this task rests on, or `None`. See [`Store::create_task`] for who
     /// may put a name here.
     pub assignee: Option<String>,
+    /// What to CALL that person, or `None`.
+    ///
+    /// Resolved when the card is read rather than copied onto the row when it is written,
+    /// for the reason [`TaskPage`] is: a name copied at assignment time would outlive both
+    /// a rename and the access it was granted under. Always [`Store::assignee_named`]'s
+    /// answer, which cannot be reached without asking whether that person may still read
+    /// the governing page — so this is `None` while `assignee` is `Some` exactly when the
+    /// card rests on somebody the board may no longer name. See the module header.
+    pub assignee_name: Option<String>,
     pub due_at: Option<String>,
     pub project_id: Option<String>,
     pub position: i64,
@@ -294,13 +344,43 @@ fn home_of(row: &TaskRow) -> Result<TaskHome> {
     }
 }
 
-/// A row, plus the page it names.
+/// What a read has already worked out about the people its cards rest on.
 ///
-/// `page` is a parameter rather than something this function looks up, and that is the
-/// design: a `TaskRow` carries a `doc_id`, so a lookup here would be one line away and
-/// would be unchecked. Every caller therefore has to have asked the accessor already, and
-/// hands in what it answered.
-fn row_to_task(row: TaskRow, page: Option<TaskPage>) -> Result<Task> {
+/// **Two memos, keyed differently on purpose**, because the work has two halves and only
+/// one of them depends on the page:
+///
+/// - An ACCOUNT does not. [`Store::principal_by_id`] is three round trips — the row, the
+///   credential, the team memberships — and none of them change with which card is being
+///   read, so a board resolves each distinct account once however many cards rest on it.
+///   This is the N+1 that a name-per-card would otherwise be.
+/// - A VERDICT does. It is whether THIS account may read THIS page, and D-3 makes a project
+///   span pages with different grants by design — so it is keyed on the pair. Keying it on
+///   the account alone would take whichever page happened to be looked at first and carry
+///   its answer across the whole board, naming somebody on a card from a page they cannot
+///   read because they could read another one. That is the subtree bug wearing a different
+///   hat, and `a_board_names_an_assignee_per_page_rather_than_once_for_the_whole_board` is
+///   what stops it.
+///
+/// Neither memo is shared between reads: a verdict is only as fresh as the request that
+/// asked for it, and one that outlived its request would keep naming somebody after their
+/// access was taken away — which is the whole point of resolving the name at read time.
+#[derive(Default)]
+struct AssigneeNames {
+    accounts: HashMap<String, Option<Principal>>,
+    verdicts: HashMap<(String, String), Option<String>>,
+}
+
+/// A row, plus the page it names and what it calls the person it rests on.
+///
+/// Both are parameters rather than something this function looks up, and that is the
+/// design: a `TaskRow` carries a `doc_id` and an `assignee`, so either lookup would be one
+/// line away and would be unchecked. Every caller therefore has to have asked the accessor
+/// already, and hands in what it answered.
+fn row_to_task(
+    row: TaskRow,
+    page: Option<TaskPage>,
+    assignee_name: Option<String>,
+) -> Result<Task> {
     let Some(status) = TaskStatus::from_stored(&row.status) else {
         bail!(
             "task {} carries the status {:?}, which is not one of D-9's three",
@@ -315,6 +395,7 @@ fn row_to_task(row: TaskRow, page: Option<TaskPage>) -> Result<Task> {
         title: row.title,
         status,
         assignee: row.assignee,
+        assignee_name,
         due_at: row.due_at,
         project_id: row.project_id,
         position: row.position,
@@ -397,26 +478,77 @@ impl Store {
         })
     }
 
-    /// Whether `assignee_id` may be given a task governed by the page at `governing_path`.
+    /// What a card resting on `account` calls them, **if** they may be given a task
+    /// governed by the page at `governing_path`.
     ///
-    /// **This asks the assignee's own question, not the caller's.** It loads that
-    /// principal — with their groups, their teams and their active flag — and puts THEM
-    /// through [`Store::document_for`], which resolves their baseline rather than reusing
-    /// the one the caller was authorised with. Reusing the caller's would answer "could I
-    /// read it", which is the question that has already been answered and not the one being
-    /// asked.
+    /// This is D-10 clause 3 and there is no second copy of it: the same call decides
+    /// whether an assignment is permitted at all and produces the name a board renders, so
+    /// the two cannot drift into disagreeing about the same person. It is the trick
+    /// [`TaskPage`] plays with a document, in the one other place this module discloses
+    /// something a page was keeping to itself — the verdict and what may be said are one
+    /// value, and there is nothing to build a name out of without having asked.
     ///
-    /// An id with no principal row is `false`: an obligation cannot rest on somebody who
-    /// cannot sign in. (The foreign key on `tasks.assignee` refuses it too; this is what
-    /// turns a constraint violation into an answer.)
-    async fn may_be_assigned(&self, assignee_id: &str, governing_path: &str) -> Result<bool> {
-        let Some((assignee, _)) = self.principal_by_id(assignee_id).await? else {
-            return Ok(false);
-        };
-        Ok(self
-            .document_for(&assignee, governing_path, Action::Read)
+    /// **It asks the assignee's own question, not the caller's.** `account` is put through
+    /// [`Store::document_for`], which resolves THEIR baseline rather than reusing the one
+    /// the caller was authorised with. Reusing the caller's would answer "could I read it",
+    /// which is the question that has already been answered and not the one being asked —
+    /// and their baseline is deliberately not hoisted out of a board's loop, because a
+    /// baseline belonging to somebody else is a hole that reads like an optimisation.
+    ///
+    /// `None` means refused: they may not read that page, or the account is suspended and
+    /// may read nothing at all. It never means "they have no name" — [`byline`] always
+    /// yields one — so a caller may read the `Option` as the verdict.
+    async fn assignee_named(
+        &self,
+        account: &Principal,
+        governing_path: &str,
+    ) -> Result<Option<String>> {
+        let readable = self
+            .document_for(account, governing_path, Action::Read)
             .await?
-            .is_some())
+            .is_some();
+        Ok(readable.then(|| byline(account).to_string()))
+    }
+
+    /// [`Store::assignee_named`] reached by an id — which is what a card actually carries —
+    /// and asked at most once per pair.
+    ///
+    /// The same relationship [`Store::document_for_id`] has to [`Store::document_for`]: one
+    /// authorisation answer, two ways in. `None` covers "the card rests on nobody", "the id
+    /// names no account" and "that account may not read the page" alike, which is the
+    /// conflation the module header explains — it is what keeps the name from answering
+    /// "does this account exist" to whoever asks.
+    ///
+    /// An id with no principal row is refused rather than named: an obligation cannot rest
+    /// on somebody who cannot sign in. (The foreign key on `tasks.assignee` refuses to
+    /// store one too; this is what turns a constraint violation into an answer.)
+    async fn assignee_name_for(
+        &self,
+        memo: &mut AssigneeNames,
+        assignee: Option<&str>,
+        governing_path: &str,
+    ) -> Result<Option<String>> {
+        let Some(assignee_id) = assignee else {
+            return Ok(None);
+        };
+        let key = (assignee_id.to_string(), governing_path.to_string());
+        if let Some(known) = memo.verdicts.get(&key) {
+            return Ok(known.clone());
+        }
+        let account = match memo.accounts.get(assignee_id) {
+            Some(known) => known.clone(),
+            None => {
+                let known = self.principal_by_id(assignee_id).await?.map(|(who, _)| who);
+                memo.accounts.insert(assignee_id.to_string(), known.clone());
+                known
+            }
+        };
+        let known = match &account {
+            Some(account) => self.assignee_named(account, governing_path).await?,
+            None => None,
+        };
+        memo.verdicts.insert(key, known.clone());
+        Ok(known)
     }
 
     /// A task row with NO permission check whatsoever.
@@ -469,10 +601,16 @@ impl Store {
             return Ok(TaskOutcome::Refused);
         };
 
-        if let Some(assignee) = &new.assignee {
-            if !self.may_be_assigned(assignee, &governing.path).await? {
-                return Ok(TaskOutcome::AssigneeMayNotRead);
-            }
+        // Clause 3, and the same call that will name the card below — so the gate and the
+        // name cannot disagree, and the second ask is free.
+        let mut names = AssigneeNames::default();
+        if new.assignee.is_some()
+            && self
+                .assignee_name_for(&mut names, new.assignee.as_deref(), &governing.path)
+                .await?
+                .is_none()
+        {
+            return Ok(TaskOutcome::AssigneeMayNotRead);
         }
 
         let (doc_id, block_id, project_id) = match &new.home {
@@ -505,7 +643,14 @@ impl Store {
         // The page named on the card is the document that just authorised the write, not a
         // second lookup by the `doc_id` two lines above.
         let page = page_of(&new.home, &governing);
-        Ok(TaskOutcome::Done(Box::new(row_to_task(row, page)?)))
+        // Named from the row that was actually written rather than from `new`, for the
+        // reason `Store::set_tag` reads its answer back: what the caller is shown is what
+        // the store holds. It is the same question the gate above already answered, asked
+        // of the stored value.
+        let name = self
+            .assignee_name_for(&mut names, row.assignee.as_deref(), &governing.path)
+            .await?;
+        Ok(TaskOutcome::Done(Box::new(row_to_task(row, page, name)?)))
     }
 
     /// One task, if the caller may Read its governing page.
@@ -520,14 +665,21 @@ impl Store {
         let baseline = self.baseline_for(principal).await?;
         // What authorises the read is what names the page: one answer, and no way to reach
         // the second line without having acted on the first.
-        let page = match self
+        let (page, governing_path) = match self
             .governing_document(principal, &home, Action::Read, baseline)
             .await?
         {
-            Some(governing) => page_of(&home, &governing),
+            Some(governing) => (page_of(&home, &governing), governing.path),
             None => return Ok(None),
         };
-        Ok(Some(row_to_task(row, page)?))
+        let name = self
+            .assignee_name_for(
+                &mut AssigneeNames::default(),
+                row.assignee.as_deref(),
+                &governing_path,
+            )
+            .await?;
+        Ok(Some(row_to_task(row, page, name)?))
     }
 
     /// Change a task. Rule 2 of [`Store::create_task`] decides whether it happens at all.
@@ -597,10 +749,14 @@ impl Store {
             None if moved_to.is_some() => row.assignee.clone(),
             None => None,
         };
-        if let Some(assignee) = &effective_assignee {
-            if !self.may_be_assigned(assignee, &governing_path).await? {
-                return Ok(TaskOutcome::AssigneeMayNotRead);
-            }
+        let mut names = AssigneeNames::default();
+        if effective_assignee.is_some()
+            && self
+                .assignee_name_for(&mut names, effective_assignee.as_deref(), &governing_path)
+                .await?
+                .is_none()
+        {
+            return Ok(TaskOutcome::AssigneeMayNotRead);
         }
 
         // COALESCE(?, column) is not usable here: it cannot express "set this to NULL", and
@@ -637,7 +793,13 @@ impl Store {
         let Some(row) = self.task_row_unchecked(task_id).await? else {
             bail!("task {task_id} vanished immediately after being updated");
         };
-        Ok(TaskOutcome::Done(Box::new(row_to_task(row, page)?)))
+        // Asked of the row as it now stands, not of `effective_assignee`. A change that
+        // says nothing about the assignee leaves a name on the card that the gate above
+        // never looked at — and that person may have lost their read since it was written.
+        let name = self
+            .assignee_name_for(&mut names, row.assignee.as_deref(), &governing_path)
+            .await?;
+        Ok(TaskOutcome::Done(Box::new(row_to_task(row, page, name)?)))
     }
 
     /// Delete a task. `false` for "no such task" and for "not permitted" alike.
@@ -694,11 +856,17 @@ impl Store {
         .await?;
 
         // Every row here is anchored to `document_id` — that is what the WHERE says — so
-        // they all name the one page that was just authorised.
-        let mut out = rows
-            .into_iter()
-            .map(|row| row_to_task(row, Some(page.clone())))
-            .collect::<Result<Vec<_>>>()?;
+        // they all name the one page that was just authorised, and every assignee is asked
+        // about against that same page. One memo across the loop, so a page with twenty
+        // lines on one person asks about them once.
+        let mut names = AssigneeNames::default();
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let name = self
+                .assignee_name_for(&mut names, row.assignee.as_deref(), &page.path)
+                .await?;
+            out.push(row_to_task(row, Some(page.clone()), name)?);
+        }
         in_board_order(&mut out);
         Ok(out)
     }
@@ -805,6 +973,11 @@ impl Store {
         // fetching the name afterwards would be the same code with an unchecked lookup in
         // the middle, correct only for as long as the loop above stays right.
         let mut pages: HashMap<String, Option<TaskPage>> = HashMap::new();
+        // And the people the cards rest on, resolved once each — see [`AssigneeNames`],
+        // which is the same argument one field further in: forty cards on one person must
+        // not be forty account loads any more than forty cards on one page may be forty
+        // authorisations.
+        let mut names = AssigneeNames::default();
         for (task_id, path, anchored) in candidates {
             // Defence in depth against the SQL above, in the bound case: the prefix narrows,
             // `within` is the same boundary stated where a human can read it, and neither
@@ -832,9 +1005,15 @@ impl Store {
             let Some(row) = self.task_row_unchecked(&task_id).await? else {
                 continue;
             };
+            // Asked against the page that governs THIS card, which on an unbound board is
+            // a different page for almost every card — see [`AssigneeNames`] for why the
+            // memo is keyed on the pair and not on the person.
+            let name = self
+                .assignee_name_for(&mut names, row.assignee.as_deref(), &path)
+                .await?;
             // A loose card names no page: no page holds it, and naming the one that governs
             // it would say a line exists somewhere that never held one.
-            out.push(row_to_task(row, (anchored == 1).then_some(page))?);
+            out.push(row_to_task(row, (anchored == 1).then_some(page), name)?);
         }
 
         in_board_order(&mut out);
@@ -1354,8 +1533,14 @@ mod tests {
     /// own groups and teams to ask what THEY may read, which a synthetic principal has no
     /// row to answer from.
     async fn account(store: &Store, username: &str) -> Principal {
+        account_called(store, username, username).await
+    }
+
+    /// The same, with a display name of its own — so a test about the name a card SHOWS
+    /// cannot pass by the two being the same string.
+    async fn account_called(store: &Store, username: &str, display_name: &str) -> Principal {
         store
-            .create_local_principal(username, username, None, "irrelevanter-hash")
+            .create_local_principal(username, display_name, None, "irrelevanter-hash")
             .await
             .unwrap()
     }
@@ -2646,10 +2831,15 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !store
-                .may_be_assigned(&kollegin.id, "/projekt")
+            store
+                .assignee_name_for(
+                    &mut AssigneeNames::default(),
+                    Some(&kollegin.id),
+                    "/projekt"
+                )
                 .await
-                .unwrap(),
+                .unwrap()
+                .is_none(),
             "the fixture did not actually take her access away"
         );
 
@@ -2685,6 +2875,210 @@ mod tests {
         assert_eq!(
             cleared.assignee, None,
             "a stale assignee could not be cleared"
+        );
+    }
+
+    /// **Clause 3, read back.** A card carries what to CALL the person it rests on, and it
+    /// carries it exactly as long as clause 3 would still allow the assignment — because
+    /// the name and the verdict are the same value, resolved by the same call.
+    ///
+    /// The revocation is the half that matters. Losing a read must stop disclosing the
+    /// person, not leave their name pinned to a board for ever; the id stays so that
+    /// clause 4 has something to clear.
+    ///
+    /// Every reader is asserted, not just one: `create_task`, `task_for`, `board_for` and
+    /// `tasks_for_document` each build a [`Task`], and a name resolved in three of the four
+    /// is a card that says who it rests on until somebody opens the fourth.
+    #[tokio::test]
+    async fn a_card_names_the_person_it_rests_on_only_while_they_may_read_the_page() {
+        let (store, chef, project) = project_fixture().await;
+        let home = store
+            .document_for(&chef, "/projekt", Action::Read)
+            .await
+            .unwrap()
+            .unwrap();
+        let kollegin = account_called(&store, "kollegin", "Frau Dr. Kollegin").await;
+        grant(&store, "/projekt", &kollegin, Permission::Read).await;
+
+        let assigned = NewTask {
+            assignee: Some(kollegin.id.clone()),
+            ..new_task(standalone(&project), "Lose Karte")
+        };
+        let card = done(store.create_task(&chef, &assigned).await.unwrap());
+        let line = done(
+            store
+                .create_task(
+                    &chef,
+                    &NewTask {
+                        assignee: Some(kollegin.id.clone()),
+                        ..new_task(anchored(&home.id), "Zeile")
+                    },
+                )
+                .await
+                .unwrap(),
+        );
+
+        // The feature, and the anti-vacuity half of everything below: while she may read
+        // the page, every one of the four readers says what she is called.
+        assert_eq!(card.assignee_name.as_deref(), Some("Frau Dr. Kollegin"));
+        let named = |task: &Task| task.assignee_name.clone();
+        assert_eq!(
+            named(&store.task_for(&chef, &card.id).await.unwrap().unwrap()),
+            Some("Frau Dr. Kollegin".to_string()),
+        );
+        for task in store.board_for(&chef, Some(&project)).await.unwrap() {
+            assert_eq!(
+                named(&task),
+                Some("Frau Dr. Kollegin".to_string()),
+                "{task:?}"
+            );
+        }
+        for task in store.tasks_for_document(&chef, &home.id).await.unwrap() {
+            assert_eq!(
+                named(&task),
+                Some("Frau Dr. Kollegin".to_string()),
+                "{task:?}"
+            );
+        }
+
+        // A change that says nothing about the assignee still comes back naming her. The
+        // gate above only looks at an assignee the change NAMES, so a card whose assignee
+        // is left alone would come back nameless if the answer were assembled from the
+        // change rather than read off the row the change left behind.
+        let touched = done(
+            store
+                .update_task(
+                    &chef,
+                    &card.id,
+                    &TaskUpdate {
+                        status: Some(TaskStatus::Laeuft),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            touched.assignee_name.as_deref(),
+            Some("Frau Dr. Kollegin"),
+            "a change that left the assignee alone came back naming nobody",
+        );
+
+        // She leaves, and the grant goes with her.
+        store
+            .remove_grant(
+                "/projekt",
+                &Subject::Principal(kollegin.id.clone()),
+                Permission::Read,
+            )
+            .await
+            .unwrap();
+
+        let after = store.task_for(&chef, &card.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.assignee.as_deref(),
+            Some(kollegin.id.as_str()),
+            "the card stopped resting on her, which is clause 4's job and not a read's",
+        );
+        assert_eq!(
+            after.assignee_name, None,
+            "the board still says what somebody who may no longer read the page is called",
+        );
+        for task in store.board_for(&chef, Some(&project)).await.unwrap() {
+            assert_eq!(named(&task), None, "{task:?}");
+        }
+        for task in store.tasks_for_document(&chef, &home.id).await.unwrap() {
+            assert_eq!(named(&task), None, "{task:?}");
+        }
+        assert_eq!(
+            named(&store.task_for(&chef, &line.id).await.unwrap().unwrap()),
+            None
+        );
+
+        // And a change that says nothing about the assignee re-reads the name rather than
+        // carrying the one it was created with: the state after the write is what is named.
+        let moved = done(
+            store
+                .update_task(
+                    &chef,
+                    &card.id,
+                    &TaskUpdate {
+                        status: Some(TaskStatus::Fertig),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(moved.assignee.as_deref(), Some(kollegin.id.as_str()));
+        assert_eq!(moved.assignee_name, None);
+    }
+
+    /// The verdict is about a PERSON and a PAGE, so a board resolves it per pair.
+    ///
+    /// D-3 makes a project span pages with different grants by design, so the same account
+    /// can be a reader of one page on a board and a stranger to the next. A name memoised
+    /// on the person alone would take whichever page happened to be checked first and carry
+    /// its answer across the whole board — naming somebody on a card from the closed half
+    /// because they could read the open one, which is the subtree bug wearing a different
+    /// hat.
+    #[tokio::test]
+    async fn a_board_names_an_assignee_per_page_rather_than_once_for_the_whole_board() {
+        let (store, chef, project) = project_fixture().await;
+        let offen = page(&store, Some("/projekt"), "Offen", Visibility::Restricted).await;
+        let geheim = page(&store, Some("/projekt"), "Geheim", Visibility::Restricted).await;
+        // Defined AT the secret page, which is what stops an inherited grant reaching it.
+        grant(&store, "/projekt/geheim", &chef, Permission::Write).await;
+
+        let kollegin = account_called(&store, "kollegin", "Frau Dr. Kollegin").await;
+        grant(&store, "/projekt", &kollegin, Permission::Read).await;
+        grant(&store, "/projekt/geheim", &kollegin, Permission::Read).await;
+
+        for (home, title) in [
+            (anchored(&offen), "Offene Zeile"),
+            (anchored(&geheim), "Geheime Zeile"),
+        ] {
+            done(
+                store
+                    .create_task(
+                        &chef,
+                        &NewTask {
+                            assignee: Some(kollegin.id.clone()),
+                            ..new_task(home, title)
+                        },
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        // Her read on the secret page goes; her read on the rest of the project stays.
+        store
+            .remove_grant(
+                "/projekt/geheim",
+                &Subject::Principal(kollegin.id.clone()),
+                Permission::Read,
+            )
+            .await
+            .unwrap();
+
+        let named: Vec<(String, Option<String>)> = store
+            .board_for(&chef, Some(&project))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|task| (task.title, task.assignee_name))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                (
+                    "Offene Zeile".to_string(),
+                    Some("Frau Dr. Kollegin".to_string())
+                ),
+                ("Geheime Zeile".to_string(), None),
+            ],
+            "one verdict was carried from one page of the board onto another",
         );
     }
 

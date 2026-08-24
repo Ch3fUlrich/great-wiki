@@ -617,19 +617,31 @@ mutation crates/gw-store/src/tasks.rs equivalent \
 # That shape is deliberate and it is why neither of these gates can be *deleted* rather than
 # mutated: the value that authorises the read is the value that names the page, so a version
 # that skipped the check would have nothing to build the name out of and would not compile.
+#
+# `task_for`'s arm now yields a PAIR — the page the card names and the path its assignee is
+# asked about — so the mutation has to build both halves out of nothing. That is the honest
+# version of "the card was already filtered": a card with no page on it and an empty path to
+# ask about, handed to somebody who may not read a word of it.
 mutation crates/gw-store/src/tasks.rs killed \
-  '/pub async fn task_for/,/^    }$/ s@            None => return Ok(None),@            None => None,@' \
+  '/pub async fn task_for/,/^    }$/ s@            None => return Ok(None),@            None => (None, String::new()),@' \
   'tasks: reading one task follows the read on the page that governs it'
 mutation crates/gw-store/src/tasks.rs killed \
   's@            None => return Ok(Vec::new()),@            None => TaskPage { path: String::new(), title: String::new() },@' \
   "tasks: a page's own task list follows that page's read"
 
-# --- D-10: who may assign whom, which the design left open and the plan had to answer ---
+# --- D-10: who may assign whom, and what a card may say about them ----------------------
 #
 # Four clauses, and the third is the security-relevant one. Assigning somebody to a task on
 # a page they cannot open hands them an obligation they cannot see, and the card's title
 # tells them what a page they may not read is called — the board's version of the leak a
 # graph edge would be.
+#
+# Clause 3 is also what decides whether a board may say what its assignee is CALLED, asked
+# again when the card is read (ADR 0009). The name is more legible than the id that was
+# always there, and more identifying — so it is disclosed to a reader of the page exactly
+# while the person named may read that page too, and it comes off again when they cannot.
+# The verdict and the name are deliberately one value, which is why several of the
+# mutations below stand behind both at once.
 mutation crates/gw-store/src/tasks.rs killed \
   's|            .governing_document(principal, \&new.home, Action::Write, baseline)|            .governing_document(principal, \&new.home, Action::Read, baseline)|' \
   'assignment: creating a task needs WRITE on the governing page, not read'
@@ -639,12 +651,51 @@ mutation crates/gw-store/src/tasks.rs killed \
 mutation crates/gw-store/src/tasks.rs killed \
   '/pub async fn delete_task/,/^    }$/ s|Action::Write, baseline|Action::Read, baseline|' \
   'assignment: deleting a task needs WRITE on the governing page, not read'
+# Clause 3 itself. `assignee_named` asks the ASSIGNEE'S own question — their groups, their
+# teams, their active flag, their baseline — and this is the line that acts on the answer.
+#
+# It is also the mutation that stands behind the NAME a card shows. The verdict and the name
+# are deliberately one value: `assignee_named` returns what to call the person exactly when
+# clause 3 would still permit the assignment, so there is no version of this code in which
+# the gate is intact and the name leaks anyway. That is why one mutation covers both, and it
+# is checked from both ends — `a_task_may_not_be_assigned_to_somebody_who_may_not_read_its_governing_page`
+# fails on the assignment, and `a_card_names_the_person_it_rests_on_only_while_they_may_read_the_page`
+# fails on the name a board shows after her read is taken away.
 mutation crates/gw-store/src/tasks.rs killed \
-  '/async fn may_be_assigned/,/^    }$/ s|            .is_some())|            .is_some() \|\| true)|' \
+  '/async fn assignee_named/,/^    }$/ s|            .is_some();|            .is_some() \|\| true;|' \
   'assignment: a task may not rest on somebody who may not read the page it is on'
+# The same clause, for an id that names no account at all. The `None` arm is what refuses it;
+# naming it after its own id instead is the shape somebody reaches for when a board renders a
+# bare uuid and they want SOMETHING on the card.
 mutation crates/gw-store/src/tasks.rs killed \
-  '/async fn may_be_assigned/,/^    }$/ s|            return Ok(false);|            return Ok(true);|' \
+  '/async fn assignee_name_for/,/^    }$/ s|            None => None,|            None => Some(assignee_id.to_string()),|' \
   'assignment: an id that is not an account cannot be given a task'
+# The memo is keyed on the PAIR — the account and the page — and the pair is the point. D-3
+# makes a project span pages with different grants by design, so a verdict memoised on the
+# account alone takes whichever page happened to be looked at first and carries its answer
+# across the whole board: somebody who may read the open half of a project gets named on a
+# card from the closed half. That is the subtree bug wearing a different hat, and it is
+# invisible on any fixture whose assignee can read every page on the board.
+#
+# `a_board_names_an_assignee_per_page_rather_than_once_for_the_whole_board` is the shape that
+# can tell them apart, and it cannot pass vacuously: it asserts the name IS on the card from
+# the page she may read, as well as absent from the other.
+mutation crates/gw-store/src/tasks.rs killed \
+  's|        let key = (assignee_id.to_string(), governing_path.to_string());|        let key = (assignee_id.to_string(), String::new());|' \
+  'assignee: the verdict is memoised per person AND page, never per person alone'
+# And that the board asks at all. Every other reader of a card resolves the name too, so a
+# board that quietly stopped would still look right anywhere a single card is fetched.
+mutation crates/gw-store/src/tasks.rs killed \
+  '/pub async fn board_for/,/^        in_board_order/ s|                .assignee_name_for(&mut names, row.assignee.as_deref(), &path)|                .assignee_name_for(\&mut names, None, \&path)|' \
+  'board: the board resolves the name of the person each card rests on'
+# A change that says nothing about the assignee still comes back naming them, because the
+# name is read off the row the change LEFT BEHIND rather than assembled from the change. The
+# mutation writes the tempting version — name whatever the change named — which answers
+# correctly for every request that sets an assignee and nameless for every one that does not,
+# so a `PATCH {"status": …}` on an assigned card silently loses the name it was showing.
+mutation crates/gw-store/src/tasks.rs killed \
+  '/pub async fn update_task/,/^    }$/ s|            .assignee_name_for(&mut names, row.assignee.as_deref(), &governing_path)|            .assignee_name_for(\&mut names, effective_assignee.as_deref(), \&governing_path)|' \
+  'assignee: a change names the person the card rests on AFTERWARDS, not the one it named'
 # Clause 4, and it is a mutation that ADDS a check rather than removing one — which is the
 # only way to test a deliberate permission. Making the unassign path ask whether the person
 # being removed may still read the page pins a stale name to the card for ever.
@@ -799,7 +850,7 @@ mutation crates/gw-store/src/tasks.rs killed \
 # loose card names no page; naming the one that governs it would claim a line exists on a
 # page that never held one, and the page named is real, readable and wrong.
 mutation crates/gw-store/src/tasks.rs killed \
-  's|out.push(row_to_task(row, (anchored == 1).then_some(page))?);|out.push(row_to_task(row, Some(page))?);|' \
+  's|out.push(row_to_task(row, (anchored == 1).then_some(page), name)?);|out.push(row_to_task(row, Some(page), name)?);|' \
   'global board: a loose card names no page, and an anchored one names the page it is on'
 # `?seite=` answers the board of the project homed AT that path. Matching any project instead
 # is the shape of the bug — `find` on a predicate that is true too often — and on a page that

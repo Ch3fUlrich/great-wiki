@@ -31,6 +31,14 @@
 //! the second answer the paragraph above rules out, and it would be tempting to make it an
 //! unchecked one on the grounds that the card had already been filtered.
 //!
+//! A card also names the person it rests on, and that is the same shape of answer: the id
+//! was always on the wire, but what an account is *called* is the legible half and the more
+//! identifying one. It is likewise not resolved here — `gw_store::Task` carries it, and the
+//! store will only produce it for somebody who may still read the page the card is governed
+//! by (D-10, clause 3, asked again at read time). Where that leaves a card that may not name
+//! its assignee, and why an absent name is not an answer to "does this account exist", is
+//! recorded in `gw_store::tasks`' module header, which is where the decision lives.
+//!
 //! The way this layer loses that property is not by asking the wrong question but by
 //! **adding to the answer**. A total, a count of what was omitted, an id for a card that was
 //! filtered out, a status code that differs — each says that something is there. So a board
@@ -150,9 +158,23 @@ pub struct TaskView {
     pub title: String,
     pub status: TaskStatus,
     /// The principal this card rests on, by id — the same id a change sets it with, so what
-    /// is read back is what was written. Resolving it to a display name is left to whoever
-    /// needs one: it would be a lookup per card and a name-to-id mapping nothing asked for.
+    /// is read back is what was written. Kept beside the name rather than replaced by it:
+    /// it is what a change sends back to clear a stale assignment (D-10, clause 4), and a
+    /// card that named somebody without saying who would leave nothing to clear.
     pub assignee: Option<String>,
+    /// What to call that person, or `null`.
+    ///
+    /// Not looked up here, for the reason the card's `page` is not: `gw_store::Task` carries
+    /// it, and the store cannot produce it without having asked whether that person may
+    /// still read the page the card is governed by. A lookup in this handler would be the
+    /// second permission answer the module header rules out, and it would be tempting to
+    /// make it an unchecked one on the grounds that the id was on the wire anyway.
+    ///
+    /// `null` beside a non-null `assignee` is a card resting on somebody this board may no
+    /// longer name — they lost their read, or the account was suspended. It is not a state
+    /// that says whether the account exists: see `gw_store::tasks`' module header, which
+    /// records the whole of that decision.
+    pub assignee_name: Option<String>,
     pub due_at: Option<String>,
     pub position: i64,
     /// Whether this card was written as a line in a page, as against created on the board.
@@ -180,6 +202,7 @@ impl From<&Task> for TaskView {
             title: task.title.clone(),
             status: task.status,
             assignee: task.assignee.clone(),
+            assignee_name: task.assignee_name.clone(),
             due_at: task.due_at.clone(),
             position: task.position,
             anchored: task.doc_id.is_some(),

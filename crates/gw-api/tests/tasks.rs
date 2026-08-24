@@ -78,8 +78,14 @@ async fn page(store: &Store, parent: Option<&str>, title: &str, body: Block) -> 
 /// assignment rule loads the assignee's own groups to ask what THEY may read — which a
 /// synthetic principal has no row to answer from.
 async fn account(store: &Store, username: &str) -> Principal {
+    account_called(store, username, username).await
+}
+
+/// The same, with a display name of its own — so a test about the name a card SHOWS cannot
+/// pass by the name and the username being the same string.
+async fn account_called(store: &Store, username: &str, display_name: &str) -> Principal {
     store
-        .create_local_principal(username, username, None, "irrelevanter-hash")
+        .create_local_principal(username, display_name, None, "irrelevanter-hash")
         .await
         .unwrap()
 }
@@ -785,6 +791,7 @@ async fn the_global_board_discloses_no_card_whose_page_the_caller_may_not_read()
             vec![
                 "anchored",
                 "assignee",
+                "assignee_name",
                 "created_at",
                 "detached",
                 "due_at",
@@ -1577,6 +1584,172 @@ async fn assigning_somebody_who_cannot_read_the_page_is_a_conflict_that_names_th
     assert_eq!(status, StatusCode::CONFLICT);
 }
 
+/// **What a card calls the person it rests on, and who is allowed to learn it.**
+///
+/// A card already carried its assignee as a raw principal id, which named nobody: the
+/// interface rendered `Zuständig: 0199c0de-…`. The name is the legible half and the more
+/// identifying one, so who may see it is a decision and not a convenience — see the store's
+/// module header for it. The short version is that it is disclosed to a reader of the page
+/// exactly while the person named may read that page too, which is D-10 clause 3 asked
+/// again at read time and no second rule.
+///
+/// Both halves are here. `leser` — who may read the project home and nothing else — IS told
+/// who the card rests on while `kollegin` may read it too, which is the feature and the
+/// anti-vacuity half; and is told nothing the moment she cannot. The assertions are on the
+/// RAW body rather than on a parsed field, because a name that arrives in a field nobody
+/// thought to check is still a name.
+#[tokio::test]
+async fn a_card_names_its_assignee_only_while_that_person_may_read_the_page() {
+    let f = fixture().await;
+    let kollegin = account_called(&f.store, "kollegin", "Frau Dr. Kollegin").await;
+    grant(&f.store, "/projekt", &kollegin, Permission::Read).await;
+
+    let (status, created) = post(
+        &f.store,
+        Some("chef"),
+        "/api/tasks",
+        json!({"project_id": f.project, "title": "Karte", "assignee": kollegin.id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["assignee"], json!(kollegin.id));
+    assert_eq!(
+        created["assignee_name"],
+        json!("Frau Dr. Kollegin"),
+        "the card came back naming nobody: {created}"
+    );
+
+    // And on an ANCHORED card as well as a loose one, because `tasks_for_document` builds
+    // its cards down a path of its own and a name resolved on three readers out of four is
+    // a card that says who it rests on until somebody opens the fourth. `Harmlos` is the
+    // fixture's card on `/projekt/offen`, which `leser` may read.
+    let (_, all) = get(
+        &f.store,
+        Some("chef"),
+        &format!("/api/projects/{}/board", f.project),
+    )
+    .await;
+    let harmlos = cards(&all)
+        .into_iter()
+        .find(|card| card["title"] == json!("Harmlos"))
+        .unwrap_or_else(|| panic!("the fixture's anchored card is gone: {all}"))["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, changed) = patch(
+        &f.store,
+        Some("chef"),
+        &format!("/api/tasks/{harmlos}"),
+        json!({"assignee": kollegin.id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{changed}");
+    assert_eq!(changed["assignee_name"], json!("Frau Dr. Kollegin"));
+
+    // Every reader, because the global board is the widest aggregate in the system and the
+    // project board is the same query with a binding — none may answer differently.
+    let boards = [
+        format!("/api/projects/{}/board", f.project),
+        "/api/board".to_string(),
+        format!("/api/board?projekt={}", f.project),
+        "/api/tasks/document/projekt/offen".to_string(),
+    ];
+
+    for uri in &boards {
+        let (status, text) = raw(&f.store, Some("leser"), Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {text}");
+        assert!(
+            text.contains("Frau Dr. Kollegin"),
+            "{uri}: a reader of the page is not told who the card rests on: {text}"
+        );
+    }
+
+    // She loses her read on the page the card is governed by.
+    f.store
+        .remove_grant(
+            "/projekt",
+            &Subject::Principal(kollegin.id.clone()),
+            Permission::Read,
+        )
+        .await
+        .unwrap();
+
+    for uri in &boards {
+        let (status, text) = raw(&f.store, Some("leser"), Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {text}");
+        assert!(
+            !text.contains("Frau Dr. Kollegin"),
+            "{uri}: the name of somebody who may no longer read the page is still on the \
+             board: {text}"
+        );
+        assert!(
+            !text.contains("kollegin"),
+            "{uri}: her username reached the wire by another route: {text}"
+        );
+    }
+
+    // The card still rests on her, by id — that is what clause 4 exists to clear, and a
+    // card that quietly forgot its assignee would leave nothing to clear.
+    let (_, board) = get(
+        &f.store,
+        Some("leser"),
+        &format!("/api/projects/{}/board", f.project),
+    )
+    .await;
+    let card = cards(&board)
+        .into_iter()
+        .find(|card| card["title"] == json!("Karte"))
+        .unwrap_or_else(|| panic!("the assigned card fell off the board: {board}"));
+    assert_eq!(card["assignee"], json!(kollegin.id));
+    assert_eq!(card["assignee_name"], Value::Null);
+}
+
+/// A suspended account is a stranger to every restricted page, so its name comes off the
+/// card too — without the grant having been touched.
+///
+/// The fail-closed half of the same rule, and a genuinely different failure mode: the
+/// account still exists, still holds its entry on the page, and a name resolved from the
+/// row rather than through the permission check would still be sitting on the board. It is
+/// also what makes `null` safe to answer with: the same `null` covers an account that may
+/// not read the page and one that cannot sign in at all, so a reader who sees it cannot
+/// tell which — and the write path already conflates the two in its 409.
+#[tokio::test]
+async fn a_suspended_account_is_no_longer_named_on_a_card_it_rests_on() {
+    let f = fixture().await;
+    let kollegin = account_called(&f.store, "kollegin", "Frau Dr. Kollegin").await;
+    grant(&f.store, "/projekt", &kollegin, Permission::Read).await;
+
+    let (status, created) = post(
+        &f.store,
+        Some("chef"),
+        "/api/tasks",
+        json!({"project_id": f.project, "title": "Karte", "assignee": kollegin.id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    // Anti-vacuity: the name really is there before the account is suspended.
+    assert_eq!(created["assignee_name"], json!("Frau Dr. Kollegin"));
+
+    f.store
+        .set_principal_active(&kollegin.id, false)
+        .await
+        .unwrap();
+
+    let (status, text) = raw(
+        &f.store,
+        Some("leser"),
+        Method::GET,
+        &format!("/api/projects/{}/board", f.project),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(
+        !text.contains("Frau Dr. Kollegin") && !text.contains("kollegin"),
+        "a suspended account is still named on the board: {text}"
+    );
+}
+
 /// Clause 4. A stale assignee must be clearable after that person loses their read, or the
 /// assignment outlives the access it was granted under and the only fix is deleting the
 /// card — discarding the due date, which is the outcome D-8 exists to prevent.
@@ -1808,6 +1981,7 @@ async fn a_card_carries_no_internal_identifier() {
             vec![
                 "anchored",
                 "assignee",
+                "assignee_name",
                 "created_at",
                 "detached",
                 "due_at",
