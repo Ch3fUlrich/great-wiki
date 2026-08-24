@@ -72,7 +72,7 @@ impl Unsupported {
     /// say so rather than describing a loss that stopped happening.
     pub fn disposition(self) -> &'static str {
         match self {
-            Unsupported::Image => "alt text kept, source URL dropped — M6 adds image blocks",
+            Unsupported::Image => "alt text kept, source URL dropped — M5 adds media",
             Unsupported::LinkTarget => "NEVER REPORTED: link destinations survive as marks",
             Unsupported::InlineMarks => "NEVER REPORTED: emphasis survives as marks",
             Unsupported::HorizontalRule => "dropped; it carries no text — M4 adds the rule block",

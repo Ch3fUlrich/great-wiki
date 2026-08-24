@@ -1,8 +1,15 @@
 use crate::slugify;
 use serde::{Deserialize, Serialize};
 
-/// The node kinds M1 understands. The registry in M4 adds more; this enum is
-/// `#[non_exhaustive]` so adding one is not a breaking change for downstream matches.
+/// Every node kind this system can store. The block registry planned for M4 adds more.
+///
+/// `#[non_exhaustive]`, so adding one is not a breaking change for downstream matches —
+/// **and that is the hazard, not the convenience.** Nothing fails to compile when a variant
+/// is added, while three hand-maintained mirrors of this enum sit outside Rust entirely:
+/// the editor's node list, the reader's renderer, and the CRDT fixtures. The editor's is
+/// the dangerous one — TipTap deletes an element whose node name it does not know and the
+/// deletion is then published — so adding a variant here means updating all three, and the
+/// exporter, which at least refuses loudly. Adding `TaskList` cost exactly this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]

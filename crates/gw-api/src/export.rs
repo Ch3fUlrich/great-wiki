@@ -18,8 +18,10 @@
 //! that neither side can be edited into disagreeing with the other — and a mark covering
 //! several leaves is opened once around the whole run rather than per leaf. What a stored
 //! document still cannot hold is an image (the importer keeps only the alt text), a link
-//! resolved to another *document* rather than a URL (`Mark::attrs`' `doc`, which only Task 7
-//! produces), and a horizontal rule — those are dropped on the way *in* (see
+//! resolved to another *document* rather than a URL (`Mark::attrs`' `doc` — nothing in this
+//! system writes one yet; see `gw_store::links` for why an `href` naming a page in this wiki
+//! counts as an internal link instead), and a horizontal rule — those are dropped on the way
+//! *in* (see
 //! [`gw_core::markdown::Unsupported`]), long before anything reaches here, so an export
 //! cannot contain them either. That is a true statement about the database, not a defect in
 //! this converter, and it is the one thing an operator must not discover by accident:

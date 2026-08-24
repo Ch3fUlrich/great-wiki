@@ -112,7 +112,7 @@ be healthy while the MCP server is not attached. `docker ps | grep omnigraph` te
 apart. MCP servers load at startup, so reconnecting means restarting Claude Code; record what
 should have been written and write it then rather than dropping it.
 
-## MCP failure modes — all four are silent
+## MCP failure modes — all five are silent
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -120,8 +120,14 @@ should have been written and write it then rather than dropping it.
 | MCP tool **absent entirely** — no prompt, no error | project server never approved | `.claude/settings.local.json` → `enabledMcpjsonServers` |
 | Graph answers describe another repo | wrong cwd, or a stray hardcoded `graphify` entry | `check-graphify-scope.sh --fix` |
 | `missing bearer token` / `fetch failed` | `OMNIGRAPH_TOKEN` / `OMNIGRAPH_NET` unset or wrong | `setup-agent-memory.sh --check` |
+| `graph 'great-wiki' not found`, and `apply-cluster.sh` dies on `./.env.shared: No such file` | that repo's config was consolidated into one `.env`; the script still sources the two files it was split into | `.env.shared` and `.env.server` are now symlinks to `.env` — restore them if they vanish, rather than copying secrets into three files |
 
 MCP servers load at startup — **restart Claude Code after editing `.mcp.json`.**
 
 The graph must also exist server-side; naming it here does not create it:
 `cd ~/code/agent-skills/infra/mcp-servers && ./scripts/add-project-graph.sh great-wiki && ./scripts/apply-cluster.sh`
+
+Both halves are needed and the first one lies about it: `add-project-graph.sh` reports success
+and writes the graph into `cluster/cluster.yaml`, but nothing exists server-side until
+`apply-cluster.sh` pushes that config — so `schema_get` keeps answering **not found** with no
+hint that a second step was ever required.

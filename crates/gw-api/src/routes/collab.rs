@@ -64,12 +64,17 @@
 //! nobody asked for — a history full of rows that say nothing is a history nobody can read.
 //! Publishing is what [`publish`] does, when a **person** asks for it.
 //!
-//! It also matters for what is *kept*. A `Block` — what a revision stores — has no field
-//! for an inline mark, so [`gw_collab::Room::snapshot`] drops bold, italic and link
-//! destinations on the floor; the encoded CRDT state keeps them. While a revision was the
-//! only thing surviving a restart, a session that came back had already lost its
-//! formatting. Nothing renders marks yet, which is exactly why this had to be fixed before
-//! M4 adds them rather than after.
+//! It also matters for what is *kept*. This was written when a `Block` — what a revision
+//! stores — had no field for an inline mark, so [`gw_collab::Room::snapshot`] dropped bold,
+//! italic and link destinations on the floor while the encoded CRDT state kept them: a
+//! session that came back from a restart had already lost its formatting, and that had to
+//! be fixed before anything rendered marks rather than after.
+//!
+//! `Block` carries marks now and a snapshot keeps them, so that particular loss is gone.
+//! The separation is not: a CRDT holds things a block tree still cannot — a cursor, an
+//! unresolved concurrent edit, the history that lets two writers converge — and the two
+//! tables exist because they answer different questions, not because one of them was
+//! temporarily lossy.
 //!
 //! The consequence, stated because it is a real change in behaviour: between two publishes,
 //! what an **editor** opens (the CRDT state) and what a **reader** sees (`documents.body`,
