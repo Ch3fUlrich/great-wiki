@@ -23,6 +23,14 @@
 //! [`gw_store::Store::restore_revision`] → [`gw_store::Store::publish_revision`]; this file
 //! never takes a second one, it only turns a refusal into a status code.
 //!
+//! **Whether to offer the restore is answered elsewhere, and deliberately.** A history page
+//! already fetches its document through `/api/documents`, which carries
+//! `may_write` — the same `Action::Write` verdict this restore will be refused by. There is
+//! no second field here saying it, because the timeline is *about* a page and would then be
+//! a second place for the same answer to live. What a restore needs on top of that bit is a
+//! signed-in author, which `publish_revision` checks and `/api/me` already reports: see
+//! [`gw_store::DocumentAccess::may_write`], which states exactly where the two come apart.
+//!
 //! **Restoring appends.** It publishes the old content as a NEW revision and rewinds
 //! nothing, so the version somebody was unsure about is still there afterwards and the
 //! restore is itself undoable. That is the store's property, not this module's; the test

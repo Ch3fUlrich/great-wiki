@@ -187,10 +187,11 @@ impl Store {
     /// path is read first and refused afterwards.
     ///
     /// Both callers put the answer straight into a permission-checked accessor:
-    /// [`Store::document_for_id_with_baseline`], which is how everything in this crate that
-    /// holds a document id authorises it, and `tasks::governing_path`, which asks the same
-    /// question about a card's anchor page. Neither the id nor the path it resolves to is
-    /// an answer about who may see anything.
+    /// [`Store::document_access_id_with_baseline`], which is how everything in this crate
+    /// that holds a document id authorises it — `document_for_id` is that call with the
+    /// write verdict dropped — and `tasks::governing_path`, which asks the same question
+    /// about a card's anchor page. Neither the id nor the path it resolves to is an answer
+    /// about who may see anything.
     ///
     /// Soft-deleted rows are included deliberately: filtering them here would make this
     /// answer "which path may be read", which is not its question.

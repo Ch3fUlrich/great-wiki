@@ -796,6 +796,7 @@ async fn the_global_board_discloses_no_card_whose_page_the_caller_may_not_read()
                 "detached",
                 "due_at",
                 "id",
+                "may_write",
                 "page",
                 "position",
                 "status",
@@ -1986,6 +1987,7 @@ async fn a_card_carries_no_internal_identifier() {
                 "detached",
                 "due_at",
                 "id",
+                "may_write",
                 "page",
                 "position",
                 "status",
@@ -2017,4 +2019,180 @@ async fn a_card_carries_no_internal_identifier() {
         !text.contains(&f.geheim_doc),
         "a document id reached the wire: {text}"
     );
+}
+
+// -------------------------------------------------------------------------------------
+// may_write: the bit an interface offers a control on.
+// -------------------------------------------------------------------------------------
+
+/// The bit on the wire and the refusal a person meets are one answer, asserted by taking
+/// both.
+///
+/// A boolean compared against a hand-written expectation proves that two people agreed about
+/// a fixture. What has to hold is that offering the control and permitting the act cannot
+/// come apart — so every caller below is read the bit off three responses and then made to
+/// attempt the corresponding write over HTTP, and the two are compared to each other and
+/// never to a constant.
+///
+/// Four callers, refused for four different reasons: a grant, a grant that stops at Read,
+/// the admin baseline that D-M2-8 says confers no write at all, and nobody. The last two are
+/// what a second implementation gets wrong — neither is refused by anything a grant explains.
+///
+/// Absent counts as `false` on both sides. A page, a card or a project the caller may not
+/// see carries no bit at all, and no control either; that the write is refused as well is
+/// what makes the two halves comparable.
+#[tokio::test]
+async fn may_write_on_the_wire_agrees_with_what_a_write_actually_does() {
+    let f = fixture().await;
+    // D-M2-8: reads everything, writes nothing. In the fixture by name, because a caller who
+    // is refused for a reason no grant explains is the one this bit is most likely to get
+    // wrong.
+    let chefin = account(&f.store, "chefin").await;
+    f.store.set_instance_admin(&chefin.id, true).await.unwrap();
+
+    // One fresh page per caller, all under `/projekt` so all four inherit the same grants:
+    // making a page a project's home is a real write to that page, and it can only be done
+    // once per page.
+    for (i, _) in ["chef", "leser", "chefin", "anon"].iter().enumerate() {
+        page(
+            &f.store,
+            Some("/projekt"),
+            &format!("Frei {i}"),
+            empty_body(),
+        )
+        .await;
+    }
+
+    // The one card anchored to `/projekt/offen`, which the fixture put there.
+    let harmlos = f
+        .store
+        .board_for(
+            &f.store
+                .principal_by_username("chef")
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            Some(&f.project),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|task| task.title == "Harmlos")
+        .expect("the fixture's anchored card is missing");
+
+    let mut seen = Vec::new();
+    for (i, who) in [Some("chef"), Some("leser"), Some("chefin"), None]
+        .into_iter()
+        .enumerate()
+    {
+        let name = who.unwrap_or("niemand");
+        let frei = format!("/projekt/frei-{i}");
+
+        // What the three READS say.
+        let (_, doc) = get(&f.store, who, &format!("/api/documents{frei}")).await;
+        let on_the_page = doc["may_write"] == json!(true);
+
+        // A caller who may not reach the board at all is answered 404 and shown no card, so
+        // `columns` is absent rather than empty — which is itself the "no bit, no control"
+        // half of what this test compares.
+        let (_, board) = get(&f.store, who, &format!("/api/board?projekt={}", f.project)).await;
+        let on_the_card = board["columns"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|column| column["tasks"].as_array().unwrap().iter())
+            .find(|card| card["id"] == json!(harmlos.id))
+            .is_some_and(|card| card["may_write"] == json!(true));
+
+        let (_, listing) = get(&f.store, who, "/api/projects").await;
+        let on_the_project = listing["projects"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .find(|project| project["id"] == json!(f.project))
+            .is_some_and(|project| project["may_write"] == json!(true));
+
+        // What three WRITES do. One per surface: the page becomes a project's home, the card
+        // changes column, the project changes its tag.
+        let (wrote_the_page, body) =
+            post(&f.store, who, "/api/projects", json!({ "home_path": frei })).await;
+        let wrote_the_page = wrote_the_page == StatusCode::CREATED;
+
+        let (moved_the_card, _) = patch(
+            &f.store,
+            who,
+            &format!("/api/tasks/{}", harmlos.id),
+            json!({ "status": "Läuft" }),
+        )
+        .await;
+        let moved_the_card = moved_the_card == StatusCode::OK;
+
+        let (changed_the_project, _) = patch(
+            &f.store,
+            who,
+            &format!("/api/projects/{}", f.project),
+            json!({ "tag_id": "marke" }),
+        )
+        .await;
+        let changed_the_project = changed_the_project == StatusCode::OK;
+
+        assert_eq!(
+            on_the_page, wrote_the_page,
+            "{name}: the page said may_write={on_the_page} and the write said \
+             {wrote_the_page}: {body}"
+        );
+        assert_eq!(
+            on_the_card, moved_the_card,
+            "{name}: the card said may_write={on_the_card} and the move said {moved_the_card}"
+        );
+        assert_eq!(
+            on_the_project, changed_the_project,
+            "{name}: the project said may_write={on_the_project} and the change said \
+             {changed_the_project}"
+        );
+        seen.push(on_the_page);
+    }
+
+    // Not vacuous: had every caller answered the same way, the comparisons above would hold
+    // for a constant and this test would assert nothing. That is the shape
+    // `scripts/mutate.sh` exists to catch, so it is ruled out here by name.
+    assert!(
+        seen.contains(&true) && seen.contains(&false),
+        "every caller got the same verdict, so the agreement above is a constant: {seen:?}"
+    );
+}
+
+/// The bit is asserted only about pages the caller can already see, and a refusal stays a
+/// refusal.
+///
+/// This is the whole of its disclosure surface (ADR 0010), so it is pinned rather than
+/// argued: a page somebody may not read answers 403 with no body, and one that is not there
+/// answers 404 — neither grows a `may_write` that would say the path exists, or that it is
+/// the sort of page somebody could edit.
+#[tokio::test]
+async fn a_page_the_caller_may_not_read_says_nothing_about_writing_it() {
+    let f = fixture().await;
+    for (who, uri, expected) in [
+        (
+            Some("leser"),
+            "/api/documents/projekt/geheim",
+            StatusCode::FORBIDDEN,
+        ),
+        (None, "/api/documents/projekt/offen", StatusCode::FORBIDDEN),
+        (
+            Some("chef"),
+            "/api/documents/gibt-es-nicht",
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let (status, text) = raw(&f.store, who, Method::GET, uri, None).await;
+        assert_eq!(status, expected, "{uri}: {text}");
+        assert!(
+            !text.contains("may_write"),
+            "{uri}: a refusal carried the write bit: {text}"
+        );
+    }
 }

@@ -5,6 +5,39 @@ use axum::Json;
 use axum_extra::extract::CookieJar;
 use gw_auth::Action;
 use gw_store::StoredDocument;
+use serde::Serialize;
+
+/// One page, as somebody reading it is given it: the stored document, and the one thing
+/// about the *caller's own* rights that an interface has to know before it offers a control.
+///
+/// The document's own fields are flattened rather than nested, so this is `StoredDocument`
+/// plus one key and every client that already reads a page keeps working. `may_write` is
+/// declared here, on this crate's wire type, rather than on the store's row type: a column
+/// added to `documents` must not appear on the API by itself, which is the division
+/// [`super::tasks::ProjectView`] makes for the same reason.
+#[derive(Debug, Serialize)]
+pub struct DocumentView {
+    #[serde(flatten)]
+    pub document: StoredDocument,
+    /// Whether the caller may **write** this page.
+    ///
+    /// Not computed here. It is [`gw_store::DocumentAccess::may_write`], produced by the
+    /// very authorisation that let this response exist — the same `permits()` verdict a
+    /// write to this page goes through — so the answer an interface offers a control on and
+    /// the answer that refuses it afterwards are one answer. A check written in this handler
+    /// would be the second one, and the second one is always the one that gets it wrong.
+    ///
+    /// **What it licenses**: opening the editor and saving what is typed, making the page a
+    /// project's home, and changing or throwing away a card the page governs. **Filing a
+    /// revision needs one thing more** — a signed-in, active account, because a revision
+    /// records an author — so a control that publishes or restores composes this with
+    /// `authenticated` from `/api/me`. See [`gw_store::DocumentAccess::may_write`] and
+    /// ADR 0010.
+    ///
+    /// Asserted only about a page the caller may already read: a refused read is a 403 and
+    /// carries no body at all, so this discloses nothing about pages they cannot see.
+    pub may_write: bool,
+}
 
 /// One document, if the caller may read it.
 ///
@@ -15,7 +48,7 @@ pub async fn get_document(
     State(state): State<AppState>,
     jar: CookieJar,
     Path(path): Path<String>,
-) -> Result<Json<StoredDocument>, ApiError> {
+) -> Result<Json<DocumentView>, ApiError> {
     let principal = state.principal(&jar).await;
     // Paths are stored with a leading slash; the route captures without one.
     let full = format!("/{}", path.trim_start_matches('/'));
@@ -35,11 +68,19 @@ pub async fn get_document(
         return Err(ApiError::NotFound);
     }
 
+    // `document_access` rather than `document_for`: same accessor, same decision, one field
+    // further. The read this handler already performs is what produces the write verdict, so
+    // there is no second query and no second answer.
     state
         .store
-        .document_for(&principal, &full, Action::Read)
+        .document_access(&principal, &full, Action::Read)
         .await
         .map_err(ApiError::Internal)?
-        .map(Json)
+        .map(|access| {
+            Json(DocumentView {
+                document: access.document,
+                may_write: access.may_write,
+            })
+        })
         .ok_or(ApiError::Forbidden)
 }

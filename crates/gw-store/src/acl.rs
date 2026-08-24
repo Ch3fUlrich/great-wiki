@@ -52,6 +52,44 @@ struct GrantRow {
     permission: String,
 }
 
+/// A document the accessor has authorised, and what the same verdict says about writing it.
+///
+/// **One value, because it is one answer.** [`Store::document_access_with_baseline`] reads
+/// the page's visibility and the grants that reach it once, and then asks [`permits`] — the
+/// only thing in this crate that interprets either — for the caller's action and for
+/// `Action::Write`. So the bit is not "a second opinion about writing" computed beside the
+/// read: it is the opinion, taken from the same inputs by the same function, before anybody
+/// has pressed anything. There is no version of this type in which the document came back
+/// and the verdict beside it was worked out somewhere else.
+///
+/// That is the trick [`crate::tasks::TaskPage`] plays with a document and
+/// `Store::assignee_named` plays with a name, and it is here for the same reason: a value
+/// that can only be built by having asked cannot be built by having forgotten to ask.
+#[derive(Debug, Clone)]
+pub struct DocumentAccess {
+    /// The document, exactly as [`Store::document_for`] would have answered.
+    pub document: StoredDocument,
+    /// Whether this caller may **write** this page.
+    ///
+    /// The verdict [`permits`] gives for `Action::Write` — which is the check every write
+    /// to this page goes through: opening an editing session, saving what is being typed,
+    /// making the page a project's home, and moving, changing or throwing away a card the
+    /// page governs. It exists so that a control can be offered honestly, rather than
+    /// offered to everybody and refused after it is pressed.
+    ///
+    /// **It is not a promise that every act called "writing" will succeed.** Filing a
+    /// *revision* also requires a signed-in, active account, because a revision records an
+    /// author — see [`Store::publish_revision`], which checks that before it asks this
+    /// question at all. On a path carrying `anyone: write` (a public share link) an
+    /// anonymous caller therefore gets `true` here, may edit and may save, and still cannot
+    /// publish under a byline nobody chose. Whoever offers a publish or a restore composes
+    /// this bit with "am I signed in", which the interface already knows.
+    ///
+    /// Meaningful only about a page the caller may already see: this value does not exist
+    /// unless the read it came from was permitted. See ADR 0010.
+    pub may_write: bool,
+}
+
 fn to_grant(row: GrantRow) -> Option<Grant> {
     let subject = match row.subject_kind.as_str() {
         "principal" => Subject::Principal(row.subject_id?),
@@ -323,6 +361,61 @@ impl Store {
         active_instance_admins(&mut conn).await
     }
 
+    /// Fetch a document only if `principal` may perform `action` on it, **and say whether
+    /// the same verdict would let them write it**.
+    ///
+    /// [`Store::document_for`] with one more field, for the callers that have to offer a
+    /// control before anybody presses it — see [`DocumentAccess::may_write`] for what the
+    /// field means and why it costs nothing.
+    ///
+    /// The same `None` conflation as `document_for`: absent and not permitted are one
+    /// answer here, and it is the HTTP layer that decides whether existence may be revealed.
+    pub async fn document_access(
+        &self,
+        principal: &Principal,
+        path: &str,
+        action: Action,
+    ) -> Result<Option<DocumentAccess>> {
+        let baseline = self.baseline_for(principal).await?;
+        self.document_access_with_baseline(principal, path, action, baseline)
+            .await
+    }
+
+    /// [`Store::document_access`], with the caller's baseline already resolved.
+    ///
+    /// **This is the whole body of `document_for`**, and `document_for` is the same call
+    /// with the write verdict dropped. That direction matters: the read a handler already
+    /// performs is what produces the bit, so there is one authorisation here rather than a
+    /// read and a separate "could I also write this" that could answer differently.
+    ///
+    /// `pub(crate)` for the reason [`Store::document_for_with_baseline`] is: outside this
+    /// crate the accessor resolves its own baseline, and cannot be handed somebody else's.
+    pub(crate) async fn document_access_with_baseline(
+        &self,
+        principal: &Principal,
+        path: &str,
+        action: Action,
+        baseline: Baseline,
+    ) -> Result<Option<DocumentAccess>> {
+        let Some(document) = self.document_by_path_unchecked(path).await? else {
+            return Ok(None);
+        };
+        let visibility = Visibility::from_str(&document.visibility).unwrap_or_default();
+        let grants = self.grants_for_path(path).await?;
+        if !permits(principal, action, visibility, &grants, baseline) {
+            return Ok(None);
+        }
+        // The SAME function, on the SAME inputs, one action further along. Nothing is read
+        // a second time and nothing is decided a second time: `permits` is the only thing
+        // in this crate that interprets a visibility and a set of grants, and this is it
+        // being asked the question a write will ask it later.
+        let may_write = permits(principal, Action::Write, visibility, &grants, baseline);
+        Ok(Some(DocumentAccess {
+            document,
+            may_write,
+        }))
+    }
+
     /// Fetch a document only if `principal` may perform `action` on it.
     ///
     /// Returning `None` for both "absent" and "not permitted" is deliberate at this layer:
@@ -387,18 +480,53 @@ impl Store {
         action: Action,
         baseline: Baseline,
     ) -> Result<Option<StoredDocument>> {
+        Ok(self
+            .document_access_id_with_baseline(principal, document_id, action, baseline)
+            .await?
+            .map(|access| access.document))
+    }
+
+    /// [`Store::document_access`] reached by an id.
+    ///
+    /// The same relationship to [`Store::document_access`] that [`Store::document_for_id`]
+    /// has to [`Store::document_for`], and for the same reason: the id is resolved to a path
+    /// and the path goes through the one accessor. An aggregate view holds ids — a board
+    /// card knows its `doc_id` — and this is how it asks the question a page-keyed caller
+    /// asks, including the write verdict, without a second rule for ids.
+    pub async fn document_access_id(
+        &self,
+        principal: &Principal,
+        document_id: &str,
+        action: Action,
+    ) -> Result<Option<DocumentAccess>> {
+        let baseline = self.baseline_for(principal).await?;
+        self.document_access_id_with_baseline(principal, document_id, action, baseline)
+            .await
+    }
+
+    /// [`Store::document_access_id`], with the caller's baseline already resolved. The one
+    /// body both id-keyed accessors above share, so neither can drift from the other.
+    pub(crate) async fn document_access_id_with_baseline(
+        &self,
+        principal: &Principal,
+        document_id: &str,
+        action: Action,
+        baseline: Baseline,
+    ) -> Result<Option<DocumentAccess>> {
         let Some(path) = self.document_path_unchecked(document_id).await? else {
             return Ok(None);
         };
-        self.document_for_with_baseline(principal, &path, action, baseline)
+        self.document_access_with_baseline(principal, &path, action, baseline)
             .await
     }
 
     /// [`Store::document_for`], with the caller's baseline already resolved.
     ///
-    /// The whole of `document_for` lives here, and `document_for` is one line calling it —
-    /// so this is not a second answer to the authorisation question, it is the *only* one,
-    /// reached two ways. What differs is who pays for the baseline: a caller asking about
+    /// The authorisation itself lives one function up, in
+    /// [`Store::document_access_with_baseline`], and this is that call with the write
+    /// verdict dropped — so this is not a second answer to the authorisation question, it is
+    /// the *only* one, reached by callers that do not need the extra field. What differs
+    /// between this and `document_for` is who pays for the baseline: a caller asking about
     /// ONE document has no reason to care, while an aggregate view over the whole corpus
     /// does, because the baseline is a property of the caller and not of the document. It is
     /// the same hoist [`Store::tree_for`] performs on its walk, for the same reason and with
@@ -414,12 +542,10 @@ impl Store {
         action: Action,
         baseline: Baseline,
     ) -> Result<Option<StoredDocument>> {
-        let Some(doc) = self.document_by_path_unchecked(path).await? else {
-            return Ok(None);
-        };
-        let visibility = Visibility::from_str(&doc.visibility).unwrap_or_default();
-        let grants = self.grants_for_path(path).await?;
-        Ok(permits(principal, action, visibility, &grants, baseline).then_some(doc))
+        Ok(self
+            .document_access_with_baseline(principal, path, action, baseline)
+            .await?
+            .map(|access| access.document))
     }
 
     /// The navigation tree, filtered to what `principal` may read.

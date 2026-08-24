@@ -11,7 +11,7 @@ pub mod revisions;
 pub mod sessions;
 pub mod tasks;
 
-pub use acl::Baseline;
+pub use acl::{Baseline, DocumentAccess};
 pub use admin::MembershipOutcome;
 pub use audit::{AuditEntry, AuditPage};
 pub use documents::{NewDocument, StoredDocument, TreeNode};

@@ -372,9 +372,24 @@ mutation crates/gw-store/src/acl.rs killed \
 # asserts the equivalence in both directions over three callers and two actions, and counts
 # the permitted answers, so a fixture that refused everybody — or permitted everybody —
 # fails it before the mutation is even made.
+#
+# The mutation used to swap the accessor for `document_by_path_unchecked`. It cannot any
+# more: the by-id resolution now hands back a `DocumentAccess` (0010), which the unchecked
+# lookup has no way to build, so that spelling stops compiling rather than leaking. What
+# replaces it is the same bypass expressed in the arguments — ask as an ADMIN BASELINE for a
+# READ, whatever was actually asked — which is exactly "the id route answers a different
+# question from the path route", and which the equivalence test is built to catch.
 mutation crates/gw-store/src/acl.rs killed \
-  '/pub(crate) async fn document_for_id_with_baseline/,/^    }$/ s@        self.document_for_with_baseline(principal, \&path, action, baseline)@        self.document_by_path_unchecked(\&path)@' \
+  '/pub(crate) async fn document_access_id_with_baseline/,/^    }$/ s@        self.document_access_with_baseline(principal, \&path, action, baseline)@        self.document_access_with_baseline(principal, \&path, Action::Read, Baseline::Admin)@' \
   'documents: reading a page by its id asks exactly what reading it by path asks'
+# And the one body every one of those routes ends in. `document_access_with_baseline` is now
+# the single place a visibility and a set of grants are turned into a verdict — `document_for`,
+# `document_for_id`, `document_access` and `governing_document` are all ways in — so deleting
+# its refusal is the whole permission system off in one line. It is here rather than assumed
+# because "everything reaches it" is only worth stating if reaching it decides something.
+mutation crates/gw-store/src/acl.rs killed \
+  's@        if !permits(principal, action, visibility, \&grants, baseline) {@        if false {@' \
+  'documents: the one accessor every read goes through actually refuses'
 
 # --- revisions: the append-only history under every page -----------------------------
 #
@@ -550,11 +565,15 @@ mutation crates/gw-store/src/links.rs killed \
 # leaked name.
 #
 # The first mutation is the one that matters: `governing_document` is the single line every
-# task, board and project in the module is authorised through, and swapping it for the
-# unchecked accessor is the same shape, the same types, and compiles.
+# task, board and project in the module is authorised through. It used to be swapped for the
+# unchecked accessor; since 0010 that call answers a `DocumentAccess`, which the unchecked
+# lookup cannot build, so the bypass is written in the arguments instead — authorise every
+# card, board and project as an ADMIN BASELINE performing a READ, whatever was asked. Same
+# shape, same types, compiles, and it is every leak this section is about at once: a stranger
+# sees the closed page's card, and a reader moves it.
 mutation crates/gw-store/src/tasks.rs killed \
-  's|        self.document_for_with_baseline(principal, \&path, action, baseline)|        self.document_by_path_unchecked(\&path)|' \
-  'tasks: every card and project goes through the permission-checked accessor'
+  's|        self.document_access_with_baseline(principal, \&path, action, baseline)|        self.document_access_with_baseline(principal, \&path, Action::Read, Baseline::Admin)|' \
+  'tasks: every card and project is authorised as the caller, for the action asked'
 #
 # This is also the mutation that stands behind the card's PAGE. An anchored card carries the
 # path and the title of the page its line was written on, and both come from the document
@@ -565,7 +584,7 @@ mutation crates/gw-store/src/tasks.rs killed \
 # `tests/tasks.rs` greps the whole response body for the secret page's path and title, and
 # asserts the privileged caller gets both.
 mutation crates/gw-store/src/tasks.rs killed \
-  's|                        .document_for_with_baseline(principal, \&path, Action::Read, baseline)|                        .document_by_path_unchecked(\&path)|' \
+  's|                        .document_access_with_baseline(principal, \&path, Action::Read, baseline)|                        .document_access_with_baseline(principal, \&path, Action::Read, Baseline::Admin)|' \
   'board: a card names only a page the caller may actually read'
 # Asking and then not acting on the answer. The memo now holds the PAGE the accessor
 # answered with rather than a boolean about it, so "not acting on it" has to be written as a
@@ -575,7 +594,7 @@ mutation crates/gw-store/src/tasks.rs killed \
 # asserts that the privileged caller DOES see all three cards, so neither of these can pass
 # by the fixture having nothing to hide.
 mutation crates/gw-store/src/tasks.rs killed \
-  's@            let Some(page) = known else {@            let page = known.unwrap_or(TaskPage { path: path.clone(), title: String::new() }); if false {@' \
+  's@            let Some(governed) = known else {@            let governed = known.unwrap_or(Governed { page: TaskPage { path: path.clone(), title: String::new() }, may_write: false }); if false {@' \
   'board: the per-document verdict is acted on rather than merely computed'
 # The baseline is hoisted out of the loop because it is a property of the caller. Hoisting
 # the WRONG one — anybody's but theirs — is how that optimisation goes wrong, and it reads
@@ -618,15 +637,17 @@ mutation crates/gw-store/src/tasks.rs equivalent \
 # mutated: the value that authorises the read is the value that names the page, so a version
 # that skipped the check would have nothing to build the name out of and would not compile.
 #
-# `task_for`'s arm now yields a PAIR — the page the card names and the path its assignee is
-# asked about — so the mutation has to build both halves out of nothing. That is the honest
-# version of "the card was already filtered": a card with no page on it and an empty path to
-# ask about, handed to somebody who may not read a word of it.
+# `task_for`'s arm now yields a TRIPLE — the page the card names, whether the caller may
+# change it (0010), and the path its assignee is asked about — so the mutation has to build
+# all three out of nothing. That is the honest version of "the card was already filtered": a
+# card with no page on it, no verdict behind it and an empty path to ask about, handed to
+# somebody who may not read a word of it. `tasks_for_document`'s arm is the same shape one
+# type further in, because its answer is now a `Governed` rather than a bare page.
 mutation crates/gw-store/src/tasks.rs killed \
-  '/pub async fn task_for/,/^    }$/ s@            None => return Ok(None),@            None => (None, String::new()),@' \
+  '/pub async fn task_for/,/^    }$/ s@            None => return Ok(None),@            None => (None, false, String::new()),@' \
   'tasks: reading one task follows the read on the page that governs it'
 mutation crates/gw-store/src/tasks.rs killed \
-  's@            None => return Ok(Vec::new()),@            None => TaskPage { path: String::new(), title: String::new() },@' \
+  's@            None => return Ok(Vec::new()),@            None => Governed { page: TaskPage { path: String::new(), title: String::new() }, may_write: false },@' \
   "tasks: a page's own task list follows that page's read"
 
 # --- D-10: who may assign whom, and what a card may say about them ----------------------
@@ -708,7 +729,7 @@ mutation crates/gw-store/src/tasks.rs killed \
   's|            None if moved_to.is_some() => row.assignee.clone(),|            None if false => row.assignee.clone(),|' \
   'assignment: a move re-checks the assignee against the board it is going to'
 mutation crates/gw-store/src/tasks.rs killed \
-  '/if let Some(project_id) = &update.project_id/,/^            governing_path = target_page.path;$/ s|                .governing_document(principal, \&target, Action::Write, baseline)|                .governing_document(principal, \&target, Action::Read, baseline)|' \
+  '/if let Some(project_id) = &update.project_id/,/^            governing_path = target_page.document.path;$/ s|                .governing_document(principal, \&target, Action::Write, baseline)|                .governing_document(principal, \&target, Action::Read, baseline)|' \
   'assignment: moving a card needs WRITE on the destination board, not read'
 mutation crates/gw-store/src/tasks.rs killed \
   '/pub async fn create_project/,/^    }$/ s|Action::Write|Action::Read|' \
@@ -850,7 +871,7 @@ mutation crates/gw-store/src/tasks.rs killed \
 # loose card names no page; naming the one that governs it would claim a line exists on a
 # page that never held one, and the page named is real, readable and wrong.
 mutation crates/gw-store/src/tasks.rs killed \
-  's|out.push(row_to_task(row, (anchored == 1).then_some(page), name)?);|out.push(row_to_task(row, Some(page), name)?);|' \
+  's|                (anchored == 1).then_some(governed.page),|                Some(governed.page),|' \
   'global board: a loose card names no page, and an anchored one names the page it is on'
 # `?seite=` answers the board of the project homed AT that path. Matching any project instead
 # is the shape of the bug — `find` on a predicate that is true too often — and on a page that
@@ -874,6 +895,66 @@ mutation crates/gw-api/src/routes/tasks.rs killed \
 mutation crates/gw-api/src/routes/tasks.rs killed \
   '/pub async fn global_board/,/^}$/ s@            if !state@            if false \&\& !state@' \
   'global board: seite= asks whether the page is there before it asks who may read it'
+
+# --- may_write: the bit an interface offers a control on (0010) -------------------------
+#
+# Nothing on the wire used to say whether the caller may WRITE a page, so every control that
+# needs write was offered to whoever was signed in and the true answer arrived as a refusal
+# afterwards. The fix is one boolean — and the whole of its correctness is that it is the
+# SAME `permits()` verdict the write itself goes through, taken from the same visibility and
+# the same grants, one action further along. A separately computed "can I write this" is a
+# second answer, and a second answer can disagree with the one that decides: the interface
+# then either offers somebody a thing that is refused, or hides a control from somebody
+# entitled to it — and nobody reports the second.
+#
+# Which is why the mutations below are not about a value being wrong. They are about the bit
+# being derived from something OTHER than the verdict, which is what every plausible wrong
+# version of this code does. `the_write_bit_agrees_with_what_a_write_actually_does`
+# (gw-store) and `may_write_on_the_wire_agrees_with_what_a_write_actually_does` (gw-api) are
+# what fail: neither compares the boolean against a written-down expectation — each asks for
+# the bit and then PERFORMS the write, for four callers refused for four different reasons.
+# Neither can pass vacuously either; both assert that the four callers did not all answer the
+# same way, which would make the agreement a constant.
+mutation crates/gw-store/src/acl.rs killed \
+  's|        let may_write = permits(principal, Action::Write, visibility, \&grants, baseline);|        let may_write = permits(principal, Action::Read, visibility, \&grants, baseline);|' \
+  'may_write: the bit is the WRITE verdict, not the read that just permitted the answer'
+# The same line, asked with a reach that is not the caller's. This one is EQUIVALENT and is
+# recorded rather than dropped, because the reason it is equivalent is a rule worth pinning:
+# D-M2-8 says no baseline confers write, so `permits` returns on the grant alone for any
+# action but Read and the baseline argument cannot change this line's answer. If that ever
+# stops being true the script will report this entry as mis-recorded, which is exactly the
+# alarm wanted — a baseline that silently began conferring write would otherwise turn this
+# bit into an offer nobody can accept.
+mutation crates/gw-store/src/acl.rs equivalent \
+  's|        let may_write = permits(principal, Action::Write, visibility, \&grants, baseline);|        let may_write = permits(principal, Action::Write, visibility, \&grants, Baseline::Admin);|' \
+  "may_write: the baseline cannot widen it — D-M2-8 means no baseline confers write, so this argument is dead for Action::Write"
+# A board of forty cards is the surface where "just say yes" is most tempting, because the
+# person writing it is looking at their own board and every card on it is theirs to move.
+mutation crates/gw-store/src/tasks.rs killed \
+  '/pub async fn board_for/,/^        in_board_order/ s|                governed.may_write,|                true,|' \
+  'may_write: a board says WHICH cards may be moved, not that all of them may'
+# And the other half: a card created ON a board names no page at all, so an implementation
+# that hung the verdict off the page the card NAMES answers false for somebody who may move
+# it perfectly well. `a_card_that_names_no_page_still_says_whether_it_may_be_moved` is the
+# shape that can tell the two apart; the ordinary fixture cannot, because its anchored cards
+# have both.
+mutation crates/gw-store/src/tasks.rs killed \
+  '/pub async fn board_for/,/^        in_board_order/ s|                governed.may_write,|                anchored == 1 \&\& governed.may_write,|' \
+  'may_write: a card that names no page still says whether it may be moved'
+# A project listing is the same claim one object up, and it is what »Neues Projekt« and the
+# delete control are offered on.
+mutation crates/gw-store/src/tasks.rs killed \
+  's|            may_write: home.may_write,|            may_write: true,|' \
+  'may_write: a project says which rows may be changed, not that every listed row may'
+# The two places the wire could invent it instead of carrying it. The module header of
+# `routes/tasks.rs` says this layer takes no permission decision of its own; these are what
+# make that a property rather than a promise.
+mutation crates/gw-api/src/routes/tasks.rs killed \
+  's|            may_write: task.may_write,|            may_write: true,|' \
+  'may_write: a card on the wire carries the store verdict, not one the handler made up'
+mutation crates/gw-api/src/routes/docs.rs killed \
+  's|                may_write: access.may_write,|                may_write: true,|' \
+  'may_write: a page read carries the verdict the accessor gave, not a constant'
 
 # --- crash recovery ------------------------------------------------------------------
 #

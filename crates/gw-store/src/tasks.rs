@@ -26,6 +26,11 @@
 //!   it has nothing to construct.
 //! - **Who may change a card**, including who may set its assignee, is whoever may Write
 //!   that same page.
+//! - **Whether a card says so** is [`Task::may_write`], and it is the same answer rather
+//!   than a second one: [`Store::governing_document`] hands back a [`DocumentAccess`], so
+//!   the one call that decides whether a card may be seen also carries the verdict on
+//!   changing it. A board therefore says which of its cards offer a control without asking
+//!   anything per card — see [`Governed`], and ADR 0010 for who is told.
 //! - **Who may be assigned** is anybody who may Read it. This is the answer to D-10's open
 //!   question, and [`Store::create_task`] states it in full.
 //! - **What a card may say about the person it rests on** is decided by that same rule,
@@ -77,7 +82,7 @@
 
 use crate::acl::Baseline;
 use crate::revisions::byline;
-use crate::{Store, StoredDocument};
+use crate::{DocumentAccess, Store, StoredDocument};
 use anyhow::{bail, Result};
 use gw_auth::{Action, Principal};
 use gw_core::{Block, BlockKind};
@@ -227,6 +232,18 @@ pub struct Task {
     /// a board and lives in no page. Always the page that was just authorised — see
     /// [`TaskPage`], which cannot be built from anything else.
     pub page: Option<TaskPage>,
+    /// Whether this caller may **change** this card: move it between columns, retitle it,
+    /// hand it to somebody, or throw it away.
+    ///
+    /// All four are one permission — Write on the card's **governing page** (rule 2 of
+    /// [`Store::create_task`]) — so this is one bit and not four. It is
+    /// [`crate::DocumentAccess::may_write`] for that page, taken from the same authorisation
+    /// that decided whether this card may be seen at all, which is why it costs no query: a
+    /// board asks its per-page question once either way.
+    ///
+    /// **Not the page this card NAMES.** A standalone card names no page and is still
+    /// governed by its project's home page, so `page` being `None` says nothing about this.
+    pub may_write: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -243,6 +260,14 @@ pub struct Project {
     pub home_path: String,
     pub home_title: String,
     pub tag_id: Option<String>,
+    /// Whether this caller may **change** this project: point it at another tag, delete it,
+    /// and create cards on its board.
+    ///
+    /// Write on the home page, which is the one gate every project mutation goes through
+    /// (see [`Store::may_administer_project`]) — and it is that gate's own answer, taken
+    /// from the authorisation that produced `home_path` and `home_title` above rather than
+    /// asked again per row when a listing is built.
+    pub may_write: bool,
     pub created_at: String,
 }
 
@@ -370,15 +395,41 @@ struct AssigneeNames {
     verdicts: HashMap<(String, String), Option<String>>,
 }
 
-/// A row, plus the page it names and what it calls the person it rests on.
+/// What one authorisation established about the page that governs a card: what to call the
+/// page, and whether the caller may change what it governs.
 ///
-/// Both are parameters rather than something this function looks up, and that is the
-/// design: a `TaskRow` carries a `doc_id` and an `assignee`, so either lookup would be one
-/// line away and would be unchecked. Every caller therefore has to have asked the accessor
-/// already, and hands in what it answered.
+/// **One value, for the reason [`TaskPage`] is one value.** A board that kept the page from
+/// the accessor's answer and worked the verdict out separately would have two answers to
+/// hold in step, and the separate one is the one that goes wrong. This is
+/// [`DocumentAccess`] with the document narrowed to the two fields a card may say — which is
+/// also why a board memoises this rather than the `DocumentAccess` itself: that carries the
+/// page's whole body, and a board can span forty pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Governed {
+    page: TaskPage,
+    may_write: bool,
+}
+
+impl From<&DocumentAccess> for Governed {
+    fn from(access: &DocumentAccess) -> Self {
+        Self {
+            page: TaskPage::from(&access.document),
+            may_write: access.may_write,
+        }
+    }
+}
+
+/// A row, plus the page it names, whether the caller may change it, and what it calls the
+/// person it rests on.
+///
+/// All three are parameters rather than something this function looks up, and that is the
+/// design: a `TaskRow` carries a `doc_id` and an `assignee`, so every one of those lookups
+/// would be one line away and would be unchecked. Every caller therefore has to have asked
+/// the accessor already, and hands in what it answered.
 fn row_to_task(
     row: TaskRow,
     page: Option<TaskPage>,
+    may_write: bool,
     assignee_name: Option<String>,
 ) -> Result<Task> {
     let Some(status) = TaskStatus::from_stored(&row.status) else {
@@ -401,6 +452,7 @@ fn row_to_task(
         position: row.position,
         detached: row.detached != 0,
         page,
+        may_write,
         created_at: row.created_at,
         updated_at: row.updated_at,
     })
@@ -434,9 +486,15 @@ impl Store {
     /// The document that governs a task, if `principal` may `action` it.
     ///
     /// This is the whole permission model of this module in one function: resolve the
-    /// governing page, then hand it to [`Store::document_for_with_baseline`] — the crate's
-    /// one authorisation path — and let it answer. Nothing here decides anything itself,
-    /// and no caller in this module is allowed to skip it.
+    /// governing page, then hand it to [`Store::document_access_with_baseline`] — the
+    /// crate's one authorisation path — and let it answer. Nothing here decides anything
+    /// itself, and no caller in this module is allowed to skip it.
+    ///
+    /// It answers with a [`DocumentAccess`] rather than a bare document, so that the ONE
+    /// call every function here already makes is also what says whether the caller may
+    /// change the thing it just authorised. A card and a project both need that bit, and
+    /// working it out beside this call — rather than out of it — would be the second answer
+    /// this module exists to not have.
     ///
     /// `None` covers "the page is gone", "the project is gone" and "not permitted" alike.
     async fn governing_document(
@@ -445,11 +503,11 @@ impl Store {
         home: &TaskHome,
         action: Action,
         baseline: Baseline,
-    ) -> Result<Option<StoredDocument>> {
+    ) -> Result<Option<DocumentAccess>> {
         let Some(path) = self.governing_path(home).await? else {
             return Ok(None);
         };
-        self.document_for_with_baseline(principal, &path, action, baseline)
+        self.document_access_with_baseline(principal, &path, action, baseline)
             .await
     }
 
@@ -457,7 +515,7 @@ impl Store {
     ///
     /// Crate-private and unexported. It answers "which page decides?", never "may you", and
     /// its one caller is [`Store::governing_document`], which puts the path straight into
-    /// `document_for`.
+    /// [`Store::document_access_with_baseline`] — the crate's one authorisation body.
     ///
     /// The anchored arm is [`Store::document_path_unchecked`] rather than the same SELECT
     /// written again: "which path does this id name" has one answer in this crate, and two
@@ -606,7 +664,11 @@ impl Store {
         let mut names = AssigneeNames::default();
         if new.assignee.is_some()
             && self
-                .assignee_name_for(&mut names, new.assignee.as_deref(), &governing.path)
+                .assignee_name_for(
+                    &mut names,
+                    new.assignee.as_deref(),
+                    &governing.document.path,
+                )
                 .await?
                 .is_none()
         {
@@ -642,15 +704,27 @@ impl Store {
         };
         // The page named on the card is the document that just authorised the write, not a
         // second lookup by the `doc_id` two lines above.
-        let page = page_of(&new.home, &governing);
+        let page = page_of(&new.home, &governing.document);
         // Named from the row that was actually written rather than from `new`, for the
         // reason `Store::set_tag` reads its answer back: what the caller is shown is what
         // the store holds. It is the same question the gate above already answered, asked
         // of the stored value.
         let name = self
-            .assignee_name_for(&mut names, row.assignee.as_deref(), &governing.path)
+            .assignee_name_for(
+                &mut names,
+                row.assignee.as_deref(),
+                &governing.document.path,
+            )
             .await?;
-        Ok(TaskOutcome::Done(Box::new(row_to_task(row, page, name)?)))
+        // `governing` came back from an `Action::Write` authorisation, so the bit it carries
+        // is the very verdict that let this insert happen. Read off it rather than written
+        // as `true`, because a literal here is a second claim about the same thing.
+        Ok(TaskOutcome::Done(Box::new(row_to_task(
+            row,
+            page,
+            governing.may_write,
+            name,
+        )?)))
     }
 
     /// One task, if the caller may Read its governing page.
@@ -665,11 +739,15 @@ impl Store {
         let baseline = self.baseline_for(principal).await?;
         // What authorises the read is what names the page: one answer, and no way to reach
         // the second line without having acted on the first.
-        let (page, governing_path) = match self
+        let (page, may_write, governing_path) = match self
             .governing_document(principal, &home, Action::Read, baseline)
             .await?
         {
-            Some(governing) => (page_of(&home, &governing), governing.path),
+            Some(governing) => (
+                page_of(&home, &governing.document),
+                governing.may_write,
+                governing.document.path,
+            ),
             None => return Ok(None),
         };
         let name = self
@@ -679,7 +757,7 @@ impl Store {
                 &governing_path,
             )
             .await?;
-        Ok(Some(row_to_task(row, page, name)?))
+        Ok(Some(row_to_task(row, page, may_write, name)?))
     }
 
     /// Change a task. Rule 2 of [`Store::create_task`] decides whether it happens at all.
@@ -717,9 +795,11 @@ impl Store {
 
         // Named from the document that authorised the change. A move cannot change it: only
         // a standalone card moves, and a standalone card names no page either side of one.
-        let page = page_of(&home, &governing);
+        let page = page_of(&home, &governing.document);
+        // The verdict that let this change happen, which is also the one the answer carries.
+        let mut may_write = governing.may_write;
         // Where the card will be governed from once this update lands.
-        let mut governing_path = governing.path;
+        let mut governing_path = governing.document.path;
         let mut moved_to = None;
         if let Some(project_id) = &update.project_id {
             if !matches!(home, TaskHome::Standalone { .. }) {
@@ -737,7 +817,10 @@ impl Store {
             else {
                 return Ok(TaskOutcome::Refused);
             };
-            governing_path = target_page.path;
+            // Both halves from the destination's own authorisation: after a move it is that
+            // page, not the one this card came from, that decides what may be done next.
+            may_write = target_page.may_write;
+            governing_path = target_page.document.path;
             moved_to = Some(project_id.clone());
         }
 
@@ -799,7 +882,9 @@ impl Store {
         let name = self
             .assignee_name_for(&mut names, row.assignee.as_deref(), &governing_path)
             .await?;
-        Ok(TaskOutcome::Done(Box::new(row_to_task(row, page, name)?)))
+        Ok(TaskOutcome::Done(Box::new(row_to_task(
+            row, page, may_write, name,
+        )?)))
     }
 
     /// Delete a task. `false` for "no such task" and for "not permitted" alike.
@@ -832,22 +917,24 @@ impl Store {
     /// asked once and the rows follow. An empty list is the answer both for "no tasks" and
     /// for "not for you", the same closed conflation the rest of this crate makes.
     ///
-    /// [`Store::document_for_id`] rather than [`Store::may`], because the answer is needed
-    /// twice: once to decide whether there is anything to return, and once to name the page
-    /// on every card. A boolean would have thrown away the document and left the name to be
-    /// fetched again, unchecked, from the id right there in the signature.
+    /// [`Store::document_access_id`] rather than [`Store::may`], because the answer is
+    /// needed three times: once to decide whether there is anything to return, once to name
+    /// the page on every card, and once to say whether these cards may be changed. A boolean
+    /// would have thrown away the document and left the name to be fetched again,
+    /// unchecked, from the id right there in the signature.
     pub async fn tasks_for_document(
         &self,
         principal: &Principal,
         document_id: &str,
     ) -> Result<Vec<Task>> {
-        let page = match self
-            .document_for_id(principal, document_id, Action::Read)
+        let governed = match self
+            .document_access_id(principal, document_id, Action::Read)
             .await?
         {
-            Some(doc) => TaskPage::from(&doc),
+            Some(access) => Governed::from(&access),
             None => return Ok(Vec::new()),
         };
+        let page = governed.page;
         let rows = sqlx::query_as::<_, TaskRow>(&format!(
             "SELECT {TASK_COLUMNS} FROM tasks WHERE doc_id = ?1"
         ))
@@ -865,7 +952,12 @@ impl Store {
             let name = self
                 .assignee_name_for(&mut names, row.assignee.as_deref(), &page.path)
                 .await?;
-            out.push(row_to_task(row, Some(page.clone()), name)?);
+            out.push(row_to_task(
+                row,
+                Some(page.clone()),
+                governed.may_write,
+                name,
+            )?);
         }
         in_board_order(&mut out);
         Ok(out)
@@ -931,7 +1023,7 @@ impl Store {
                 else {
                     return Ok(Vec::new());
                 };
-                Some(home_page.path)
+                Some(home_page.document.path)
             }
             None => None,
         };
@@ -967,12 +1059,13 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
 
-        // The memo holds the PAGE the accessor answered with, not a boolean about it. The
-        // verdict and the name are then one value: a card is emitted exactly when its page
-        // came back, and what it is called is that page's own title. Storing a boolean and
-        // fetching the name afterwards would be the same code with an unchecked lookup in
-        // the middle, correct only for as long as the loop above stays right.
-        let mut pages: HashMap<String, Option<TaskPage>> = HashMap::new();
+        // The memo holds what the accessor ANSWERED — the page and the write verdict
+        // together — not a boolean about it. The verdict and the name are then one value: a
+        // card is emitted exactly when its page came back, what it is called is that page's
+        // own title, and whether it may be moved is what the same call said. Storing a
+        // boolean and fetching the rest afterwards would be the same code with an unchecked
+        // lookup in the middle, correct only for as long as the loop above stays right.
+        let mut pages: HashMap<String, Option<Governed>> = HashMap::new();
         // And the people the cards rest on, resolved once each — see [`AssigneeNames`],
         // which is the same argument one field further in: forty cards on one person must
         // not be forty account loads any more than forty cards on one page may be forty
@@ -992,14 +1085,15 @@ impl Store {
                 Some(known) => known.clone(),
                 None => {
                     let known = self
-                        .document_for_with_baseline(principal, &path, Action::Read, baseline)
+                        .document_access_with_baseline(principal, &path, Action::Read, baseline)
                         .await?
-                        .map(|doc| TaskPage::from(&doc));
+                        .as_ref()
+                        .map(Governed::from);
                     pages.insert(path.clone(), known.clone());
                     known
                 }
             };
-            let Some(page) = known else {
+            let Some(governed) = known else {
                 continue;
             };
             let Some(row) = self.task_row_unchecked(&task_id).await? else {
@@ -1012,8 +1106,15 @@ impl Store {
                 .assignee_name_for(&mut names, row.assignee.as_deref(), &path)
                 .await?;
             // A loose card names no page: no page holds it, and naming the one that governs
-            // it would say a line exists somewhere that never held one.
-            out.push(row_to_task(row, (anchored == 1).then_some(page), name)?);
+            // it would say a line exists somewhere that never held one. The verdict is NOT
+            // conditional in the same way — the page that governs a loose card is its
+            // project's home, and that is the page just authorised.
+            out.push(row_to_task(
+                row,
+                (anchored == 1).then_some(governed.page),
+                governed.may_write,
+                name,
+            )?);
         }
 
         in_board_order(&mut out);
@@ -1088,7 +1189,7 @@ impl Store {
             doc_id: home_doc.clone(),
             block_id: None,
         };
-        let Some(page) = self
+        let Some(home) = self
             .governing_document(principal, &home, Action::Read, baseline)
             .await?
         else {
@@ -1097,8 +1198,11 @@ impl Store {
         Ok(Some(Project {
             id,
             home_doc,
-            home_path: page.path,
-            home_title: page.title,
+            home_path: home.document.path,
+            home_title: home.document.title,
+            // The same call, one field along — never a second ask about the same page. It is
+            // the answer `may_administer_project` gets when somebody actually tries.
+            may_write: home.may_write,
             tag_id,
             created_at,
         }))
@@ -4035,5 +4139,157 @@ mod tests {
             vec![("Bleibt", false)],
             "the revision was rolled back and the board it implies was not: {after:#?}"
         );
+    }
+
+    // --- may_write: the bit an interface offers a control on --------------------------
+
+    /// The whole point of the bit, asserted the only way that can prove it: **by doing the
+    /// write**.
+    ///
+    /// A boolean checked against a hand-written expectation proves that two people agreed
+    /// about a fixture. What has to hold is that `may_write` and the refusal a person meets
+    /// when they press the control are the same answer — so every caller below is asked for
+    /// the bit and then made to attempt the write, and the two are compared to each other
+    /// and never to a constant.
+    ///
+    /// Four callers, because the four disagree for four different reasons: a grant, a grant
+    /// that stops at Read, the admin baseline that D-M2-8 says confers no write at all, and
+    /// nobody. The last two are the ones a second implementation gets wrong — neither is
+    /// refused by anything a grant explains.
+    ///
+    /// Absent counts as `false` on both sides. A caller who may not read the page is shown
+    /// no page, no card and no project, so there is no bit and no control; that the write is
+    /// also refused is what makes the two halves comparable at all.
+    #[tokio::test]
+    async fn the_write_bit_agrees_with_what_a_write_actually_does() {
+        let store = store().await;
+        page(&store, None, "Projekt", Visibility::Restricted).await;
+        let seite = page(&store, Some("/projekt"), "Seite", Visibility::Restricted).await;
+
+        let chef = account(&store, "chef").await;
+        grant(&store, "/projekt", &chef, Permission::Write).await;
+        let leserin = account(&store, "leserin").await;
+        grant(&store, "/projekt", &leserin, Permission::Read).await;
+        // D-M2-8: the admin baseline reads everything and writes nothing.
+        let chefin = account(&store, "chefin").await;
+        store.set_instance_admin(&chefin.id, true).await.unwrap();
+        let niemand = Principal::anonymous();
+
+        let project = store
+            .create_project(&chef, "/projekt", None)
+            .await
+            .unwrap()
+            .expect("the fixture's project was refused");
+        let card = done(
+            store
+                .create_task(&chef, &new_task(anchored(&seite), "Karte"))
+                .await
+                .unwrap(),
+        );
+
+        let mut seen = Vec::new();
+        for who in [&chef, &leserin, &chefin, &niemand] {
+            // What the READ says, on each of the three surfaces that carry it.
+            let on_the_page = store
+                .document_access(who, "/projekt/seite", Action::Read)
+                .await
+                .unwrap()
+                .is_some_and(|access| access.may_write);
+            let on_the_card = store
+                .board_for(who, None)
+                .await
+                .unwrap()
+                .iter()
+                .find(|task| task.id == card.id)
+                .is_some_and(|task| task.may_write);
+            let on_the_project = store
+                .projects_for(who)
+                .await
+                .unwrap()
+                .iter()
+                .find(|listed| listed.id == project.id)
+                .is_some_and(|listed| listed.may_write);
+
+            // What a WRITE does. Three real ones, one per surface: the page's live content,
+            // the card's column, and the project's tag.
+            let wrote_the_page = store
+                .save_crdt_state(who, &seite, b"zustand")
+                .await
+                .unwrap();
+            let moved_the_card = matches!(
+                store
+                    .update_task(
+                        who,
+                        &card.id,
+                        &TaskUpdate {
+                            status: Some(TaskStatus::Fertig),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap(),
+                TaskOutcome::Done(_)
+            );
+            let changed_the_project = store
+                .set_project_tag(who, &project.id, Some("marke"))
+                .await
+                .unwrap();
+
+            let name = &who.username;
+            assert_eq!(
+                on_the_page, wrote_the_page,
+                "{name}: the page said may_write={on_the_page} and the write said                  {wrote_the_page}"
+            );
+            assert_eq!(
+                on_the_card, moved_the_card,
+                "{name}: the card said may_write={on_the_card} and the move said                  {moved_the_card}"
+            );
+            assert_eq!(
+                on_the_project, changed_the_project,
+                "{name}: the project said may_write={on_the_project} and the change said                  {changed_the_project}"
+            );
+            seen.push(on_the_page);
+        }
+
+        // Not vacuous: if every caller answered the same way, the two halves would agree
+        // for a constant and this test would assert nothing. That is the shape
+        // `scripts/mutate.sh` exists to catch, so it is ruled out here by name.
+        assert!(
+            seen.contains(&true) && seen.contains(&false),
+            "every caller got the same verdict, so the agreement above is a constant: {seen:?}"
+        );
+    }
+
+    /// A card created ON a board carries the bit too, and it comes from the page that
+    /// actually governs it — its project's home page — rather than from the page it names,
+    /// which is `None`.
+    ///
+    /// Worth its own test because the two are different fields on the same card: a standalone
+    /// card names no page at all (`page_of` returns `None`), so an implementation that hung
+    /// the verdict off the named page would answer `false` here for somebody who may move
+    /// the card perfectly well.
+    #[tokio::test]
+    async fn a_card_that_names_no_page_still_says_whether_it_may_be_moved() {
+        let (store, chef, project) = project_fixture().await;
+        let card = done(
+            store
+                .create_task(&chef, &new_task(standalone(&project), "Lose Karte"))
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(card.page, None, "a standalone card named a page");
+        assert!(
+            card.may_write,
+            "the card's own maker was told they may not move it"
+        );
+
+        let board = store.board_for(&chef, Some(&project)).await.unwrap();
+        let listed = board
+            .iter()
+            .find(|task| task.id == card.id)
+            .expect("the card is not on its own board");
+        assert_eq!(listed.page, None);
+        assert!(listed.may_write, "the board dropped the bit the create set");
     }
 }

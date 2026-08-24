@@ -39,12 +39,24 @@
 //! its assignee, and why an absent name is not an answer to "does this account exist", is
 //! recorded in `gw_store::tasks`' module header, which is where the decision lives.
 //!
+//! A card also says whether the caller may **change** it — [`TaskView::may_write`] — which
+//! is the third answer of this shape and the one that is *about the caller* rather than
+//! about the card. It is not decided here either: `gw_store::Task` carries the verdict the
+//! store's accessor gave for `Action::Write` on the card's governing page, which is the very
+//! check a move goes through. Offering the control on anything else — "are they signed in",
+//! say — is what the interface had to do while this was missing, and it made a board offer
+//! moves to people it had no reason to think could make them. ADR 0010 records who is told
+//! and why the answer discloses nothing beyond what the card already did.
+//!
 //! The way this layer loses that property is not by asking the wrong question but by
 //! **adding to the answer**. A total, a count of what was omitted, an id for a card that was
 //! filtered out, a status code that differs — each says that something is there. So a board
 //! response carries the cards it carries and nothing that could be a number about the rest;
 //! `the_board_carries_no_field_that_could_count_what_it_hid` in `tests/tasks.rs` asserts
 //! that structurally, on the keys, because a field that cannot exist cannot be wrong later.
+//! `may_write` is not of that family and the distinction is worth stating: it is a fact
+//! about the reader's own rights on a card they are already being shown, and it is the same
+//! for a board of one card as for a board of forty, so there is no arithmetic to do with it.
 //!
 //! # One board, in two places, from one query
 //!
@@ -187,6 +199,18 @@ pub struct TaskView {
     /// can express, which is deliberate — it would be the disclosure with the name filed
     /// off.
     pub page: Option<PageView>,
+    /// Whether the caller may **change** this card — move it between columns, retitle it,
+    /// hand it to somebody, or throw it away.
+    ///
+    /// One bit for all four, because they are one permission: Write on the card's governing
+    /// page (D-10, rule 2). Not decided here — `gw_store::Task` carries it, taken from the
+    /// same authorisation that decided whether this card may be seen at all, which is why a
+    /// board of forty cards asks nothing extra to answer it. It exists so a board can mark a
+    /// card read-only instead of offering a move that comes back refused.
+    ///
+    /// `true` on a card whose `page` is `null` is not a contradiction: a card created on a
+    /// board names no page and is governed by its project's home page all the same.
+    pub may_write: bool,
     /// D-8: the page no longer mentions the line that authored this card. Carried rather
     /// than hidden, because a card that looks live but is written nowhere is worse than one
     /// that says so.
@@ -207,6 +231,7 @@ impl From<&Task> for TaskView {
             position: task.position,
             anchored: task.doc_id.is_some(),
             page: task.page.as_ref().map(PageView::from),
+            may_write: task.may_write,
             detached: task.detached,
             created_at: task.created_at.clone(),
             updated_at: task.updated_at.clone(),
@@ -222,6 +247,15 @@ pub struct ProjectView {
     pub home_path: String,
     pub home_title: String,
     pub tag_id: Option<String>,
+    /// Whether the caller may **change** this project: retag it, delete it, and put new
+    /// cards on its board.
+    ///
+    /// Write on its home page, which is the single gate every project mutation goes through
+    /// — and it is that gate's own answer, carried by `gw_store::Project` from the
+    /// authorisation that produced `home_path` and `home_title`. A listing therefore says
+    /// which of its rows offer a control without asking a second question per row, and
+    /// »Neues Projekt« on a page is the same bit read off `/api/documents`.
+    pub may_write: bool,
     pub created_at: String,
 }
 
@@ -232,6 +266,7 @@ impl From<Project> for ProjectView {
             home_path: project.home_path,
             home_title: project.home_title,
             tag_id: project.tag_id,
+            may_write: project.may_write,
             created_at: project.created_at,
         }
     }
