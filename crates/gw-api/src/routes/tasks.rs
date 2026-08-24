@@ -38,20 +38,42 @@
 //! `the_board_carries_no_field_that_could_count_what_it_hid` in `tests/tasks.rs` asserts
 //! that structurally, on the keys, because a field that cannot exist cannot be wrong later.
 //!
+//! # One board, in two places, from one query
+//!
+//! D-12 put a board in **both** places — a global one at `/aufgaben` showing every task the
+//! caller may see, and one embedded in each project's home page — and named the cost in the
+//! same breath: two places that must agree. They agree because there is only one of them.
+//! `GET /api/board` and `GET /api/projects/{id}/board` answer the same [`BoardResponse`] out
+//! of the same [`gw_store::Store::board_for`], whose project binding is an `Option`; the
+//! project board is that call with a project bound and nothing else. There is no second
+//! board query to disagree with the first, and since every card is a disclosure surface,
+//! there is no second query to leak from either.
+//!
+//! `project` is therefore `null` on an unbound board and set on a bound one — one shape, so
+//! one component renders both.
+//!
 //! # Two answers, and which questions get which
 //!
-//! For a **path** — `POST /api/projects`, `GET /api/tasks/document/…` — an absent page is
-//! 404 and a refused one is 403, exactly as `/api/documents`, `/api/links/backlinks` and
-//! `/api/revisions/document` split them. Collapsing both into 404 hides configuration
-//! mistakes; collapsing both into 403 confirms the existence of every path somebody guesses.
+//! For a **path** — `POST /api/projects`, `GET /api/tasks/document/…`, `GET /api/board?seite=`
+//! — an absent page is 404 and a refused one is 403, exactly as `/api/documents`,
+//! `/api/links/backlinks` and `/api/revisions/document` split them. Collapsing both into 404
+//! hides configuration mistakes; collapsing both into 403 confirms the existence of every
+//! path somebody guesses.
 //!
-//! For a **project or task id** everything unreachable is 404 — an id is a uuid nobody
-//! guesses, so there is no existence to protect — *except* when the caller may read the
-//! governing page but not write it. There the refusal is about their rights on something
-//! they can already see, and saying 403 is what sends them to ask for access rather than to
-//! check the address. That is `revisions::restore`'s split, and it is taken the same way:
-//! the store is asked to do the thing first, and only a refusal asks the second, read-only
-//! question. A refused change writes nothing, so asking afterwards is free.
+//! For a **project or task id** — `GET /api/projects/{id}/board`, `GET /api/board?projekt=`
+//! — everything unreachable is 404 — an id is a uuid nobody guesses, so there is no
+//! existence to protect — *except* when the caller may read the governing page but not write
+//! it. There the refusal is about their rights on something they can already see, and saying
+//! 403 is what sends them to ask for access rather than to check the address. That is
+//! `revisions::restore`'s split, and it is taken the same way: the store is asked to do the
+//! thing first, and only a refusal asks the second, read-only question. A refused change
+//! writes nothing, so asking afterwards is free.
+//!
+//! **`GET /api/board` takes one of each, so the split lives on the parameter rather than on
+//! the route.** `?seite=` is path-keyed and gets 404/403; `?projekt=` is id-keyed and gets
+//! 404 for everything. That is not an inconsistency to be tidied away later: the two
+//! parameters are asking about two different kinds of thing, and a path is guessable where a
+//! uuid is not.
 //!
 //! # DEVIATION from the plan, and it is the trap this repository has hit twice
 //!
@@ -82,7 +104,7 @@
 
 use super::AppState;
 use crate::error::ApiError;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
@@ -203,9 +225,15 @@ pub struct ColumnView {
 ///
 /// **Two fields, and there is deliberately no third.** Anything that counted — a total, an
 /// `omitted`, a "3 cards" badge — would be a number about what the caller was not shown.
+///
+/// `project` is `null` for the **unbound** global board, which belongs to no project, and
+/// for a page that is nobody's home. It is a field that is always present and sometimes
+/// empty rather than a field that comes and goes: a key set that varied with the answer
+/// would be a shape a client has to branch on, and the structural test that pins these two
+/// fields could no longer say what it says.
 #[derive(Debug, Serialize)]
 pub struct BoardResponse {
-    pub project: ProjectView,
+    pub project: Option<ProjectView>,
     pub columns: Vec<ColumnView>,
 }
 
@@ -245,6 +273,24 @@ where
     T: Deserialize<'de>,
 {
     Option::<T>::deserialize(deserializer).map(Some)
+}
+
+/// What the global board is bound to, off the query string. Nothing, a project, or the page
+/// a project is homed on — never two at once.
+///
+/// German on the wire because these are the words the interface uses: `/aufgaben` is the
+/// board and `?projekt=`/`?seite=` are what a person filtering it would type into an address
+/// bar. The Rust below stays English, exactly as [`TaskStatus`] does.
+#[derive(Debug, Deserialize)]
+pub struct BoardQuery {
+    #[serde(default)]
+    pub projekt: Option<String>,
+    /// A page's path. This exists so the board embedded in a project's home page is ONE
+    /// request from a page loader that knows only the path it is rendering — without it,
+    /// every page would have to fetch the project listing first to find out whether it is a
+    /// home page, and an ordinary page would pay for a board it does not have.
+    #[serde(default)]
+    pub seite: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -321,6 +367,13 @@ const HOME_TAKEN: &str =
 
 const NOTHING_TO_CHANGE: &str = "name at least one field to change";
 
+/// Two bindings is a request with two answers. Preferring one of them quietly would hand the
+/// caller a board they did not ask for, and — because the two are authorised by different
+/// rules — possibly one they were refused under the other.
+const ONE_BINDING: &str =
+    "name a project or a page, not both: projekt=<id> for a project's board, seite=<pfad> \
+     for the board of the project that page is the home of";
+
 /// An untitled card cannot be told from any other untitled card, and nothing but a deletion
 /// would ever remove it. The store refuses the same thing one layer down for the same reason
 /// — an empty checkbox line is not yet a task.
@@ -364,6 +417,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/projects", get(list_projects).post(create_project))
         .route("/api/projects/{id}", patch(set_tag).delete(remove_project))
         .route("/api/projects/{id}/board", get(board))
+        // The global board (D-12). A literal two-segment path, so it shadows nothing: the
+        // only catch-all under `/api` is `/api/documents/{*path}`, and a page whose slug is
+        // `board` is still served from there.
+        .route("/api/board", get(global_board))
         .route("/api/tasks", post(create_task))
         .route("/api/tasks/{id}", patch(change_task).delete(remove_task))
         // The catch-all comes LAST in the pattern, which is what keeps it from shadowing
@@ -538,13 +595,35 @@ pub async fn remove_project(
     }
 }
 
+/// D-9's three columns, always all three, built from [`TaskStatus::ALL`] so they cannot drift
+/// from the set the store stores.
+///
+/// `board_for` already returns board order — column, then position, then id — so a column is
+/// a filter over that list and keeps the order it was given.
+///
+/// Shared by both boards deliberately: D-12's two places have to agree, and a second copy of
+/// this loop is a second thing to keep in step. It takes the cards it is given and asks
+/// nothing about them, which is what keeps every permission decision in `gw-store`.
+fn columns_of(tasks: &[Task]) -> Vec<ColumnView> {
+    TaskStatus::ALL
+        .into_iter()
+        .map(|status| ColumnView {
+            status,
+            tasks: tasks
+                .iter()
+                .filter(|task| task.status == status)
+                .map(TaskView::from)
+                .collect(),
+        })
+        .collect()
+}
+
 /// One project's board: its standalone cards, plus the tasks written into the pages of its
 /// home subtree, filtered per document (D-3).
 ///
 /// The filtering is `Store::board_for`'s and is not repeated here — a second filter in the
 /// handler would be a second place for the property to be wrong, and it is mutation-tested
-/// in `gw-store`. What this handler adds is the shape: D-9's three columns, always all
-/// three, built from [`TaskStatus::ALL`] so they cannot drift from the set the store stores.
+/// in `gw-store`. What this handler adds is the shape.
 ///
 /// `project_for` decides the status code and `board_for` decides what is disclosed. Both ask
 /// the same accessor the same question; neither is redundant.
@@ -565,27 +644,103 @@ pub async fn board(
 
     let tasks = state
         .store
-        .board_for(&principal, &id)
+        .board_for(&principal, Some(&id))
         .await
         .map_err(ApiError::Internal)?;
 
-    // `board_for` already returns board order — column, then position, then id — so a column
-    // is a filter over that list and keeps the order it was given.
-    let columns = TaskStatus::ALL
-        .into_iter()
-        .map(|status| ColumnView {
-            status,
-            tasks: tasks
-                .iter()
-                .filter(|task| task.status == status)
-                .map(TaskView::from)
-                .collect(),
-        })
-        .collect();
+    Ok(Json(BoardResponse {
+        project: Some(project.into()),
+        columns: columns_of(&tasks),
+    }))
+}
+
+/// The global board (D-12): every task the caller may see, optionally bound to one project.
+///
+/// **This is the project board with the binding taken off**, not a second board. The one
+/// call below is the one the project board makes, and the binding is a filter it already
+/// takes — see the module header on why D-12 required exactly that. So nothing here decides
+/// what is disclosed; what it decides is which of the two settled status-code rules applies,
+/// because the two parameters ask about two different kinds of thing:
+///
+/// - `?projekt=<id>` — an id, so everything unreachable is 404 and a refusal is
+///   indistinguishable from a project that is not there.
+/// - `?seite=<pfad>` — a path, so an absent page is 404 and a refused one is 403, exactly as
+///   a plain `GET` of that page already answers. It is resolved to the project homed there
+///   through `projects_for`, which is the permission-filtered listing — the same one
+///   `create_project` asks about a duplicate home — so "which project is this page the home
+///   of" has one answer in this crate rather than a second, board-shaped one. A page that is
+///   nobody's home is an **empty** board, never the unbound one: a page loader asks this
+///   about every page it renders, and falling through would put every task in the wiki on an
+///   ordinary page.
+/// - neither — 200 and whatever the caller is entitled to, which for somebody entitled to
+///   nothing is an empty board. No 403 and no 404, for the reason [`list_projects`] gives:
+///   the request asks about no particular thing, so there is no existence a status code
+///   could confirm.
+pub async fn global_board(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Query(query): Query<BoardQuery>,
+) -> Result<Json<BoardResponse>, ApiError> {
+    let principal = state.principal(&jar).await;
+
+    let project = match (query.projekt.as_deref(), query.seite.as_deref()) {
+        (Some(_), Some(_)) => return Err(ApiError::Invalid(ONE_BINDING.into())),
+        (Some(id), None) => Some(
+            state
+                .store
+                .project_for(&principal, id)
+                .await
+                .map_err(ApiError::Internal)?
+                .ok_or(ApiError::NotFound)?,
+        ),
+        (None, Some(captured)) => {
+            let path = full_path(captured);
+            if !state
+                .store
+                .document_exists(&path)
+                .await
+                .map_err(ApiError::Internal)?
+            {
+                return Err(ApiError::NotFound);
+            }
+            // Authorised on the page itself before anything is said about a project homed
+            // there. Otherwise "is this page a project's home" is a question anybody could
+            // ask of any page — and the answer names the project, its tag and when it was
+            // made.
+            state
+                .store
+                .document_for(&principal, &path, Action::Read)
+                .await
+                .map_err(ApiError::Internal)?
+                .ok_or(ApiError::Forbidden)?;
+
+            let homed = state
+                .store
+                .projects_for(&principal)
+                .await
+                .map_err(ApiError::Internal)?
+                .into_iter()
+                .find(|project| project.home_path == path);
+            let Some(project) = homed else {
+                return Ok(Json(BoardResponse {
+                    project: None,
+                    columns: columns_of(&[]),
+                }));
+            };
+            Some(project)
+        }
+        (None, None) => None,
+    };
+
+    let tasks = state
+        .store
+        .board_for(&principal, project.as_ref().map(|p| p.id.as_str()))
+        .await
+        .map_err(ApiError::Internal)?;
 
     Ok(Json(BoardResponse {
-        project: project.into(),
-        columns,
+        project: project.map(ProjectView::from),
+        columns: columns_of(&tasks),
     }))
 }
 

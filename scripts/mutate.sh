@@ -580,6 +580,16 @@ mutation crates/gw-store/src/tasks.rs killed \
 # The baseline is hoisted out of the loop because it is a property of the caller. Hoisting
 # the WRONG one — anybody's but theirs — is how that optimisation goes wrong, and it reads
 # as a tidy constant rather than as a hole.
+#
+# What it now breaks is subtler than it was, and the test had to be strengthened to keep
+# catching it. Before D-12 the loose cards were emitted without a second question — the home
+# page had just been authorised — so a borrowed baseline handed a stranger the whole board.
+# Now every card goes through the per-document check, so a stranger still gets nothing and
+# the leak has moved: the caller is let past the home-page gate and handed the cards they
+# happen to be able to read, which is a PARTIAL board where the design says there is none.
+# `a_board_is_refused_entirely_to_somebody_who_may_not_read_the_project_home` gained a caller
+# with read on a page inside the subtree and nothing on the home page, which is the only
+# shape that can tell the two apart.
 mutation crates/gw-store/src/tasks.rs killed \
   '/pub async fn board_for/,/^        let mut out: Vec<Task>/ s|Action::Read, baseline)|Action::Read, Baseline::Admin)|' \
   'board: the home page is read with the CALLERS baseline, never a borrowed one'
@@ -592,8 +602,12 @@ mutation crates/gw-store/src/tasks.rs killed \
 # and recorded as equivalent rather than as a gap: the prefix in the query is what stops it
 # loading every task in the corpus, and `within` is the boundary a reader can check. Either
 # alone is correct; they are kept as a pair on purpose, so breaking one changes nothing.
+#
+# The `?1 IS NULL` in front of it is the global board's filter (D-12) and is kept on both
+# sides of the mutation: unbound, the subtree predicate stands down entirely, so removing it
+# from the mutated form would be testing something else.
 mutation crates/gw-store/src/tasks.rs equivalent \
-  's|AND (d.path = ?1 OR substr(d.path, 1, length(?1) + 1) = ?1 \|\| ./.)|AND substr(d.path, 1, length(?1)) = ?1|' \
+  's|AND (?1 IS NULL OR d.path = ?1 OR substr(d.path, 1, length(?1) + 1) = ?1 \|\| ./.)|AND (?1 IS NULL OR substr(d.path, 1, length(?1)) = ?1)|' \
   'board: the candidate SQL narrows to the same subtree — defence in depth behind within()'
 # Both of these read a document and then decide, in one `match`, whether there is anything
 # to return AND what the card names its page. The refusal is the arm that is mutated: with
@@ -750,6 +764,66 @@ mutation crates/gw-api/src/routes/tasks.rs killed \
   '/pub async fn board/,/^}$/ s@.ok_or(ApiError::NotFound)?@.ok_or(ApiError::Forbidden)?@' \
   'board api: an id is not a path — an unreachable board is 404, never the 403 a path gets'
 
+# --- the GLOBAL board (D-12): the same query with nothing bound ------------------------
+#
+# D-12 put a board in two places and named the cost in the same breath: two places that must
+# agree. They agree by being ONE query with a filter — `board_for`'s project binding is an
+# `Option` and the project board is that call with a project bound — so there is no second
+# retrieval path here to mutate. That is the point: the mutations that stand behind the
+# global board are the ones already recorded above, because the global board runs the same
+# lines. In particular `board: a card names only a page the caller may actually read` and
+# `board: the per-document verdict is acted on rather than merely computed` now guard the
+# widest aggregate in the system as well as the narrowest, and
+# `an_unbound_board_carries_every_card_the_caller_may_see_and_no_other` fails on its own for
+# either of them — verified by hand, with the mutation applied and that one test run alone.
+#
+# What IS new is the filter, and each of the three below is a way of writing it that filters
+# nothing. None can pass vacuously: the tests they must fail assert the positive too — which
+# cards ARE on each board, and that the two places answer byte for byte.
+#
+# The first is the one that matters, and it SURVIVED when it was first written — which is the
+# only reason the test it now needs exists.
+#
+# The loose half of the query is bound by project id, and a loose card has no page of its own:
+# its `project_id` is the ONLY thing that can say which board it belongs on. Unbinding it
+# looked equivalent, because `within` filters a loose card too whenever its project's home
+# page lies outside the bound subtree — which was true of every fixture in the suite. It stops
+# being true the moment a project is homed on a page INSIDE another project's subtree, which
+# D-3 makes ordinary: the inner project's loose cards then land on the outer board.
+# `a_project_homed_inside_another_keeps_its_loose_cards_to_itself` is that shape, and it fails
+# on its own under this mutation.
+mutation crates/gw-store/src/tasks.rs killed \
+  's|AND (?2 IS NULL OR t.project_id = ?2)|AND (?2 IS NULL OR t.project_id IS NOT NULL)|' \
+  'global board: the project binding filters the loose cards, which nothing else can'
+# What a card SAYS about its page, in the one place the unified query could get it wrong. A
+# loose card names no page; naming the one that governs it would claim a line exists on a
+# page that never held one, and the page named is real, readable and wrong.
+mutation crates/gw-store/src/tasks.rs killed \
+  's|out.push(row_to_task(row, (anchored == 1).then_some(page))?);|out.push(row_to_task(row, Some(page))?);|' \
+  'global board: a loose card names no page, and an anchored one names the page it is on'
+# `?seite=` answers the board of the project homed AT that path. Matching any project instead
+# is the shape of the bug — `find` on a predicate that is true too often — and on a page that
+# is nobody's home it turns an empty board into somebody else's, on every ordinary page a
+# loader renders.
+mutation crates/gw-api/src/routes/tasks.rs killed \
+  's@.find(|project| project.home_path == path)@.find(|project| true \|\| project.home_path == path)@' \
+  'global board: seite= answers the board of the project homed at THAT path, or none'
+# The two status-code rules, on one endpoint. `?seite=` is a path and `?projekt=` is an id,
+# so they answer differently on purpose — which makes this the likeliest place in the crate
+# for somebody to copy the wrong one of the two branches sitting next to each other.
+mutation crates/gw-api/src/routes/tasks.rs killed \
+  '/pub async fn global_board/,/^}$/ s@.ok_or(ApiError::NotFound)?@.ok_or(ApiError::Forbidden)?@' \
+  'global board: projekt= is an id — unreachable is 404, never the 403 a path gets'
+mutation crates/gw-api/src/routes/tasks.rs killed \
+  '/pub async fn global_board/,/^}$/ s@.ok_or(ApiError::Forbidden)?@.ok_or(ApiError::NotFound)?@' \
+  'global board: seite= is a path — 404 for a page that is not there, 403 for one refused'
+# Existence before permission, for the path binding. With the check gone an absent page falls
+# through to the accessor and is refused as 403, which says nothing exists at a path where
+# nothing does — the configuration mistake this split exists to keep visible.
+mutation crates/gw-api/src/routes/tasks.rs killed \
+  '/pub async fn global_board/,/^}$/ s@            if !state@            if false \&\& !state@' \
+  'global board: seite= asks whether the page is there before it asks who may read it'
+
 # --- crash recovery ------------------------------------------------------------------
 #
 # A trap does not survive SIGKILL, and a killed run leaves the mutated file in place.
@@ -761,6 +835,18 @@ mutation crates/gw-api/src/routes/tasks.rs killed \
 # So the backup lives at a known path, and a marker records what is currently mutated.
 # Any later run restores it first. The marker is the durable part; the trap is now only
 # an optimisation for the ordinary case.
+#
+# DO NOT WRAP THIS IN `timeout`. The trap restores the file and does NOT exit — bash resumes
+# the interrupted command — so a SIGTERM arriving mid-mutation un-mutates the code UNDER the
+# test that is scoring it. That test then passes and the entry is recorded SURVIVED, while
+# the run carries on past its own deadline as if nothing had happened. Nothing in the output
+# says so: `verify_tree` is satisfied, because the file was put back to exactly what it
+# should be, and `note_drift` sees a clean tree for the same reason. It happened on
+# 2026-08-24 — `timeout 595`, fired eleven seconds into `tasks: reading one task follows the
+# read on the page that governs it`, which re-ran KILLED alone a minute later. The tell is a
+# lone SURVIVED near the end of a run whose reported wall clock EXCEEDS the timeout it was
+# given. If you need a deadline, run this in the background and read the summary when it
+# lands.
 #
 # NOTHING ELSE MAY WRITE TO THE TREE WHILE THIS RUNS — and the marker does not save you
 # from that one. This script restores by copying the backup over the file; a `cargo fmt`

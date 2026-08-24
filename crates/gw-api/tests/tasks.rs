@@ -445,29 +445,20 @@ async fn a_card_names_its_page_only_to_somebody_who_may_read_that_page() {
 ///
 /// Asserted structurally, on the keys, rather than by grepping for the number: a field that
 /// cannot exist cannot be wrong later.
+/// Both boards, because D-12 made them one shape: an unbound board's `project` is `null`
+/// rather than absent, so the key set does not vary with the answer and a client never has
+/// to branch on which board it is looking at.
 #[tokio::test]
 async fn the_board_carries_no_field_that_could_count_what_it_hid() {
     let f = fixture().await;
-    let (_, board) = get(
-        &f.store,
-        Some("leser"),
-        &format!("/api/projects/{}/board", f.project),
-    )
-    .await;
+    for uri in [
+        format!("/api/projects/{}/board", f.project),
+        "/api/board".to_string(),
+        format!("/api/board?projekt={}", f.project),
+    ] {
+        let (_, board) = get(&f.store, Some("leser"), &uri).await;
 
-    let keys: Vec<&str> = board
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    assert_eq!(
-        keys,
-        vec!["columns", "project"],
-        "the board grew a field beyond the project and its columns: {board}"
-    );
-    for column in board["columns"].as_array().unwrap() {
-        let keys: Vec<&str> = column
+        let keys: Vec<&str> = board
             .as_object()
             .unwrap()
             .keys()
@@ -475,9 +466,22 @@ async fn the_board_carries_no_field_that_could_count_what_it_hid() {
             .collect();
         assert_eq!(
             keys,
-            vec!["status", "tasks"],
-            "a column grew a field that could count what it hid: {column}"
+            vec!["columns", "project"],
+            "{uri}: the board grew a field beyond the project and its columns: {board}"
         );
+        for column in board["columns"].as_array().unwrap() {
+            let keys: Vec<&str> = column
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                keys,
+                vec!["status", "tasks"],
+                "{uri}: a column grew a field that could count what it hid: {column}"
+            );
+        }
     }
 }
 
@@ -526,6 +530,562 @@ async fn a_board_has_the_three_fixed_columns_even_when_they_are_empty() {
     assert!(
         board["columns"][1]["tasks"].as_array().unwrap().is_empty(),
         "the Läuft column should be empty in this fixture: {board}"
+    );
+}
+
+// -------------------------------------------------------------------------------------
+// D-12: the global board. The same query with nothing bound, and the widest aggregate
+// view in the system.
+// -------------------------------------------------------------------------------------
+
+/// The fixture above, widened until every route onto the global board is represented.
+///
+/// | Page | `chef` | `leser` | why it is here |
+/// |---|---|---|---|
+/// | `/projekt`, `/projekt/offen`, `/projekt/geheim` | as above | as above | one project, two grants |
+/// | `/anderes` — a second project's home | write | read | a card from *another* project |
+/// | `/anderes/tief` — grant defined AT the page | write | **nothing** | the same split, twice |
+/// | `/verschlossen` — a third project's home | write | **nothing** | a **loose** card nothing else can filter |
+/// | `/notizen` — no project's home, in no project's subtree | write | read | a card on **no** board but this one |
+///
+/// The third project is the one the project board never had to ask about: its card is loose,
+/// so it has no page of its own and the only thing that can filter it is its project's home
+/// page. A global board that kept the project board's shortcut — "the home page was
+/// authorised once, so its loose cards are fine" — hands that card straight over, and it is
+/// the shortcut anybody would keep, because for a *bound* board it is correct.
+///
+/// `/notizen` is the other half: D-12 rejected a per-project-only answer because a to-do
+/// filed under nothing would have nowhere at all to appear.
+struct Wide {
+    store: Arc<Store>,
+    /// `/projekt`, from the fixture above.
+    projekt: String,
+    /// `/anderes`, the second project.
+    anderes: String,
+    /// `/verschlossen`, the third — the one `leser` may not reach.
+    verschlossen: String,
+    /// The three cards `leser` must never learn about, by id.
+    hidden_task: String,
+    tief_task: String,
+    verschlossen_task: String,
+}
+
+async fn wide() -> Wide {
+    let f = fixture().await;
+    let store = f.store;
+    let (chef, _) = store.principal_by_username("chef").await.unwrap().unwrap();
+    let (leser, _) = store.principal_by_username("leser").await.unwrap().unwrap();
+
+    page(&store, None, "Anderes", empty_body()).await;
+    grant(&store, "/anderes", &chef, Permission::Write).await;
+    grant(&store, "/anderes", &leser, Permission::Read).await;
+    let tief = page(&store, Some("/anderes"), "Tief", empty_body()).await;
+    // Defined AT the page, which is what stops `leser`'s grant one level up reaching it.
+    grant(&store, "/anderes/tief", &chef, Permission::Write).await;
+    let anderes = store
+        .create_project(&chef, "/anderes", None)
+        .await
+        .unwrap()
+        .expect("the second project was refused");
+
+    page(&store, None, "Verschlossen", empty_body()).await;
+    grant(&store, "/verschlossen", &chef, Permission::Write).await;
+    let verschlossen = store
+        .create_project(&chef, "/verschlossen", None)
+        .await
+        .unwrap()
+        .expect("the third project was refused");
+
+    let notizen = page(&store, None, "Notizen", empty_body()).await;
+    grant(&store, "/notizen", &chef, Permission::Write).await;
+    grant(&store, "/notizen", &leser, Permission::Read).await;
+
+    let mut minted = Vec::new();
+    for (home, title) in [
+        (
+            TaskHome::Standalone {
+                project_id: anderes.id.clone(),
+            },
+            "Zweite Karte",
+        ),
+        (
+            TaskHome::Anchored {
+                doc_id: tief,
+                block_id: None,
+            },
+            "Tiefes Geheimnis",
+        ),
+        (
+            TaskHome::Standalone {
+                project_id: verschlossen.id.clone(),
+            },
+            "Verschlossene Karte",
+        ),
+        (
+            TaskHome::Anchored {
+                doc_id: notizen,
+                block_id: None,
+            },
+            "Unabgelegte Zeile",
+        ),
+    ] {
+        minted.push(
+            done(
+                store
+                    .create_task(
+                        &chef,
+                        &NewTask {
+                            home,
+                            title: title.into(),
+                            status: TaskStatus::Offen,
+                            assignee: None,
+                            due_at: None,
+                            position: 0,
+                        },
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .id,
+        );
+    }
+
+    Wide {
+        store,
+        projekt: f.project,
+        anderes: anderes.id,
+        verschlossen: verschlossen.id,
+        hidden_task: f.hidden_task,
+        tief_task: minted[1].clone(),
+        verschlossen_task: minted[2].clone(),
+    }
+}
+
+/// Every card `leser` may see, in board order: all seven are `Offen` at position 0, so the
+/// tie breaks on the id, which for a uuid v7 is the order they were created in.
+const LESER_SEES: [&str; 4] = ["Lose Karte", "Harmlos", "Zweite Karte", "Unabgelegte Zeile"];
+
+const CHEF_SEES: [&str; 7] = [
+    "Lose Karte",
+    "Harmlos",
+    "Befund besprechen",
+    "Zweite Karte",
+    "Tiefes Geheimnis",
+    "Verschlossene Karte",
+    "Unabgelegte Zeile",
+];
+
+/// What the global board must not say to `leser`, and what it DOES say to `chef` — so the
+/// same list is the assertion and its anti-vacuity half.
+///
+/// Three card titles, which are their pages' own words (D-2); two pages by path and by name,
+/// because an anchored card names the page its line was written on; and three card ids,
+/// because an id says the card exists.
+fn secrets_on_a_board(w: &Wide) -> Vec<&str> {
+    vec![
+        "Befund besprechen",
+        "Tiefes Geheimnis",
+        "Verschlossene Karte",
+        "/projekt/geheim",
+        "Geheim",
+        "/anderes/tief",
+        "Tief",
+        &w.hidden_task,
+        &w.tief_task,
+        &w.verschlossen_task,
+    ]
+}
+
+/// The third project itself, which `leser` may not reach at all. These reach a board through
+/// its `project` field rather than through a card, so their anti-vacuity half is `chef`'s
+/// board of that project rather than the unbound one — where `project` is `null` for
+/// everybody.
+fn secrets_about_the_closed_project(w: &Wide) -> Vec<&str> {
+    vec!["/verschlossen", "Verschlossen", &w.verschlossen]
+}
+
+/// **The one that matters, and the widest version of it.** The project board is filtered per
+/// document across one subtree; this is the same filtering across the whole corpus, every
+/// project in it and the pages no project claims — the single most likely place for the
+/// per-document check to be lost, because the query that answers it is the one with nothing
+/// to narrow it.
+///
+/// Asserted against the RAW BODY rather than by walking the JSON: a leak that arrives in a
+/// field nobody thought to check is still a leak, and a parsed `Value` has already thrown
+/// away the only evidence. Asserted on the KEYS too, because the other way an aggregate loses
+/// the property is by *adding* to its answer — a total, an `omitted`, an id for a card that
+/// was filtered away — and a field that cannot exist cannot be wrong later.
+///
+/// The anti-vacuity half is at the bottom: `chef` gets all seven cards and every one of the
+/// strings above, so none of this can pass by the board being empty for everybody.
+#[tokio::test]
+async fn the_global_board_discloses_no_card_whose_page_the_caller_may_not_read() {
+    let w = wide().await;
+
+    let (status, text) = raw(&w.store, Some("leser"), Method::GET, "/api/board", None).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let board: Value = serde_json::from_str(&text).unwrap();
+
+    assert_eq!(
+        titles(&board),
+        LESER_SEES.to_vec(),
+        "the global board leaked a card whose page the caller cannot read, or dropped one \
+         they can"
+    );
+    for secret in secrets_on_a_board(&w)
+        .into_iter()
+        .chain(secrets_about_the_closed_project(&w))
+    {
+        assert!(
+            !text.contains(secret),
+            "{secret:?} is in the global board's response: {text}"
+        );
+    }
+
+    // Nothing that could be a number about what was left out, on the board or on a column,
+    // and no field on a card beyond the ones the wire already promises.
+    let keys: Vec<&str> = board
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["columns", "project"],
+        "the global board grew a field beyond the project and its columns: {board}"
+    );
+    assert_eq!(
+        board["project"],
+        json!(null),
+        "an unbound board named a project: {board}"
+    );
+    for column in board["columns"].as_array().unwrap() {
+        let keys: Vec<&str> = column
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["status", "tasks"],
+            "a column grew a field that could count what it hid: {column}"
+        );
+    }
+    for card in cards(&board) {
+        let keys: Vec<&str> = card
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "anchored",
+                "assignee",
+                "created_at",
+                "detached",
+                "due_at",
+                "id",
+                "page",
+                "position",
+                "status",
+                "title",
+                "updated_at",
+            ],
+            "a card on the global board grew a field: {card}"
+        );
+    }
+
+    // Anti-vacuity. Every one of those cards, pages and identifiers really is there — for
+    // somebody who may read the page that governs it.
+    let (status, all) = raw(&w.store, Some("chef"), Method::GET, "/api/board", None).await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    let board: Value = serde_json::from_str(&all).unwrap();
+    assert_eq!(
+        titles(&board),
+        CHEF_SEES.to_vec(),
+        "the fixture never had a card to hide: {all}"
+    );
+    for secret in secrets_on_a_board(&w) {
+        assert!(
+            all.contains(secret),
+            "{secret:?} is not on the privileged caller's board either, so hiding it from \
+             the other one proves nothing: {all}"
+        );
+    }
+
+    // And the third project, whose name reaches a board through `project` rather than
+    // through a card: `chef` gets all of it, `leser` gets the 404 an id always gets.
+    let (status, closed) = raw(
+        &w.store,
+        Some("chef"),
+        Method::GET,
+        &format!("/api/board?projekt={}", w.verschlossen),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{closed}");
+    for secret in secrets_about_the_closed_project(&w) {
+        assert!(
+            closed.contains(secret),
+            "{secret:?} is nowhere for anybody, so hiding it proves nothing: {closed}"
+        );
+    }
+
+    // And an anonymous caller, who is granted nothing anywhere, gets a board rather than an
+    // error — the same conflation the project listing makes, for the same reason.
+    let (status, none) = get(&w.store, None, "/api/board").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(cards(&none).is_empty(), "{none}");
+}
+
+/// D-12's reason for a global board existing at all: a card written on a page that no
+/// project claims appears on no project's board, so without this one it would have nowhere
+/// to be — which is how a to-do goes missing, the failure D-6 exists to prevent.
+#[tokio::test]
+async fn a_card_no_project_claims_appears_on_the_global_board_and_on_no_other() {
+    let w = wide().await;
+
+    for project in [&w.projekt, &w.anderes, &w.verschlossen] {
+        let (_, board) = get(
+            &w.store,
+            Some("chef"),
+            &format!("/api/projects/{project}/board"),
+        )
+        .await;
+        assert!(
+            !titles(&board).contains(&"Unabgelegte Zeile".to_string()),
+            "a card on a page no project claims turned up on a project's board: {board}"
+        );
+    }
+
+    let (_, board) = get(&w.store, Some("chef"), "/api/board").await;
+    assert!(
+        titles(&board).contains(&"Unabgelegte Zeile".to_string()),
+        "the card is on no board at all, which is the to-do going missing: {board}"
+    );
+}
+
+/// **The cost D-12 named, asserted rather than intended.** The board exists in two places
+/// and they must agree; they agree by being one query with a filter, so binding the global
+/// board to a project must answer that project's own board byte for byte — not merely the
+/// same cards, the same bytes, because a difference in any field is a difference one of the
+/// two interfaces would render.
+#[tokio::test]
+async fn binding_the_global_board_to_a_project_answers_that_projects_own_board_byte_for_byte() {
+    let w = wide().await;
+
+    for who in [Some("chef"), Some("leser")] {
+        for project in [&w.projekt, &w.anderes] {
+            let bound = raw(
+                &w.store,
+                who,
+                Method::GET,
+                &format!("/api/board?projekt={project}"),
+                None,
+            )
+            .await;
+            let own = raw(
+                &w.store,
+                who,
+                Method::GET,
+                &format!("/api/projects/{project}/board"),
+                None,
+            )
+            .await;
+            assert_eq!(
+                bound, own,
+                "the two places a board appears do not agree, for {who:?} on {project}"
+            );
+        }
+    }
+
+    // And the binding really narrows: `leser`'s bound board is a strict subset of their
+    // global one, so the assertion above is not two identically empty answers.
+    let (_, bound) = get(
+        &w.store,
+        Some("leser"),
+        &format!("/api/board?projekt={}", w.projekt),
+    )
+    .await;
+    assert_eq!(titles(&bound), vec!["Lose Karte", "Harmlos"], "{bound}");
+}
+
+/// `?seite=` exists so the board embedded in a project's home page is ONE request from a
+/// page loader that knows only its own path — no round trip to find out which project, if
+/// any, is homed there.
+#[tokio::test]
+async fn binding_the_global_board_to_a_page_answers_the_board_of_the_project_homed_there() {
+    let w = wide().await;
+
+    let by_page = raw(
+        &w.store,
+        Some("leser"),
+        Method::GET,
+        "/api/board?seite=/projekt",
+        None,
+    )
+    .await;
+    let by_id = raw(
+        &w.store,
+        Some("leser"),
+        Method::GET,
+        &format!("/api/board?projekt={}", w.projekt),
+        None,
+    )
+    .await;
+    assert_eq!(
+        by_page, by_id,
+        "the page a project is homed on does not answer that project's board"
+    );
+    assert_eq!(by_page.0, StatusCode::OK);
+    let board: Value = serde_json::from_str(&by_page.1).unwrap();
+    assert_eq!(board["project"]["home_path"], json!("/projekt"));
+    assert_eq!(titles(&board), vec!["Lose Karte", "Harmlos"]);
+
+    // A leading slash is optional, because a client holding a path has it either way.
+    let bare = raw(
+        &w.store,
+        Some("leser"),
+        Method::GET,
+        "/api/board?seite=projekt",
+        None,
+    )
+    .await;
+    assert_eq!(bare, by_page);
+}
+
+/// A page that is nobody's home gets an EMPTY board, not the global one. The difference
+/// matters: a page loader asks this question about every page it renders, and falling
+/// through to the unbound board would put every task in the wiki on an ordinary page.
+#[tokio::test]
+async fn a_page_that_is_no_projects_home_answers_an_empty_board() {
+    let w = wide().await;
+
+    let (status, board) = get(&w.store, Some("chef"), "/api/board?seite=/notizen").await;
+    assert_eq!(status, StatusCode::OK, "{board}");
+    assert_eq!(
+        board["project"],
+        json!(null),
+        "a page that is nobody's home named a project: {board}"
+    );
+    assert!(
+        cards(&board).is_empty(),
+        "an unclaimed page fell through to the global board: {board}"
+    );
+    // Three columns all the same, so one component renders this without a special case.
+    let columns: Vec<&str> = board["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["status"].as_str().unwrap())
+        .collect();
+    assert_eq!(columns, vec!["Offen", "Läuft", "Fertig"]);
+
+    // Anti-vacuity: `/notizen` really does hold a card, and the global board shows it.
+    let (_, global) = get(&w.store, Some("chef"), "/api/board").await;
+    assert!(titles(&global).contains(&"Unabgelegte Zeile".to_string()));
+}
+
+/// A **path** splits 404 from 403; an **id** conflates everything unreachable into 404.
+/// The two rules disagree deliberately and this endpoint takes both, so the split lives on
+/// the parameter rather than on the route — which is exactly where somebody copying one of
+/// the two branches would get it wrong.
+#[tokio::test]
+async fn the_global_boards_two_bindings_take_the_two_answers_this_crate_has_settled() {
+    let w = wide().await;
+
+    // A path: absent is 404, refused is 403. `/projekt/geheim` exists and `leser` may not
+    // read it — a plain GET of that page already says as much, so a 404 here would be a
+    // third answer to a question this wiki has settled.
+    let (status, _) = get(&w.store, Some("chef"), "/api/board?seite=/gibt-es-nicht").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = get(&w.store, Some("leser"), "/api/board?seite=/projekt/geheim").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // An id: a uuid nobody guesses, so there is no existence to protect and a refusal must
+    // be indistinguishable from a project that is not there — byte for byte, or the endpoint
+    // answers "does this project exist" to anybody who asks.
+    let refused = raw(
+        &w.store,
+        Some("leser"),
+        Method::GET,
+        &format!("/api/board?projekt={}", w.verschlossen),
+        None,
+    )
+    .await;
+    let missing = raw(
+        &w.store,
+        Some("leser"),
+        Method::GET,
+        "/api/board?projekt=0192f000-0000-7000-8000-000000000000",
+        None,
+    )
+    .await;
+    assert_eq!(refused.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        refused, missing,
+        "a project the caller may not read is distinguishable from one that is not there"
+    );
+
+    // Naming both is a request with two answers, and quietly preferring one of them is how a
+    // caller ends up reading a board they did not ask for.
+    let (status, body) = get(
+        &w.store,
+        Some("chef"),
+        &format!("/api/board?projekt={}&seite=/anderes", w.projekt),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// D-8, on the widest board: a card whose line has gone from its page still appears, marked.
+/// Hiding it here would be worse than on a project board — the global board is the one place
+/// somebody goes to find a to-do they cannot otherwise locate.
+#[tokio::test]
+async fn a_detached_card_stays_on_the_global_board_carrying_that_state() {
+    let w = wide().await;
+    let (chef, _) = w
+        .store
+        .principal_by_username("chef")
+        .await
+        .unwrap()
+        .unwrap();
+    // A page in no project at all, so only the global board can show this card.
+    let seite = page(&w.store, Some("/notizen"), "Ablauf", empty_body()).await;
+    grant(&w.store, "/notizen/ablauf", &chef, Permission::Write).await;
+
+    w.store
+        .publish_revision(&chef, &seite, &checklist_body("Termin machen"), None)
+        .await
+        .unwrap()
+        .expect("chef may write the page");
+
+    let (_, board) = get(&w.store, Some("chef"), "/api/board").await;
+    let card = cards(&board)
+        .into_iter()
+        .find(|task| task["title"] == "Termin machen")
+        .unwrap_or_else(|| panic!("the checklist line minted no card: {board}"));
+    assert_eq!(card["detached"], json!(false));
+
+    w.store
+        .publish_revision(&chef, &seite, &empty_body(), None)
+        .await
+        .unwrap()
+        .expect("chef may write the page");
+
+    let (_, board) = get(&w.store, Some("chef"), "/api/board").await;
+    let card = cards(&board)
+        .into_iter()
+        .find(|task| task["title"] == "Termin machen")
+        .unwrap_or_else(|| panic!("the card vanished with its line: {board}"));
+    assert_eq!(
+        card["detached"],
+        json!(true),
+        "the global board hid the detached state instead of carrying it: {card}"
     );
 }
 

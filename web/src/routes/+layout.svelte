@@ -28,9 +28,16 @@
        is here rather than on a page because that is what it is: every page at once. Projects
        are here for the same reason and for one more: D-13 put the list of projects on a page
        of its own precisely so that "what projects exist" has somewhere to be asked, and a
-       page nothing links to is a page nobody finds. -->
+       page nothing links to is a page nobody finds.
+
+       Aufgaben is here for exactly that last reason, and D-12 makes it sharper. There is a
+       board on every project's home page too — but a task that belongs to no project has no
+       home page to appear on, and the global board is the only place it exists. A link
+       nobody can find is how such a to-do goes missing, which is the failure D-6 exists to
+       prevent. It comes first because it is the one of the three you would open daily. -->
   <nav class="brand-group" aria-label="Hauptbereiche">
     <a class="brand" href="/">great&#8209;wiki</a>
+    <a class="section" href="/aufgaben">Aufgaben</a>
     <a class="section" href="/projekte">Projekte</a>
     <a class="section" href="/graph">Graph</a>
   </nav>

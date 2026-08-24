@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import Page from './+page.svelte';
 import { ANONYMOUS, type Backlink, type Me, type StoredDocument, type TreeNode } from '$lib/api';
+import type { BoardNotice, BoardResponse, BoardTask } from '$lib/board';
 import type { Block } from '$lib/blocks/render';
 
 /**
@@ -73,13 +74,71 @@ function html(
   {
     me = ANONYMOUS,
     edit = false,
-    backlinks = []
-  }: { me?: Me; edit?: boolean; backlinks?: Backlink[] } = {}
+    backlinks = [],
+    board = null,
+    boardFehler = null,
+    hinweis = null
+  }: {
+    me?: Me;
+    edit?: boolean;
+    backlinks?: Backlink[];
+    board?: BoardResponse | null;
+    boardFehler?: string | null;
+    hinweis?: BoardNotice | null;
+  } = {}
 ): string {
-  return render(Page, { props: { data: { me, doc, body, tree, backlinks, edit } } }).body.replace(
-    /<!--.*?-->/g,
-    ''
-  );
+  return render(Page, {
+    props: {
+      data: {
+        me,
+        doc,
+        body,
+        tree,
+        backlinks,
+        edit,
+        board,
+        boardFehler,
+        hinweis,
+        zurueck: doc.path,
+        now: NOW
+      }
+    }
+  }).body.replace(/<!--.*?-->/g, '');
+}
+
+/** One instant for the whole file — the loader captures one for the same reason. */
+const NOW = Date.UTC(2026, 7, 24, 12, 0, 0);
+
+/** A board homed at the container page, with one card on it. */
+function boardFor(over: Partial<BoardTask> = {}): BoardResponse {
+  const card: BoardTask = {
+    id: 't1',
+    title: 'Kabel bestellen',
+    status: 'Offen',
+    assignee: null,
+    due_at: null,
+    position: 0,
+    anchored: true,
+    page: { path: container.path, title: container.title },
+    detached: false,
+    created_at: '2026-08-20 09:00:00',
+    updated_at: '2026-08-20 09:00:00',
+    ...over
+  };
+  return {
+    project: {
+      id: 'p1',
+      home_path: container.path,
+      home_title: container.title,
+      tag_id: null,
+      created_at: '2026-08-20 09:00:00'
+    },
+    columns: [
+      { status: 'Offen', tasks: card.status === 'Offen' ? [card] : [] },
+      { status: 'Läuft', tasks: card.status === 'Läuft' ? [card] : [] },
+      { status: 'Fertig', tasks: card.status === 'Fertig' ? [card] : [] }
+    ]
+  };
 }
 
 describe('the reader page, server-rendered', () => {
@@ -209,5 +268,71 @@ describe('offering the editor', () => {
     expect(out).toMatch(/<article[^>]*class="prose/);
     expect(out).toMatch(/aria-label="Pfad"/);
     expect(out).toContain('Unterseiten');
+  });
+});
+
+/**
+ * D-12's second placement, on the page itself.
+ *
+ * The board is proved in `$lib/components/Board.test.ts` — it is the SAME component
+ * `/aufgaben` renders, which is how the two are kept from disagreeing. What is proved here
+ * is where it sits and when it appears at all: only on a page the endpoint named as a
+ * project's home, above the subpage list, and never as furniture on the pages that are
+ * nobody's home — which is nearly every page in this wiki.
+ */
+describe('the board embedded in a project home page', () => {
+  it('renders nothing at all on a page that is nobody s home', () => {
+    const out = html();
+    expect(out).not.toContain('tafel-titel');
+    expect(out).not.toContain('>Offen<');
+  });
+
+  it('carries the whole board in the first response when this page is a home', () => {
+    const out = html(container, { board: boardFor() });
+    expect(out).toMatch(/<h2[^>]*>Aufgaben<\/h2>/);
+    expect(out).toContain('>Offen<');
+    expect(out).toContain('>Läuft<');
+    expect(out).toContain('>Fertig<');
+    expect(out).toContain('Kabel bestellen');
+  });
+
+  it('puts the tasks above the subpage list, because that is what you came for', () => {
+    const out = html(container, { board: boardFor() });
+    expect(out.indexOf('Kabel bestellen')).toBeLessThan(out.indexOf('Unterseiten'));
+  });
+
+  it('moves a card back to THIS page, not to the global board', () => {
+    const out = html(container, { me: signedIn, board: boardFor() });
+    expect(out).toMatch(/action="\/aufgaben\?\/verschieben"/);
+    expect(out).toMatch(
+      /name="zurueck"[^>]*value="\/rundgang\/import-export"|value="\/rundgang\/import-export"[^>]*name="zurueck"/
+    );
+  });
+
+  it('shows a card it cannot move, marked, rather than hiding it', () => {
+    const out = html(container, { board: boardFor() });
+    expect(out).toContain('Kabel bestellen');
+    expect(out).toContain('Nur lesbar');
+  });
+
+  it('announces a move where it happened', () => {
+    const out = html(container, {
+      board: boardFor(),
+      hinweis: { art: 'ok', text: '»Kabel bestellen« steht jetzt in Läuft.' }
+    });
+    expect(out).toContain('id="aufgaben-hinweis"');
+    expect(out).toContain('steht jetzt in Läuft');
+  });
+
+  it('does not claim a page has a board when it merely failed to ask', () => {
+    // A failed request cannot tell a project's home page from any other, and nearly every
+    // page here is the other. The sentence therefore says "if one belongs here".
+    const out = html(container, {
+      boardFehler:
+        'Falls zu dieser Seite eine Aufgabentafel gehört, konnte sie nicht geladen werden: Fehler 500.'
+    });
+    expect(out).toContain('Falls zu dieser Seite');
+    expect(out).toMatch(/role="alert"/);
+    expect(out).not.toContain('>Offen<');
   });
 });

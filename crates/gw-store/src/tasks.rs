@@ -703,63 +703,99 @@ impl Store {
         Ok(out)
     }
 
-    /// One project's board: its standalone cards, plus the tasks written into the pages of
-    /// its home subtree (D-3), filtered per document.
+    /// A board: every card the caller may see, optionally bound to one project.
     ///
-    /// **The filtering is the point, and it is per DOCUMENT.** The subtree prefix below
-    /// narrows which candidates are considered — it is cheap and it discloses nothing —
-    /// and then every survivor goes through [`Store::document_for_with_baseline`], which is
-    /// what actually decides. Never the other way round: D-3 makes membership per document,
-    /// so a project spanning pages with different grants is normal rather than exceptional,
-    /// and a path prefix cannot express who may read what. A card whose page the caller may
-    /// not read is omitted **entirely** — not shown as "a card you may not open", and not
-    /// counted, either of which would say that the page exists.
+    /// # One query with a filter, which is D-12's decision and not an economy
     ///
-    /// Nothing at all is returned to somebody who may not read the project's home page, and
-    /// an empty board is the answer for "no such project" too.
+    /// D-12 put a board in two places — a global one, and one embedded in each project's
+    /// home page — and named the cost in the same breath: **two places that must agree.** So
+    /// `project_id` is a *filter over this query*, never a second query. `Some(id)` narrows
+    /// the candidates to that project; `None` considers every task there is, in every project
+    /// and in none. Both leave by the same loop with the same per-document verdict on every
+    /// card, because a second retrieval path would be a second answer — and since every card
+    /// is a disclosure surface, a second answer is also a second chance to leak.
+    ///
+    /// The unbound board is therefore the widest aggregate in this system, and the one thing
+    /// it must never do is widen what any card *says*.
+    ///
+    /// # The filtering is the point, and it is per DOCUMENT
+    ///
+    /// The SQL narrows which candidates are considered — it is cheap and it discloses
+    /// nothing — and then **every** survivor's governing page goes through
+    /// [`Store::document_for_with_baseline`], which is what actually decides. Never the
+    /// other way round: D-3 makes membership per document, so a project spanning pages with
+    /// different grants is normal rather than exceptional, and a path prefix cannot express
+    /// who may read what. A card whose page the caller may not read is omitted **entirely** —
+    /// not shown as "a card you may not open", and not counted, either of which would say
+    /// that the page exists.
+    ///
+    /// A **standalone** card is governed by its project's home page and is put through that
+    /// same check like everything else. The bound board could have skipped it, having just
+    /// authorised its one home page; the unbound board must not, because it spans every
+    /// project there is. One code path is what stops the two from answering differently.
+    ///
+    /// Bound to a project whose home page the caller may not read — or to one that is not
+    /// there — the answer is an empty board, the same closed conflation the rest of this
+    /// crate makes.
     ///
     /// The verdict is memoised per path and the baseline is hoisted out of the loop, for the
     /// reason [`Store::graph_for`] gives: the baseline is a property of the caller, not of
     /// the document, and forty cards on one page must not be forty authorisations.
-    pub async fn board_for(&self, principal: &Principal, project_id: &str) -> Result<Vec<Task>> {
+    pub async fn board_for(
+        &self,
+        principal: &Principal,
+        project_id: Option<&str>,
+    ) -> Result<Vec<Task>> {
         let baseline = self.baseline_for(principal).await?;
-        let home = TaskHome::Standalone {
-            project_id: project_id.to_string(),
-        };
-        let Some(home_page) = self
-            .governing_document(principal, &home, Action::Read, baseline)
-            .await?
-        else {
-            return Ok(Vec::new());
-        };
 
-        // The standalone cards. Their governing page is the home page, which the caller has
-        // just been authorised for, so no second question arises for these — and they name
-        // no page, because no page holds them.
-        let mut out: Vec<Task> = sqlx::query_as::<_, TaskRow>(&format!(
-            "SELECT {TASK_COLUMNS} FROM tasks WHERE project_id = ?1"
-        ))
-        .bind(project_id)
-        .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(|row| row_to_task(row, None))
-        .collect::<Result<Vec<_>>>()?;
+        // The binding, resolved once and through the accessor. Two things come of it: the
+        // anchored half of the query below is narrowed to that project's home subtree, and a
+        // caller who may not read the home page is answered with an empty board before
+        // anything at all has been selected.
+        let root = match project_id {
+            Some(id) => {
+                let home = TaskHome::Standalone {
+                    project_id: id.to_string(),
+                };
+                let Some(home_page) = self
+                    .governing_document(principal, &home, Action::Read, baseline)
+                    .await?
+                else {
+                    return Ok(Vec::new());
+                };
+                Some(home_page.path)
+            }
+            None => None,
+        };
+        let mut out: Vec<Task> = Vec::new();
 
-        // The anchored ones, with the path of the page each is written in. A JOIN, so that
-        // forty cards across ten pages is one round trip rather than forty — and it
-        // discloses nothing, because nothing selected here is returned until the loop below
-        // has put its path through the accessor.
+        // Every candidate card, with the path of the page that GOVERNS it — the page the line
+        // was written on for an anchored card, the project's home page for a loose one — and
+        // which of those two it is.
         //
-        // `substr(...) = ?1 || '/'` rather than `LIKE ?1 || '/%'`: LIKE would read a `%` or
-        // a `_` in a path as a wildcard, and the boundary has to be a segment anyway so that
-        // `/darmspiegelung` is outside `/darm`.
-        let anchored: Vec<(String, String)> = sqlx::query_as(
-            "SELECT t.id, d.path FROM tasks t JOIN documents d ON d.id = t.doc_id \
+        // One statement rather than two, and the halves are the two homes a task can have
+        // (`CHECK ((doc_id IS NULL) <> (project_id IS NULL))` keeps them exclusive, so no card
+        // can arrive twice), not two implementations of a board. A JOIN, so that forty cards
+        // across ten pages is one round trip rather than forty — and it discloses nothing,
+        // because nothing selected here is returned until the loop below has put its path
+        // through the accessor.
+        //
+        // `?1 IS NULL` and `?2 IS NULL` are the filter: unbound, both predicates stand down
+        // and every task is a candidate. `substr(...) = ?1 || '/'` rather than
+        // `LIKE ?1 || '/%'`: LIKE would read a `%` or a `_` in a path as a wildcard, and the
+        // boundary has to be a segment anyway so that `/darmspiegelung` is outside `/darm`.
+        let candidates: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT t.id, d.path, 1 FROM tasks t JOIN documents d ON d.id = t.doc_id \
              WHERE d.deleted_at IS NULL \
-               AND (d.path = ?1 OR substr(d.path, 1, length(?1) + 1) = ?1 || '/')",
+               AND (?1 IS NULL OR d.path = ?1 OR substr(d.path, 1, length(?1) + 1) = ?1 || '/') \
+             UNION ALL \
+             SELECT t.id, d.path, 0 FROM tasks t \
+             JOIN projects p ON p.id = t.project_id \
+             JOIN documents d ON d.id = p.home_doc \
+             WHERE d.deleted_at IS NULL AND (?2 IS NULL OR t.project_id = ?2)",
         )
-        .bind(&home_page.path)
+        .bind(root.as_deref())
+        .bind(project_id)
         .fetch_all(&self.pool)
         .await?;
 
@@ -769,11 +805,15 @@ impl Store {
         // fetching the name afterwards would be the same code with an unchecked lookup in
         // the middle, correct only for as long as the loop above stays right.
         let mut pages: HashMap<String, Option<TaskPage>> = HashMap::new();
-        for (task_id, path) in anchored {
-            // Defence in depth against the SQL above: the prefix narrows, `within` is the
-            // same boundary stated where a human can read it, and neither decides.
-            if !within(&home_page.path, &path) {
-                continue;
+        for (task_id, path, anchored) in candidates {
+            // Defence in depth against the SQL above, in the bound case: the prefix narrows,
+            // `within` is the same boundary stated where a human can read it, and neither
+            // decides. Unbound there is no subtree to be inside of, and nothing is skipped
+            // here — the accessor below is the only thing that omits a card either way.
+            if let Some(root) = &root {
+                if !within(root, &path) {
+                    continue;
+                }
             }
             let known = match pages.get(&path) {
                 Some(known) => known.clone(),
@@ -792,7 +832,9 @@ impl Store {
             let Some(row) = self.task_row_unchecked(&task_id).await? else {
                 continue;
             };
-            out.push(row_to_task(row, Some(page))?);
+            // A loose card names no page: no page holds it, and naming the one that governs
+            // it would say a line exists somewhere that never held one.
+            out.push(row_to_task(row, (anchored == 1).then_some(page))?);
         }
 
         in_board_order(&mut out);
@@ -1747,7 +1789,7 @@ mod tests {
             );
         }
 
-        let board = store.board_for(&chef, &project).await.unwrap();
+        let board = store.board_for(&chef, Some(&project)).await.unwrap();
         let titles: Vec<&str> = board.iter().map(|t| t.title.as_str()).collect();
         assert_eq!(
             titles,
@@ -1777,7 +1819,7 @@ mod tests {
                 .unwrap(),
         );
 
-        let board = store.board_for(&chef, &project).await.unwrap();
+        let board = store.board_for(&chef, Some(&project)).await.unwrap();
         assert!(
             board.is_empty(),
             "a page whose path merely starts with the project's landed on its board: {board:?}"
@@ -1822,7 +1864,7 @@ mod tests {
         let leser = account(&store, "leser").await;
         grant(&store, "/projekt", &leser, Permission::Read).await;
 
-        let board = store.board_for(&leser, &project).await.unwrap();
+        let board = store.board_for(&leser, Some(&project)).await.unwrap();
         let titles: Vec<&str> = board.iter().map(|t| t.title.as_str()).collect();
         assert_eq!(
             titles,
@@ -1832,11 +1874,214 @@ mod tests {
 
         // Anti-vacuity: the card really is on the board for somebody who may read the page,
         // so the assertion above is about filtering and not about an empty fixture.
-        let all = store.board_for(&chef, &project).await.unwrap();
+        let all = store.board_for(&chef, Some(&project)).await.unwrap();
         assert_eq!(
             all.len(),
             3,
             "the fixture never had a card to hide: {all:?}"
+        );
+    }
+
+    /// **The widest aggregate in the system, and therefore the likeliest place to lose the
+    /// filtering.** D-12 puts a board in two places — a global one and one embedded in each
+    /// project's home page — and names the cost: two places that must agree. They agree by
+    /// being ONE query with a filter, so the project binding is an `Option` and the unbound
+    /// call is the same code with nothing bound.
+    ///
+    /// Six cards, reaching this board by every route there is: a loose card on a project the
+    /// caller may read, a loose card on one they may **not** (which the bound board never had
+    /// to ask about, because it had already authorised its one home page — that shortcut is
+    /// exactly what this call cannot take), a line on a page inside a project, a line on a
+    /// page inside a *different* project, a line on a page no project claims at all, and a
+    /// line on a page the caller may not read.
+    ///
+    /// The anti-vacuity half is at the bottom: `chef` sees all six.
+    #[tokio::test]
+    async fn an_unbound_board_carries_every_card_the_caller_may_see_and_no_other() {
+        let (store, chef, projekt) = project_fixture().await;
+        let leser = account(&store, "leser").await;
+        grant(&store, "/projekt", &leser, Permission::Read).await;
+
+        // A grant defined AT the page is what stops `leser`'s grant one level up reaching
+        // it — the shape D-3 calls normal rather than exceptional.
+        let geheim = page(&store, Some("/projekt"), "Geheim", Visibility::Restricted).await;
+        grant(&store, "/projekt/geheim", &chef, Permission::Write).await;
+
+        // A second project, with a subtree of its own and the same split inside it.
+        page(&store, None, "Anderes", Visibility::Restricted).await;
+        grant(&store, "/anderes", &chef, Permission::Write).await;
+        grant(&store, "/anderes", &leser, Permission::Read).await;
+        let anderes = store
+            .create_project(&chef, "/anderes", None)
+            .await
+            .unwrap()
+            .expect("the second project was refused");
+        let tief = page(&store, Some("/anderes"), "Tief", Visibility::Restricted).await;
+        grant(&store, "/anderes/tief", &chef, Permission::Write).await;
+
+        // A third project whose home page `leser` may not read at all. Its loose card has no
+        // page of its own, so the ONLY thing that can filter it is the project's home.
+        page(&store, None, "Verschlossen", Visibility::Restricted).await;
+        grant(&store, "/verschlossen", &chef, Permission::Write).await;
+        let verschlossen = store
+            .create_project(&chef, "/verschlossen", None)
+            .await
+            .unwrap()
+            .expect("the third project was refused");
+
+        // And a page no project claims. Its card appears on no project board at all, which
+        // is the reason D-12 rejected a per-project-only answer: a to-do filed nowhere would
+        // have nowhere to appear.
+        let notizen = page(&store, None, "Notizen", Visibility::Restricted).await;
+        grant(&store, "/notizen", &chef, Permission::Write).await;
+        grant(&store, "/notizen", &leser, Permission::Read).await;
+
+        for (home, title) in [
+            (standalone(&projekt), "Lose A"),
+            (anchored(&geheim), "Befund besprechen"),
+            (standalone(&anderes.id), "Lose B"),
+            (anchored(&tief), "Tiefe Zeile"),
+            (standalone(&verschlossen.id), "Lose C"),
+            (anchored(&notizen), "Unabgelegte Zeile"),
+        ] {
+            done(
+                store
+                    .create_task(&chef, &new_task(home, title))
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let board = store.board_for(&leser, None).await.unwrap();
+        let titles: Vec<&str> = board.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["Lose A", "Lose B", "Unabgelegte Zeile"],
+            "the global board leaked a card whose page the caller cannot read, or dropped \
+             one they can"
+        );
+
+        // Anti-vacuity: every one of the three hidden cards really is there, for somebody
+        // who may read the page that governs it.
+        let all = store.board_for(&chef, None).await.unwrap();
+        let titles: Vec<&str> = all.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "Lose A",
+                "Befund besprechen",
+                "Lose B",
+                "Tiefe Zeile",
+                "Lose C",
+                "Unabgelegte Zeile",
+            ],
+            "the fixture never had a card to hide: {all:?}"
+        );
+    }
+
+    /// The binding is a filter over the one query, so binding it must answer exactly what
+    /// the project's own board answers — that is D-12's "two places that must agree", stated
+    /// as an assertion rather than as an intention.
+    #[tokio::test]
+    async fn binding_the_board_to_a_project_answers_that_projects_own_board() {
+        let (store, chef, projekt) = project_fixture().await;
+        let seite = page(&store, Some("/projekt"), "Befunde", Visibility::Restricted).await;
+        grant(&store, "/projekt/befunde", &chef, Permission::Write).await;
+        page(&store, None, "Anderes", Visibility::Restricted).await;
+        grant(&store, "/anderes", &chef, Permission::Write).await;
+        let anderes = store
+            .create_project(&chef, "/anderes", None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        for (home, title) in [
+            (standalone(&projekt), "Lose Karte"),
+            (anchored(&seite), "Zeile"),
+            (standalone(&anderes.id), "Fremde Karte"),
+        ] {
+            done(
+                store
+                    .create_task(&chef, &new_task(home, title))
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let bound = store.board_for(&chef, Some(&projekt)).await.unwrap();
+        assert_eq!(
+            bound.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(),
+            vec!["Lose Karte", "Zeile"],
+            "binding to a project did not answer that project's board"
+        );
+
+        // The unbound one is a superset, and the other project's card is what it adds.
+        let unbound = store.board_for(&chef, None).await.unwrap();
+        assert_eq!(
+            unbound.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(),
+            vec!["Lose Karte", "Zeile", "Fremde Karte"]
+        );
+    }
+
+    /// A project homed on a page **inside** another project's subtree, which D-3 makes
+    /// ordinary rather than exotic: a project is a claim about a page and the pages below it,
+    /// and a sub-project's home page is one of those pages.
+    ///
+    /// The two kinds of card then part company, and this is the one place where that is
+    /// visible. A line written on the inner home page is inside the outer subtree, so it is
+    /// on **both** boards — that is what "the subtree decides membership" means for an
+    /// anchored card. A **loose** card is on its own project's board and nowhere else: no
+    /// page holds it, so there is no subtree to place it in, and only its `project_id` can
+    /// say where it belongs.
+    ///
+    /// Found by a mutation. Unbinding the loose half of the query looked equivalent, because
+    /// `within` happens to filter a loose card too whenever its project's home lies outside
+    /// the subtree — which is every fixture in this file but this one.
+    #[tokio::test]
+    async fn a_project_homed_inside_another_keeps_its_loose_cards_to_itself() {
+        let (store, chef, aussen) = project_fixture().await;
+        let unter = page(&store, Some("/projekt"), "Unter", Visibility::Restricted).await;
+        grant(&store, "/projekt/unter", &chef, Permission::Write).await;
+        let innen = store
+            .create_project(&chef, "/projekt/unter", None)
+            .await
+            .unwrap()
+            .expect("a page inside another project's subtree was refused as a home");
+
+        for (home, title) in [
+            (standalone(&aussen), "Lose aussen"),
+            (standalone(&innen.id), "Lose innen"),
+            (anchored(&unter), "Zeile auf der inneren Seite"),
+        ] {
+            done(
+                store
+                    .create_task(&chef, &new_task(home, title))
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let outer = store.board_for(&chef, Some(&aussen)).await.unwrap();
+        assert_eq!(
+            outer.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(),
+            vec!["Lose aussen", "Zeile auf der inneren Seite"],
+            "the inner project's loose card landed on the outer board, where nothing but its \
+             project id could ever have placed it"
+        );
+
+        let inner = store.board_for(&chef, Some(&innen.id)).await.unwrap();
+        assert_eq!(
+            inner.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(),
+            vec!["Lose innen", "Zeile auf der inneren Seite"],
+            "the inner board lost its own loose card, or the line written on its home page"
+        );
+
+        // And all three, once each, on the board that is bound to nothing.
+        let unbound = store.board_for(&chef, None).await.unwrap();
+        assert_eq!(
+            unbound.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(),
+            vec!["Lose aussen", "Lose innen", "Zeile auf der inneren Seite"],
+            "a card appeared twice on the unbound board, or not at all"
         );
     }
 
@@ -1871,7 +2116,7 @@ mod tests {
                 .unwrap(),
         );
 
-        let board = store.board_for(&chef, &project).await.unwrap();
+        let board = store.board_for(&chef, Some(&project)).await.unwrap();
         let named: Vec<(&str, Option<(&str, &str)>)> = board
             .iter()
             .map(|task| {
@@ -1922,7 +2167,7 @@ mod tests {
             .await
             .unwrap();
 
-        let board = store.board_for(&chef, &project).await.unwrap();
+        let board = store.board_for(&chef, Some(&project)).await.unwrap();
         assert_eq!(
             board[0].page.as_ref().map(|page| page.title.as_str()),
             Some("Laborbefunde"),
@@ -1943,7 +2188,7 @@ mod tests {
         let fremder = account(&store, "fremder").await;
         assert!(
             store
-                .board_for(&fremder, &project)
+                .board_for(&fremder, Some(&project))
                 .await
                 .unwrap()
                 .is_empty(),
@@ -1959,10 +2204,56 @@ mod tests {
         // And a project that does not exist is the same empty answer, not a distinguishable
         // error — otherwise the call answers "does this project exist" to anybody who asks.
         assert!(store
-            .board_for(&chef, "gibt-es-nicht")
+            .board_for(&chef, Some("gibt-es-nicht"))
             .await
             .unwrap()
             .is_empty());
+
+        // **Entirely**, and this is the half that says it. Somebody who may read a page
+        // INSIDE the subtree but not the home page still gets nothing: the board belongs to
+        // the project, and the home page is what a project's own access is decided by. The
+        // API layer says the same thing in a status code — `project_for` refuses them, so
+        // that board is a 404 rather than a shorter board.
+        //
+        // The home page is therefore read with the CALLER's baseline. Borrowing anybody
+        // else's reads like an optimisation and is a hole: with an admin one, this caller is
+        // let past and handed the cards they happen to be able to read, which is a partial
+        // board where the design says there is none.
+        let teilhaber = account(&store, "teilhaber").await;
+        let unterseite = page(&store, Some("/projekt"), "Befunde", Visibility::Restricted).await;
+        grant(&store, "/projekt/befunde", &teilhaber, Permission::Read).await;
+        // A path that carries any grant of its own inherits none, so `chef`'s write on
+        // `/projekt` stops here and has to be restated — which is exactly the shape D-3 calls
+        // normal, and the reason `teilhaber` reaches this page and not the one above it.
+        grant(&store, "/projekt/befunde", &chef, Permission::Write).await;
+        done(
+            store
+                .create_task(&chef, &new_task(anchored(&unterseite), "Zeile"))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            store
+                .board_for(&teilhaber, Some(&project))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a board answered, in part, somebody who may not read the page it belongs to"
+        );
+
+        // Anti-vacuity, and D-12's asymmetry in one line: that card really is readable by
+        // them, and the board bound to nothing — which belongs to no project and so has no
+        // home page to be refused at — is where they see it.
+        assert_eq!(
+            store
+                .board_for(&teilhaber, None)
+                .await
+                .unwrap()
+                .iter()
+                .map(|t| t.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Zeile"]
+        );
     }
 
     #[tokio::test]
@@ -2006,7 +2297,10 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        assert_eq!(store.board_for(&chef, &project).await.unwrap().len(), 1);
+        assert_eq!(
+            store.board_for(&chef, Some(&project)).await.unwrap().len(),
+            1
+        );
 
         sqlx::query("UPDATE documents SET deleted_at = datetime('now') WHERE id = ?1")
             .bind(&unterseite)
@@ -2015,7 +2309,11 @@ mod tests {
             .unwrap();
 
         assert!(
-            store.board_for(&chef, &project).await.unwrap().is_empty(),
+            store
+                .board_for(&chef, Some(&project))
+                .await
+                .unwrap()
+                .is_empty(),
             "a soft-deleted page's card stayed on the board"
         );
         assert!(store.task_for(&chef, &task.id).await.unwrap().is_none());

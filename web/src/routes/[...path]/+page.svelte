@@ -2,6 +2,7 @@
   import { browser } from '$app/environment';
   import Backlinks from '$lib/components/Backlinks.svelte';
   import BlockView from '$lib/components/BlockView.svelte';
+  import Board from '$lib/components/Board.svelte';
   import Breadcrumb from '$lib/components/Breadcrumb.svelte';
   import PageMeta from '$lib/components/PageMeta.svelte';
   import Subpages from '$lib/components/Subpages.svelte';
@@ -176,6 +177,35 @@
       </article>
     {/if}
 
+    <!-- D-12's second placement: this page's own board, when this page is a project's home.
+         It is the SAME component `/aufgaben` renders, fed by the SAME endpoint with the
+         filter bound to this path — which is how the two boards are kept from disagreeing,
+         and the whole of what the decision permitted. A move made here posts to
+         `/aufgaben?/verschieben` like every other one and comes back to this page.
+
+         Above the subpage list and the backlinks, because on a project's home page the
+         tasks are what you came for; below the document, because the document is still what
+         the page is. Rendered at all only when the endpoint named a project: nearly every
+         page in this wiki is nobody's home, and furniture on all of them is not a cost D-12
+         asked anybody to pay. -->
+    {#if data.board}
+      <Board
+        board={data.board}
+        me={data.me}
+        now={data.now}
+        zurueck={data.zurueck}
+        titel="Aufgaben"
+        ebene={2}
+        hinweis={data.hinweis}
+        fehler={null}
+      />
+    {:else if data.boardFehler}
+      <!-- Hedged on purpose — see `describeEmbeddedBoard`. A failed request cannot tell a
+           project's home page from any other, so the sentence must not claim this page has
+           a board; it says only that if one belongs here, it is not here now. -->
+      <p class="tafel-fehler" role="alert">{data.boardFehler}</p>
+    {/if}
+
     <Subpages nodes={subpages} />
     <Backlinks backlinks={data.backlinks} />
   </main>
@@ -320,6 +350,16 @@
   .editor-loading {
     color: var(--ink-muted);
     font-size: var(--text-sm);
+  }
+
+  .tafel-fehler {
+    padding: var(--space-3) var(--space-4);
+    border: 1px solid var(--border);
+    border-inline-start: 3px solid var(--danger);
+    border-radius: var(--radius-sm);
+    background: var(--bg-raised);
+    font-size: var(--text-sm);
+    max-width: var(--measure);
   }
 
   /* One column below 64rem.
