@@ -31,6 +31,7 @@
 //! document that has one. Nothing persists CRDT state today, so nothing here can hit it
 //! yet — but the day it does, this is the paragraph that says so.
 
+use crate::export;
 use anyhow::{Context, Result};
 use gw_auth::{Action, Principal};
 use gw_core::{markdown, slugify, split_frontmatter, Block, BlockKind, SeedMeta};
@@ -501,7 +502,17 @@ async fn update_one(
     // comparing extracted text instead would call a table turned into paragraphs
     // "unchanged". An unchanged page writes NOTHING: a no-op revision per file per run
     // buries the real edits in a history nobody can then read.
-    if serde_json::to_value(&stored)? == serde_json::to_value(&new.body)? {
+    //
+    // Through [`crate::export::comparable`], and it must be — a raw comparison asks
+    // "are these trees identical?" when the question is "does this FILE still say what
+    // the database says?". A stored tree carries things a markdown file cannot: the uuid
+    // the store mints into every task block on publish, and the `target`/`rel`/`class`
+    // that ProseMirror fills in on every link the editor has touched. Compared raw, a
+    // page holding one checkbox is republished on every single run — measured: four
+    // revisions after three runs — which is precisely the no-op revision the paragraph
+    // above forbids. Sharing the reduction with the exporter rather than writing a second
+    // one keeps one answer to "what can markdown state"; two would drift.
+    if export::comparable(&stored) == export::comparable(&new.body) {
         return Ok(Ok(Outcome::Unchanged));
     }
 

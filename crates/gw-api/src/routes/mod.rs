@@ -3,6 +3,7 @@ pub mod collab;
 pub mod docs;
 pub mod links;
 pub mod revisions;
+pub mod tasks;
 pub mod tree;
 
 use crate::auth::{OidcClient, OidcConfig};
@@ -354,6 +355,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(collab::routes())
         .merge(links::routes())
         .merge(revisions::routes())
+        .merge(tasks::routes())
         .merge(admin::routes())
         .merge(crate::auth::routes())
         .merge(crate::view_as::routes())

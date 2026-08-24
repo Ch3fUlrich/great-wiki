@@ -396,11 +396,18 @@ mutation crates/gw-store/src/revisions.rs killed \
 mutation crates/gw-store/src/revisions.rs killed \
   's/        if !readable {/        if false {/' \
   'revisions: one revision body is gated by the same read as the page it belongs to'
+# Both of these moved when `Author` grew `id()` and `name()`: the binds in
+# `append_revision` are now `author.id()` and `author.name()`, and the choice they used to
+# make inline is made inside those two methods. The expressions target the methods, which
+# is where the decision actually lives — and the entries were silently STALE until this
+# was noticed, which is worth knowing about: a stale expression makes the whole script
+# refuse to start, but only on an UNFILTERED run, because the pre-flight staleness check
+# skips entries the filter excluded.
 mutation crates/gw-store/src/revisions.rs killed \
-  's/        .bind(&author.id)/        .bind(\&author.username)/' \
+  's|            Author::Account(principal) => &principal.id,|            Author::Account(principal) => \&principal.username,|' \
   'revisions: the author recorded is the principal, by id — the thing a rename cannot move'
 mutation crates/gw-store/src/revisions.rs killed \
-  's/        .bind(byline(author))/        .bind(author.username.as_str())/' \
+  's|            Author::Account(principal) => byline(principal),|            Author::Account(principal) => principal.username.as_str(),|' \
   'revisions: the byline is the display name as it was then, which is what survives deletion'
 # Not a disclosure, but the two ways a history can be quietly wrong about ITSELF. The
 # timeline and the parent chain are read against each other by diff, restore and blame; if
@@ -409,7 +416,7 @@ mutation crates/gw-store/src/revisions.rs killed \
   's/WHERE document_id = ?1 ORDER BY created_at DESC, id DESC/WHERE document_id = ?1 ORDER BY created_at DESC/' \
   "revisions: the timeline breaks ties on the uuid v7 id — datetime('now') is per-second, so two edits in one second are otherwise unordered"
 mutation crates/gw-store/src/revisions.rs killed \
-  's/sqlx::query_scalar("SELECT current_revision_id FROM documents WHERE id = ?1")/sqlx::query_scalar("SELECT NULL FROM documents WHERE id = ?1")/' \
+  's|sqlx::query_as("SELECT path, current_revision_id FROM documents WHERE id = ?1")|sqlx::query_as("SELECT path, NULL FROM documents WHERE id = ?1")|' \
   'revisions: parent_id is the revision the document actually pointed at, not NULL for everything'
 # The schema half of append-only. `BEFORE UPDATE ON revisions` is NOT the line to mutate —
 # pointing the trigger at another table makes the migration itself fail, because the table
@@ -607,6 +614,104 @@ mutation crates/gw-store/src/tasks.rs killed \
   '/async fn may_administer_project/,/^    }$/ s|Action::Write, baseline|Action::Read, baseline|' \
   'projects: retagging and deleting a project need WRITE on its home page'
 
+# --- reconciliation on publish: the detach loop, which loses data under a green suite ---
+#
+# This one is not a disclosure. It is here because the failure it guards against is silent,
+# cumulative and destroys exactly the thing D-8 exists to keep: if a republish mints a
+# SECOND id for a line that already has a record, the first record is orphaned, marked
+# detached, and the board sheds a card — with the due date and the assignee somebody set on
+# it — on every single save. Nothing errors, nothing is logged, and the page still reads
+# correctly. The two mutations below are the two ways to arrive there, and the third is the
+# way to lose the card outright.
+#
+# Neither can pass vacuously: the tests they must fail also assert the POSITIVE — that the
+# task exists, is attached, and keeps its state — so a reconciliation that did nothing at
+# all would fail them too.
+#
+# Mint into a copy and store the original. This is the one an author is most likely to
+# write and least likely to notice, because the FIRST publish is perfect and every later
+# one re-mints; a test that publishes once passes forever.
+mutation crates/gw-store/src/revisions.rs killed \
+  's|    let body_json = if minted {|    let body_json = if false {|' \
+  'reconciliation: the body that is stored is the body the ids were minted into'
+# Adoption by the words, which is what makes an ID-LESS republish idempotent — a markdown
+# import, and `seed --update`, which re-converts the same file on every run and would
+# otherwise shed the whole board once per run for as long as anybody kept seeding.
+#
+# `#` as the delimiter, here and below: these expressions contain Rust closures, and a `|`
+# delimiter ends the substitution in the middle of `|&r|`. sed then reports "unknown option
+# to `s'" and the entry is refused at startup rather than silently doing nothing — but only
+# because the pre-flight check runs every expression before the first test.
+mutation crates/gw-store/src/tasks.rs killed \
+  's#        if let Some(r) = (0..rows.len()).find(|&r| !taken\[r\] && &rows\[r\].title == text) {#        if let Some(r) = (0..rows.len()).find(|\&r| false \&\& !taken[r] \&\& \&rows[r].title == text) {#' \
+  'reconciliation: a line with no id adopts the record for its words rather than minting a second'
+# And the ordinary case: a line that CARRIES an id claims the record with that id.
+mutation crates/gw-store/src/tasks.rs killed \
+  's#        if let Some(r) = rows.iter().position(|row| &row.block_id == id) {#        if let Some(r) = rows.iter().position(|row| false \&\& \&row.block_id == id) {#' \
+  'reconciliation: a line carrying an id claims the record with that id'
+# D-8, and the tempting wrong answer stated in SQL: a line that has gone is a record
+# MARKED, never a record deleted. Deleting discards a due date and an assignee that were
+# never the page's to hold in the first place (D-2), and it is unrecoverable — the marker
+# is what lets somebody see what happened and put the line back.
+mutation crates/gw-store/src/tasks.rs killed \
+  's#sqlx::query("UPDATE tasks SET detached = 1, updated_at = datetime(.now.) WHERE id = ?1")#sqlx::query("DELETE FROM tasks WHERE id = ?1")#' \
+  'reconciliation: a line that disappears leaves its record detached, not deleted (D-8)'
+# The other half of D-2. Reconciliation takes the words and touches nothing else; a pass
+# that also wrote the workflow state would undo a card somebody dragged, on the next save,
+# from a page that is not the owner of that state. `position` stands in for all four here
+# because it is the one a drag writes.
+mutation crates/gw-store/src/tasks.rs killed \
+  's#"UPDATE tasks SET title = ?2, detached = 0, \\#"UPDATE tasks SET title = ?2, position = 0, detached = 0, \\#' \
+  'reconciliation: the page owns the words and the record owns the state (D-2)'
+# A checklist copied and pasted in the editor carries the attrs it was copied from, id and
+# all. Two blocks quietly sharing one record put one card on the board for two lines, and
+# then each edit to either rewrote the other's title.
+mutation crates/gw-store/src/tasks.rs killed \
+  's#            seen.insert(id).then(|| id.to_string())#            Some(id.to_string())#' \
+  'reconciliation: a pasted line carrying an id already in use gets a record of its own'
+
+# --- the task API: the same conflations, kept intact on the way out --------------------
+#
+# `gw-api` holds NO unfiltered accessor for a task, a board or a project — `gw-store`
+# exposes none — so a handler here cannot leak a card by asking the wrong question. What it
+# CAN do is un-conflate an answer the store deliberately conflated, or open a door the store
+# would have closed a moment later, and those are the four below.
+#
+# None can pass vacuously: `a_board_discloses_no_card_whose_page_the_caller_may_not_read`
+# asserts that the privileged caller sees all three cards, and every test named here asserts
+# a POSITIVE outcome beside the refusal it is about.
+#
+# The first is the one that matters, and it is the only real permission gate in the file.
+# `create_project` looks for a duplicate home page BEFORE it inserts, so that a second
+# project is a 409 rather than a UNIQUE violation surfacing as a 500. That check runs after
+# the caller has been authorised, deliberately: with the gate weakened to Read, somebody who
+# may only READ a page is told "that page is already the home of a project" — a fact about a
+# board they may not touch, and one a 403 does not give them.
+mutation crates/gw-api/src/routes/tasks.rs killed \
+  '/pub async fn create_project/,/^}$/ s@Action::Write@Action::Read@' \
+  'project api: the door asks for WRITE, so a reader is refused before the conflict check speaks'
+# Fail closed on a value this code does not understand (D-9). The mutation writes the
+# tempting version — parse, and fall back to the default — which is not merely lax: it
+# silently REOPENS a task somebody marked done, because `TaskStatus::default()` is `Offen`.
+# The schema CHECK would never see the bad value, so nothing anywhere would say so.
+mutation crates/gw-api/src/routes/tasks.rs killed \
+  's@TaskStatus::from_stored(&composed).ok_or_else@Some(TaskStatus::from_stored(\&composed).unwrap_or_default()).ok_or_else@' \
+  'task api: an unrecognised status is refused, never quietly defaulted to Offen'
+# Existence before permission, for a PATH. Collapsing the refusal into 404 hides a
+# configuration mistake behind a status code that says "you spelled it wrong" — the split
+# `/api/documents`, `/api/links/backlinks` and `/api/revisions/document` all make.
+mutation crates/gw-api/src/routes/tasks.rs killed \
+  '/pub async fn document_tasks/,/^}$/ s@.ok_or(ApiError::Forbidden)?@.ok_or(ApiError::NotFound)?@' \
+  "task api: a page's task list answers 404 for a page that is not there, 403 for one refused"
+# And the opposite rule for an ID, which is where somebody copying the pattern above goes
+# wrong. A project id is a uuid nobody guesses, so there is no existence to protect and
+# everything unreachable is 404; a 403 would be an answer about a board the caller cannot
+# see. `an_unreachable_project_answers_exactly_what_a_missing_one_answers` compares the two
+# replies byte for byte, so the two branches cannot drift apart later either.
+mutation crates/gw-api/src/routes/tasks.rs killed \
+  '/pub async fn board/,/^}$/ s@.ok_or(ApiError::NotFound)?@.ok_or(ApiError::Forbidden)?@' \
+  'board api: an id is not a path — an unreachable board is 404, never the 403 a path gets'
+
 # --- crash recovery ------------------------------------------------------------------
 #
 # A trap does not survive SIGKILL, and a killed run leaves the mutated file in place.
@@ -773,6 +878,10 @@ probe_for() {
     # resolves the principal; every test that notices it is in this binary.
     crates/gw-api/src/view_as.rs) echo "-p gw-api --test view_as" ;;
     crates/gw-api/src/routes/mod.rs) echo "-p gw-api --test view_as" ;;
+    # The task, board and project endpoints. One integration binary covers all of them,
+    # including the two disclosure tests, so the probe is exact rather than a whole-crate
+    # build of six binaries.
+    crates/gw-api/src/routes/tasks.rs) echo "-p gw-api --test tasks" ;;
     *) echo "" ;;
   esac
 }

@@ -32,6 +32,7 @@ use gw_auth::{Action, Principal};
 use gw_core::Block;
 use serde::Serialize;
 use sqlx::FromRow;
+use std::borrow::Cow;
 use url::Url;
 
 /// The columns of a revision, in the order [`Revision`] declares them.
@@ -178,7 +179,6 @@ pub(crate) async fn append_revision(
     author.refuse_if_nobody()?;
 
     let id = uuid::Uuid::now_v7().to_string();
-    let size = body_json.len() as i64;
 
     // `path` alongside `current_revision_id` in one query: extraction below needs the
     // document's OWN path as the base a bare relative `href` resolves against (see
@@ -205,8 +205,32 @@ pub(crate) async fn append_revision(
     // The body arrives as JSON because that is what a revision stores; parsing it back is
     // the price of extraction living in the ONE function every body change goes through,
     // rather than in each of its callers where a later third caller would forget it.
-    let body: Block = serde_json::from_str(body_json)?;
+    let mut body: Block = serde_json::from_str(body_json)?;
     crate::links::replace_links(&mut *conn, document_id, &path, &body, public_origin).await?;
+
+    // The board is derived from the body too, and joins the same transaction for the same
+    // reasons. It differs from the graph in one way, and that one way is what the lines
+    // below are about: reconciliation can *change the tree*, because a checklist line
+    // arrives with no id and leaves with one (D-6, and `gw_core::markdown` mints none).
+    //
+    // **What is stored has to be what was minted into.** Writing `body_json` — the string
+    // this function was handed — would file a revision whose lines carry no ids, so the
+    // next publish would mint again, orphan every task on the page and mark it detached,
+    // and the board would shed a card with its due date and its assignee on every save.
+    // `publishing_the_same_content_twice_keeps_one_task_with_the_same_id` is the test that
+    // holds this up, and it is the one to trust most.
+    //
+    // Re-serialised only when something was minted, so an ordinary edit to a page with no
+    // checklist in it pays nothing and stores the caller's own bytes unchanged. `byte_size`
+    // is therefore measured after this rather than before it: the timeline's delta must
+    // describe the revision that was actually written.
+    let minted = crate::tasks::reconcile_tasks(&mut *conn, document_id, &mut body).await?;
+    let body_json = if minted {
+        Cow::Owned(serde_json::to_string(&body)?)
+    } else {
+        Cow::Borrowed(body_json)
+    };
+    let size = body_json.len() as i64;
 
     sqlx::query(
         "INSERT INTO revisions \
@@ -216,7 +240,7 @@ pub(crate) async fn append_revision(
     .bind(&id)
     .bind(document_id)
     .bind(parent)
-    .bind(body_json)
+    .bind(body_json.as_ref())
     .bind(summary)
     .bind(author.id())
     .bind(author.name())
@@ -229,7 +253,7 @@ pub(crate) async fn append_revision(
          updated_at = datetime('now') WHERE id = ?1",
     )
     .bind(document_id)
-    .bind(body_json)
+    .bind(body_json.as_ref())
     .bind(&id)
     .execute(&mut *conn)
     .await?;

@@ -24,16 +24,19 @@
 //!
 //! Reconciling a page's task blocks against these rows on publish — minting a task for a
 //! new checkbox line and marking one [`Task::detached`] when its line disappears (D-6, D-8)
-//! — is a later task. Nothing here writes `block_id` or `detached`; the columns exist so
-//! that work is a query and not a migration.
+//! — is [`reconcile_tasks`], at the bottom of this file. It is the only thing that writes
+//! `block_id` or `detached`, and it runs inside the transaction that writes the revision
+//! the blocks were read out of.
 
 use crate::acl::Baseline;
 use crate::{Store, StoredDocument};
 use anyhow::{bail, Result};
 use gw_auth::{Action, Principal};
+use gw_core::{Block, BlockKind};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use sqlx::FromRow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// D-9's fixed columns. The same three on every board, built in.
 ///
@@ -876,6 +879,306 @@ impl Store {
             .await?
             .is_some())
     }
+}
+
+// --- reconciliation on publish ----------------------------------------------------------
+
+/// The `attrs` key a task block carries its identity under — the uuid that ties the line
+/// somebody typed to the row that holds its due date.
+///
+/// `gw_core::markdown::convert` deliberately mints none: it is a pure function of its
+/// input, and `gw_api::export::render_file` re-imports its own output and compares it
+/// against the stored document, so a random id would fail that comparison on every export
+/// forever. `export`'s `TASK_ITEM_ATTRS` reduces a `taskItem` to `checked` alone for the
+/// same reason. So this key is written in exactly one place: here, on publish.
+const BLOCK_ID: &str = "id";
+
+/// One checklist line, paired with the `attrs` map its id is written into.
+struct TaskLine<'a> {
+    attrs: &'a mut Map<String, Value>,
+    /// The words. `tasks.title` is a copy of this and of nothing else — D-2: the page owns
+    /// the words.
+    text: String,
+    /// Whether the box is ticked. This decides a NEW record's status and nothing else; see
+    /// [`reconcile_tasks`] for why it must never be read for an existing one.
+    checked: bool,
+}
+
+/// The words a card shows for this line: its **first paragraph**, not its whole subtree.
+///
+/// A `taskItem` holds block content rather than bare text, deliberately, so that a line can
+/// grow a second paragraph or a nested checklist without changing kind. Taking the item's
+/// whole [`Block::plain_text`] would therefore fold a nested checklist's lines into their
+/// parent's title — "Reise buchen Flug Hotel" for three separate to-dos, two of which have
+/// cards of their own saying the same words again.
+fn task_text(item: &Block) -> String {
+    item.content
+        .iter()
+        .find(|child| child.kind == BlockKind::Paragraph)
+        .map(Block::plain_text)
+        .unwrap_or_else(|| item.plain_text())
+        .trim()
+        .to_string()
+}
+
+/// Every checklist line in the tree, in document order, skipping the ones with no words.
+///
+/// **An empty checkbox line is not yet a task.** Pressing Enter in a checklist makes an
+/// empty item, and the next autosave would otherwise put a nameless card on somebody's
+/// board — one that cannot be told from any other nameless card, and that nothing but a
+/// deletion will ever remove. So an empty line gets no id and no record. It is not
+/// *claimed*, either, which means clearing a line's words detaches its record like any
+/// other disappearance; typing words back re-attaches it, because the block kept its id
+/// through the edit. That self-healing is the reason this is safe to do at all.
+///
+/// The walk descends INTO an empty item all the same: a checklist nested under one is
+/// still a checklist, and its lines are still to-dos.
+fn collect_task_lines<'a>(block: &'a mut Block, out: &mut Vec<TaskLine<'a>>) {
+    let line = (block.kind == BlockKind::TaskItem).then(|| (task_text(block), is_checked(block)));
+
+    // Destructured so that `attrs` and `content` are two disjoint borrows: this function
+    // both stores a mutable handle on the item's own attrs and keeps walking its children,
+    // and a `&mut Block` cannot do both.
+    let Block { attrs, content, .. } = block;
+    if let Some((text, checked)) = line {
+        if !text.is_empty() {
+            out.push(TaskLine {
+                attrs,
+                text,
+                checked,
+            });
+        }
+    }
+    for child in content.iter_mut() {
+        collect_task_lines(child, out);
+    }
+}
+
+fn is_checked(item: &Block) -> bool {
+    item.attrs
+        .get("checked")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Write `id` onto a block, reporting whether that changed anything.
+///
+/// The answer is what tells [`crate::revisions::append_revision`] whether the tree it was
+/// handed is still the tree it should store.
+fn stamp(attrs: &mut Map<String, Value>, id: &str) -> bool {
+    if attrs.get(BLOCK_ID).and_then(Value::as_str) == Some(id) {
+        return false;
+    }
+    attrs.insert(BLOCK_ID.into(), Value::String(id.to_string()));
+    true
+}
+
+/// A task row this document's blocks own.
+#[derive(FromRow)]
+struct AnchoredRow {
+    id: String,
+    block_id: String,
+    title: String,
+    detached: i64,
+}
+
+/// Reconcile a document's checklist lines against the `tasks` table, on publish.
+///
+/// **D-2 is the whole rule: the page owns the words, the record owns the state.** The text
+/// is taken from the block on every pass; `status`, `assignee`, `due_at` and `position` are
+/// never written for a record that already exists. Nothing here writes to a page — the one
+/// thing it changes about the tree is the id it mints into a line that has none, which is
+/// identity rather than content — and no board operation files a revision.
+///
+/// Returns whether the tree was changed, so that the caller stores **the tree that was
+/// minted into**. Storing the original instead would re-mint on every publish, and the
+/// detach loop below is what that costs.
+///
+/// # Permission
+///
+/// **This function asks nobody anything, and that is deliberate.** It is unreachable except
+/// through [`crate::revisions::append_revision`], which is itself reachable only from
+/// [`Store::publish_revision`] — which refuses a caller who may not **Write** the document
+/// (and refuses an anonymous one outright) before a transaction is even opened — and from
+/// [`Store::create_document`], which is the importer's path and states in its own doc
+/// comment why it answers no permission question. So reconciliation inherits publishing's
+/// authorisation exactly, and a second check here would be a second rule to keep in step
+/// with the first. `a_reader_cannot_cause_a_task_to_be_created` is what holds that claim up.
+///
+/// The rows it may touch are exactly the rows carrying a `block_id`: the ones it or an
+/// earlier pass authored. An anchored task created through [`Store::create_task`] with no
+/// block behind it is left entirely alone — no page ever mentioned a line for it, so a line
+/// disappearing cannot be said about it, and detaching it would be reconciliation asserting
+/// something about a task it did not write.
+///
+/// # Identity, in three passes
+///
+/// 1. **A line carrying an id claims the row with that id.** This is the ordinary case and
+///    the one that makes republishing idempotent.
+/// 2. **A line carrying none adopts an unclaimed row with the same words.** Without this,
+///    the two paths that produce an id-less body — a markdown import, and any republish of
+///    a body that never went through an editor — would mint a fresh id every time, orphan
+///    the previous record and shed a card, with its due date and its assignee, on every
+///    save. `seed --update` republishes converted markdown on every run, so that loop would
+///    run for as long as anybody kept seeding. Adoption is by title because that is the only
+///    thing an id-less line has: two lines reading the same words are genuinely
+///    interchangeable, and which of their records each adopts is decided in board order so
+///    that at least it is the same answer every time.
+/// 3. **Anything left mints a fresh uuid**, which is stamped onto the block.
+///
+/// A block id that appears twice in one document — a checklist copied and pasted in the
+/// editor carries the attrs it was copied from — is treated as an id on the first line and
+/// as no id at all on the rest, so pasting a line makes a second task rather than two
+/// blocks quietly sharing one record's due date.
+///
+/// # Detaching, and what happens when a line comes back
+///
+/// A row nothing claimed is marked [`Task::detached`] (D-8) and **not** deleted: deleting
+/// would silently discard a due date and an assignee somebody set on a board. Retyping a
+/// line therefore produces a new task and leaves the old one visibly detached, because a
+/// retyped line carries no id.
+///
+/// **A detached record whose block comes back re-attaches, keeping its state.** Both
+/// answers are defensible and this one is chosen, for a reason that is not symmetric: the
+/// block id is the identity, so the same id returning *is* the same line returning. That
+/// happens on an editor undo and on [`Store::restore_revision`], which republishes an older
+/// body — one that carries the ids this function minted into it. The alternative would
+/// double every card on a page whose revision was restored, leave the original detached
+/// with the due date on it, and store two rows with one `(doc_id, block_id)` between them,
+/// which the next pass could not tell apart. Re-attaching also makes the empty-line rule
+/// above self-healing.
+pub(crate) async fn reconcile_tasks(
+    conn: &mut sqlx::SqliteConnection,
+    document_id: &str,
+    body: &mut Block,
+) -> Result<bool> {
+    let mut lines: Vec<TaskLine> = Vec::new();
+    collect_task_lines(body, &mut lines);
+
+    // `block_id IS NOT NULL`: see the permission note above — these are the rows this
+    // function authored. Ordered so that adoption is deterministic and prefers a record
+    // still attached to the page over one that has fallen off it.
+    let rows: Vec<AnchoredRow> = sqlx::query_as(
+        "SELECT id, block_id, title, detached FROM tasks \
+         WHERE doc_id = ?1 AND block_id IS NOT NULL \
+         ORDER BY detached, position, id",
+    )
+    .bind(document_id)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    // The id each line effectively carries, with a repeat inside one document counting as
+    // none. Resolved up front so the matching below borrows nothing from `lines`, which is
+    // written to afterwards.
+    let mut seen: HashSet<&str> = HashSet::new();
+    let carried: Vec<Option<String>> = lines
+        .iter()
+        .map(|line| {
+            let id = line.attrs.get(BLOCK_ID).and_then(Value::as_str)?;
+            seen.insert(id).then(|| id.to_string())
+        })
+        .collect();
+
+    let mut row_for_line: Vec<Option<usize>> = vec![None; lines.len()];
+    let mut taken: Vec<bool> = vec![false; rows.len()];
+
+    // Pass 1: exact identity.
+    for (i, id) in carried.iter().enumerate() {
+        let Some(id) = id else { continue };
+        if let Some(r) = rows.iter().position(|row| &row.block_id == id) {
+            if !taken[r] {
+                taken[r] = true;
+                row_for_line[i] = Some(r);
+            }
+        }
+    }
+
+    // Pass 2: an id-less line adopts a record with the same words. A line that DOES carry
+    // an id and matched nothing is not offered adoption — it names a record, and the honest
+    // answer to "that record is not here" is a new one under the id it names, not somebody
+    // else's card that happens to read the same.
+    for (i, id) in carried.iter().enumerate() {
+        if id.is_some() {
+            continue;
+        }
+        let text = &lines[i].text;
+        if let Some(r) = (0..rows.len()).find(|&r| !taken[r] && &rows[r].title == text) {
+            taken[r] = true;
+            row_for_line[i] = Some(r);
+        }
+    }
+
+    let mut changed = false;
+    for (i, line) in lines.iter_mut().enumerate() {
+        match row_for_line[i] {
+            Some(r) => {
+                let row = &rows[r];
+                changed |= stamp(line.attrs, &row.block_id);
+                // Only when something actually differs, so that publishing an unchanged
+                // page does not walk `updated_at` forward on every card in it. `detached`
+                // is cleared here and nowhere else: this is a line that came back.
+                if row.title != line.text || row.detached != 0 {
+                    sqlx::query(
+                        "UPDATE tasks SET title = ?2, detached = 0, \
+                         updated_at = datetime('now') WHERE id = ?1",
+                    )
+                    .bind(&row.id)
+                    .bind(&line.text)
+                    .execute(&mut *conn)
+                    .await?;
+                }
+            }
+            None => {
+                let block_id = match &carried[i] {
+                    Some(id) => id.clone(),
+                    None => uuid::Uuid::now_v7().to_string(),
+                };
+                changed |= stamp(line.attrs, &block_id);
+                // `checked` is read HERE and only here. A new record has no state of its
+                // own yet, and the tick is the only thing the page can say about it — D-7
+                // adopts existing checkbox lines as they were written, and once the page
+                // renders its checkbox from the record (D-2) a ticked line that arrived as
+                // Offen would visibly untick itself. For a record that already exists the
+                // tick is a stale copy and reading it would undo a card somebody dragged,
+                // which is exactly the disagreement D-2 exists to prevent.
+                //
+                // `position` is the line's place in the page, so a page's to-dos land on
+                // the board in the order they were written. It is a starting value and
+                // nothing more: an existing record's position is the board's, never the
+                // page's.
+                let status = if line.checked {
+                    TaskStatus::Fertig
+                } else {
+                    TaskStatus::Offen
+                };
+                sqlx::query(
+                    "INSERT INTO tasks (id, doc_id, block_id, title, status, position) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )
+                .bind(uuid::Uuid::now_v7().to_string())
+                .bind(document_id)
+                .bind(&block_id)
+                .bind(&line.text)
+                .bind(status.as_str())
+                .bind(i as i64)
+                .execute(&mut *conn)
+                .await?;
+            }
+        }
+    }
+
+    // D-8. Marked, never deleted.
+    for (r, row) in rows.iter().enumerate() {
+        if taken[r] || row.detached != 0 {
+            continue;
+        }
+        sqlx::query("UPDATE tasks SET detached = 1, updated_at = datetime('now') WHERE id = ?1")
+            .bind(&row.id)
+            .execute(&mut *conn)
+            .await?;
+    }
+
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -2063,6 +2366,809 @@ mod tests {
                 .await
                 .unwrap(),
             TaskOutcome::Refused,
+        );
+    }
+
+    // --- reconciliation on publish (D-2, D-6, D-7, D-8) --------------------------------
+
+    /// One checklist line, unticked, carrying **no id** — exactly what
+    /// `gw_core::markdown::convert` produces and what the editor sends for a line somebody
+    /// has just typed.
+    fn task_line(text: &str) -> Block {
+        let mut item = Block {
+            kind: BlockKind::TaskItem,
+            attrs: Default::default(),
+            content: vec![Block {
+                kind: BlockKind::Paragraph,
+                attrs: Default::default(),
+                content: vec![Block {
+                    kind: BlockKind::Text,
+                    attrs: Default::default(),
+                    content: Vec::new(),
+                    text: Some(text.into()),
+                    marks: Vec::new(),
+                }],
+                text: None,
+                marks: Vec::new(),
+            }],
+            text: None,
+            marks: Vec::new(),
+        };
+        item.attrs
+            .insert("checked".into(), serde_json::Value::Bool(false));
+        item
+    }
+
+    /// A document body holding one checklist with these lines.
+    fn body_with_tasks(lines: &[&str]) -> Block {
+        let list = Block {
+            kind: BlockKind::TaskList,
+            attrs: Default::default(),
+            content: lines.iter().map(|t| task_line(t)).collect(),
+            text: None,
+            marks: Vec::new(),
+        };
+        Block {
+            kind: BlockKind::Doc,
+            attrs: Default::default(),
+            content: vec![list],
+            text: None,
+            marks: Vec::new(),
+        }
+    }
+
+    /// A page and somebody who may write it.
+    async fn writable_page(title: &str, path: &str) -> (Store, Principal, String) {
+        let store = store().await;
+        let doc = page(&store, None, title, Visibility::Restricted).await;
+        let chef = account(&store, "chef").await;
+        grant(&store, path, &chef, Permission::Write).await;
+        (store, chef, doc)
+    }
+
+    /// The body the store actually holds for a document, parsed back.
+    async fn stored_body(store: &Store, doc: &str) -> Block {
+        let json: String = sqlx::query_scalar("SELECT body FROM documents WHERE id = ?1")
+            .bind(doc)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
+
+    /// Every `id` a task block in this tree carries, in document order.
+    fn block_ids(body: &Block) -> Vec<String> {
+        let mut out = Vec::new();
+        fn walk(block: &Block, out: &mut Vec<String>) {
+            if block.kind == BlockKind::TaskItem {
+                if let Some(id) = block.attrs.get("id").and_then(|v| v.as_str()) {
+                    out.push(id.to_string());
+                }
+            }
+            for child in &block.content {
+                walk(child, out);
+            }
+        }
+        walk(body, &mut out);
+        out
+    }
+
+    #[tokio::test]
+    async fn a_checkbox_line_becomes_a_task_on_publish() {
+        let (store, chef, doc) = writable_page("Seite", "/seite").await;
+
+        store
+            .publish_revision(
+                &chef,
+                &doc,
+                &body_with_tasks(&["Stuhlprobe einschicken"]),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        let tasks = store.tasks_for_document(&chef, &doc).await.unwrap();
+        assert_eq!(tasks.len(), 1, "a checkbox line is a task (D-6)");
+        assert_eq!(tasks[0].title, "Stuhlprobe einschicken");
+        assert_eq!(tasks[0].status, TaskStatus::Offen);
+        assert!(!tasks[0].detached);
+        assert_eq!(
+            tasks[0].block_id.as_deref(),
+            block_ids(&stored_body(&store, &doc).await)
+                .first()
+                .map(String::as_str),
+            "the record points at the id the stored block carries"
+        );
+    }
+
+    /// **The test to trust most.** Publishing the same content twice must not mint a second
+    /// id: if it does, the first task is orphaned, marked detached, and the board sheds a
+    /// card — with its due date and its assignee — on every single save.
+    #[tokio::test]
+    async fn publishing_the_same_content_twice_keeps_one_task_with_the_same_id() {
+        let (store, chef, doc) = writable_page("Seite", "/seite").await;
+
+        for _ in 0..3 {
+            store
+                .publish_revision(&chef, &doc, &body_with_tasks(&["Kaffee kaufen"]), None)
+                .await
+                .unwrap()
+                .expect("the publish was refused");
+        }
+
+        let tasks = store.tasks_for_document(&chef, &doc).await.unwrap();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "publishing the same content again minted a second task: {tasks:#?}"
+        );
+        assert!(
+            !tasks[0].detached,
+            "the task detached itself while its line never moved"
+        );
+    }
+
+    /// The other half of idempotence, and the half that is easy to get wrong invisibly: if
+    /// the ids are minted into a copy and the revision is written from the original, every
+    /// publish re-mints forever and the test above only passes by accident of adoption.
+    #[tokio::test]
+    async fn the_body_that_is_stored_is_the_body_the_ids_were_minted_into() {
+        let (store, chef, doc) = writable_page("Seite", "/seite").await;
+
+        let revision = store
+            .publish_revision(&chef, &doc, &body_with_tasks(&["Kaffee kaufen"]), None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        let ids = block_ids(&stored_body(&store, &doc).await);
+        assert_eq!(ids.len(), 1, "the stored page carries no minted id");
+
+        // And the revision, which is what a restore republishes and what an export reads.
+        let stored = store
+            .revision_for(&chef, &revision)
+            .await
+            .unwrap()
+            .expect("the revision was refused");
+        let body: Block = serde_json::from_str(&stored.body).unwrap();
+        assert_eq!(
+            block_ids(&body),
+            ids,
+            "the revision carries a different tree"
+        );
+        assert_eq!(
+            stored.byte_size as usize,
+            stored.body.len(),
+            "the recorded size describes a body that was never written"
+        );
+    }
+
+    /// Change the words of the first checklist line, leaving its id where it is — which is
+    /// what editing a line in the editor does, and what a *retyped* line pointedly is not.
+    fn reword(body: &mut Block, text: &str) -> bool {
+        if body.kind == BlockKind::TaskItem {
+            if let Some(leaf) = body
+                .content
+                .iter_mut()
+                .find(|c| c.kind == BlockKind::Paragraph)
+                .and_then(|p| p.content.first_mut())
+            {
+                leaf.text = Some(text.into());
+                return true;
+            }
+        }
+        body.content.iter_mut().any(|child| reword(child, text))
+    }
+
+    /// D-2 in one test: republishing with the words changed updates the title and touches
+    /// nothing else. Get this backwards and dragging a card is undone by the next save.
+    #[tokio::test]
+    async fn the_page_owns_the_words_and_the_record_owns_the_state() {
+        let (store, chef, doc) = writable_page("Seite", "/seite").await;
+        store
+            .publish_revision(&chef, &doc, &body_with_tasks(&["Termin machen"]), None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        let task = store
+            .tasks_for_document(&chef, &doc)
+            .await
+            .unwrap()
+            .remove(0);
+        done(
+            store
+                .update_task(
+                    &chef,
+                    &task.id,
+                    &TaskUpdate {
+                        status: Some(TaskStatus::Laeuft),
+                        assignee: Some(Some(chef.id.clone())),
+                        due_at: Some(Some("2026-09-01".into())),
+                        position: Some(42),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap(),
+        );
+
+        // The stored tree, reworded in place: the line keeps its identity and changes its
+        // words, exactly as typing into it in the editor does.
+        let mut edited = stored_body(&store, &doc).await;
+        assert!(reword(&mut edited, "Termin verschieben"));
+        store
+            .publish_revision(&chef, &doc, &edited, None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        let after = store.tasks_for_document(&chef, &doc).await.unwrap();
+        assert_eq!(after.len(), 1, "editing the words made a second task");
+        assert_eq!(after[0].id, task.id, "editing the words made a new record");
+        assert_eq!(
+            after[0].title, "Termin verschieben",
+            "the page owns the words"
+        );
+        assert_eq!(
+            after[0].status,
+            TaskStatus::Laeuft,
+            "the record owns the state"
+        );
+        assert_eq!(after[0].assignee.as_deref(), Some(chef.id.as_str()));
+        assert_eq!(after[0].due_at.as_deref(), Some("2026-09-01"));
+        assert_eq!(after[0].position, 42);
+    }
+
+    /// D-8: the record survives its line, marked. Deleting it would discard a due date and
+    /// an assignee somebody set on a board, which is the whole reason the column exists.
+    #[tokio::test]
+    async fn a_line_that_disappears_leaves_its_record_detached_rather_than_deleted() {
+        let (store, chef, doc) = writable_page("Seite", "/seite").await;
+        store
+            .publish_revision(&chef, &doc, &body_with_tasks(&["Rezept holen"]), None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+        let task = store
+            .tasks_for_document(&chef, &doc)
+            .await
+            .unwrap()
+            .remove(0);
+        done(
+            store
+                .update_task(
+                    &chef,
+                    &task.id,
+                    &TaskUpdate {
+                        due_at: Some(Some("2026-09-01".into())),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap(),
+        );
+
+        store
+            .publish_revision(&chef, &doc, &empty_body(), None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        let after = store.tasks_for_document(&chef, &doc).await.unwrap();
+        assert_eq!(after.len(), 1, "the record was deleted with its line");
+        assert_eq!(after[0].id, task.id);
+        assert!(after[0].detached, "the record was not marked detached");
+        assert_eq!(
+            after[0].due_at.as_deref(),
+            Some("2026-09-01"),
+            "the due date somebody set went with the line"
+        );
+    }
+
+    /// D-8's stated consequence, and the reason detachment is visible rather than silent: a
+    /// retyped line is a NEW to-do, because it carries no id. One task does not quietly
+    /// become another.
+    #[tokio::test]
+    async fn retyping_a_line_makes_a_new_record_and_leaves_the_old_one_detached() {
+        let (store, chef, doc) = writable_page("Seite", "/seite").await;
+        store
+            .publish_revision(&chef, &doc, &body_with_tasks(&["Alt"]), None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+        let first = store
+            .tasks_for_document(&chef, &doc)
+            .await
+            .unwrap()
+            .remove(0);
+
+        store
+            .publish_revision(&chef, &doc, &body_with_tasks(&["Neu"]), None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        let after = store.tasks_for_document(&chef, &doc).await.unwrap();
+        assert_eq!(
+            after.len(),
+            2,
+            "expected the old record and a new one: {after:#?}"
+        );
+        let old = after
+            .iter()
+            .find(|t| t.id == first.id)
+            .expect("the old record is gone");
+        assert_eq!(old.title, "Alt");
+        assert!(old.detached, "the old record was mutated into the new one");
+        let new = after
+            .iter()
+            .find(|t| t.id != first.id)
+            .expect("no new record");
+        assert_eq!(new.title, "Neu");
+        assert!(!new.detached);
+    }
+
+    /// The decision this task had to make deliberately, and it is documented on
+    /// [`reconcile_tasks`]: a detached record whose BLOCK comes back re-attaches, keeping
+    /// its due date. The same id returning is the same line returning — which is what an
+    /// editor undo and a revision restore both produce.
+    #[tokio::test]
+    async fn a_line_that_comes_back_re_attaches_its_record_with_its_due_date() {
+        let (store, chef, doc) = writable_page("Seite", "/seite").await;
+        store
+            .publish_revision(&chef, &doc, &body_with_tasks(&["Blutbild"]), None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+        // The tree as it was stored — ids and all. This is what an undo restores.
+        let with_ids = stored_body(&store, &doc).await;
+
+        let task = store
+            .tasks_for_document(&chef, &doc)
+            .await
+            .unwrap()
+            .remove(0);
+        done(
+            store
+                .update_task(
+                    &chef,
+                    &task.id,
+                    &TaskUpdate {
+                        due_at: Some(Some("2026-10-02".into())),
+                        status: Some(TaskStatus::Laeuft),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap(),
+        );
+        store
+            .publish_revision(&chef, &doc, &empty_body(), None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+        assert!(store.tasks_for_document(&chef, &doc).await.unwrap()[0].detached);
+
+        store
+            .publish_revision(&chef, &doc, &with_ids, None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        let after = store.tasks_for_document(&chef, &doc).await.unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "the returning line doubled the card: {after:#?}"
+        );
+        assert_eq!(after[0].id, task.id);
+        assert!(
+            !after[0].detached,
+            "the record stayed detached with its line back"
+        );
+        assert_eq!(after[0].due_at.as_deref(), Some("2026-10-02"));
+        assert_eq!(after[0].status, TaskStatus::Laeuft);
+    }
+
+    /// The same decision, end to end and through the door people actually use it by.
+    #[tokio::test]
+    async fn restoring_a_revision_brings_its_cards_back_rather_than_doubling_them() {
+        let (store, chef, doc) = writable_page("Seite", "/seite").await;
+        let with_tasks = store
+            .publish_revision(&chef, &doc, &body_with_tasks(&["Anruf", "Brief"]), None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+        store
+            .publish_revision(&chef, &doc, &empty_body(), None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        store
+            .restore_revision(&chef, &with_tasks)
+            .await
+            .unwrap()
+            .expect("the restore was refused");
+
+        let after = store.tasks_for_document(&chef, &doc).await.unwrap();
+        assert_eq!(after.len(), 2, "restoring doubled the board: {after:#?}");
+        assert!(
+            after.iter().all(|t| !t.detached),
+            "the restored page still says its cards are gone: {after:#?}"
+        );
+    }
+
+    /// Publishing needs Write, so reconciliation does. Nothing here asks a second time —
+    /// which is exactly why this test exists rather than a comment saying so.
+    #[tokio::test]
+    async fn a_reader_cannot_cause_a_task_to_be_created() {
+        let (store, _chef, doc) = writable_page("Seite", "/seite").await;
+        let leser = account(&store, "leser").await;
+        grant(&store, "/seite", &leser, Permission::Read).await;
+
+        assert!(
+            store
+                .publish_revision(&leser, &doc, &body_with_tasks(&["Heimlich"]), None)
+                .await
+                .unwrap()
+                .is_none(),
+            "a reader published a revision"
+        );
+
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "a reader caused {rows} task row(s) to be written");
+    }
+
+    /// The importer's path. A seeded page arrives with no ids at all, and its first publish
+    /// is a `create_document` rather than a `publish_revision`, so reconciliation has to
+    /// cope inside creation's transaction too.
+    #[tokio::test]
+    async fn a_page_imported_from_markdown_gets_its_tasks_on_its_first_publish() {
+        let store = store().await;
+        let doc = store
+            .create_document(
+                Author::Import,
+                &NewDocument {
+                    parent_path: None,
+                    doc_type: DocumentType::Page,
+                    title: "Darm".into(),
+                    slug: None,
+                    language: "de".into(),
+                    visibility: Visibility::Public,
+                    body: gw_core::markdown::markdown_to_blocks(
+                        "- [ ] Stuhlprobe einschicken\n- [x] Termin bestätigt\n",
+                    ),
+                    sort_key: 0,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let chef = account(&store, "chef").await;
+        let mut tasks = store.tasks_for_document(&chef, &doc).await.unwrap();
+        tasks.sort_by(|a, b| a.title.cmp(&b.title));
+        assert_eq!(tasks.len(), 2, "the import produced {tasks:#?}");
+        assert_eq!(tasks[0].title, "Stuhlprobe einschicken");
+        // D-7: a line adopted as it was written. Once the page renders its checkbox from
+        // the record, a ticked line that arrived Offen would visibly untick itself.
+        assert_eq!(tasks[1].title, "Termin bestätigt");
+        assert_eq!(tasks[1].status, TaskStatus::Fertig);
+        assert_eq!(tasks[0].status, TaskStatus::Offen);
+
+        // Creation writes the body TWICE — once into `documents` with the INSERT, once
+        // again as the revision — so it is the path where the stored page most easily ends
+        // up being the tree nothing was minted into.
+        let mut stored = block_ids(&stored_body(&store, &doc).await);
+        stored.sort();
+        let mut recorded: Vec<_> = tasks.iter().filter_map(|t| t.block_id.clone()).collect();
+        recorded.sort();
+        assert_eq!(
+            stored, recorded,
+            "the created page and its records disagree"
+        );
+    }
+
+    /// `seed --update` republishes freshly converted markdown, which carries no ids. If
+    /// that minted a new id every run, every seed would shed every card on the page.
+    #[tokio::test]
+    async fn re_importing_the_same_markdown_keeps_the_same_records() {
+        let (store, chef, doc) = writable_page("Seite", "/seite").await;
+        let markdown = "- [ ] Stuhlprobe einschicken\n- [ ] Blutbild\n";
+
+        store
+            .publish_revision(
+                &chef,
+                &doc,
+                &gw_core::markdown::markdown_to_blocks(markdown),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+        let before = store.tasks_for_document(&chef, &doc).await.unwrap();
+        let ids: Vec<_> = before.iter().map(|t| t.id.clone()).collect();
+
+        // Twice more, exactly as running the seeder again would.
+        for _ in 0..2 {
+            store
+                .publish_revision(
+                    &chef,
+                    &doc,
+                    &gw_core::markdown::markdown_to_blocks(markdown),
+                    None,
+                )
+                .await
+                .unwrap()
+                .expect("the publish was refused");
+        }
+
+        let after = store.tasks_for_document(&chef, &doc).await.unwrap();
+        assert_eq!(
+            after.len(),
+            2,
+            "re-importing multiplied the board: {after:#?}"
+        );
+        assert_eq!(
+            after.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+            ids,
+            "re-importing the same file replaced the records behind its lines"
+        );
+        assert!(after.iter().all(|t| !t.detached));
+    }
+
+    /// A checklist under a checklist line is still a checklist, and its lines are still
+    /// to-dos — but the parent's card must not swallow their words.
+    #[tokio::test]
+    async fn a_checklist_nested_under_a_line_is_reconciled_too() {
+        let (store, chef, doc) = writable_page("Seite", "/seite").await;
+
+        let mut outer = task_line("Reise buchen");
+        outer.content.push(Block {
+            kind: BlockKind::TaskList,
+            attrs: Default::default(),
+            content: vec![task_line("Flug"), task_line("Hotel")],
+            text: None,
+            marks: Vec::new(),
+        });
+        let body = Block {
+            kind: BlockKind::Doc,
+            attrs: Default::default(),
+            content: vec![Block {
+                kind: BlockKind::TaskList,
+                attrs: Default::default(),
+                content: vec![outer],
+                text: None,
+                marks: Vec::new(),
+            }],
+            text: None,
+            marks: Vec::new(),
+        };
+
+        store
+            .publish_revision(&chef, &doc, &body, None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        let mut titles: Vec<_> = store
+            .tasks_for_document(&chef, &doc)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.title)
+            .collect();
+        titles.sort();
+        assert_eq!(titles, vec!["Flug", "Hotel", "Reise buchen"]);
+    }
+
+    /// Pressing Enter in a checklist makes an empty line. It must not put a nameless card
+    /// on a board — and typing into it afterwards must produce exactly one.
+    #[tokio::test]
+    async fn an_empty_checkbox_line_is_not_yet_a_task() {
+        let (store, chef, doc) = writable_page("Seite", "/seite").await;
+        store
+            .publish_revision(&chef, &doc, &body_with_tasks(&["", "   "]), None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+        assert!(
+            store
+                .tasks_for_document(&chef, &doc)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an empty line put a nameless card on the board"
+        );
+        assert!(
+            block_ids(&stored_body(&store, &doc).await).is_empty(),
+            "an empty line was given an identity it has no record for"
+        );
+
+        store
+            .publish_revision(
+                &chef,
+                &doc,
+                &body_with_tasks(&["Endlich Worte", "   "]),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+        let after = store.tasks_for_document(&chef, &doc).await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].title, "Endlich Worte");
+    }
+
+    /// Copy and paste in the editor duplicates the attrs it copied, id and all. Two blocks
+    /// sharing one record would put one card on the board for two lines — and the next edit
+    /// to either of them would rewrite the other's title.
+    #[tokio::test]
+    async fn a_pasted_line_carrying_an_id_already_in_use_becomes_a_record_of_its_own() {
+        let (store, chef, doc) = writable_page("Seite", "/seite").await;
+        store
+            .publish_revision(&chef, &doc, &body_with_tasks(&["Kaffee"]), None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        // The stored tree, with its one line duplicated exactly as a paste would.
+        let mut pasted = stored_body(&store, &doc).await;
+        let line = pasted.content[0].content[0].clone();
+        pasted.content[0].content.push(line);
+
+        store
+            .publish_revision(&chef, &doc, &pasted, None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        let after = store.tasks_for_document(&chef, &doc).await.unwrap();
+        assert_eq!(
+            after.len(),
+            2,
+            "the pasted line shares a record: {after:#?}"
+        );
+        assert!(after.iter().all(|t| !t.detached));
+        let ids = block_ids(&stored_body(&store, &doc).await);
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1], "two lines were stored under one identity");
+    }
+
+    /// Two lines reading the same words are genuinely interchangeable, and both are to-dos.
+    /// Adoption by title must not collapse them into one.
+    #[tokio::test]
+    async fn two_lines_with_the_same_words_keep_two_records() {
+        let (store, chef, doc) = writable_page("Seite", "/seite").await;
+        for _ in 0..2 {
+            store
+                .publish_revision(&chef, &doc, &body_with_tasks(&["Kaffee", "Kaffee"]), None)
+                .await
+                .unwrap()
+                .expect("the publish was refused");
+        }
+        let after = store.tasks_for_document(&chef, &doc).await.unwrap();
+        assert_eq!(after.len(), 2, "two identical lines produced {after:#?}");
+        assert!(after.iter().all(|t| !t.detached));
+    }
+
+    /// An anchored task that no line ever authored — created through the API on a page — is
+    /// none of reconciliation's business. Detaching it would be this code asserting
+    /// something about a record it did not write, and nothing could ever re-attach it.
+    #[tokio::test]
+    async fn a_task_with_no_block_behind_it_is_left_alone() {
+        let (store, chef, doc) = writable_page("Seite", "/seite").await;
+        let by_hand = done(
+            store
+                .create_task(&chef, &new_task(anchored(&doc), "Von Hand"))
+                .await
+                .unwrap(),
+        );
+
+        store
+            .publish_revision(&chef, &doc, &body_with_tasks(&["Geschrieben"]), None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        let after = store.task_for(&chef, &by_hand.id).await.unwrap().unwrap();
+        assert!(
+            !after.detached,
+            "a task with no line behind it was detached"
+        );
+        assert_eq!(after.title, "Von Hand");
+    }
+
+    /// The other half of the tick rule. A new record takes its status from the box (D-7);
+    /// an existing one never does. Reading it every publish would undo a card somebody had
+    /// dragged, from a copy of the state that the page is not even the owner of (D-2).
+    #[tokio::test]
+    async fn a_ticked_box_does_not_reopen_or_close_a_record_that_already_exists() {
+        let (store, chef, doc) = writable_page("Seite", "/seite").await;
+        store
+            .publish_revision(&chef, &doc, &body_with_tasks(&["Rechnung"]), None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+        let task = store
+            .tasks_for_document(&chef, &doc)
+            .await
+            .unwrap()
+            .remove(0);
+        done(
+            store
+                .update_task(
+                    &chef,
+                    &task.id,
+                    &TaskUpdate {
+                        status: Some(TaskStatus::Fertig),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap(),
+        );
+
+        // The stored tree still says the box is unticked, because ticking it is a board
+        // action and the board does not rewrite pages.
+        let stale = stored_body(&store, &doc).await;
+        store
+            .publish_revision(&chef, &doc, &stale, None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        let after = store.tasks_for_document(&chef, &doc).await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after[0].status,
+            TaskStatus::Fertig,
+            "the page's stale checkbox reopened a finished task"
+        );
+    }
+
+    /// The atomicity claim, forced: reconciliation runs before the revision INSERT, so a
+    /// failure there is the one ordering in which cards could outlive the revision that
+    /// authored them. Mirrors `a_failed_publish_leaves_no_edges`.
+    #[tokio::test]
+    async fn a_failed_publish_leaves_no_tasks() {
+        let (store, chef, doc) = writable_page("Seite", "/seite").await;
+        store
+            .publish_revision(&chef, &doc, &body_with_tasks(&["Bleibt"]), None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        sqlx::query(
+            "CREATE TRIGGER refuse_revisions BEFORE INSERT ON revisions
+             BEGIN SELECT RAISE(ABORT, 'nope'); END",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        assert!(
+            store
+                .publish_revision(&chef, &doc, &body_with_tasks(&["Neu"]), None)
+                .await
+                .is_err(),
+            "the publish should have failed"
+        );
+
+        let after = store.tasks_for_document(&chef, &doc).await.unwrap();
+        assert_eq!(
+            after
+                .iter()
+                .map(|t| (t.title.as_str(), t.detached))
+                .collect::<Vec<_>>(),
+            vec![("Bleibt", false)],
+            "the revision was rolled back and the board it implies was not: {after:#?}"
         );
     }
 }

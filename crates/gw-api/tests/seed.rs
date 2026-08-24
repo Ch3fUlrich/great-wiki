@@ -1002,3 +1002,37 @@ async fn a_page_whose_file_was_skipped_is_not_also_reported_as_missing() {
         "the skipped file's page is present in the directory: {report}"
     );
 }
+
+#[tokio::test]
+async fn a_page_holding_a_checkbox_is_not_republished_on_every_run() {
+    // The store mints a uuid into every task block when a page is published, so the tree in
+    // the database says something the markdown file it came from cannot. Compared raw, the
+    // file and the page therefore differ forever: `seed --update` appended a revision on
+    // EVERY run — measured at four revisions after three runs — and a to-do list quietly
+    // filled its own history with edits nobody made, burying the real ones.
+    //
+    // The same shape of bug applies to a link the editor has touched: ProseMirror fills in
+    // `target`/`rel`/`class`, none of which markdown can state. Both are fixed by asking
+    // the exporter's question — "does this FILE still say what the database says?" — rather
+    // than "are these two trees identical?".
+    let file = "---\ntitle: Einkauf\n---\n- [ ] Stuhlprobe einschicken\n- [x] Termin bestätigt\n";
+    let store = loaded(&[("einkauf.md", file)]).await;
+    let who = autorin(&store, "/einkauf").await;
+
+    let first = fetch(&store, "/einkauf").await.unwrap();
+    assert!(
+        first.body.contains("taskItem"),
+        "the fixture must actually hold a checklist: {}",
+        first.body
+    );
+
+    for run in 1..=3 {
+        let report = again(&store, &[("einkauf.md", file)], &who, true).await;
+        assert_eq!(
+            report.count(Outcome::Unchanged),
+            1,
+            "run {run} rewrote a page whose file had not changed: {report}"
+        );
+        assert_eq!(report.count(Outcome::Updated), 0, "run {run}: {report}");
+    }
+}

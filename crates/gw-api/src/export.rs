@@ -452,7 +452,7 @@ const TASK_ITEM_ATTRS: [&str; 1] = ["checked"];
 /// is the right trade only while `checked` stays the sole thing GFM's `[x]` states. Block
 /// kinds other than `taskItem` are compared with their attributes whole — a `heading` that
 /// has grown a stray key is still refused.
-fn comparable(block: &Block) -> serde_json::Value {
+pub(crate) fn comparable(block: &Block) -> serde_json::Value {
     let mut copy = block.clone();
     reduce(&mut copy);
     serde_json::to_value(&copy).expect("a Block always serialises")

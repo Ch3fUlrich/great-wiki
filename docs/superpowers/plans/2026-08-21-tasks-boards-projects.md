@@ -140,3 +140,35 @@ subtrees with different grants is normal, not exceptional.
 
 This is the property most likely to be quietly lost by an aggregate query written in a hurry,
 which is why it is the one that gets mutation-tested rather than merely unit-tested.
+
+## Owner's decisions, 2026-08-21
+
+Asked during implementation, because each one changes what gets built rather than how.
+
+### D-12: The board exists in both places
+
+A global board at `/aufgaben` showing every task the viewer may see, filterable by project —
+*and* a board embedded in each project's home page.
+
+Rejected: one global board only (a project's own page is where you look when you are thinking
+about that project, and sending you elsewhere breaks that) and per-project only (a task that
+belongs to no project would have nowhere to appear at all, which is how a to-do goes missing —
+the failure D-6 exists to prevent).
+
+**The cost is the thing to watch: two places that must agree.** They must therefore be one
+query with a filter, not two implementations. A second retrieval path is a second answer, and
+because every card is a disclosure surface (see Security), a second answer is also a second
+chance to leak. The embedded board is the global board with `project` bound.
+
+### D-13: A project is created on a page of its own, at `/projekte`
+
+A list of projects with a form that names the home page.
+
+Rejected: a "make this page a project" control on the page itself (cheapest to build, but it
+buries the one place you would go to ask *what projects exist*) and putting it in the admin
+console (a project is not an administrative object — it is ordinary content, and requiring an
+admin to create one makes projects rare, which defeats them).
+
+**Consequence:** `/projekte` is itself an aggregate view, so it is filtered per document like
+every other one. You see a project only if you may read its home page — which is also what
+decides whether you may read its board, so the two cannot disagree.
