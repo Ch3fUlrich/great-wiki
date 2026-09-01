@@ -1072,6 +1072,123 @@ mutation crates/gw-store/src/trash.rs equivalent \
   's/            destroyed == pages.len() as i64,/            true,/' \
   'purge: the report names as many pages as the DELETE destroyed — unobservable until deleted_root gains a cascade'
 
+# --- attachments: the one path that returns BYTES rather than a title -------------------
+#
+# Every other disclosure in this system reveals that a page exists or what it is called. This
+# one hands over the contents, which is why D-16's rule is that a download is authorised
+# against **the page it was reached through** and never against the blob — and why the
+# mutations below are mostly one shape: the permission-checked accessor swapped for a lookup
+# that answers about a row without asking anybody.
+#
+# None of them can pass vacuously. `tests/attachments.rs` puts the SAME file on `/raum` (which
+# `leser` may read) and on `/geheim` (which they may not), so a mutation that drops the page
+# check hands `leser` the restricted page's file through the restricted page's own address —
+# and the test asserts on the raw response body, not on the status code, because a handler
+# that answered 403 with the bytes in it would satisfy a status-code test.
+#
+# THE one. `document_for` is the permission-checked accessor; `document_by_path_unchecked` is
+# the row lookup underneath it. With this swap the download resolves the page, finds the
+# attachment, and serves it to anybody who can spell the path — which is precisely "the sha
+# never appears in an address" being the ONLY thing standing between a reader and the bytes.
+mutation crates/gw-store/src/attachments.rs killed \
+  '/pub async fn attachment_for/,/^    }$/ s/let Some(document) = self.document_for(principal, path, Action::Read).await? else {/let Some(document) = self.document_by_path_unchecked(path).await? else {/' \
+  'attachments: a download is authorised against the page it was reached through'
+# The list is a weaker disclosure than the bytes and still a real one: it says a page exists,
+# what is on it, how big each file is and who put it there.
+mutation crates/gw-store/src/attachments.rs killed \
+  '/pub async fn attachments_for/,/^    }$/ s/let Some(access) = self.document_access(principal, path, Action::Read).await? else {/let Some(access) = self.document_by_path_unchecked(path).await?.map(|document| crate::DocumentAccess { document, may_write: false }) else {/' \
+  'attachments: listing a page files needs read on that page'
+# Attaching is an edit, so it follows WRITE. Reduced to read it is not merely weaker — every
+# public page in the wiki becomes a place a stranger may put 250 MB.
+mutation crates/gw-store/src/attachments.rs killed \
+  '/pub async fn attach(/,/^    }$/ s/let Some(access) = self.document_access(principal, path, Action::Write).await? else {/let Some(access) = self.document_access(principal, path, Action::Read).await? else {/' \
+  'attachments: attaching a file needs write on the page, not merely read'
+mutation crates/gw-store/src/attachments.rs killed \
+  '/pub async fn detach(/,/^    }$/ s/let Some(access) = self.document_access(principal, path, Action::Write).await? else {/let Some(access) = self.document_access(principal, path, Action::Read).await? else {/' \
+  'attachments: taking a file off a page needs write on it'
+# The account, and not merely the write bit — the same hole `trash_document` has. `can()`
+# answers an `Anyone` grant before it looks at whether the caller signed in, so on a path
+# carrying `anyone: write` the write verdict alone would let a request that has not said who
+# it is fill the mount, under a list that cannot say who did it.
+mutation crates/gw-store/src/attachments.rs killed \
+  '/pub async fn attach(/,/^    }$/ s/        if !principal.is_authenticated() || !principal.active {/        if false {/' \
+  'attachments: attaching needs a signed-in, active account even where anyone may write'
+mutation crates/gw-store/src/attachments.rs killed \
+  '/pub async fn detach(/,/^    }$/ s/        if !principal.is_authenticated() || !principal.active {/        if false {/' \
+  'attachments: detaching needs a signed-in, active account for the same reason'
+# A name is half of the address. One holding `/` is a different page; one that is `..` names a
+# directory. It never becomes a filesystem path — the file on disk is named by its digest —
+# so what this refusal buys is that a row cannot be unreachable, and that nothing downstream
+# ever meets a filename shaped like a path.
+mutation crates/gw-store/src/attachments.rs killed \
+  "s/        .any(|c| c == '\\/' || c == '\\\\\\\\' || c == '\"' || c.is_control())/        .any(|c| c.is_control())/" \
+  'attachments: a name that could not be an address is refused'
+# Replacing bytes under a name an inline block already points at changes what a paragraph
+# shows without anybody touching the page.
+mutation crates/gw-store/src/attachments.rs killed \
+  's/        if taken.is_some() {/        if false {/' \
+  'attachments: a name already on the page is a conflict, never a silent replacement'
+# Dedup has to be INVISIBLE (ADR 0013). `INSERT` rather than `INSERT OR IGNORE` turns the
+# second upload of a file somebody else already stored into an error — which is an oracle for
+# whether that file is filed on a page the uploader cannot read.
+mutation crates/gw-store/src/attachments.rs killed \
+  's/            "INSERT OR IGNORE INTO blobs (sha256, byte_size, media_type) VALUES (?1, ?2, ?3)",/            "INSERT INTO blobs (sha256, byte_size, media_type) VALUES (?1, ?2, ?3)",/' \
+  'attachments: storing bytes somebody already stored is not observable'
+# The bytes themselves. `sniff` refuses what it does not recognise; the mutation writes the
+# tempting version — call it something generic and serve it — which is how a page of markup
+# gets handed to a browser under a type the uploader chose.
+mutation crates/gw-store/src/blobs.rs killed \
+  's/        let Some(media_type) = sniff(&self.head) else {/        let media_type = sniff(\&self.head).unwrap_or("application\/octet-stream"); if false {/' \
+  'blobs: a type the allowlist does not know is refused, never guessed'
+mutation crates/gw-store/src/blobs.rs killed \
+  's/        if self.byte_size > self.max_bytes {/        if false {/' \
+  'blobs: D-17 250 MB cap actually refuses'
+# The digest IS the path on disk. Nothing can produce a bad one today — it is computed here
+# and the column is CHECKed — but this is the defence that survives a second writer.
+mutation crates/gw-store/src/blobs.rs killed \
+  's/^    if sha256.len() != 64$/    if false/' \
+  'blobs: a digest that is not one never becomes a path'
+# Publishing bytes a caller was not entitled to attach is exactly the failure `PendingBlob`
+# exists to prevent: the upload has already been read and hashed — there is no other way to
+# know what it is — and what must not follow is it ending up on the mount anyway, under a
+# name nothing will ever reference. This mutation publishes on the refusing branch.
+mutation crates/gw-store/src/attachments.rs killed \
+  '/pub async fn attach(/,/^    }$/ s/^            return Ok(AttachOutcome::Refused);$/            pending.publish().await?; return Ok(AttachOutcome::Refused);/' \
+  'attachments: an upload nobody may attach never reaches the mount'
+# The purge report. A purge takes the LIST and leaves the BYTES (ADR 0013), so both numbers
+# have to be there and be measured across the DELETE — `attachments: 3` on its own reads as
+# "and the files are gone", which is the misreading the second number exists to prevent.
+mutation crates/gw-store/src/trash.rs killed \
+  's/            attachments: before.attachments - after.attachments,/            attachments: 0,/' \
+  'purge: the report counts the attachment entries it destroyed'
+mutation crates/gw-store/src/trash.rs killed \
+  's/            blobs_orphaned: after.orphan_blobs - before.orphan_blobs,/            blobs_orphaned: before.orphan_blobs - after.orphan_blobs,/' \
+  'purge: orphans are what the purge CREATED, so the difference runs the other way'
+# The HTTP half. A row whose bytes are gone is not a missing attachment: 404 sends whoever
+# investigates to the database, which is the one place the problem is not.
+mutation crates/gw-api/src/routes/attachments.rs killed \
+  's/        return Err(ApiError::Unavailable);/        return Err(ApiError::NotFound);/' \
+  'attachments: bytes that are not on the mount are 503 and not 404'
+# `attachment` for a type nobody thought about, `inline` only for the two D-15 asks for. The
+# mutation renders everything, which is how a format that can carry script gets a page.
+# `Content-Length` comes from the stored size, so a file the mount has truncated becomes a
+# response that simply stops — indistinguishable from a dropped connection, and therefore
+# never reported. The check turns it into a refusal.
+mutation crates/gw-api/src/routes/attachments.rs killed \
+  's/    if on_disk != source.byte_size as u64 {/    if false {/' \
+  'attachments: a file that is not the length the database recorded is refused'
+mutation crates/gw-api/src/routes/attachments.rs killed \
+  's/    let inline = media_type.starts_with("image\/") || media_type == "application\/pdf";/    let inline = true;/' \
+  'attachments: only pictures and PDFs are offered inline'
+mutation crates/gw-api/src/routes/attachments.rs killed \
+  's/        HeaderValue::from_static("nosniff"),/        HeaderValue::from_static("nosniff-not"),/' \
+  'attachments: the browser is forbidden from re-typing the bytes itself'
+# D-17 is 250 MB and the ordinary limit is 2 MB. They live in one router, so the thing that
+# breaks silently is the attachment route ending up under the small one.
+mutation crates/gw-api/src/routes/attachments.rs killed \
+  's/        .layer(RequestBodyLimitLayer::new(MAX_ATTACHMENT_BYTES as usize))/        .layer(RequestBodyLimitLayer::new(super::REQUEST_BODY_LIMIT))/' \
+  'attachments: the upload route is not under the ordinary 2 MB body limit'
+
 # --- crash recovery ------------------------------------------------------------------
 #
 # A trap does not survive SIGKILL, and a killed run leaves the mutated file in place.
@@ -1265,6 +1382,9 @@ probe_for() {
     # The trash endpoints, including the purge gate. One integration binary covers all
     # four, so the probe is exact rather than a whole-crate build of seven binaries.
     crates/gw-api/src/routes/trash.rs) echo "-p gw-api --test trash" ;;
+    # The attachment endpoints, including the download authorisation and everything a
+    # download tells the browser. One integration binary covers all four routes.
+    crates/gw-api/src/routes/attachments.rs) echo "-p gw-api --test attachments" ;;
     *) echo "" ;;
   esac
 }

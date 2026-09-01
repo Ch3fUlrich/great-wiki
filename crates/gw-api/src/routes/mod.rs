@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod attachments;
 pub mod collab;
 pub mod docs;
 pub mod links;
@@ -17,7 +18,7 @@ use axum_extra::extract::CookieJar;
 use gw_auth::breach::BreachRange;
 use gw_auth::password::HashingCost;
 use gw_auth::Principal;
-use gw_store::Store;
+use gw_store::{BlobStore, Store};
 use std::sync::{Arc, OnceLock};
 
 /// The cookie a signed-in browser presents. Defined next to the code that issues it; this
@@ -39,9 +40,28 @@ pub enum PrincipalSource {
     Anonymous,
 }
 
+/// The ordinary request-body limit, for every route except the attachment ones.
+///
+/// 2 MB: a page body, an ACL change and a login form are all kilobytes, and a limit that
+/// admits a quarter of a gigabyte everywhere would be no limit at all.
+///
+/// It lives HERE, applied inside [`build_router`], rather than in `main.rs` around the whole
+/// router — which is where it used to be. Two things were wrong with that. Layers wrap, so
+/// nothing inside this crate could carve out the exception D-17 needs for a 250 MB upload;
+/// and no test saw the limit at all, because tests build the router and never the binary.
+pub const REQUEST_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
+    /// The media mount: every attachment's bytes, content-addressed.
+    ///
+    /// Beside the store rather than inside it, because that is AGENTS.md rule 5 expressed in
+    /// the type — metadata on NVMe, blobs on NFS, and never the other way round. Nothing here
+    /// resolves a request to a blob: `gw_store::Store::attachment_for` turns a page and a
+    /// filename into a digest after asking the permission engine, and only then is this
+    /// consulted.
+    pub blobs: Arc<BlobStore>,
     /// When present, every request arrives as this user. Only reachable on a loopback
     /// bind — `config::validate` refuses to start otherwise.
     ///
@@ -117,6 +137,7 @@ impl AppState {
     /// [`HashingCost::PRODUCTION`], so there is nothing here for a caller to get wrong.
     pub fn serving(
         store: Arc<Store>,
+        blobs: Arc<BlobStore>,
         dev_identity: Option<Identity>,
         proxy_guard: ProxyGuard,
         oidc: Option<Arc<OidcClient>>,
@@ -124,6 +145,7 @@ impl AppState {
     ) -> Self {
         let state = Self {
             store,
+            blobs,
             dev_identity,
             proxy_guard,
             oidc,
@@ -156,6 +178,7 @@ impl AppState {
     ) -> Self {
         Self {
             store,
+            blobs: scratch_media(),
             dev_identity,
             proxy_guard,
             oidc: None,
@@ -342,6 +365,28 @@ impl AppState {
     }
 }
 
+/// One media directory per test process, cleared when it is first asked for.
+///
+/// [`AppState::for_test`] has to hand every test a usable [`BlobStore`], and almost no test
+/// ever puts a byte in it — so this is one directory rather than one per state, and it is
+/// emptied on first use so a process that reuses a pid cannot inherit a previous run's files.
+/// A test that cares what is on the mount reaches it through `state.blobs`.
+///
+/// It is ordinary code and not `#[cfg(test)]` because `for_test` is called from integration
+/// tests, which link the library as a dependency. The same is already true of
+/// `HashingCost::CHEAP_FOR_TESTS` and of the `for_test*` constructors themselves.
+fn scratch_media() -> Arc<BlobStore> {
+    static MEDIA: OnceLock<Arc<BlobStore>> = OnceLock::new();
+    MEDIA
+        .get_or_init(|| {
+            let root =
+                std::env::temp_dir().join(format!("great-wiki-test-media-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            Arc::new(BlobStore::open(root).expect("a test media directory must be creatable"))
+        })
+        .clone()
+}
+
 pub fn build_router(state: AppState) -> Router {
     // The view-as layer needs the whole state (it reads the store); the proxy layer needs
     // only its own policy. Cloned here because `with_state` consumes the original.
@@ -369,6 +414,17 @@ pub fn build_router(state: AppState) -> Router {
         .merge(admin::routes())
         .merge(crate::auth::routes())
         .merge(crate::view_as::routes())
+        // Every route above answers in kilobytes, so every route above is capped in
+        // kilobytes. Applied here rather than around the whole router in `main.rs` — see
+        // [`REQUEST_BODY_LIMIT`] — and BEFORE the attachment routes are merged, because a
+        // layer applies to what has been added so far and an outer limit would swallow the
+        // inner one.
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            REQUEST_BODY_LIMIT,
+        ))
+        // Merged after that layer and carrying its own, which is the whole point: D-17 allows
+        // 250 MB per attachment and nothing else here comes close.
+        .merge(attachments::routes())
         // D-M2-17, and it is applied HERE rather than in each handler for one reason: a
         // layer added after every route wraps the 404 fallback too, so a path that does
         // not exist yet is already covered. Per-handler checks fail open for code that has

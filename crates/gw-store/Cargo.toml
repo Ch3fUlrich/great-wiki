@@ -12,6 +12,8 @@ gw-core = { path = "../gw-core" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The content address of every blob. See `crate::blobs`.
+sha2 = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 tokio = { workspace = true }
 tracing = { workspace = true }

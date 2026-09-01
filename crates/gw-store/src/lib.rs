@@ -1,6 +1,8 @@
 pub mod acl;
 pub mod admin;
+pub mod attachments;
 pub mod audit;
+pub mod blobs;
 pub mod crdt;
 pub mod documents;
 pub mod invites;
@@ -15,7 +17,11 @@ pub mod trash;
 
 pub use acl::{Baseline, DocumentAccess};
 pub use admin::MembershipOutcome;
+pub use attachments::{AttachOutcome, Attachment, AttachmentList, AttachmentSource, DetachOutcome};
 pub use audit::{AuditEntry, AuditPage};
+pub use blobs::{
+    BlobOutcome, BlobStore, BlobWriter, PendingBlob, StoredBlob, MAX_ATTACHMENT_BYTES,
+};
 pub use documents::{NewDocument, StoredDocument, TreeNode};
 pub use invites::{
     AcceptOutcome, CreateInviteOutcome, InviteOffer, InviteSummary, NewInvite, RevokeInviteOutcome,

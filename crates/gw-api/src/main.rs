@@ -190,8 +190,10 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Check => {
             println!(
-                "configuration OK — bind {}, db {}",
-                cfg.bind, cfg.database_url
+                "configuration OK — bind {}, db {}, media {}",
+                cfg.bind,
+                cfg.database_url,
+                cfg.media_dir.display()
             );
             Ok(())
         }
@@ -311,21 +313,30 @@ async fn main() -> Result<()> {
                         std::sync::Arc::new(gw_auth::breach::UnavailableCorpus)
                     }
                 };
+            // The media mount, opened BEFORE a listener is bound: a server that starts
+            // without a usable one would accept an upload and lose it (AGENTS.md rule 3).
+            // It is a directory rather than a connection, so this both creates it and
+            // proves it is writable.
+            let blobs = std::sync::Arc::new(gw_store::BlobStore::open(&cfg.media_dir)?);
+            tracing::info!(media = %cfg.media_dir.display(), "media directory ready");
             // `serving` takes no hashing cost and offers none: a server hashes at
             // Authelia's parameters. The check below is what makes that true of the
             // *process* rather than only of this line, since `AppState`'s fields are
             // public and a future edit could set one directly.
             let state = gw_api::AppState::serving(
                 store,
+                blobs,
                 cfg.dev_identity.clone(),
                 gw_api::ProxyGuard::from_config(&cfg),
                 oidc,
                 corpus,
             );
             refuse_weak_hashing(state.hashing)?;
-            let app = gw_api::build_router(state).layer(
-                tower_http::limit::RequestBodyLimitLayer::new(2 * 1024 * 1024),
-            );
+            // The request-body limits live in `build_router` — one for the ordinary routes
+            // and a larger one for attachments (D-17). They used to be one layer here, which
+            // meant no test ever saw them and no route inside the crate could be excepted
+            // from them; see `gw_api::routes::REQUEST_BODY_LIMIT`.
+            let app = gw_api::build_router(state);
             let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
             tracing::info!(bind = %cfg.bind, "great-wiki listening");
             axum::serve(listener, app).await?;

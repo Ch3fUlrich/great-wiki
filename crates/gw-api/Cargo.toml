@@ -57,7 +57,7 @@ serde_json = { workspace = true }
 # parses it with, so a title holding a colon, a quote or a leading `-` is quoted by the
 # rules that will read it back rather than by a format string that guesses.
 serde_yaml = { workspace = true }
-sha2 = "0.10"
+sha2 = { workspace = true }
 # sqlx is a DIRECT dependency because handlers query. The predecessor plan omitted it
 # from this crate's manifest while calling sqlx from four of its modules.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }

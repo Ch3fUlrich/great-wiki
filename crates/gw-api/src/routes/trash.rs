@@ -128,6 +128,12 @@ pub struct PurgeReportView {
     pub links: i64,
     pub topic_filings: i64,
     pub topics: i64,
+    /// Rows of the `Anhänge` list that went with those pages. Not files.
+    pub attachments: i64,
+    /// Stored files no page references any more. **Not files deleted** — a purge takes the
+    /// list and leaves the bytes on the mount (ADR 0013), and this is what says so rather
+    /// than leaving an administrator to assume otherwise.
+    pub blobs_orphaned: i64,
 }
 
 impl From<PurgeReport> for PurgeReportView {
@@ -148,6 +154,8 @@ impl From<PurgeReport> for PurgeReportView {
             links: report.links,
             topic_filings: report.topic_filings,
             topics: report.topics,
+            attachments: report.attachments,
+            blobs_orphaned: report.blobs_orphaned,
         }
     }
 }

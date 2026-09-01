@@ -148,6 +148,20 @@ pub struct PurgeReport {
     pub topic_filings: i64,
     /// Topics that no page carries any more once those filings are gone.
     pub topics: i64,
+    /// Rows of the `Anhänge` list — "this page carries that file, under this name" — that
+    /// went with those pages. Not files: the same file on a surviving page is still there.
+    pub attachments: i64,
+    /// Stored files that **no page references any more** once those rows are gone.
+    ///
+    /// Not "files deleted". A purge takes the list and leaves the bytes, so this is the count
+    /// of things that are now taking up space on the mount and are reachable from nowhere —
+    /// `docs/decisions/0013-what-a-purge-leaves-on-the-mount.md` is why that is the design
+    /// rather than an omission, and this number is how an administrator is told about it
+    /// rather than discovering it.
+    ///
+    /// Measured the same way as every other number here: the count of unreferenced blobs
+    /// before the DELETE subtracted from the count after it. It is the one that goes UP.
+    pub blobs_orphaned: i64,
 }
 
 /// The subtree predicate, written once. `substr(...) = ?1 || '/'` rather than `LIKE ?1 ||
@@ -521,6 +535,9 @@ impl Store {
             links: before.links - after.links,
             topic_filings: before.topic_filings - after.topic_filings,
             topics: before.topics - after.topics,
+            attachments: before.attachments - after.attachments,
+            // The other way round, and deliberately: orphans are what the purge CREATED.
+            blobs_orphaned: after.orphan_blobs - before.orphan_blobs,
             pages,
         };
 
@@ -548,6 +565,8 @@ impl Store {
                 "links": report.links,
                 "topic_filings": report.topic_filings,
                 "topics": report.topics,
+                "attachments": report.attachments,
+                "blobs_orphaned": report.blobs_orphaned,
             }),
         )
         .await?;
@@ -591,6 +610,12 @@ struct Totals {
     links: i64,
     topic_filings: i64,
     topics: i64,
+    attachments: i64,
+    /// Blobs nothing references. The only figure here that is not a whole-table count, and it
+    /// is still a whole-corpus one: a predicate written to resemble the `DELETE`'s would be
+    /// the second statement ADR 0012 refuses, and there is no way to express "lost its last
+    /// reference" as a table total.
+    orphan_blobs: i64,
 }
 
 impl Totals {
@@ -608,6 +633,13 @@ impl Totals {
             links: count(&mut *tx, "links").await?,
             topic_filings: count(&mut *tx, "document_tags").await?,
             topics: count(&mut *tx, "tags").await?,
+            attachments: count(&mut *tx, "attachments").await?,
+            orphan_blobs: sqlx::query_scalar(
+                "SELECT count(*) FROM blobs b WHERE NOT EXISTS ( \
+                   SELECT 1 FROM attachments a WHERE a.sha256 = b.sha256)",
+            )
+            .fetch_one(&mut *tx)
+            .await?,
         })
     }
 }
@@ -1248,6 +1280,71 @@ mod tests {
         assert!(report.pages.iter().any(|p| p.path == "/handbuch/alt"));
         assert_eq!(count(&store, "documents").await, 0);
         assert!(store.trash_for(&chef).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_purge_takes_the_files_off_the_page_and_says_what_it_orphaned() {
+        // D-14: the report names what it destroys, "and the count includes the things that
+        // cascade". Attachments cascade. The bytes do NOT go — ADR 0013 — so the report has
+        // to say how many files nothing references any more, or a purge would silently claim
+        // to have removed something it left on the mount.
+        let store = store().await;
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = crate::BlobStore::open(dir.path()).unwrap();
+        page(&store, None, "Notiz", Visibility::Public).await;
+        page(&store, None, "Andere", Visibility::Public).await;
+        let chef = who(&store, "chef", Permission::Admin, &["/notiz", "/andere"]).await;
+
+        // Two files on the doomed page. One of them is also on a page that survives, so
+        // exactly one blob loses its last reference.
+        for (path, name, tail) in [
+            ("/notiz", "nur-hier.png", "a"),
+            ("/notiz", "geteilt.png", "b"),
+            ("/andere", "geteilt.png", "b"),
+        ] {
+            let mut writer = blobs.writer().unwrap();
+            let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+            bytes.extend_from_slice(tail.as_bytes());
+            writer.push(&bytes).await.unwrap();
+            let crate::BlobOutcome::Accepted(pending) = writer.finish().await.unwrap() else {
+                panic!("a PNG must be acceptable");
+            };
+            assert!(matches!(
+                store.attach(&chef, path, name, pending).await.unwrap(),
+                crate::AttachOutcome::Done(_)
+            ));
+        }
+
+        store.trash_document(&chef, "/notiz").await.unwrap();
+        let preview = report(
+            store
+                .purge_document(&chef.id, "/notiz", Purge::Preview)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(preview.attachments, 2);
+        assert_eq!(
+            preview.blobs_orphaned, 1,
+            "only the file the surviving page does not also carry"
+        );
+
+        let done = report(
+            store
+                .purge_document(&chef.id, "/notiz", Purge::Commit)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            (done.attachments, done.blobs_orphaned),
+            (preview.attachments, preview.blobs_orphaned),
+            "the preview IS the purge, so the numbers cannot differ"
+        );
+        assert_eq!(count(&store, "attachments").await, 1);
+        assert_eq!(
+            count(&store, "blobs").await,
+            2,
+            "the index keeps the orphan, so a sweep can find it"
+        );
     }
 
     #[tokio::test]
