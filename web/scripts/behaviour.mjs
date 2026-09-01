@@ -1879,6 +1879,240 @@ await check('I6 a topic can be filed and un-filed from the page you are reading'
   );
 });
 
+// ---------------------------------------------------------------------------------------
+// Group J — the Papierkorb: deleting where the page is, recovering where you can find it,
+// and the one act in this system that loses data
+//
+// The fixture's identity (`sergej:editors`) holds **write** on `/rundgang` and
+// `/verweisbeispiel`, and **admin** on exactly one page, `/verweisbeispiel/verweist-zurueck`.
+// That split is what makes both halves of the purge checkable end to end: J5 watches the gate
+// refuse where there is only write, and J6 watches it allow where there is admin. Without the
+// admin grant J6 could not run at all and J5 would report "ok" for having correctly detected a
+// refusal — proving nothing, which is precisely the failure `just behaviour-fixture`'s own
+// comments were written about.
+//
+// **J6 really destroys a page**, which is why it is last. `behaviour-fixture` deletes and
+// reseeds the database on every run, so the corpus is whole again next time; nothing after
+// this line may depend on `/verweisbeispiel/verweist-zurueck` existing.
+//
+// What is NOT checked here is who may see which entry. `Store::trash_for` decides that, per
+// document, and it is mutation-tested; proving it end to end would need a deleted page this
+// identity cannot read, and putting one there means editing `content-example`, which several
+// Rust tests assert against.
+// ---------------------------------------------------------------------------------------
+
+/** Write, and deliberately no admin: the page J3, J4 and J5 borrow and put back. */
+const TRASH_PAGE = '/rundgang/was-schon-geht';
+/** The one page this identity administers, and the one J6 destroys. */
+const PURGE_PAGE = '/verweisbeispiel/verweist-zurueck';
+
+/**
+ * Submit a form by its own submit control and wait for the navigation it causes.
+ *
+ * The address is what is waited on, not a load state: these are native form submissions, so
+ * the page is already `domcontentloaded` when the click happens and `waitForLoadState`
+ * resolves instantly — the assertion after it then reads the URL of the page that has not
+ * navigated yet. That failure looked exactly like a broken form, and was not one.
+ */
+async function submit(page, name) {
+  const button = page.getByRole('button', { name });
+  await button.waitFor({ state: 'visible', timeout: 10_000 });
+  const before = page.url();
+  await button.click();
+  await page.waitForFunction((was) => location.href !== was, before, { timeout: 10_000 });
+  await page.waitForLoadState('domcontentloaded');
+}
+
+/** Put a page back, so a check that borrowed one leaves the corpus as it found it. */
+async function restore(page, path) {
+  await page.goto(BASE + '/papierkorb', { waitUntil: 'domcontentloaded' });
+  const row = page.locator(`tr[data-eintrag="${path}"]`);
+  if ((await row.count()) === 0) return;
+  await Promise.all([
+    page.waitForLoadState('domcontentloaded'),
+    row.getByRole('button').first().click()
+  ]);
+}
+
+await check('J1 the Papierkorb is a place in the header, and counts nothing it did not show', async (page) => {
+  const home = await page.request.get(BASE + '/');
+  assert(home.ok(), `expected 200 from /, got ${home.status()}`);
+  const nav = (await home.text()).match(/<nav[^>]*aria-label="Hauptbereiche"[\s\S]*?<\/nav>/)?.[0];
+  assert(nav !== undefined, 'no main navigation in the server-rendered HTML');
+  assert(nav.includes('href="/papierkorb"'), 'the main navigation does not link the Papierkorb');
+
+  const response = await page.request.get(BASE + '/papierkorb');
+  assert(response.ok(), `expected 200 from /papierkorb, got ${response.status()}`);
+  const html = await response.text();
+  assert(/<h1[^>]*>Papierkorb<\/h1>/.test(html), '/papierkorb does not name itself');
+  // The listing is filtered per document. The one number it may carry is the size of an
+  // entry this reader may see; anything about what was left out is a fact about pages they
+  // may not read.
+  assert(
+    !/weitere|insgesamt|ausgeblendet|verborgen/i.test(html),
+    'the Papierkorb hints at entries or pages it did not show'
+  );
+});
+
+await check('J2 deleting is offered on the page, as a link that asks before it does anything', async (page) => {
+  const response = await page.request.get(BASE + TRASH_PAGE);
+  assert(response.ok(), `expected 200 from ${TRASH_PAGE}, got ${response.status()}`);
+  const html = await response.text();
+
+  const bar = html.match(/<p class="editbar[\s\S]*?<\/p>/)?.[0];
+  assert(bar !== undefined, 'no control bar in the server-rendered HTML');
+  assert(bar.includes('Bearbeiten') && bar.includes('Verlauf'), 'the control bar lost its own controls');
+  assert(
+    bar.includes(`href="${TRASH_PAGE}?loeschen=1#gw-loeschen"`),
+    'deleting is not offered beside Bearbeiten and Verlauf, as a real link'
+  );
+  // Nothing on the reading page can delete anything by being clicked.
+  assert(!html.includes('?/loeschen'), 'the reading page carries a control that deletes on click');
+
+  const asked = await page.request.get(`${BASE}${TRASH_PAGE}?loeschen=1`);
+  const question = await asked.text();
+  assert(
+    /<form[^>]*method="post"[^>]*action="\?\/loeschen"/.test(question),
+    'the question before a delete is not a real form submission'
+  );
+  // The one thing nobody would guess, said before it happens rather than discovered after.
+  assert(
+    /darunter/.test(question),
+    'the question does not say that the pages under this one go with it'
+  );
+  assert(question.includes('Abbrechen'), 'the question offers no way out');
+});
+
+await check('J3 a page really goes to the Papierkorb and really comes back', async (page) => {
+  await page.goto(`${BASE}${TRASH_PAGE}?loeschen=1`, { waitUntil: 'domcontentloaded' });
+  await submit(page, 'In den Papierkorb');
+
+  assert(page.url().includes('/papierkorb'), `a finished delete should land in the Papierkorb, landed on ${page.url()}`);
+  const row = page.locator(`tr[data-eintrag="${TRASH_PAGE}"]`);
+  await row.waitFor({ state: 'visible', timeout: 10_000 });
+
+  // The page is genuinely out of the wiki, not merely hidden from a list.
+  const gone = await page.request.get(BASE + TRASH_PAGE);
+  assert(gone.status() === 404, `a deleted page should be gone; ${TRASH_PAGE} answered ${gone.status()}`);
+  const tree = await page.request.get(BASE + '/rundgang');
+  assert(
+    !(await tree.text()).includes(`href="${TRASH_PAGE}"`),
+    'a deleted page is still linked from the navigation'
+  );
+
+  await Promise.all([page.waitForLoadState('domcontentloaded'), row.getByRole('button').first().click()]);
+  await page.locator(`tr[data-eintrag="${TRASH_PAGE}"]`).waitFor({ state: 'detached', timeout: 10_000 });
+
+  const back = await page.request.get(BASE + TRASH_PAGE);
+  assert(back.ok(), `a restored page should answer again; ${TRASH_PAGE} answered ${back.status()}`);
+});
+
+await check('J4 a subtree that is not all yours is refused, and the refusal says what is in the way', async (page) => {
+  // `/rundgang/nur-intern` carries its own grant for a group this identity is not in, so the
+  // whole of `/rundgang` cannot go to the trash — a page goes with everything under it, and
+  // that page is not this caller's to move.
+  await page.goto(BASE + '/rundgang?loeschen=1', { waitUntil: 'domcontentloaded' });
+  await submit(page, 'In den Papierkorb');
+
+  const alarm = page.locator('[role="alert"]');
+  await alarm.first().waitFor({ state: 'visible', timeout: 10_000 });
+  const said = await alarm.first().innerText();
+  assert(/Unterseite/.test(said), `the refusal must say what is in the way: ${said}`);
+  assert(/nichts gelöscht/.test(said), `the refusal must promise that nothing moved: ${said}`);
+
+  const still = await page.request.get(BASE + '/rundgang');
+  assert(still.ok(), `nothing should have moved; /rundgang answered ${still.status()}`);
+  const intern = await page.request.get(BASE + '/papierkorb');
+  assert(
+    !(await intern.text()).includes('data-eintrag="/rundgang"'),
+    'a refused delete still put the page in the Papierkorb'
+  );
+});
+
+await check('J5 no report, no control: the gate that refuses a purge refuses to describe one', async (page) => {
+  // Write on this page, and no admin. ADR 0012 makes those different permissions on purpose.
+  await page.goto(`${BASE}${TRASH_PAGE}?loeschen=1`, { waitUntil: 'domcontentloaded' });
+  await submit(page, 'In den Papierkorb');
+
+  const frage = page.locator(`tr[data-eintrag="${TRASH_PAGE}"] a`).first();
+  await frage.waitFor({ state: 'visible', timeout: 10_000 });
+  await Promise.all([page.waitForLoadState('domcontentloaded'), frage.click()]);
+
+  const said = await page.locator('[role="alert"]').first().innerText();
+  assert(/verwalt/i.test(said), `the refusal must say who may ask: ${said}`);
+  // The whole point: the control that destroys is not drawn at all, rather than drawn and
+  // refused on press.
+  assert(
+    (await page.getByRole('button', { name: 'Endgültig löschen' }).count()) === 0,
+    'a purge control was offered to somebody the API had already refused'
+  );
+
+  await restore(page, TRASH_PAGE);
+  const back = await page.request.get(BASE + TRASH_PAGE);
+  assert(back.ok(), `the borrowed page should be back; ${TRASH_PAGE} answered ${back.status()}`);
+});
+
+await check('J6 a purge names every page it is about to destroy, and then destroys them', async (page) => {
+  // LAST, and destructive: this really purges `/verweisbeispiel/verweist-zurueck`. The
+  // fixture is rebuilt from `content-example` on every run, so nothing below may depend on
+  // that page existing.
+  const titel = 'Verweist zurück';
+  await page.goto(`${BASE}${PURGE_PAGE}?loeschen=1`, { waitUntil: 'domcontentloaded' });
+  await submit(page, 'In den Papierkorb');
+
+  const frage = page.locator(`tr[data-eintrag="${PURGE_PAGE}"] a`).first();
+  await frage.waitFor({ state: 'visible', timeout: 10_000 });
+  const href = await frage.getAttribute('href');
+  assert(
+    href !== null && href.endsWith('#gw-endgueltig'),
+    `the link to the question must carry the fragment that announces it, got ${href}`
+  );
+
+  // Followed as a reader would follow it, in a hydrated page — which is the case that was
+  // wrong. The fragment moves focus only on a real page load, so the client-side router left
+  // the question drawn and unannounced; `data-sveltekit-reload` on the link is what makes the
+  // hydrated path behave as the scriptless one already did. This assertion is the only thing
+  // that can tell the two apart, and it read the body before the attribute was there.
+  await Promise.all([page.waitForURL(/entfernen=/, { timeout: 10_000 }), frage.click()]);
+  await page.waitForFunction(() => document.readyState === 'complete', { timeout: 10_000 });
+  const focused = await page.evaluate(() => document.activeElement?.id ?? '');
+  assert(focused === 'gw-endgueltig', `the confirmation should take focus, got "${focused}"`);
+
+  const confirm = page.locator('#gw-endgueltig');
+  const text = await confirm.innerText();
+  assert(/nicht rückgängig/i.test(text), `the confirmation must say it cannot be undone: ${text}`);
+  // By NAME, from the report the API produced by running the purge and rolling it back —
+  // never summarised into "diese Seite und N weitere".
+  assert(text.includes(titel), 'the confirmation does not name the page it would destroy');
+  assert(text.includes(PURGE_PAGE), 'the confirmation does not give the address of what goes');
+  assert(!/und \d+ weitere/i.test(text), 'the confirmation summarised the names it was given');
+  // And by count, every kind, including the kinds that are none.
+  for (const was of ['Versionen', 'Karten', 'Projekte', 'Verweise', 'Themen']) {
+    assert(text.includes(was), `the confirmation does not say what happens to ${was}`);
+  }
+  // At least the six kinds this interface has wording for. Not exactly six: the report is
+  // walked rather than spelled out field by field, precisely so that a count the API grows
+  // later appears here instead of being silently dropped, and pinning the number would turn
+  // that safeguard into a failing check the day it did its job.
+  const zahlen = await confirm.locator('dd').allInnerTexts();
+  assert(zahlen.length >= 6, `expected at least six counted kinds, found ${zahlen.length}`);
+  assert(
+    zahlen.every((zahl) => /^\d+$/.test(zahl.trim())),
+    `every counted kind must carry a number: ${zahlen.join(', ')}`
+  );
+
+  await submit(page, 'Endgültig löschen');
+
+  const meldung = await page.locator('[role="status"]').first().innerText();
+  assert(/endgültig/i.test(meldung), `the outcome must say what happened: ${meldung}`);
+  assert(
+    (await page.locator(`tr[data-eintrag="${PURGE_PAGE}"]`).count()) === 0,
+    'a purged entry is still in the Papierkorb'
+  );
+  const weg = await page.request.get(BASE + PURGE_PAGE);
+  assert(weg.status() === 404, `a purged page should be gone; it answered ${weg.status()}`);
+});
+
 await browser.close();
 
 // ---------------------------------------------------------------------------------------

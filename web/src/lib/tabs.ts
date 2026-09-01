@@ -194,11 +194,27 @@ export function resolveTabs(raw: readonly unknown[], hier: string): TabSet {
   return { hrefs, active: hrefs.indexOf(hier) };
 }
 
-/** Path and query, split apart so a tab set can be appended to whatever is already there. */
-function split(href: string): [string, URLSearchParams] {
-  const cut = href.indexOf('?');
-  if (cut === -1) return [href, new URLSearchParams()];
-  return [href.slice(0, cut), new URLSearchParams(href.slice(cut + 1))];
+/**
+ * Path, query and fragment, split apart so a tab set can be appended to whatever is already
+ * there — and so the fragment survives it.
+ *
+ * **The fragment is not decoration in this interface.** It is how a change announces itself
+ * with no script at all: a redirect or a link that carries `#gw-…` moves focus to a region
+ * with `tabindex="-1"`, and a region that has just received focus is read out, where a live
+ * region already in the document announces nothing. So a chrome link that loses its fragment
+ * loses the announcement, silently — the link still navigates, focus simply stays at the top
+ * of the page, and only somebody listening would notice.
+ *
+ * Splitting on `?` alone read `#gw-loeschen` as part of the last parameter's value and
+ * percent-escaped it into the query. `$lib/topics`'s `withSidebar` has always split the
+ * fragment off; this is the other half of the same chrome link agreeing with it.
+ */
+function split(href: string): [string, URLSearchParams, string] {
+  const [before, ...rest] = href.split('#');
+  const fragment = rest.length > 0 ? `#${rest.join('#')}` : '';
+  const cut = before.indexOf('?');
+  if (cut === -1) return [before, new URLSearchParams(), fragment];
+  return [before.slice(0, cut), new URLSearchParams(before.slice(cut + 1)), fragment];
 }
 
 /**
@@ -230,10 +246,10 @@ export function withTabs(target: string, hrefs: readonly string[]): string {
  * on the page it lands on is bare again, because by then the set really is one tab.
  */
 function withTabsAlways(target: string, hrefs: readonly string[]): string {
-  const [path, params] = split(target);
+  const [path, params, fragment] = split(target);
   params.delete(TAB_PARAM);
   for (const href of hrefs) params.append(TAB_PARAM, href);
-  return `${path}?${params.toString()}`;
+  return `${path}?${params.toString()}${fragment}`;
 }
 
 /** Where "switch to tab `index`" goes. */

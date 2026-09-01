@@ -103,6 +103,22 @@ behaviour-fixture:
       --permission write --actor behaviour-fixture
     cargo run -q -p gw-api -- grant --path /rundgang/nur-intern --subject group:admins \
       --permission read --actor behaviour-fixture
+    # ONE page this identity administers, and exactly one — for the reason the write grants
+    # above exist. A purge is gated by `path_admin` on the page's own path (ADR 0012) and
+    # write does not satisfy it, so without an admin grant somewhere the harness could only
+    # ever watch the gate refuse: Group J's positive check — the preview naming every page it
+    # is about to destroy, and then destroying them — would be unrunnable, and its negative
+    # check would prove nothing while still reporting "ok" for having correctly detected a
+    # refusal. That is the exact failure this recipe's own comments were written about.
+    #
+    # Deliberately a LEAF, and deliberately not under /rundgang: Group J really does purge
+    # this page, so it must be one no earlier check reads. Everything under /rundgang keeps
+    # write and only write, which is what leaves Group J a page whose purge is refused to
+    # check the other half against. A grant row here replaces the one inherited from
+    # /verweisbeispiel rather than adding to it (`Store::grants_for_path`), which is harmless
+    # only because Admin satisfies Write — the editing checks on this subtree still pass.
+    cargo run -q -p gw-api -- grant --path /verweisbeispiel/verweist-zurueck \
+      --subject group:editors --permission admin --actor behaviour-fixture
     echo "behaviour fixture ready:"
     echo "  GW_DATABASE_URL=$GW_DATABASE_URL"
     echo "  GW_MEDIA_DIR=$GW_MEDIA_DIR"

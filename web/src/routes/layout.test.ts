@@ -89,6 +89,11 @@ describe('the header navigation', () => {
       // than for the other three: D-4 made topics invisible in the graph, so a topic page is
       // the ONLY way a topic is reachable at all.
       ['Themen', '/themen'],
+      // The Papierkorb is here for the reason the others are, and for one of its own:
+      // deleting happens on the page, but a deleted page is out of the tree, out of the
+      // export and out of the search — so the only way back to it is a place you can reach
+      // without knowing its address.
+      ['Papierkorb', '/papierkorb'],
       ['Graph', '/graph']
     ]) {
       expect(out).toContain(`href="${href}"`);

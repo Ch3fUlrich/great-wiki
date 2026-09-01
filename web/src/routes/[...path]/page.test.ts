@@ -96,6 +96,7 @@ function html(
     alle = alleThemen,
     seitenThemenFehler = null,
     seitenleiste = 'seiten',
+    loeschen = false,
     form = null
   }: {
     me?: Me;
@@ -108,7 +109,8 @@ function html(
     alle?: TopicSummary[];
     seitenThemenFehler?: string | null;
     seitenleiste?: SidebarMode;
-    form?: { fehler: string; getippt: string } | null;
+    loeschen?: boolean;
+    form?: { wo: 'thema' | 'loeschen'; fehler: string; getippt: string } | null;
   } = {}
 ): string {
   return render(Page, {
@@ -124,6 +126,7 @@ function html(
         tree,
         backlinks,
         edit,
+        loeschen,
         board,
         boardFehler,
         hinweis,
@@ -491,7 +494,7 @@ describe('the topics of the page being read', () => {
   });
 
   it('says out loud when a change was refused', () => {
-    const out = html(container, { form: { fehler: 'Das ist kein Thema.', getippt: 'a//b' } });
+    const out = html(container, { form: { wo: 'thema', fehler: 'Das ist kein Thema.', getippt: 'a//b' } });
     expect(out).toContain('Das ist kein Thema.');
     expect(out).toContain('value="a//b"');
   });
@@ -502,5 +505,85 @@ describe('the topics of the page being read', () => {
       seitenThemenFehler: 'Die Themen konnten nicht geladen werden (Fehler 500).'
     });
     expect(out).toContain('Fehler 500');
+  });
+});
+
+describe('deleting the page you are reading', () => {
+  it('offers nothing to a reader who is not signed in', () => {
+    // `Store::trash_document` needs write on every page that moves AND an account, because a
+    // trash entry records who made it and "nobody" is not an answer. Both halves, or nothing.
+    expect(html()).not.toContain('Löschen');
+  });
+
+  it('offers nothing to a signed-in reader the page says may not write it', () => {
+    const out = html({ ...container, may_write: false }, { me: signedIn });
+    expect(out).not.toContain('Löschen');
+    expect(out).toContain('Verlauf');
+  });
+
+  it('is a link beside Bearbeiten and Verlauf, so it works before any script arrives', () => {
+    const out = html(container, { me: signedIn });
+    expect(out).toContain('Löschen');
+    expect(out).toContain('/rundgang/import-export?loeschen=1#gw-loeschen');
+  });
+
+  it('reaches its question by a real navigation, so the question is announced', () => {
+    // Same finding, same fix as the purge link in the Papierkorb: a fragment moves focus only
+    // on a real page load, and the client-side router would leave the question drawn but
+    // unannounced.
+    const out = html(container, { me: signedIn });
+    expect(out).toMatch(/<a[^>]*loeschen=1#gw-loeschen[^>]*data-sveltekit-reload/);
+  });
+
+  it('does not delete anything by being clicked — it asks first', () => {
+    const out = html(container, { me: signedIn });
+    expect(out).not.toContain('?/loeschen');
+  });
+
+  it('says that everything under the page goes with it, before anything goes', () => {
+    // The one thing nobody would guess, and the reason the question exists rather than a bare
+    // button: `Store::tree` matches a row's parent against a parent it has already emitted, so
+    // a page left under a deleted parent is not filtered out — it is unreachable.
+    const out = html(container, { me: signedIn, loeschen: true });
+    expect(out).toMatch(/darunter|Unterseiten/);
+    expect(out).toContain('Papierkorb');
+    expect(out).toMatch(/<form[^>]*method="post"[^>]*action="\?\/loeschen"/);
+  });
+
+  it('announces that question rather than merely drawing it', () => {
+    const out = html(container, { me: signedIn, loeschen: true });
+    expect(out).toMatch(/id="gw-loeschen"[^>]*tabindex="-1"|tabindex="-1"[^>]*id="gw-loeschen"/);
+  });
+
+  it('offers a way out of the question that is as reachable as the way through', () => {
+    expect(html(container, { me: signedIn, loeschen: true })).toContain('Abbrechen');
+  });
+
+  it('asks nobody who could not do it anyway, however the address was typed', () => {
+    const out = html({ ...container, may_write: false }, { me: signedIn, loeschen: true });
+    expect(out).not.toMatch(/action="\?\/loeschen"/);
+  });
+
+  it('states a refused delete on the page, and not in the topic field', () => {
+    // Two controls, two permissions, one `form`. Before the discriminator this sentence was
+    // rendered inside the topic field, under a heading about topics — a message in the wrong
+    // place saying the wrong thing about the wrong control.
+    const fehler = 'Diese Seite gibt es nicht (mehr). Es wurde nichts gelöscht.';
+    const out = html(container, { me: signedIn, form: { wo: 'loeschen', fehler, getippt: '' } });
+    expect(out).toContain(fehler);
+    expect(out).toMatch(/role="alert"/);
+
+    const themen = out.match(/<nav[^>]*aria-label="Themen dieser Seite"[\s\S]*?<\/nav>/)?.[0];
+    expect(themen).toBeDefined();
+    expect(themen).not.toContain(fehler);
+  });
+
+  it('still states a refused topic change in the topic field', () => {
+    const out = html(container, {
+      me: signedIn,
+      form: { wo: 'thema', fehler: 'Das ist kein Thema.', getippt: 'a//b' }
+    });
+    const themen = out.match(/<nav[^>]*aria-label="Themen dieser Seite"[\s\S]*?<\/nav>/)?.[0];
+    expect(themen).toContain('Das ist kein Thema.');
   });
 });

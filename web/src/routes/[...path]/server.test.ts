@@ -158,7 +158,7 @@ function actionEvent(fetchFn: typeof fetch, fields: Record<string, string>): any
 
 /** Run an action and give back whatever it threw or returned, whichever it was. */
 async function runAction(
-  which: 'themaHinzufuegen' | 'themaEntfernen',
+  which: 'themaHinzufuegen' | 'themaEntfernen' | 'loeschen',
   fetchFn: typeof fetch,
   fields: Record<string, string>
 ) {
@@ -380,5 +380,51 @@ describe('taking a topic off the page you are reading', () => {
     const { returned } = await runAction('themaEntfernen', fetchFn, {});
     expect(isActionFailure(returned)).toBe(true);
     expect(sent.some((call) => call.method === 'PUT')).toBe(false);
+  });
+});
+
+describe('putting the page in the Papierkorb', () => {
+  it('asks the question in the address, so the page renders it in the first response', async () => {
+    const { fetchFn } = spyFetch();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const data = (await runLoad(fetchFn, '?loeschen=1')) as any;
+    expect(data.loeschen).toBe(true);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(((await runLoad(fetchFn)) as any).loeschen).toBe(false);
+  });
+
+  it('deletes through the document itself, with the verb that says which operation it is', async () => {
+    const { sent, fetchFn } = spyFetch({}, { status: 200, body: { path: '/rundgang/tabellen', title: 'Tabellen', pages: 3 } });
+    const { thrown } = await runAction('loeschen', fetchFn, {});
+    const call = sent.find((one) => one.method === 'DELETE');
+    expect(call?.url).toContain('/api/documents/rundgang/tabellen');
+    // Back to the Papierkorb, which is where the page now is and where it can be brought
+    // back from — never to the address it used to have, which now answers 404.
+    expect(isRedirect(thrown) && (thrown as { location: string }).location).toBe(
+      '/papierkorb?geloescht=%2Frundgang%2Ftabellen#gw-papierkorb'
+    );
+  });
+
+  it('says what stood in the way, on the page, rather than sending anybody to the Papierkorb', async () => {
+    const { fetchFn } = spyFetch({}, { status: 409, body: { error: 'has a subpage you may not write' } });
+    const { returned } = await runAction('loeschen', fetchFn, {});
+    expect(isActionFailure(returned)).toBe(true);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const data = (returned as any).data;
+    expect(data.wo).toBe('loeschen');
+    expect(data.fehler).toContain('Es wurde nichts gelöscht.');
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((returned as any).status).toBe(409);
+  });
+
+  it('keeps a refused delete out of the topic field, which is a different control', async () => {
+    const { fetchFn } = spyFetch({}, { status: 403, body: { error: 'forbidden' } });
+    const { returned } = await runAction('loeschen', fetchFn, {});
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((returned as any).data.wo).toBe('loeschen');
+    const { fetchFn: zweit } = spyFetch({}, { status: 403, body: { error: 'forbidden' } });
+    const { returned: thema } = await runAction('themaHinzufuegen', zweit, { thema: 'Neu' });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((thema as any).data.wo).toBe('thema');
   });
 });

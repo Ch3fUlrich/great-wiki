@@ -10,6 +10,7 @@
   import { outline } from '$lib/blocks/render';
   import { breadcrumb, childrenOf } from '$lib/pagemeta';
   import { chromeHref } from '$lib/tabs';
+  import { deleteHref, DELETE_REGION_ID, TRASH_PATH } from '$lib/trash';
 
   let { data, form } = $props();
   const headings = $derived(outline(data.body));
@@ -68,6 +69,37 @@
    * on press. What has changed is that the offer is no longer a guess.
    */
   const mayOfferEditing = $derived(darfSchreiben && data.me?.authenticated === true);
+
+  /**
+   * Whether to offer deleting, and why it is the same pair as editing rather than `may_write`
+   * alone.
+   *
+   * `Store::trash_document` refuses outright unless the caller is a signed-in, active account,
+   * before it consults a single grant — for the reason a revision needs an author: a trash
+   * entry records who made it, and "nobody" is not an answer. A path carrying `anyone: write`
+   * makes a page editable by somebody who has not said who they are; emptying a wiki into a
+   * Papierkorb that cannot say who did it is not the same act as editing a paragraph.
+   *
+   * The half neither this nor the API can settle before it is asked is the SUBTREE: a delete
+   * needs write on every page that moves, and nothing on the wire says whether it has it. That
+   * refusal is a 409 that names what is in the way, which is why the control may honestly be
+   * offered on the page's own verdict and the answer given the moment it is used.
+   */
+  const darfLoeschen = $derived(darfSchreiben && data.me?.authenticated === true);
+
+  /** The question before a delete, asked only of somebody who could actually answer it. */
+  const fragtLoeschen = $derived(darfLoeschen && data.loeschen === true);
+
+  /**
+   * The refusal that belongs to the delete, as against the one that belongs to the topics.
+   *
+   * Two controls on one page, two permissions, two sentences — and one `form`. Without the
+   * discriminator a refused delete was rendered inside the topic field, under a heading about
+   * topics, which is a message in the wrong place saying the wrong thing about the wrong
+   * control. The same split `/projekte` makes between its create form and its delete.
+   */
+  const loeschFehler = $derived(form?.wo === 'loeschen' ? form.fehler : null);
+  const themaFehler = $derived(form?.wo === 'loeschen' ? null : (form?.fehler ?? null));
 
   /**
    * `null` means "whatever the URL said". The control is a real link to `?edit=1`, so it
@@ -162,7 +194,7 @@
       themen={data.seitenThemen ?? []}
       alle={data.themen ?? []}
       darfSchreiben={darfSchreiben}
-      fehler={form?.fehler ?? data.seitenThemenFehler ?? null}
+      fehler={themaFehler ?? data.seitenThemenFehler ?? null}
       getippt={form?.getippt ?? ''}
       hrefFor={gehZu}
     />
@@ -189,7 +221,57 @@
           >
         {/if}
         <a class="edit-start" href={gehZu(`${data.doc.path}/history`)}>Verlauf</a>
+        {#if darfLoeschen}
+          <!-- The owner's second decision: deleting happens where the page is. A LINK to a
+               question, never a control that deletes on click — the question is where the
+               reader is told the part nobody would guess, which is that everything under the
+               page goes with it. Deleting is recoverable, so it is an ordinary control and
+               not a danger-styled one; the act that is not recoverable lives in the
+               Papierkorb and looks like it.
+
+               `data-sveltekit-reload` for the reason the same attribute is on the purge link:
+               the fragment is what moves focus to the question, and only a real navigation
+               does that — the client-side router leaves focus where it was, so the question
+               would be drawn and never announced. Verified in a browser, not reasoned about:
+               `document.activeElement` was the body after a hydrated click and the region
+               after a full load, on identical markup. -->
+          <a class="edit-start" href={gehZu(deleteHref(data.doc.path))} data-sveltekit-reload
+            >Löschen</a
+          >
+        {/if}
       </p>
+    {/if}
+
+    {#if loeschFehler}
+      <!-- On the page, because the page is still here: `fail()` re-renders the route that
+           owns the action, and a delete that was refused left the reader exactly where they
+           were. In words and announced, never a colour alone. -->
+      <p class="notice notice--error no-print" role="alert">{loeschFehler}</p>
+    {/if}
+
+    {#if fragtLoeschen}
+      <!-- Focused by the fragment the link carried, so a reader who cannot see it is told it
+           is there. No script: the question is an address, and the answer is a form. -->
+      <section
+        class="loeschen no-print"
+        id={DELETE_REGION_ID}
+        tabindex="-1"
+        aria-labelledby="loeschen-titel"
+      >
+        <h2 id="loeschen-titel">Diese Seite löschen?</h2>
+        <p>
+          »{data.doc.title}« kommt in den Papierkorb — <strong
+            >mit allen Seiten, die darunter liegen</strong
+          >. Das ist keine Feinheit: eine Seite, deren übergeordnete Seite im Papierkorb liegt,
+          wäre über die Navigation gar nicht mehr erreichbar, also geht der ganze Teilbaum
+          zusammen. Nichts geht dabei verloren — im
+          <a href={gehZu(TRASH_PATH)}>Papierkorb</a> lässt sich alles wieder zurückholen.
+        </p>
+        <form method="post" action="?/loeschen" class="loesch-actions">
+          <button type="submit" class="btn">In den Papierkorb</button>
+          <a class="btn" href={gehZu(data.doc.path)}>Abbrechen</a>
+        </form>
+      </section>
     {/if}
 
     {#if editing}
@@ -453,6 +535,8 @@
   .page > h1,
   .page > :global(.themen),
   .page > .editbar,
+  .page > .loeschen,
+  .page > .notice,
   .page > .editor-loading,
   .page > .tafel-fehler,
   .page > :global(article.prose) {
@@ -495,6 +579,77 @@
   .edit-start:hover,
   .edit-start:focus-visible {
     background: var(--accent-soft);
+  }
+
+  /* --- The question before a delete ---------------------------------------------------- */
+
+  /* Deliberately NOT danger-styled. Deleting is recoverable, and painting it red would spend
+     the alarm this design has on the one act that is not — the purge, in the Papierkorb,
+     which looks exactly like what it is. What this block owes the reader is the sentence
+     about the subtree, not a colour. */
+  .loeschen {
+    margin-block-start: var(--space-3);
+    border: 1px solid var(--border-strong);
+    border-inline-start-width: 4px;
+    border-radius: var(--radius);
+    padding: var(--space-4) var(--space-6);
+    background: var(--bg-raised);
+  }
+
+  .loeschen:focus {
+    outline: none;
+  }
+
+  .loeschen > * + * {
+    margin-block-start: var(--space-3);
+  }
+
+  .loeschen h2 {
+    font-size: var(--text-xl);
+    line-height: var(--leading-tight);
+  }
+
+  .loeschen p {
+    font-size: var(--text-sm);
+  }
+
+  .loesch-actions {
+    display: flex;
+    gap: var(--space-2);
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .btn {
+    display: inline-block;
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    background: var(--bg);
+    color: var(--accent);
+    font: inherit;
+    font-size: var(--text-sm);
+    text-decoration: none;
+    cursor: pointer;
+  }
+
+  .btn:hover,
+  .btn:focus-visible {
+    background: var(--accent-soft);
+  }
+
+  /* The refusal, in words. The colour is the redundant channel; the sentence carries the way
+     out, and `role="alert"` is what makes it heard. */
+  .notice {
+    margin-block-start: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    border: 1px solid var(--border);
+    border-inline-start-width: 3px;
+    border-inline-start-color: var(--danger);
+    border-radius: var(--radius-sm);
+    background: var(--bg-raised);
+    color: var(--ink);
+    font-size: var(--text-sm);
   }
 
   .editor-loading {

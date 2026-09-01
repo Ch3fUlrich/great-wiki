@@ -1,5 +1,13 @@
 import { error, fail, redirect } from '@sveltejs/kit';
 import { apiGet, apiSend, parseBody, type Backlink, type DocumentView } from '$lib/api';
+import {
+  describeDelete,
+  documentApiPath,
+  DELETE_PARAM,
+  DELETED_PARAM,
+  TRASH_PATH,
+  TRASH_REGION_ID
+} from '$lib/trash';
 import { boardPath, describeEmbeddedBoard, noticeFor, type BoardResponse } from '$lib/board';
 import {
   describeSetTopics,
@@ -117,6 +125,10 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
     seitenThemen,
     seitenThemenFehler,
     edit: url.searchParams.get('edit') === '1',
+    // The question before a delete, asked in the address so the page renders it in the first
+    // response — no dialog waiting for a bundle, and a state a test can assert with no DOM.
+    // See `$lib/trash`'s `deleteHref`.
+    loeschen: url.searchParams.get(DELETE_PARAM) === '1',
     board,
     boardFehler,
     // What just happened on the board, checked against the board itself — the same function
@@ -164,6 +176,7 @@ export const actions: Actions = {
       // Refused here rather than forwarded: the API would say the same thing, and asking it a
       // question this interface already knows the answer to is a round trip for nothing.
       return fail(400, {
+        wo: 'thema' as const,
         fehler: 'Bitte ein Thema angeben. Die Themen dieser Seite wurden nicht geändert.',
         getippt: ''
       });
@@ -177,6 +190,7 @@ export const actions: Actions = {
     const pfad = String(form.get('pfad') ?? '').trim();
     if (!pfad) {
       return fail(400, {
+        wo: 'thema' as const,
         fehler: 'Es wurde kein Thema genannt. Die Themen dieser Seite wurden nicht geändert.',
         getippt: ''
       });
@@ -187,6 +201,59 @@ export const actions: Actions = {
       { params, request, fetch },
       (jetzt) => spellings(jetzt.filter((topic) => topic.path !== pfad)),
       ''
+    );
+  },
+
+  /**
+   * Put this page in the Papierkorb — the owner's first decision, and the reason it lives
+   * here rather than in an administrative console: deleting happens where the page is.
+   *
+   * **`DELETE` on the document itself**, not a fifth route under `/api/trash`. It is the same
+   * resource `GET /api/documents/{path}` reads and the verb already says which operation this
+   * is; `gw_api::routes::trash`'s header records that choice.
+   *
+   * **The page takes everything under it**, which is stated in the question this posts from
+   * rather than discovered afterwards. `Store::tree` matches each row's parent against a
+   * parent it has already emitted, so a live page left under a deleted one is not filtered out
+   * of the navigation — it is unreachable in it, absent from the export, and still readable at
+   * its own address. The subtree therefore moves as one, and the price is that a delete needs
+   * write on every page that moves.
+   *
+   * **Nothing here decides whether the caller may do this.** `Store::trash_document` needs
+   * write on every page in the subtree and a signed-in, active account; this action turns its
+   * answer into a German sentence and nothing more. The control is offered on `may_write`
+   * composed with `authenticated`, which is the same pair — so the offer and the refusal
+   * cannot disagree about the ordinary case, and the one they can disagree about (a subpage
+   * that is somebody else's) comes back as a 409 that says so.
+   *
+   * **A success goes to the Papierkorb, not back here.** This address answers 404 now. The
+   * Papierkorb is where the page is and where it can be brought back from, and landing there
+   * is what makes the delete feel undoable rather than final — which it is.
+   */
+  loeschen: async ({ params, request, fetch }) => {
+    const path = `/${params.path}`;
+    const { status, failure } = await apiSend(
+      fetch,
+      'DELETE',
+      documentApiPath(path),
+      request.headers.get('cookie')
+    );
+
+    if (failure) {
+      // `fail()` re-renders the route that owns the action, and that route is this page — the
+      // one the reader is standing on, which still exists precisely because the delete did
+      // not happen. `wo` is what keeps this refusal out of the topic field, which is a
+      // different control with a different permission and its own sentence.
+      return fail(status === 0 ? 503 : status, {
+        wo: 'loeschen' as const,
+        fehler: describeDelete(status, failure.message),
+        getippt: ''
+      });
+    }
+
+    redirect(
+      303,
+      `${TRASH_PATH}?${DELETED_PARAM}=${encodeURIComponent(path)}#${TRASH_REGION_ID}`
     );
   }
 };
@@ -224,13 +291,14 @@ async function setzeThemen(
     const answer = await apiGet<DocumentTopicsResponse>(fetch, endpoint, cookie);
     if (!answer.data) {
       return fail(answer.status === 0 ? 503 : answer.status, {
+        wo: 'thema' as const,
         fehler: describeSetTopics(answer.status, null),
         getippt
       });
     }
     jetzt = answer.data.topics ?? [];
   } catch {
-    return fail(503, { fehler: describeSetTopics(0, null), getippt });
+    return fail(503, { wo: 'thema' as const, fehler: describeSetTopics(0, null), getippt });
   }
 
   const { status, failure } = await apiSend(fetch, 'PUT', endpoint, cookie, {
@@ -243,6 +311,7 @@ async function setzeThemen(
     // which string it would not take and why, and dropping that turns a typo into "Fehler
     // 400", which is a refusal nobody can act on.
     return fail(status === 0 ? 503 : status, {
+      wo: 'thema' as const,
       fehler: describeSetTopics(status, failure.message),
       getippt
     });

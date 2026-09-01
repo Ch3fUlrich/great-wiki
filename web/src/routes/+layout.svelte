@@ -59,6 +59,7 @@
     withSidebar,
     type SidebarMode
   } from '$lib/topics';
+  import { TRASH_PATH } from '$lib/trash';
 
   let { children, data } = $props();
 
@@ -254,6 +255,14 @@
              finds, so an index nothing linked to would make the whole feature unreachable
              rather than merely inconvenient. -->
         <a class="section" href={gehZu(TOPICS_PATH)}>Themen</a>
+        <!-- The Papierkorb is here for the reason Themen is, and for one of its own. D-14
+             puts the delete control on the page, where you are when you decide a page should
+             go — but a page in the trash is out of the navigation below, out of the markdown
+             export and out of the search, so there is nothing left to click through to reach
+             it. Recovering therefore has to have a place, and a place nothing links to is a
+             place nobody finds: without this link the only way back to a deleted page would
+             be an address somebody happened to have kept. -->
+        <a class="section" href={gehZu(TRASH_PATH)}>Papierkorb</a>
         <a class="section" href={gehZu('/graph')}>Graph</a>
       </nav>
       <!-- Two reading preferences, side by side, because they are the same kind of thing.
@@ -383,8 +392,17 @@
 
   .brand-group {
     display: flex;
+    /* Wraps, like `header` and `.prefs` around it. It did not, and the omission was latent
+       until the Papierkorb became the fifth entry: at 390px the row then ran to 456px and the
+       whole document scrolled sideways — which D7 and F4 caught, on two pages that have
+       nothing to do with the header. A navigation is a list of links and there is no width at
+       which pushing the page sideways is better than using a second line. */
+    flex-wrap: wrap;
     align-items: baseline;
-    gap: var(--space-4);
+    /* Row gap smaller than the column gap: two wrapped lines want to read as one block, and
+       --space-4 between them opens a gap wide enough to look like a divider. */
+    gap: var(--space-1) var(--space-4);
+    min-inline-size: 0;
   }
 
   .brand {
