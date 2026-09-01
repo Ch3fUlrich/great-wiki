@@ -90,6 +90,11 @@ function html(options: Options = {}): string {
         // but it is part of `PageData` and the type says so — the same reason `me` is here.
         tree: [],
         tabHrefs: [],
+        // `themen` is that one query, which the sidebar renders beside every view; this one
+        // does not read it, but it is part of `PageData` and the type says so.
+        themen: [],
+        themenFehler: null,
+        seitenleiste: 'seiten' as const,
         hier: '/aufgaben',
         board: options.board ?? board,
         projects: options.projects ?? projects,

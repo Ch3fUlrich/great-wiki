@@ -40,6 +40,7 @@
   import FontToggle from '$lib/components/FontToggle.svelte';
   import AccountMenu from '$lib/components/AccountMenu.svelte';
   import TabStrip from '$lib/components/TabStrip.svelte';
+  import TopicTree from '$lib/components/TopicTree.svelte';
   import Tree from '$lib/components/Tree.svelte';
   import ViewAsBanner from '$lib/components/ViewAsBanner.svelte';
   import {
@@ -52,6 +53,12 @@
     withTabs,
     writeStored
   } from '$lib/tabs';
+  import {
+    activeTopicPath,
+    TOPICS_PATH,
+    withSidebar,
+    type SidebarMode
+  } from '$lib/topics';
 
   let { children, data } = $props();
 
@@ -77,15 +84,44 @@
   const aktiverPfad = $derived((strip.tabs[strip.active]?.href ?? '/').split('?')[0]);
 
   /**
-   * Where a link in the SHELL goes: the same workspace, with the active tab pointed at the
-   * new address. Following a link is navigation, not opening — the strip is unchanged
-   * around it, and the tab you were in now shows something else.
+   * Which half of the sidebar is showing — the page tree, or the topics.
    *
-   * While a single tab is open this returns the address unchanged, so a wiki nobody has
-   * opened a second tab in keeps exactly the links and exactly the address bar it had.
+   * The owner put browsing by topic in two places: a page of its own at `/themen`, and here,
+   * so that the tree and the topics are two ways through one corpus rather than two corpora.
+   * They are **one query rendered twice**: `+layout.server.ts` asks `GET /api/topics` once,
+   * and `TopicTree.svelte` is the same component `/themen` mounts.
+   *
+   * The choice is in the address (`?seitenleiste=themen`), so it is server-rendered in the
+   * first response, survives a reload, and the back button walks through it — and so it can
+   * be asserted by a test in a project with no DOM. It is deliberately NOT part of a tab's
+   * identity: a tab is a page, and this says what is beside the page. See `$lib/tabs`.
+   */
+  const modus = $derived<SidebarMode>(data.seitenleiste ?? 'seiten');
+
+  /** The topic being looked at, when the active tab is a topic page, so it can be marked. */
+  const aktivesThema = $derived(activeTopicPath(aktiverPfad));
+
+  /**
+   * Where a link in the SHELL goes: the same workspace, with the active tab pointed at the
+   * new address, and the sidebar still showing what it was showing. Following a link is
+   * navigation, not opening — the strip is unchanged around it, and the tab you were in now
+   * shows something else.
+   *
+   * While a single tab is open and the sidebar is on the page tree, this returns the address
+   * unchanged, so a wiki nobody has opened a second tab in — or touched the switcher in —
+   * keeps exactly the links and exactly the address bar it had.
    */
   function gehZu(target: string): string {
-    return navigateHref(target, hrefs, strip.active);
+    return gehZuMit(target, modus);
+  }
+
+  /**
+   * The same, with the sidebar's choice named explicitly. The switcher's own two links are
+   * the only thing that needs it: they go to the address you are already on, and differ from
+   * each other in nothing but which half they ask for.
+   */
+  function gehZuMit(target: string, wunsch: SidebarMode): string {
+    return navigateHref(withSidebar(target, wunsch), hrefs, strip.active);
   }
 
   /** `localStorage` can throw on the property itself, not only on its methods. */
@@ -212,6 +248,12 @@
         <a class="brand" href={gehZu('/')}>great&#8209;wiki</a>
         <a class="section" href={gehZu('/aufgaben')}>Aufgaben</a>
         <a class="section" href={gehZu('/projekte')}>Projekte</a>
+        <!-- Themen belongs here for the reason Projekte does, only more so. D-4 kept topics
+             out of the graph and named the consequence: a topic page listing its documents is
+             the ONLY way topics are reachable. A page nothing links to is a page nobody
+             finds, so an index nothing linked to would make the whole feature unreachable
+             rather than merely inconvenient. -->
+        <a class="section" href={gehZu(TOPICS_PATH)}>Themen</a>
         <a class="section" href={gehZu('/graph')}>Graph</a>
       </nav>
       <!-- Two reading preferences, side by side, because they are the same kind of thing.
@@ -224,12 +266,51 @@
     </header>
   </div>
 
-  <!-- The wiki's navigation, on every view rather than only on a document. `aria-label` is
-       unchanged and deliberately so: this is the same landmark it always was, in one place
-       instead of two. -->
-  <nav class="seitenbaum no-print" aria-label="Seitenbaum">
-    <Tree nodes={data.tree ?? []} current={aktiverPfad} hrefFor={gehZu} />
-  </nav>
+  <!-- The wiki's navigation, on every view rather than only on a document — and now two of
+       them, because the owner decided the topics are a second way through the same corpus
+       rather than a separate feature you go somewhere else for.
+
+       The switcher is two LINKS, not a toggle: it works in the first response, the back
+       button walks through it, and the address it produces is one somebody can send. The
+       page tree's `aria-label` is unchanged and deliberately so — it is the same landmark it
+       always was, and a rename would break every test and every habit that names it. -->
+  <div class="seitenleiste no-print">
+    <nav class="umschalter" aria-label="Seitenleiste">
+      <!-- `aria-current` is the fact; the weight and the background are the second channel.
+           Two identical words with only a colour between them would say nothing to a reader
+           who cannot tell the two hues apart. -->
+      <a
+        class="halb"
+        href={gehZuMit(data.hier ?? '/', 'seiten')}
+        aria-current={modus === 'seiten' ? 'true' : undefined}>Seiten</a
+      >
+      <a
+        class="halb"
+        href={gehZuMit(data.hier ?? '/', 'themen')}
+        aria-current={modus === 'themen' ? 'true' : undefined}>Themen</a
+      >
+    </nav>
+
+    {#if modus === 'themen'}
+      <!-- The SAME component `/themen` renders, fed by the SAME single request the root
+           layout made — which is the whole of what the owner's decision permitted. A second
+           implementation would be a second answer to "which topics exist", and because a
+           topic's own name is a disclosure (ADR 0011), a second answer is also a second
+           chance to leak one. -->
+      <TopicTree
+        topics={data.themen ?? []}
+        titel="Themen"
+        ebene={2}
+        fehler={data.themenFehler ?? null}
+        current={aktivesThema ?? undefined}
+        hrefFor={gehZu}
+      />
+    {:else}
+      <nav class="seitenbaum" aria-label="Seitenbaum">
+        <Tree nodes={data.tree ?? []} current={aktiverPfad} hrefFor={gehZu} />
+      </nav>
+    {/if}
+  </div>
 
   <div class="arbeit">
     <TabStrip tabs={strip.tabs} active={strip.active} panelId={PANEL} />
@@ -325,9 +406,9 @@
     text-decoration: underline;
   }
 
-  /* --- The page tree ------------------------------------------------------------------ */
+  /* --- The sidebar: the switcher, and whichever half it is showing -------------------- */
 
-  .seitenbaum {
+  .seitenleiste {
     grid-area: baum;
     min-inline-size: 0;
     overflow: auto;
@@ -335,6 +416,50 @@
     padding: var(--space-4) var(--space-3);
     border-inline-end: 1px solid var(--border);
     font-size: var(--text-sm);
+  }
+
+  .seitenleiste > * + * {
+    margin-block-start: var(--space-3);
+  }
+
+  /* Two halves of one control, so they read as a pair rather than as two links that happen
+     to be adjacent. The border is the frame; `aria-current` is what says which one you are
+     on, and the fill below is its second channel. */
+  .umschalter {
+    display: flex;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+  }
+
+  .halb {
+    flex: 1 1 0;
+    padding: var(--space-1) var(--space-2);
+    color: var(--accent);
+    text-align: center;
+    text-decoration: none;
+    font-size: var(--text-xs);
+  }
+
+  .halb + .halb {
+    border-inline-start: 1px solid var(--border);
+  }
+
+  .halb:hover,
+  .halb:focus-visible {
+    background: var(--bg-sunken);
+    text-decoration: underline;
+    text-underline-offset: 0.15em;
+  }
+
+  .halb[aria-current='true'] {
+    background: var(--accent-soft);
+    color: var(--ink);
+    font-weight: 650;
+  }
+
+  .seitenbaum {
+    min-inline-size: 0;
   }
 
   /* --- The tab strip and the panel ----------------------------------------------------- */
@@ -403,7 +528,7 @@
       overflow: visible;
     }
 
-    .seitenbaum {
+    .seitenleiste {
       order: 2;
       overflow: visible;
       border-inline-end: 0;
@@ -426,7 +551,7 @@
       overflow: visible;
     }
 
-    .seitenbaum {
+    .seitenleiste {
       display: none;
     }
 

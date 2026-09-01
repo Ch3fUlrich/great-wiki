@@ -1,11 +1,19 @@
-import { error } from '@sveltejs/kit';
-import { apiGet, parseBody, type Backlink, type StoredDocument } from '$lib/api';
+import { error, fail, redirect } from '@sveltejs/kit';
+import { apiGet, apiSend, parseBody, type Backlink, type DocumentView } from '$lib/api';
 import { boardPath, describeEmbeddedBoard, noticeFor, type BoardResponse } from '$lib/board';
-import type { PageServerLoad } from './$types';
+import {
+  describeSetTopics,
+  describeTopics,
+  documentTopicsApiPath,
+  TOPICS_REGION_ID,
+  type DocumentTopicsResponse,
+  type Topic
+} from '$lib/topics';
+import type { Actions, PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
   const cookie = request.headers.get('cookie');
-  const { status, data } = await apiGet<StoredDocument>(
+  const { status, data } = await apiGet<DocumentView>(
     fetch,
     `/api/documents/${params.path}`,
     cookie
@@ -65,6 +73,33 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
     boardFehler = describeEmbeddedBoard(0);
   }
 
+  // The owner's second decision: a page's topics are shown and edited ON THE PAGE. So they
+  // are read here, beside the page itself, rather than fetched by a component after
+  // hydration — tagging is something you do while reading, and a chip row that appeared a
+  // second late would be furniture that flickers.
+  //
+  // **Its own prefix, not a suffix under `/api/documents`**, for the reason
+  // `gw-api/src/routes/topics.rs` gives: matchit prefers a literal segment over a catch-all,
+  // so `/api/documents/{*path}/topics` would be shadowed by a real page slugged `topics`.
+  //
+  // Already filtered — the endpoint answers nothing at all to somebody who may not read this
+  // page, and this page has already been read by then. A failure is stated rather than
+  // rendered as "this page is about nothing", and never fails the page: chips are an addition
+  // to a page, exactly as the board is.
+  let seitenThemen: Topic[] = [];
+  let seitenThemenFehler: string | null = null;
+  try {
+    const answer = await apiGet<DocumentTopicsResponse>(
+      fetch,
+      documentTopicsApiPath(data.path),
+      cookie
+    );
+    if (answer.data) seitenThemen = answer.data.topics ?? [];
+    else seitenThemenFehler = describeTopics(answer.status);
+  } catch {
+    seitenThemenFehler = describeTopics(0);
+  }
+
   // Read here rather than from `$app/state` in the component, for two reasons: the flag is
   // then part of the page's data and a server-render test can set it, and the component
   // does not have to reach for a SvelteKit runtime that only exists inside a request.
@@ -79,6 +114,8 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
     // merged `data`. Two requests for one filtered tree was two chances for the breadcrumb
     // and the sidebar to disagree about which pages exist.
     backlinks: backlinks?.backlinks ?? [],
+    seitenThemen,
+    seitenThemenFehler,
     edit: url.searchParams.get('edit') === '1',
     board,
     boardFehler,
@@ -92,3 +129,129 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
     now: Date.now()
   };
 };
+
+/**
+ * The two ways a page's topics change, both on the page itself.
+ *
+ * **Real form actions, and no `use:enhance`.** The browser submits, the server answers 303
+ * back to this page, and the whole thing works with JavaScript switched off — which is the
+ * requirement, not a fallback: this repository already records, about its own edit link, that
+ * a control which needs a bundle to arrive is a control that looks live and does nothing.
+ *
+ * **The endpoint takes the whole set**, deliberately (`PUT`, not `PATCH`): "these are the
+ * topics" is what a frontmatter line says and what a file drop has to be able to mean. So both
+ * actions are read–modify–write, and both **read fresh** rather than trusting a hidden field
+ * with the set the reader was shown — a stale one would put back a topic somebody else had
+ * just removed, silently, and the reader who pressed »entfernen« would be the one who did it.
+ *
+ * **Nothing here decides whether the caller may do this.** `PUT /api/topics/document/{path}`
+ * needs Write on the page and asks `Store::document_for` for it; these actions turn its answer
+ * into a German sentence and nothing more. The control is offered on `may_write`, which is the
+ * same verdict — so the offer and the refusal cannot disagree — and the offer can still be
+ * stale where the refusal never is.
+ *
+ * **A refusal comes back as `fail()`**, not as a redirect: `fail()` re-renders the route that
+ * owns the action, and that route is this page — the one the reader is standing on. (The
+ * board's move action is the opposite case and says so: it serves two placements, so a
+ * refusal there has to travel in the address to reach whichever board it happened on.)
+ */
+export const actions: Actions = {
+  /** File this page under one more topic. */
+  themaHinzufuegen: async ({ params, request, fetch }) => {
+    const form = await request.formData();
+    const typed = String(form.get('thema') ?? '').trim();
+    if (!typed) {
+      // Refused here rather than forwarded: the API would say the same thing, and asking it a
+      // question this interface already knows the answer to is a round trip for nothing.
+      return fail(400, {
+        fehler: 'Bitte ein Thema angeben. Die Themen dieser Seite wurden nicht geändert.',
+        getippt: ''
+      });
+    }
+    return setzeThemen({ params, request, fetch }, (jetzt) => [...spellings(jetzt), typed], typed);
+  },
+
+  /** Take one topic off this page. */
+  themaEntfernen: async ({ params, request, fetch }) => {
+    const form = await request.formData();
+    const pfad = String(form.get('pfad') ?? '').trim();
+    if (!pfad) {
+      return fail(400, {
+        fehler: 'Es wurde kein Thema genannt. Die Themen dieser Seite wurden nicht geändert.',
+        getippt: ''
+      });
+    }
+    // Matched on the canonical path, which is the topic's identity — never on the spelling,
+    // where `Darm` and `darm` are one topic wearing two strings.
+    return setzeThemen(
+      { params, request, fetch },
+      (jetzt) => spellings(jetzt.filter((topic) => topic.path !== pfad)),
+      ''
+    );
+  }
+};
+
+/** The strings the API takes: what a file states, never the canonical path. */
+function spellings(topics: Topic[]): string[] {
+  return topics.map((topic) => topic.display_path);
+}
+
+/** The parts of an action event both topic actions read. */
+interface TopicEvent {
+  params: { path: string };
+  request: Request;
+  fetch: typeof fetch;
+}
+
+/**
+ * Read this page's topics, decide the new set from them, and put it back.
+ *
+ * One function for both actions, so there is one place that knows the order of the two calls,
+ * one wording for a refusal, and one place a change comes back to. Two copies of this would be
+ * two chances for a removal and an addition to disagree about what "the whole set" is.
+ */
+async function setzeThemen(
+  { params, request, fetch }: TopicEvent,
+  next: (current: Topic[]) => string[],
+  getippt: string
+) {
+  const cookie = request.headers.get('cookie');
+  const path = `/${params.path}`;
+  const endpoint = documentTopicsApiPath(path);
+
+  let jetzt: Topic[];
+  try {
+    const answer = await apiGet<DocumentTopicsResponse>(fetch, endpoint, cookie);
+    if (!answer.data) {
+      return fail(answer.status === 0 ? 503 : answer.status, {
+        fehler: describeSetTopics(answer.status, null),
+        getippt
+      });
+    }
+    jetzt = answer.data.topics ?? [];
+  } catch {
+    return fail(503, { fehler: describeSetTopics(0, null), getippt });
+  }
+
+  const { status, failure } = await apiSend(fetch, 'PUT', endpoint, cookie, {
+    topics: next(jetzt)
+  });
+
+  if (failure) {
+    // The status is passed through as the form's own, so a refusal is not reported as a 200
+    // with a sad message in it. `failure.message` is what the API named — a 400 here says
+    // which string it would not take and why, and dropping that turns a typo into "Fehler
+    // 400", which is a refusal nobody can act on.
+    return fail(status === 0 ? 503 : status, {
+      fehler: describeSetTopics(status, failure.message),
+      getippt
+    });
+  }
+
+  // Post, redirect, get — so a reload does not offer to file the topic a second time. The
+  // fragment is what makes the change ANNOUNCED rather than merely drawn: the browser moves
+  // focus to the topics region, and a region that has just received focus is read out. A live
+  // region already present in the document announces nothing. No script is involved, which is
+  // the same mechanism `BOARD_NOTICE_ID` uses and the same reason.
+  redirect(303, `${path}#${TOPICS_REGION_ID}`);
+}

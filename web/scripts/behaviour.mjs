@@ -1656,6 +1656,229 @@ await check("H11 the grant dialog's permission select is likewise operable with 
   );
 });
 
+// ---------------------------------------------------------------------------------------
+// Group I — topics: browsing by them, and saying what a page is about
+//
+// Against the same tour corpus, which carries four tagged pages and therefore a real
+// hierarchy: `Rundgang` with `Rundgang/Tabellen` and `Rundgang/Umlaute` inside it, plus
+// `Format` and `Verweise` on their own. The fixture's identity (`sergej:editors`, with write
+// granted on `/rundgang`) is what makes I6 possible at all — without the grant the add would
+// 403 and the check would prove nothing while still reporting a refusal correctly.
+//
+// What is NOT checked here is who may see which topic. ADR 0011 decides that and
+// `Store::topics_for` implements it, mutation-tested; proving it end to end would need a
+// tagged page this fixture's identity cannot read, and adding one means editing
+// `content-example`, which several Rust tests assert against.
+// ---------------------------------------------------------------------------------------
+
+/**
+ * The two tagged pages, by the addresses the seeder actually gives them — slugged from the
+ * TITLE, not from the filename, so `content-example/rundgang/tabellen.md` lives here. Group C
+ * names the first of these for the same reason.
+ */
+const TAGGED_PAGE = '/rundgang/tabellen-was-heute-passiert'; // Rundgang/Tabellen, Format
+const UMLAUT_PAGE = '/rundgang/groesse-und-mass-deutsch-im-system'; // Rundgang/Umlaute
+
+/** The nav a topic list renders into, out of a server response. */
+function topicNav(html, label) {
+  const opened = html.indexOf(`aria-label="${label}"`);
+  if (opened === -1) return null;
+  const from = html.lastIndexOf('<nav', opened);
+  const to = html.indexOf('</nav>', opened);
+  return from === -1 || to === -1 ? null : html.slice(from, to);
+}
+
+await check('I1 the topic index is linked from the header and nests in real markup', async (page) => {
+  // `page.request` is a plain HTTP fetch: nothing renders, nothing hydrates. What comes back
+  // is what a reader with JavaScript switched off receives, which is where the hierarchy has
+  // to be — indentation is a fact about pixels, and a nested list is the only thing that says
+  // "Tabellen is inside Rundgang" to somebody not looking at them.
+  const home = await page.request.get(BASE + '/');
+  assert(home.ok(), `expected 200 from /, got ${home.status()}`);
+  const nav = (await home.text()).match(/<nav[^>]*aria-label="Hauptbereiche"[\s\S]*?<\/nav>/)?.[0];
+  assert(nav !== undefined, 'no main navigation in the server-rendered HTML');
+  assert(nav.includes('href="/themen"'), 'the main navigation does not link /themen');
+
+  const response = await page.request.get(BASE + '/themen');
+  assert(response.ok(), `expected 200 from /themen, got ${response.status()}`);
+  const html = await response.text();
+
+  const liste = topicNav(html, 'Alle Themen');
+  assert(liste !== null, 'no topic list in the server-rendered /themen');
+  assert(liste.includes('href="/themen/rundgang"'), 'the index does not link the Rundgang topic');
+  assert(
+    /<li\b[^>]*>[\s\S]*href="\/themen\/rundgang"[\s\S]*<ul[\s\S]*href="\/themen\/rundgang\/tabellen"/.test(
+      liste
+    ),
+    'Rundgang/Tabellen is not rendered as a list INSIDE the Rundgang item — the hierarchy is only indentation'
+  );
+  // The one number a topic list may carry is the length of the list this reader would be
+  // handed. Anything about what was left out is a fact about pages they may not read.
+  assert(
+    !/weitere|insgesamt|ausgeblendet|verborgen/i.test(liste),
+    'the topic index hints at topics or pages it did not show'
+  );
+});
+
+await check('I2 opening a topic shows what is filed under the topics inside it', async (page) => {
+  // The store's decision, end to end: `/rundgang/tabellen` carries `Rundgang/Tabellen` and
+  // NOT `Rundgang`, so its appearing here is the whole of "listing a topic means that topic
+  // and everything inside it". Exact matching would show one page and hide two.
+  const response = await page.request.get(BASE + '/themen/rundgang');
+  assert(response.ok(), `expected 200 from /themen/rundgang, got ${response.status()}`);
+  const html = await response.text();
+
+  assert(
+    html.includes(`href="${TAGGED_PAGE}"`),
+    'a page filed under Rundgang/Tabellen is missing from the Rundgang topic'
+  );
+  assert(
+    html.includes(`href="${UMLAUT_PAGE}"`),
+    'a page filed under Rundgang/Umlaute is missing from the Rundgang topic'
+  );
+  assert(
+    topicNav(html, 'Themen darin') !== null,
+    'the topic page does not offer the topics inside it'
+  );
+
+  // A topic nobody typed and a topic you may see nothing of must answer the same way.
+  const absent = await page.request.get(BASE + '/themen/gibt-es-nicht');
+  assert(absent.status() === 404, `expected 404 for an unknown topic, got ${absent.status()}`);
+  assert(
+    !/dürfen|Berechtigung|gesperrt/i.test(await absent.text()),
+    'the answer for an absent topic hints at a permission, which would tell absence and refusal apart'
+  );
+});
+
+await check('I3 the sidebar switches to the topics without a single line of script', async (page) => {
+  const plain = await page.request.get(BASE + '/rundgang');
+  assert(plain.ok(), `expected 200 from /rundgang, got ${plain.status()}`);
+  const before = await plain.text();
+  assert(
+    before.includes('href="/rundgang?seitenleiste=themen"'),
+    'the sidebar offers no link to its topic half'
+  );
+  assert(
+    topicNav(before, 'Themen') === null,
+    'the sidebar shows the topics before they were asked for'
+  );
+
+  const asked = await page.request.get(BASE + '/rundgang?seitenleiste=themen');
+  assert(asked.ok(), `expected 200 with the topics asked for, got ${asked.status()}`);
+  const after = await asked.text();
+  const liste = topicNav(after, 'Themen');
+  assert(liste !== null, 'the sidebar does not render the topics when they are asked for');
+  assert(
+    liste.includes('href="/themen/rundgang?seitenleiste=themen"'),
+    'a topic in the sidebar does not carry the sidebar‘s own choice, so the switcher would work exactly once'
+  );
+  // Which half you are on is stated, not left to a colour.
+  assert(
+    after.includes('aria-current="true"'),
+    'the switcher does not mark which half is showing'
+  );
+});
+
+await check('I4 a page says what it is about, under its title, in the first response', async (page) => {
+  const response = await page.request.get(BASE + TAGGED_PAGE);
+  assert(response.ok(), `expected 200 from ${TAGGED_PAGE}, got ${response.status()}`);
+  const html = await response.text();
+
+  const region = html.match(/<nav[^>]*aria-label="Themen dieser Seite"[\s\S]*?<\/nav>/)?.[0];
+  assert(region !== undefined, 'no topic chips in the server-rendered HTML');
+  assert(region.includes('href="/themen/format"'), 'a chip does not link its topic');
+  assert(
+    region.includes('Rundgang/Tabellen'),
+    'a nested topic is not spelled in full on the chip, so it cannot be told from a top-level one'
+  );
+  // Under the title and above the document, which is the whole of the placement decision.
+  const titel = html.indexOf('</h1>');
+  const chips = html.indexOf('aria-label="Themen dieser Seite"');
+  assert(titel !== -1 && chips > titel, 'the chips are not under the title');
+  assert(chips < html.indexOf('<article'), 'the chips are not above the document');
+
+  // A real form, not a button waiting for a bundle.
+  assert(
+    /<form[^>]*method="post"[^>]*action="\?\/themaHinzufuegen"/.test(region),
+    'adding a topic is not a real form submission'
+  );
+  assert(
+    /<form[^>]*action="\?\/themaEntfernen"/.test(region),
+    'removing a topic is not a real form submission'
+  );
+});
+
+await check('I5 the suggestions are the index, so they are filtered exactly as it is', async (page) => {
+  // ADR 0011 names this as the surface that gets forgotten, because it feels like a UI
+  // convenience. It cannot be forgotten here: the options ARE the array the sidebar and
+  // /themen render, so this check compares the two lists rather than trusting a comment.
+  const seite = await page.request.get(`${BASE}${TAGGED_PAGE}?seitenleiste=themen`);
+  assert(seite.ok(), `expected 200 from ${TAGGED_PAGE}, got ${seite.status()}`);
+  const html = await seite.text();
+
+  const datalist = html.match(/<datalist[\s\S]*?<\/datalist>/)?.[0];
+  assert(datalist !== undefined, 'the field offers no suggestions at all');
+  const angeboten = [...datalist.matchAll(/value="([^"]*)"/g)].map((m) => m[1]);
+
+  const liste = topicNav(html, 'Themen');
+  assert(liste !== null, 'the sidebar did not render the topics to compare against');
+  const gezeigt = [...liste.matchAll(/href="\/themen\/([^"?]*)/g)].map((m) => m[1]);
+
+  assert(angeboten.length > 0, 'the suggestion list is empty on a wiki that has topics');
+  assert(
+    angeboten.length === gezeigt.length,
+    `the suggestions and the index disagree: ${angeboten.length} offered, ${gezeigt.length} shown`
+  );
+  assert(
+    angeboten.every((value) => !value.startsWith('/')),
+    'a suggestion is spelled as a canonical path, which the API would refuse'
+  );
+});
+
+await check('I6 a topic can be filed and un-filed from the page you are reading', async (page) => {
+  // The fixture grants `group:editors` write on /rundgang, and the dev identity is in that
+  // group — so this exercises the real write path rather than a refusal. It cleans up after
+  // itself, and the topic is pruned once no page carries it.
+  const NEU = 'Verhaltensprobe';
+  await page.goto(BASE + '/rundgang', { waitUntil: 'domcontentloaded' });
+
+  const feld = page.locator('#thema');
+  await feld.waitFor({ state: 'visible', timeout: 10_000 });
+  await feld.fill(NEU);
+  await page.getByRole('button', { name: 'Hinzufügen' }).click();
+
+  const chip = page.getByRole('link', { name: NEU, exact: true });
+  await chip.waitFor({ state: 'visible', timeout: 10_000 });
+  assert(
+    page.url().endsWith('#gw-themen'),
+    `a finished change should come back to the topics region, landed on ${page.url()}`
+  );
+
+  // The chip is a way in: following it reaches that topic's own page, which is the only way
+  // a topic is reachable at all.
+  await chip.click();
+  await page.waitForURL(/\/themen\/verhaltensprobe/, { timeout: 10_000 });
+  assert(
+    (await page.locator('h1').innerText()).includes(NEU),
+    'following a chip did not reach that topic'
+  );
+
+  await page.goto(BASE + '/rundgang', { waitUntil: 'domcontentloaded' });
+  const weg = page.getByRole('button', { name: `Thema »${NEU}« entfernen` });
+  await weg.waitFor({ state: 'visible', timeout: 10_000 });
+  await weg.click();
+  await page
+    .getByRole('link', { name: NEU, exact: true })
+    .waitFor({ state: 'detached', timeout: 10_000 });
+
+  // Pruned, not merely unlinked: a topic no page carries stops existing (ADR 0011).
+  const nachher = await page.request.get(BASE + '/themen/verhaltensprobe');
+  assert(
+    nachher.status() === 404,
+    `a topic no page carries should be gone; /themen/verhaltensprobe answered ${nachher.status()}`
+  );
+});
+
 await browser.close();
 
 // ---------------------------------------------------------------------------------------

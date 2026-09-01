@@ -122,6 +122,31 @@ export interface StoredDocument {
   sort_key: number;
 }
 
+/**
+ * One page as `GET /api/documents/{path}` answers it: the stored document, **and whether the
+ * caller may write it.**
+ *
+ * Mirrors `gw_api::routes::docs::DocumentView`, which flattens the document into the response
+ * rather than nesting it — so this is `StoredDocument` plus one key, and every reader that
+ * only wanted the document is unchanged.
+ *
+ * `may_write` is not computed anywhere in this interface. It is the verdict the very
+ * authorisation that produced this response reached — the same `permits()` answer a write
+ * would get — so a control offered on it and the refusal it would receive cannot come apart.
+ * It is optional here for the reason `BoardTask::may_write` is: a response from an older API
+ * carries no such field, and each reader below says what it does with that absence.
+ *
+ * **What it licenses**: opening the editor and saving what is typed, making the page a
+ * project's home, changing a card the page governs, and re-filing the page under a topic.
+ * **Filing a revision needs one thing more** — a signed-in, active account, because a revision
+ * records an author — so a control that publishes composes this with `authenticated` from
+ * `/api/me`. Re-filing does not: `Store::set_document_topics` writes no revision. See
+ * ADR 0010.
+ */
+export interface DocumentView extends StoredDocument {
+  may_write?: boolean;
+}
+
 // `$env/dynamic/private` is server-only, which is correct: this module is imported only
 // from `+page.server.ts` files and must never end up in a client bundle.
 //
@@ -197,7 +222,7 @@ export interface ApiFailure {
  */
 export async function apiSend<T>(
   fetchFn: typeof fetch,
-  method: 'POST' | 'PATCH' | 'DELETE',
+  method: 'POST' | 'PUT' | 'PATCH' | 'DELETE',
   path: string,
   cookie: string | null,
   body?: unknown

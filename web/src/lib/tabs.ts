@@ -29,6 +29,7 @@
  */
 
 import type { TreeNode } from '$lib/api';
+import { SIDEBAR_PARAM, TOPICS_PATH, withSidebar, type SidebarMode } from '$lib/topics';
 
 /**
  * The query parameter that carries the set. German, like `?wurzel=`, `?projekt=` and
@@ -59,6 +60,8 @@ export type TabKind =
   | 'dokument'
   | 'aufgaben'
   | 'projekte'
+  | 'themen'
+  | 'thema'
   | 'graph'
   | 'verlauf'
   | 'verwaltung';
@@ -82,14 +85,30 @@ export interface TabSet {
 }
 
 /**
- * Query parameters that describe what just happened rather than where you are.
+ * Query parameters that are not part of which page a tab is showing.
  *
- * A tab that remembered one of these would re-announce a finished move, or re-open a
- * deletion prompt, every single time it was switched back to. `edit` is in the list for a
- * near-identical reason: it asks for the editor, which is an act, not a place — and an
- * editor that reopened itself on every switch is a way to file a revision nobody typed.
+ * Most of them describe what just happened rather than where you are: a tab that remembered
+ * one would re-announce a finished move, or re-open a deletion prompt, every single time it
+ * was switched back to. `edit` is in the list for a near-identical reason: it asks for the
+ * editor, which is an act, not a place — and an editor that reopened itself on every switch
+ * is a way to file a revision nobody typed.
+ *
+ * `seitenleiste` is the one entry that is neither an act nor an announcement, and it is here
+ * for the rule underneath both: **a tab is a page, and this parameter is about the shell
+ * around it.** Kept, one page would become two tabs that render the same content, cannot be
+ * told apart on the strip, and would each look like the other when one was closed. The
+ * sidebar's choice survives a navigation the other way instead — every link the shell renders
+ * carries it (see `withSidebar`) — which is where it belongs.
  */
-const TRANSIENT = new Set([TAB_PARAM, 'verschoben', 'fehler', 'angelegt', 'loeschen', 'edit']);
+const TRANSIENT = new Set([
+  TAB_PARAM,
+  'verschoben',
+  'fehler',
+  'angelegt',
+  'loeschen',
+  'edit',
+  SIDEBAR_PARAM
+]);
 
 /** Longer than any address this wiki can serve. Past it, the value is not an address. */
 const MAX_HREF = 512;
@@ -279,6 +298,30 @@ export function navigateHref(target: string, hrefs: readonly string[], active: n
   return withTabs(target, merged.hrefs);
 }
 
+/**
+ * Where a link in a VIEW'S OWN CHROME goes: the same workspace, and the same sidebar.
+ *
+ * Chrome is the breadcrumb, a subpage list, a topic's trail — every link a route puts around
+ * its content, as against the links inside a document, which are addresses somebody wrote and
+ * are deliberately left exactly as written (see the effect in `+layout.svelte`).
+ *
+ * It is one function rather than the same three lines in each of the routes that need it,
+ * because the three lines are not obvious: a chrome link has to preserve BOTH the tab set and
+ * the sidebar's choice, and a route that remembered only the first would quietly snap the
+ * sidebar back to the page tree every time somebody followed a topic. The shell keeps its own
+ * spelling of this, one function up, because it also has to serve the switcher — which needs
+ * to name a mode other than the current one.
+ */
+export function chromeHref(
+  target: string,
+  raw: readonly unknown[],
+  hier: string,
+  mode: SidebarMode = 'seiten'
+): string {
+  const { hrefs, active } = resolveTabs(raw, hier);
+  return navigateHref(withSidebar(target, mode), hrefs, active);
+}
+
 /** The tree entry for a path, or `null`. Already filtered to what this reader may see. */
 function titleIn(nodes: readonly TreeNode[], path: string): string | null {
   for (const node of nodes) {
@@ -322,6 +365,15 @@ export function labelFor(
     };
   }
   if (path === '/projekte') return { kind: 'projekte', label: 'Projekte' };
+  if (path === TOPICS_PATH) return { kind: 'themen', label: 'Themen' };
+  if (path.startsWith(`${TOPICS_PATH}/`)) {
+    // Named from the ADDRESS, never from a lookup — the same rule this function already
+    // follows for a page the tree does not name, and it is sharper here: ADR 0011 makes a
+    // topic's own name the disclosure, so a strip that fetched a prettier spelling would be
+    // a second, unfiltered answer to "which topics exist". The slug in the address is one
+    // the reader is already looking at.
+    return { kind: 'thema', label: `Thema: ${fromSlug(path)}` };
+  }
   if (path === '/graph') return { kind: 'graph', label: 'Graph' };
   if (path === '/admin') return { kind: 'verwaltung', label: 'Verwaltung' };
 

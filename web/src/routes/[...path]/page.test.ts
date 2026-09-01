@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import Page from './+page.svelte';
-import { ANONYMOUS, type Backlink, type Me, type StoredDocument, type TreeNode } from '$lib/api';
+import { ANONYMOUS, type Backlink, type DocumentView, type Me, type TreeNode } from '$lib/api';
 import type { BoardNotice, BoardResponse, BoardTask } from '$lib/board';
 import type { Block } from '$lib/blocks/render';
+import type { SidebarMode, Topic, TopicSummary } from '$lib/topics';
 
 /**
  * The whole reader page, rendered exactly as the server renders it.
@@ -36,7 +37,7 @@ const tree: TreeNode[] = [
 ];
 
 /** The container page the complaint was about: a parent whose content is its children. */
-const container: StoredDocument = {
+const container: DocumentView = {
   id: 'd1',
   path: '/rundgang/import-export',
   parent_path: '/rundgang',
@@ -46,8 +47,21 @@ const container: StoredDocument = {
   language: 'de',
   visibility: 'restricted',
   body: '',
-  sort_key: 2
+  sort_key: 2,
+  // The bit `/api/documents` has answered since 073281b: the same verdict a write would get.
+  // Every control on this page that needs Write is decided from it, and from nothing else.
+  may_write: true
 };
+
+const seitenThemen: Topic[] = [
+  { path: '/format', name: 'Format', display_path: 'Format' },
+  { path: '/rundgang/tabellen', name: 'Tabellen', display_path: 'Rundgang/Tabellen' }
+];
+
+const alleThemen: TopicSummary[] = [
+  { path: '/format', name: 'Format', display_path: 'Format', documents: 2 },
+  { path: '/rundgang', name: 'Rundgang', display_path: 'Rundgang', documents: 3 }
+];
 
 const body: Block = {
   kind: 'doc',
@@ -70,14 +84,19 @@ const signedIn: Me = {
  * affordance is decided from `me`, so both are needed.
  */
 function html(
-  doc: StoredDocument = container,
+  doc: DocumentView = container,
   {
     me = ANONYMOUS,
     edit = false,
     backlinks = [],
     board = null,
     boardFehler = null,
-    hinweis = null
+    hinweis = null,
+    themen = seitenThemen,
+    alle = alleThemen,
+    seitenThemenFehler = null,
+    seitenleiste = 'seiten',
+    form = null
   }: {
     me?: Me;
     edit?: boolean;
@@ -85,6 +104,11 @@ function html(
     board?: BoardResponse | null;
     boardFehler?: string | null;
     hinweis?: BoardNotice | null;
+    themen?: Topic[];
+    alle?: TopicSummary[];
+    seitenThemenFehler?: string | null;
+    seitenleiste?: SidebarMode;
+    form?: { fehler: string; getippt: string } | null;
   } = {}
 ): string {
   return render(Page, {
@@ -104,8 +128,16 @@ function html(
         boardFehler,
         hinweis,
         zurueck: doc.path,
-        now: NOW
-      }
+        now: NOW,
+        seitenleiste,
+        // The one topic query, from the root layout — the same array the sidebar and
+        // `/themen` render, and the suggestion source for the field below the title.
+        themen: alle,
+        themenFehler: null,
+        seitenThemen: themen,
+        seitenThemenFehler
+      },
+      form
     }
   }).body.replace(/<!--.*?-->/g, '');
 }
@@ -193,7 +225,7 @@ describe('the reader page, server-rendered', () => {
   });
 
   it('renders no subpage section on a leaf, and still renders everything else', () => {
-    const leaf: StoredDocument = {
+    const leaf: DocumentView = {
       ...container,
       path: '/rundgang/tabellen',
       slug: 'tabellen',
@@ -238,10 +270,21 @@ describe('reaching the history', () => {
 
 describe('offering the editor', () => {
   it('offers nothing to somebody who is not signed in', () => {
-    // Nobody anonymous can write anything in this deployment: write comes only from an
-    // explicit grant (D-M2-8), and no grant names `anyone`. A control that can only ever be
+    // Filing a revision needs an account, because a revision records who wrote it — ADR 0010
+    // says so and this is the composition it describes. A control that can only ever be
     // refused is worse than no control.
     expect(html()).not.toContain('Bearbeiten');
+  });
+
+  it('offers nothing to a signed-in reader the page says may not write it', () => {
+    // The defect this closes: `/api/documents` has answered `may_write` since 073281b and
+    // this page ignored it, so »Bearbeiten« was offered to anybody signed in and the real
+    // answer arrived only once they had opened an editor and typed into it.
+    const out = html({ ...container, may_write: false }, { me: signedIn });
+    expect(out).not.toContain('Bearbeiten');
+    // The history is still offered: reading it follows reading the page (D-M3-5), and needs
+    // no grant at all.
+    expect(out).toContain('Verlauf');
   });
 
   it('offers a signed-in reader a link, not a button that needs a bundle first', () => {
@@ -259,9 +302,10 @@ describe('offering the editor', () => {
   });
 
   it('is honest that the offer is not the answer', () => {
-    // The page cannot know whether this person may write — no endpoint says so. The socket
-    // decides, on press. So the SSR HTML must not contain an editing surface, a toolbar or
-    // anything else that would let somebody start typing before that decision was taken.
+    // `may_write` says the caller may write the page; the collaboration socket is still what
+    // decides whether THIS session gets an editable document, and it decides on press. So the
+    // SSR HTML must not contain an editing surface, a toolbar or anything else that would let
+    // somebody start typing before that decision was taken.
     const out = html(container, { me: signedIn, edit: true });
     expect(out).not.toContain('contenteditable');
     expect(out).not.toContain('role="textbox"');
@@ -384,5 +428,79 @@ describe('the reader page, as a view inside the shell', () => {
     expect(out).toMatch(/aria-label="Angaben zu dieser Seite"/);
     expect(out).toMatch(/aria-labelledby="gw-subpages"/);
     expect(out).toMatch(/aria-labelledby="gw-backlinks"/);
+  });
+});
+
+/**
+ * The owner's second decision, on the page: **what this page is about, shown and edited
+ * here.** Chips beneath the title, a click browses that topic, and the control that adds and
+ * removes is beside them — tagging while reading, not tagging by opening the editor.
+ *
+ * The chips themselves are proved in `$lib/components/PageTopics.test.ts`. What is proved
+ * here is where they sit, what feeds them, and who is offered the control.
+ */
+describe('the topics of the page being read', () => {
+  it('puts them under the title, before the document', () => {
+    const out = html();
+    const titel = out.indexOf('Import und Export</h1>');
+    const chips = out.indexOf('aria-label="Themen dieser Seite"');
+    const artikel = out.indexOf('<article');
+    expect(titel).toBeGreaterThan(-1);
+    expect(chips).toBeGreaterThan(titel);
+    expect(chips).toBeLessThan(artikel);
+  });
+
+  it('links each one to its topic page', () => {
+    const out = html();
+    expect(out).toContain('href="/themen/format"');
+    expect(out).toContain('href="/themen/rundgang/tabellen"');
+  });
+
+  it('is in the first response, before any script', () => {
+    // The whole reason it is loaded beside the page rather than fetched by the component: a
+    // chip row that arrived a second late is furniture that flickers, and one that never
+    // arrives is a page that claims to be about nothing.
+    expect(html()).toContain('Rundgang/Tabellen');
+  });
+
+  it('offers the control to somebody the page says may write it', () => {
+    const out = html();
+    expect(out).toMatch(/<form[^>]*action="\?\/themaHinzufuegen"/);
+    expect(out).toMatch(/<datalist/);
+  });
+
+  it('offers no control to somebody the page says may not', () => {
+    const out = html({ ...container, may_write: false });
+    expect(out).toContain('Rundgang/Tabellen');
+    expect(out).not.toContain('themaHinzufuegen');
+    expect(out).not.toContain('themaEntfernen');
+  });
+
+  it('offers no control when the wire says nothing about writing at all', () => {
+    // Fail closed (AGENTS.md rule 3). An older API sends no `may_write`, and a control
+    // offered on a missing field is a control offered on a guess.
+    const ohne = { ...container };
+    delete ohne.may_write;
+    expect(html(ohne)).not.toContain('themaHinzufuegen');
+  });
+
+  it('suggests from the one topic query the shell already made', () => {
+    const out = html();
+    expect(out).toContain('value="Format"');
+    expect(out).toContain('value="Rundgang"');
+  });
+
+  it('says out loud when a change was refused', () => {
+    const out = html(container, { form: { fehler: 'Das ist kein Thema.', getippt: 'a//b' } });
+    expect(out).toContain('Das ist kein Thema.');
+    expect(out).toContain('value="a//b"');
+  });
+
+  it('never reports a failed request as a page about nothing', () => {
+    const out = html(container, {
+      themen: [],
+      seitenThemenFehler: 'Die Themen konnten nicht geladen werden (Fehler 500).'
+    });
+    expect(out).toContain('Fehler 500');
   });
 });

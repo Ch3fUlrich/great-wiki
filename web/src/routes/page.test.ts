@@ -37,7 +37,19 @@ function html(
   { nodes = tree, tabHrefs = [] as string[], hier = '/' } = {}
 ): string {
   return render(Page, {
-    props: { data: { me: ANONYMOUS, tree: nodes, tabHrefs, hier } }
+    props: {
+      // `themen` and the sidebar's own choice come from the root layout and are part of
+      // `PageData`; this view reads neither.
+      data: {
+        me: ANONYMOUS,
+        tree: nodes,
+        tabHrefs,
+        hier,
+        themen: [],
+        themenFehler: null,
+        seitenleiste: 'seiten' as const
+      }
+    }
   }).body.replace(
     /<!--.*?-->/g,
     ''

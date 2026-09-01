@@ -4,6 +4,7 @@ import { render } from 'svelte/server';
 import Layout from './+layout.svelte';
 import { ANONYMOUS, type Me, type TreeNode } from '$lib/api';
 import { TAB_PARAM } from '$lib/tabs';
+import type { SidebarMode, TopicSummary } from '$lib/topics';
 
 /**
  * The application shell: the header, the page tree, the tab strip and the panel the routed
@@ -44,29 +45,50 @@ const tree: TreeNode[] = [
   }
 ];
 
+const themen: TopicSummary[] = [
+  { path: '/format', name: 'Format', display_path: 'Format', documents: 1 },
+  { path: '/rundgang', name: 'Rundgang', display_path: 'Rundgang', documents: 3 },
+  { path: '/rundgang/tabellen', name: 'Tabellen', display_path: 'Rundgang/Tabellen', documents: 1 }
+];
+
 function html(
   {
     me = ANONYMOUS,
     tabHrefs = [],
     hier = '/rundgang',
-    nodes = tree
-  }: { me?: Me; tabHrefs?: string[]; hier?: string; nodes?: TreeNode[] } = {},
+    nodes = tree,
+    topics = themen,
+    themenFehler = null,
+    seitenleiste = 'seiten'
+  }: {
+    me?: Me;
+    tabHrefs?: string[];
+    hier?: string;
+    nodes?: TreeNode[];
+    topics?: TopicSummary[];
+    themenFehler?: string | null;
+    seitenleiste?: SidebarMode;
+  } = {},
   inhalt = '<p>Inhalt</p>'
 ): string {
   return render(Layout, {
     props: {
-      data: { me, tree: nodes, tabHrefs, hier },
+      data: { me, tree: nodes, tabHrefs, hier, themen: topics, themenFehler, seitenleiste },
       children: createRawSnippet(() => ({ render: () => inhalt }))
     }
   }).body.replace(/<!--.*?-->/g, '');
 }
 
 describe('the header navigation', () => {
-  it('names all three whole-wiki views, and links each of them', () => {
+  it('names every whole-wiki view, and links each of them', () => {
     const out = html();
     for (const [label, href] of [
       ['Aufgaben', '/aufgaben'],
       ['Projekte', '/projekte'],
+      // A page nothing links to is a page nobody finds, and that is sharper for `/themen`
+      // than for the other three: D-4 made topics invisible in the graph, so a topic page is
+      // the ONLY way a topic is reachable at all.
+      ['Themen', '/themen'],
       ['Graph', '/graph']
     ]) {
       expect(out).toContain(`href="${href}"`);
@@ -82,6 +104,61 @@ describe('the header navigation', () => {
     // The board filters itself; being anonymous is a reason to be shown less ON it, never a
     // reason to be unable to find it.
     expect(html()).toContain('href="/aufgaben"');
+  });
+});
+
+describe('the sidebar, and the two ways through the corpus it offers', () => {
+  it('shows the page tree until the topics are asked for', () => {
+    const out = html();
+    expect(out).toMatch(/<nav[^>]*aria-label="Seitenbaum"/);
+    expect(out).not.toMatch(/<nav[^>]*aria-label="Themen"/);
+  });
+
+  it('shows the topics instead when they are, and only then', () => {
+    const out = html({ seitenleiste: 'themen' });
+    expect(out).toMatch(/<nav[^>]*aria-label="Themen"/);
+    expect(out).not.toMatch(/<nav[^>]*aria-label="Seitenbaum"/);
+  });
+
+  it('renders the topics it was handed, and asks for none of its own', () => {
+    // The whole of "one query rendered twice": what the sidebar draws is the array the root
+    // layout's load fetched once, the same one `/themen` renders. `layout.server.test.ts`
+    // counts the requests; this pins that the shell adds nothing to them.
+    const out = html({ seitenleiste: 'themen' });
+    // Carrying `?seitenleiste=themen` is the point of the next test; what this one pins is
+    // that every topic the layout was handed is a link, at the depth it belongs to.
+    expect(out).toContain('href="/themen/rundgang?seitenleiste=themen"');
+    expect(out).toContain('href="/themen/rundgang/tabellen?seitenleiste=themen"');
+    expect(out).toContain('3 Seiten');
+  });
+
+  it('switches with links, so the choice works before any script arrives', () => {
+    const out = html();
+    expect(out).toMatch(/<a[^>]*href="\/rundgang\?seitenleiste=themen"/);
+  });
+
+  it('says which half you are looking at, and not by colour alone', () => {
+    // `aria-current` is the fact; the styling is the second channel. Without it, the two
+    // links are two identical words and nothing says which one you already took.
+    const seiten = html();
+    expect(seiten).toMatch(/aria-current="true"[^>]*>\s*Seiten|Seiten[\s\S]{0,40}aria-current="true"/);
+    expect(html({ seitenleiste: 'themen' }).match(/aria-current="true"/g)).toHaveLength(1);
+  });
+
+  it('carries the choice onto every link the shell renders, so it survives a navigation', () => {
+    const out = html({ seitenleiste: 'themen' });
+    expect(out).toContain('href="/aufgaben?seitenleiste=themen"');
+    expect(out).toContain('href="/themen?seitenleiste=themen"');
+  });
+
+  it('never conflates a failed request with a wiki nobody has filed anything in', () => {
+    const out = html({
+      seitenleiste: 'themen',
+      topics: [],
+      themenFehler: 'Die Themen konnten nicht geladen werden (Fehler 500).'
+    });
+    expect(out).toContain('Fehler 500');
+    expect(out).not.toContain('Keine Themen');
   });
 });
 

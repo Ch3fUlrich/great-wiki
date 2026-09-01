@@ -5,12 +5,13 @@
   import Board from '$lib/components/Board.svelte';
   import Breadcrumb from '$lib/components/Breadcrumb.svelte';
   import PageMeta from '$lib/components/PageMeta.svelte';
+  import PageTopics from '$lib/components/PageTopics.svelte';
   import Subpages from '$lib/components/Subpages.svelte';
   import { outline } from '$lib/blocks/render';
   import { breadcrumb, childrenOf } from '$lib/pagemeta';
-  import { navigateHref, resolveTabs } from '$lib/tabs';
+  import { chromeHref } from '$lib/tabs';
 
-  let { data } = $props();
+  let { data, form } = $props();
   const headings = $derived(outline(data.body));
 
   /**
@@ -24,35 +25,49 @@
    * address with no workspace in it, which the shell restores from storage — see the
    * effect in `+layout.svelte` for why that is the honest split rather than a gap.
    *
-   * With one tab open this returns the address unchanged, so nothing about a wiki nobody
-   * has opened a second tab in looks any different.
+   * It carries the sidebar's own choice too, for the reason `chromeHref` gives: following a
+   * topic from a page while the sidebar is showing topics must not snap the sidebar back to
+   * the page tree.
+   *
+   * With one tab open and the sidebar untouched this returns the address unchanged, so
+   * nothing about a wiki nobody has opened a second tab in looks any different.
    */
-  const workspace = $derived(resolveTabs(data.tabHrefs ?? [], data.hier ?? data.doc.path));
   function gehZu(target: string): string {
-    return navigateHref(target, workspace.hrefs, workspace.active);
+    return chromeHref(target, data.tabHrefs ?? [], data.hier ?? data.doc.path, data.seitenleiste);
   }
 
   /**
-   * Whether to offer editing at all, and why the answer is this crude.
+   * Whether the caller may write this page — **the same verdict a write would get.**
    *
-   * There is no capability on the wire. `/api/documents` returns ten fields and none of
-   * them is "may I write this"; `/api/me` reports groups and a baseline, and D-M2-8 is
-   * explicit that no baseline confers write — an instance admin with no grant is refused
-   * like anybody else. The only endpoint that knows is the collaboration socket, and it
-   * cannot be asked without either a real WebSocket handshake (which allocates a room on
-   * the server, on every page view) or a POST (which would publish somebody else's live
-   * session as a revision). Neither belongs in a page render.
+   * `/api/documents` answers `may_write` off the very authorisation that let this page be
+   * read (ADR 0010), so a control offered on it and the refusal it would receive cannot come
+   * apart. This file used to say there was no such bit on the wire and offer every control to
+   * whoever was signed in; there has been one since 073281b, and the offer was a guess for as
+   * long as this went on reading `/api/me` instead.
    *
-   * So the control is offered to whoever is signed in, and the true answer is given the
-   * moment it is pressed: `Editor.svelte` opens the session, and a refusal produces a
-   * sentence rather than an editor. That is the honest arrangement available today — the
-   * button can be a false offer, but it can never be a false editor.
-   *
-   * What would fix it is one boolean from the API; the accompanying report names it.
-   * Anonymous readers are left out because nothing in this deployment grants write to
-   * `anyone`, and an offer nobody can accept is worse than no offer.
+   * `=== true`, not `!== false`: an API that says nothing is an API this cannot ask, and a
+   * control offered on a missing field is a control offered on a guess. Fail closed —
+   * AGENTS.md rule 3.
    */
-  const mayOfferEditing = $derived(data.me?.authenticated === true);
+  const darfSchreiben = $derived(data.doc.may_write === true);
+
+  /**
+   * Whether to offer editing at all: **write, AND an account.**
+   *
+   * The composition ADR 0010 describes, and the reason the two halves are not the same
+   * question. `may_write` licenses opening the editor and changing what is there; *filing a
+   * revision* needs a signed-in, active account as well, because a revision records who wrote
+   * it. So an editor offered to somebody with write and no account would be an editor they
+   * could type into and never publish from.
+   *
+   * Re-filing this page under a topic is deliberately NOT in that second group:
+   * `Store::set_document_topics` writes no revision — the page's words are unchanged — so it
+   * needs Write and nothing more, which is why the chips below read `darfSchreiben` alone.
+   *
+   * The socket is still the thing that hands over an editable document, and it still decides
+   * on press. What has changed is that the offer is no longer a guess.
+   */
+  const mayOfferEditing = $derived(darfSchreiben && data.me?.authenticated === true);
 
   /**
    * `null` means "whatever the URL said". The control is a real link to `?edit=1`, so it
@@ -132,6 +147,25 @@
   <main id="content" class="page">
     <Breadcrumb {crumbs} hrefFor={gehZu} />
     <h1>{data.doc.title}</h1>
+
+    <!-- The owner's second decision, and its whole point is the position: what this page is
+         about sits UNDER ITS TITLE, where you are already looking, not behind an editor and
+         not in the panel of facts beside the document. Tagging is something you do while
+         reading. Clicking a chip browses that topic, which is the only way topics are
+         reachable at all (D-4).
+
+         The suggestion list is the shell's own single `GET /api/topics` answer, handed
+         straight through — so it is filtered exactly as the index is, structurally rather
+         than by anybody remembering to. ADR 0011 warns that this is the surface that gets
+         forgotten precisely because it feels like a convenience. -->
+    <PageTopics
+      themen={data.seitenThemen ?? []}
+      alle={data.themen ?? []}
+      darfSchreiben={darfSchreiben}
+      fehler={form?.fehler ?? data.seitenThemenFehler ?? null}
+      getippt={form?.getippt ?? ''}
+      hrefFor={gehZu}
+    />
 
     <!-- Bearbeiten is offered only to somebody signed in, and it is a LINK: before hydration
          it navigates to `?edit=1`, which renders the same page with the editor asked for. A
@@ -417,6 +451,7 @@
      the layout bug this whole change is about. */
   .page > :global(.crumbs),
   .page > h1,
+  .page > :global(.themen),
   .page > .editbar,
   .page > .editor-loading,
   .page > .tafel-fehler,
@@ -431,9 +466,13 @@
     margin-inline: auto;
   }
 
-  /* Tight to the title above it rather than a block of its own: it is a thing you can do
-     to this page. `.page > * + *` would otherwise put a full --space-6 between two rows of
-     chrome. */
+  /* Both of these belong to the title rather than being blocks of their own — one says what
+     the page is about, the other what you can do to it — so `.page > * + *`'s full --space-6
+     between rows of chrome is wrong for them. */
+  .page > :global(.themen) {
+    margin-block-start: var(--space-3);
+  }
+
   .editbar {
     margin-block-start: var(--space-3);
     /* Two controls now, and a flex row rather than inline text so the gap between them is
