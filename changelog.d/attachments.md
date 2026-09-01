@@ -22,17 +22,14 @@
   attaching the same 40 MB scan to four pages costs 40 MB.
 
 - **What a file *is* is read from the file, never from what it was called.** A document named
-  `befund.png` that is actually an HTML page is refused, and one named `.txt` that is actually
-  a PDF is served as a PDF. The type the browser is told is the type the bytes are, because
-  the browser is the thing being protected: it is what would run a script if it were told a
-  page of markup was a picture.
+  `befund.png` that is actually an HTML page is served as text, and one named `.txt` that is
+  actually a PDF is served as a PDF. The type the browser is told is the type the bytes are,
+  because the browser is the thing being protected: it is what would run a script if it were
+  told a page of markup was a picture.
 
-  The cost is stated rather than hidden: **plain text, Markdown, CSV and SVG cannot be
-  attached.** None of them has anything in its bytes that identifies it, so accepting them
-  would mean guessing — and the two available guesses are "call it text and hope it is not
-  markup" and "call it an image and hope it carries no script". Images, PDFs, ZIP archives
-  (which is what a Word or LibreOffice document is), and MP4, WebM and Ogg media are what this
-  stores. Text belongs in a page.
+  Images, PDFs, ZIP archives (which is what a Word or LibreOffice document is), MP4, WebM and
+  Ogg media, and UTF-8 text are what this stores. A file whose bytes match none of those is
+  refused rather than guessed at.
 
 - **A picture or a PDF opens where you are; anything else is saved.** A download also arrives
   with the browser forbidden from second-guessing its type and with scripting switched off for
@@ -44,9 +41,8 @@
   cards, and counts them. It does **not** delete the stored files, and says how many are now
   referenced by nothing at all, rather than letting an administrator assume they went. Why the
   bytes stay — and what has to be true before anything deletes them — is
-  [ADR 0013](docs/decisions/0013-what-a-purge-leaves-on-the-mount.md). Until that exists,
-  a purged file is still on the media mount and removing it is a manual job; the number in the
-  report is what tells you there is one to do.
+  [ADR 0013](docs/decisions/0013-what-a-purge-leaves-on-the-mount.md). The number in the report
+  is what tells you there is something to clear, and `great-wiki reclaim` is what clears it.
 
 - **Attaching a file you already have tells you nothing about who else has it.** Uploading a
   document the wiki has already stored — on a page you cannot read — answers exactly as

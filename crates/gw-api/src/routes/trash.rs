@@ -133,6 +133,10 @@ pub struct PurgeReportView {
     /// Stored files no page references any more. **Not files deleted** — a purge takes the
     /// list and leaves the bytes on the mount (ADR 0013), and this is what says so rather
     /// than leaving an administrator to assume otherwise.
+    ///
+    /// What removes them is `great-wiki reclaim --commit`
+    /// ([`gw_store::Store::reclaim_blobs`]), run deliberately and off the request path. Its
+    /// own report's `blobs` is the number to check this one against.
     pub blobs_orphaned: i64,
 }
 

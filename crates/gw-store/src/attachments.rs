@@ -44,7 +44,10 @@
 //!
 //! An `attachments` row cascades away with its page; a `blobs` row does not, and the bytes
 //! stay on the mount. `docs/decisions/0013-what-a-purge-leaves-on-the-mount.md` is why, and
-//! [`crate::trash::PurgeReport::blobs_orphaned`] is how an administrator is told.
+//! [`crate::trash::PurgeReport::blobs_orphaned`] is how an administrator is told. What takes
+//! them off the mount afterwards is [`crate::Store::reclaim_blobs`], a separate deliberate
+//! act — and the reason it is safe is that [`Store::attach`] publishes its bytes *inside* the
+//! transaction that will reference them, so the two can never interleave.
 
 use crate::blobs::PendingBlob;
 use crate::Store;
@@ -246,7 +249,12 @@ impl Store {
             )));
         }
 
-        // Bytes before rows. See the doc comment above for why this way round.
+        // Bytes before rows. See the doc comment above for why this way round — and note
+        // that this is INSIDE the transaction, which [`Store::reclaim_blobs`] depends on:
+        // between this line and the INSERT below the bytes are on the mount referenced by
+        // nothing, and a reclamation sweep that could run here would delete a live page's
+        // file. It cannot, because this transaction holds the store's only connection. Moving
+        // the publish above `begin()` would reopen that race with nothing else changing.
         let blob = pending.publish().await?;
 
         // `OR IGNORE`: the same bytes may already be indexed from another page, and that is
@@ -365,7 +373,8 @@ impl Store {
     /// It removes the row and nothing else: the bytes stay on the mount and the `blobs` row
     /// stays in the index, because this is not a destruction and must not become one — the
     /// same file may be attached to another page, and finding out is not this operation's
-    /// business. ADR 0013 is where the bytes go, and when.
+    /// business. ADR 0013 is where the bytes go, and when: [`Store::reclaim_blobs`], run
+    /// deliberately, is what takes them.
     ///
     /// The account is required for the same reason attaching needs one, pointed the other
     /// way: a file that quietly stopped being on a page is exactly the change somebody asks

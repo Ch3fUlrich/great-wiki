@@ -67,6 +67,34 @@ enum Command {
         #[arg(long = "as", value_name = "USERNAME")]
         identity: String,
     },
+    /// Remove stored files that no page references any more.
+    ///
+    /// The second act after `endgültig löschen`. A purge destroys a page's attachment
+    /// entries and reports `blobs_orphaned` — the stored files nothing points at any
+    /// more — but it deliberately leaves the bytes on the media mount, because an
+    /// `unlink` is not in the database transaction and no ordering of the two has a
+    /// worst case better than a live page losing its file. See
+    /// `docs/decisions/0013-what-a-purge-leaves-on-the-mount.md`.
+    ///
+    /// This is what takes them. It previews by default and destroys only with
+    /// `--commit`, because a wiki that holds medical documents needs the operation that
+    /// forgets them to be one somebody meant.
+    ///
+    /// A command rather than a button or a timer: it is instance-wide, so there is no
+    /// page whose permissions could authorise it, and it holds the store's only
+    /// connection for the whole of its transaction, so every other request waits behind
+    /// it. If it should be periodic, something else calls it on a schedule — never host
+    /// cron.
+    Reclaim {
+        /// Actually delete the files. Without it, nothing is destroyed and nothing is
+        /// recorded: the report says what a `--commit` run would take.
+        #[arg(long)]
+        commit: bool,
+        /// Recorded as `audit_log.principal_id`, exactly as `grant --actor` is, and for
+        /// the same reason: a destruction with no actor is not a record.
+        #[arg(long, default_value = "cli-reclaim")]
+        actor: String,
+    },
     /// Add an ACL grant on a path, from the command line.
     ///
     /// Exists for the case `seed --as` cannot reach: bootstrapping the FIRST grant on a
@@ -254,6 +282,29 @@ async fn main() -> Result<()> {
                     report.refused.len()
                 )
             }
+        }
+        Command::Reclaim { commit, actor } => {
+            let store = gw_store::Store::open(&cfg.database_url)
+                .await?
+                .with_public_origin(cfg.public_origin.clone());
+            // Opened rather than assumed, for the reason `serve` opens it before binding a
+            // listener: a sweep pointed at a media directory that is not there would
+            // report having reclaimed files it never touched.
+            let blobs = gw_store::BlobStore::open(&cfg.media_dir)?;
+            let mode = if commit {
+                gw_store::Reclaim::Commit
+            } else {
+                gw_store::Reclaim::Preview
+            };
+            let report = store.reclaim_blobs(&blobs, &actor, mode).await?;
+            println!("media {}", cfg.media_dir.display());
+            println!("{report}");
+            if !commit && report.blobs > 0 {
+                println!(
+                    "nothing was deleted — run again with --commit to take them off the mount"
+                );
+            }
+            Ok(())
         }
         Command::Grant {
             path,

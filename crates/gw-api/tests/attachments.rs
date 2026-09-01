@@ -470,14 +470,17 @@ async fn attaching_needs_write_on_the_page() {
 #[tokio::test]
 async fn a_file_the_wiki_does_not_serve_is_refused_by_its_bytes() {
     let store = fixture().await;
-    // Named `.png`, and it is an HTML document. The name is not consulted, so this is 415
+    // Named `.png`, and it is a WAV: a RIFF container with no WEBP payload, which is neither
+    // a format the allowlist knows nor text. The name is not consulted, so this is 415
     // rather than a stored file the browser would later be handed as `image/png`.
+    let mut wav = b"RIFF\x24\x00\x00\x00WAVEfmt ".to_vec();
+    wav.extend_from_slice(&[0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00]);
     let (status, _, body) = as_user(
         &store,
         "schreiber",
         "POST",
         "/api/attachment/harmlos.png/raum",
-        b"<!doctype html><script>alert(1)</script>".to_vec(),
+        wav,
     )
     .await;
     assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
@@ -489,6 +492,33 @@ async fn a_file_the_wiki_does_not_serve_is_refused_by_its_bytes() {
 
     let (_, _, body) = as_user(&store, "leser", "GET", "/api/attachments/raum", Vec::new()).await;
     assert_eq!(json(&body)["attachments"].as_array().unwrap().len(), 0);
+
+    // The same rule pointed the other way, and it is the reason accepting text is safe: an
+    // HTML document IS stored — Markdown may legitimately contain HTML, so refusing markup
+    // would refuse Markdown — and what the name claimed is still ignored. It comes back as
+    // text, which is a type no browser will run.
+    let (status, _, _) = as_user(
+        &store,
+        "schreiber",
+        "POST",
+        "/api/attachment/harmlos.png/raum",
+        b"<!doctype html><script>alert('stored-as-text')</script>".to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, headers, _) = as_user(
+        &store,
+        "leser",
+        "GET",
+        "/api/attachment/harmlos.png/raum",
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(
+        header(&headers, "content-type"),
+        "text/plain; charset=utf-8"
+    );
+    assert!(header(&headers, "content-disposition").starts_with("attachment;"));
 }
 
 #[tokio::test]
@@ -754,6 +784,99 @@ async fn a_download_says_what_the_bytes_are_and_forbids_the_browser_from_guessin
     .await;
     assert!(
         header(&headers, "content-disposition").starts_with("inline;"),
+        "{headers:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_svg_is_never_offered_inline_however_much_of_an_image_it_is() {
+    // SVG is XML that can carry `<script>`, event handlers and external references: the one
+    // image format that is also a program. It is stored exactly as it arrived — nothing here
+    // sanitises it, because half-stripping script out of XML produces a file that invites
+    // being trusted — so every defence is on the way out, and this is where they are pinned.
+    let store = fixture().await;
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" onload="alert('svg-inline-test')">
+                    <script>alert('svg-inline-test')</script><rect width="1" height="1"/>
+                  </svg>"#
+        .to_vec();
+
+    let (status, _, _) = as_user(
+        &store,
+        "schreiber",
+        "POST",
+        "/api/attachment/karte.svg/raum",
+        svg.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "an SVG can be attached");
+
+    let (status, headers, body) = as_user(
+        &store,
+        "leser",
+        "GET",
+        "/api/attachment/karte.svg/raum",
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body, svg,
+        "the bytes come back exactly as they went in: nothing is sanitised"
+    );
+    assert_eq!(header(&headers, "content-type"), "image/svg+xml");
+
+    // THE assertion. `image/svg+xml` starts with `image/`, and the inline rule is written
+    // for images — so this is the one type that must not be allowed to fall through it.
+    let disposition = header(&headers, "content-disposition");
+    assert!(
+        disposition.starts_with("attachment;"),
+        "an SVG must be saved, never rendered where it was reached: {disposition}"
+    );
+    assert!(
+        !disposition.contains("inline"),
+        "not inline under any spelling: {disposition}"
+    );
+
+    // The three headers that back it up. They were written before this type existed, so
+    // whether they actually cover it is a question rather than an assumption — and the
+    // outermost CSP layer must not overwrite the one this route sets, either.
+    assert_eq!(
+        header(&headers, "x-content-type-options"),
+        "nosniff",
+        "the browser may not decide these bytes are something else"
+    );
+    assert_eq!(
+        header(&headers, "content-security-policy"),
+        "default-src 'none'; sandbox",
+        "no script, no fetch, no origin — even if something did render it"
+    );
+    assert_eq!(header(&headers, "cache-control"), "private, no-store");
+
+    // A plain-text file is saved rather than rendered for the same reason: it may be
+    // markup, and only the type it is served under decides whether that matters.
+    as_user(
+        &store,
+        "schreiber",
+        "POST",
+        "/api/attachment/notiz.md/raum",
+        b"# Notiz\n\n<script>alert('markdown-inline-test')</script>\n".to_vec(),
+    )
+    .await;
+    let (_, headers, _) = as_user(
+        &store,
+        "leser",
+        "GET",
+        "/api/attachment/notiz.md/raum",
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(
+        header(&headers, "content-type"),
+        "text/plain; charset=utf-8",
+        "Markdown, CSV and plain text are all this: nothing in the bytes tells them apart"
+    );
+    assert!(
+        header(&headers, "content-disposition").starts_with("attachment;"),
         "{headers:?}"
     );
 }

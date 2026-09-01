@@ -1138,8 +1138,8 @@ mutation crates/gw-store/src/attachments.rs killed \
 # tempting version — call it something generic and serve it — which is how a page of markup
 # gets handed to a browser under a type the uploader chose.
 mutation crates/gw-store/src/blobs.rs killed \
-  's/        let Some(media_type) = sniff(&self.head) else {/        let media_type = sniff(\&self.head).unwrap_or("application\/octet-stream"); if false {/' \
-  'blobs: a type the allowlist does not know is refused, never guessed'
+  's/        let Some(media_type) = self.media_type() else {/        let media_type = self.media_type().unwrap_or("application\/octet-stream"); if false {/' \
+  'blobs: a type that is neither a signature nor text is refused, never guessed'
 mutation crates/gw-store/src/blobs.rs killed \
   's/        if self.byte_size > self.max_bytes {/        if false {/' \
   'blobs: D-17 250 MB cap actually refuses'
@@ -1178,7 +1178,7 @@ mutation crates/gw-api/src/routes/attachments.rs killed \
   's/    if on_disk != source.byte_size as u64 {/    if false {/' \
   'attachments: a file that is not the length the database recorded is refused'
 mutation crates/gw-api/src/routes/attachments.rs killed \
-  's/    let inline = media_type.starts_with("image\/") || media_type == "application\/pdf";/    let inline = true;/' \
+  's/        other => other.starts_with("image\/") || other == "application\/pdf",/        _ => true,/' \
   'attachments: only pictures and PDFs are offered inline'
 mutation crates/gw-api/src/routes/attachments.rs killed \
   's/        HeaderValue::from_static("nosniff"),/        HeaderValue::from_static("nosniff-not"),/' \
@@ -1188,6 +1188,114 @@ mutation crates/gw-api/src/routes/attachments.rs killed \
 mutation crates/gw-api/src/routes/attachments.rs killed \
   's/        .layer(RequestBodyLimitLayer::new(MAX_ATTACHMENT_BYTES as usize))/        .layer(RequestBodyLimitLayer::new(super::REQUEST_BODY_LIMIT))/' \
   'attachments: the upload route is not under the ordinary 2 MB body limit'
+
+# --- SVG: the one image format that is also a program -----------------------------------
+#
+# An SVG is XML that can carry `<script>`, event handlers and external references, and it is
+# stored EXACTLY as uploaded — nothing sanitises it, because half-stripping script out of XML
+# produces a file that invites being trusted. So every defence is on the way out, and the
+# first of them is that it is never rendered where it was reached.
+#
+# THE one. `content_disposition` is a match whose first arm names `image/svg+xml`, and this
+# mutation deletes that arm so the type falls through to the image rule underneath — which is
+# precisely the mistake the arm exists to prevent, and precisely what would happen if somebody
+# "simplified" the match back into a boolean. `image/svg+xml` starts with `image/`, so the
+# fall-through renders it.
+mutation crates/gw-api/src/routes/attachments.rs killed \
+  's/        "image\/svg+xml" => false,//' \
+  'attachments: an SVG never falls through the is-image branch into inline'
+# The same property from the other side, for a reader who deletes the arm's VALUE rather than
+# the arm. Both spellings have to be caught, because both are one-character edits.
+mutation crates/gw-api/src/routes/attachments.rs killed \
+  's/        "image\/svg+xml" => false,/        "image\/svg+xml" => true,/' \
+  'attachments: an SVG is attachment, and inverting that one word is noticed'
+# The headers that back the disposition up were written before this type existed. `nosniff`
+# already has its own mutation above; this is the sandbox, which is what would stop a script
+# in an SVG reaching anything even if something did render it.
+mutation crates/gw-api/src/routes/attachments.rs killed \
+  's/        HeaderValue::from_static("default-src '"'"'none'"'"'; sandbox"),/        HeaderValue::from_static("default-src '"'"'self'"'"'"),/' \
+  'attachments: a download renders with nothing reachable from it'
+# And the typing that gets there. An SVG typed as text would be `attachment` anyway — safe,
+# but it would make the disposition rule above dead code, and the next person to read it would
+# not be able to tell.
+mutation crates/gw-store/src/blobs.rs killed \
+  's/        Some(if looks_like_svg(head) {/        Some(if false {/' \
+  'blobs: an SVG is typed as the image it is'
+
+# --- accepting text: a validity check, not a signature -----------------------------------
+#
+# Text has no magic number, so the question asked of it is a different KIND of question: not
+# "does this begin like text" but "is ALL of this text". Every mutation here breaks that
+# distinction in a way that looks like a simplification.
+#
+# The head-only version — which is what a signature is, applied to something that is not one.
+# A file whose first kilobyte is a licence header and whose remainder is a binary payload
+# would be accepted as text.
+mutation crates/gw-store/src/blobs.rs killed \
+  's/        self.text.push(chunk);/        self.text.push(\&chunk[..chunk.len().min(HEAD_BYTES)]);/' \
+  'blobs: text is decided over every byte, not over the leading ones'
+# The control-character half of the check. Without it a binary file that happens to decode as
+# UTF-8 is text, which is how a NUL-riddled payload gets served with a type on it.
+mutation crates/gw-store/src/blobs.rs killed \
+  "s/            .any(|c| c.is_control() \&\& !matches!(c, '\\\\t' | '\\\\n' | '\\\\r'))/            .any(|_| false)/" \
+  'blobs: a control character other than tab, newline or return is not text'
+# The end of the stream. An incomplete UTF-8 sequence at a CHUNK boundary is ordinary and is
+# carried across; the same bytes at the end of the FILE are a truncated file. The mutation
+# conflates them.
+mutation crates/gw-store/src/blobs.rs killed \
+  's/        if !self.textual || !self.partial.is_empty() {/        if !self.textual {/' \
+  'blobs: a file that ends mid-character is not text'
+# The order of the two questions. A signature is a statement a format makes about itself and
+# is taken at its word first; reversed, `%PDF-` becomes text/plain because those bytes are
+# also perfectly good text.
+mutation crates/gw-store/src/blobs.rs killed \
+  's/        sniff(&self.head).or_else(|| self.text.media_type(&self.head))/        self.text.media_type(\&self.head).or_else(|| sniff(\&self.head))/' \
+  'blobs: a signature decides before the text check ever runs'
+
+# --- the reclamation sweep: the operation that exists to forget a file -------------------
+#
+# ADR 0013 left the wiki unable to fully forget a file: a purge takes the attachment rows and
+# leaves the bytes. `Store::reclaim_blobs` is the second act, and it is the one operation in
+# this system that deletes from the media mount. Every mutation below is a way for it to
+# delete the wrong thing, or to fail to delete at all.
+#
+# THE safety property. Every argument for why a sweep cannot race an upload rests on
+# `Store::open` fixing the pool at ONE connection: an upload holds it from `tx.begin()`
+# through `publish()` to its INSERT, so the window where bytes are on the mount and no row
+# references them is entirely inside somebody else's hold. With a second connection that
+# window is reachable and the sweep unlinks a live page's file. The guard is what makes that
+# a refusal rather than a comment, and this mutation removes it.
+mutation crates/gw-store/src/reclaim.rs killed \
+  's/            self.pool.options().get_max_connections() == 1,/            true,/' \
+  'reclaim: the sweep refuses a store something else could write to behind it'
+# The worklist. `NOT EXISTS (…)` is the whole of "nothing references these bytes"; without it
+# the sweep takes every blob in the wiki, including the ones live pages carry. The foreign key
+# would refuse the delete — which is `0013_attachments.sql`'s absent ON DELETE clause doing
+# its job — and the test has to notice either way.
+mutation crates/gw-store/src/reclaim.rs killed \
+  's/            "DELETE FROM blobs WHERE NOT EXISTS ( \\/            "DELETE FROM blobs WHERE 1 = 1 OR NOT EXISTS ( \\/' \
+  'reclaim: a file a page still carries is never swept'
+# A preview must not unlink. This is the ONE place ADR 0012's "the preview is the operation,
+# rolled back" cannot hold, because an unlink does not roll back — so a preview that performed
+# one would destroy the files it was asked to describe.
+mutation crates/gw-store/src/reclaim.rs killed \
+  's/                Reclaim::Preview => match tokio::fs::metadata(&path).await {/                Reclaim::Preview => match tokio::fs::remove_file(\&path).await {/' \
+  'reclaim: a preview looks at the mount instead of acting on it'
+# And a preview must not commit the rows either.
+mutation crates/gw-store/src/reclaim.rs killed \
+  's/        if mode == Reclaim::Preview {/        if false {/' \
+  'reclaim: a preview rolls the database half back'
+# The report is what an administrator checks against the purge's `blobs_orphaned`, and the
+# split between "removed" and "was already gone" is what says the index and the mount had
+# drifted. Collapsed, a sweep over a half-empty mount reads as a clean one.
+mutation crates/gw-store/src/reclaim.rs killed \
+  's/            if was_there {/            if true {/' \
+  'reclaim: a row whose file had already gone is counted apart'
+# The only surviving trace of a destruction. Every other record of these bytes is exactly what
+# the sweep has just deleted.
+mutation crates/gw-store/src/reclaim.rs killed \
+  's/                "blobs.reclaim",/                "blobs.aufraeumen",/' \
+  'reclaim: a sweep that destroyed bytes writes the audit row an administrator reads back'
 
 # --- crash recovery ------------------------------------------------------------------
 #

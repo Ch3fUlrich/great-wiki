@@ -9,6 +9,7 @@ pub mod invites;
 pub mod links;
 pub mod login_attempts;
 pub mod principals;
+pub mod reclaim;
 pub mod revisions;
 pub mod sessions;
 pub mod tasks;
@@ -30,6 +31,7 @@ pub use invites::{
 pub use links::{Backlink, Graph, GraphEdge, GraphNode};
 pub use login_attempts::{LoginScope, LOGIN_FAILURE_LIMIT, LOGIN_LOCKOUT_SECONDS};
 pub use principals::TeamSummary;
+pub use reclaim::{Reclaim, ReclaimReport};
 pub use revisions::{Author, Revision, IMPORT_AUTHOR_ID, IMPORT_AUTHOR_NAME};
 pub use sessions::SESSION_TTL_SECONDS;
 pub use tasks::{NewTask, Project, Task, TaskHome, TaskOutcome, TaskPage, TaskStatus, TaskUpdate};

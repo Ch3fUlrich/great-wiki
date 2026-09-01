@@ -159,6 +159,10 @@ pub struct PurgeReport {
     /// rather than an omission, and this number is how an administrator is told about it
     /// rather than discovering it.
     ///
+    /// **It is a number with something to do about it.** [`crate::Store::reclaim_blobs`] —
+    /// `great-wiki reclaim` — is the second act that takes those files off the mount, and
+    /// [`crate::ReclaimReport::blobs`] is what this should be checked against afterwards.
+    ///
     /// Measured the same way as every other number here: the count of unreferenced blobs
     /// before the DELETE subtracted from the count after it. It is the one that goes UP.
     pub blobs_orphaned: i64,

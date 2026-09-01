@@ -47,6 +47,13 @@
 //! format that can carry script (a PDF can) renders in an opaque origin with nothing reachable
 //! from it; and `Content-Disposition: attachment` for everything that is not an image or a
 //! PDF, so an unexpected type is saved rather than rendered.
+//!
+//! **`image/svg+xml` is `attachment` too, and that is a rule rather than a consequence.** An
+//! SVG is an image by media type and a program by capability, and [`content_disposition`]
+//! names it before it asks whether anything is an image. The whole of the reasoning, and the
+//! constraint it leaves for whoever renders an attachment in the interface, is on that
+//! function and in
+//! `docs/decisions/0014-what-a-file-has-to-be-to-be-attached.md`.
 
 use super::AppState;
 use crate::error::ApiError;
@@ -363,8 +370,24 @@ pub async fn download(
 /// Whether the browser may render this, and under what name it saves it.
 ///
 /// `inline` for images and PDFs, because D-15 wants a picture beside the paragraph explaining
-/// it. `attachment` for everything else — a ZIP, a video, anything added to the allowlist
-/// later — so a type nobody thought about is saved rather than rendered.
+/// it. `attachment` for everything else — a ZIP, a video, plain text, anything added to the
+/// allowlist later — so a type nobody thought about is saved rather than rendered.
+///
+/// **`image/svg+xml` is the exception, and it is checked before the image rule rather than
+/// carved out of it.** An SVG is XML that can carry `<script>`, event handlers and external
+/// references: the one image format that is also a program. It is stored exactly as
+/// uploaded — `gw_store::blobs` says why nothing sanitises it — so *not being rendered where
+/// it was reached* is the defence, and a defence that depends on somebody remembering that
+/// SVG is an image would not survive the next type being added. Written as a match whose
+/// first arm names it, so the image branch is not even reached.
+///
+/// The constraint that leaves this file with it: **anything that later renders an attachment
+/// inline must not render an SVG through a mechanism that executes it.** `<img src>` and a
+/// CSS `background-image` are safe — no browser runs script in either — while `<object>`,
+/// `<embed>`, `<iframe>` and inlining the markup into this wiki's own DOM all execute it,
+/// and the last of those would execute it *in this origin*, with the session cookie in
+/// reach. `attachment` also makes an `<iframe>` pointing here download rather than render,
+/// so the disposition is doing work for a page that has not been written yet.
 ///
 /// Both spellings of the name are sent: a quoted ASCII fallback for a client that does not
 /// implement RFC 5987, and `filename*=UTF-8''…` for the ones that do, so `Röntgen.png` keeps
@@ -374,7 +397,11 @@ pub async fn download(
 /// It cannot inject a header: `canonical_filename` has already refused `"`, `\` and every
 /// control character, and the encoder below emits nothing else.
 fn content_disposition(media_type: &str, filename: &str) -> HeaderValue {
-    let inline = media_type.starts_with("image/") || media_type == "application/pdf";
+    let inline = match media_type {
+        // Never, whatever else is true of it. See the doc comment above.
+        "image/svg+xml" => false,
+        other => other.starts_with("image/") || other == "application/pdf",
+    };
     let disposition = if inline { "inline" } else { "attachment" };
     let ascii: String = filename
         .chars()
@@ -445,9 +472,10 @@ pub async fn upload(
         }
         gw_store::BlobOutcome::UnknownType => {
             return Err(ApiError::Unsupported(
-                "this wiki stores images, PDFs, ZIP archives, and MP4, WebM or Ogg media. \
-                 The type is read from the file itself, so renaming it does not help — and \
-                 plain text, Markdown and SVG are deliberately not on the list."
+                "this wiki stores images, PDFs, ZIP archives, MP4, WebM or Ogg media, and \
+                 UTF-8 text — which is how plain text, Markdown, CSV and SVG get in. The \
+                 type is read from the file itself, so renaming it does not help: what is \
+                 refused is a file that is neither a format this recognises nor text at all."
                     .into(),
             ))
         }
@@ -531,6 +559,9 @@ mod tests {
             ("application/zip", "attachment"),
             ("video/mp4", "attachment"),
             ("audio/ogg", "attachment"),
+            // The exception, and the only one: an image type that is never rendered.
+            ("image/svg+xml", "attachment"),
+            ("text/plain; charset=utf-8", "attachment"),
         ] {
             let header = content_disposition(media_type, "x.bin");
             assert!(

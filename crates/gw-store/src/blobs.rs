@@ -17,19 +17,68 @@
 //! resolves a request to a blob; [`crate::attachments`] resolves a page and a filename to a
 //! digest, after asking the permission engine, and hands it here.
 //!
-//! # Typed by magic bytes, and only by magic bytes
+//! # Typed by the bytes, in two ways that are not the same kind of question
 //!
-//! [`sniff`] reads the leading bytes and matches them against a closed allowlist. There is
-//! no parameter for a declared `Content-Type` and no code path that looks at a filename
-//! extension, because a type that came from the request is a type the uploader chose, and
-//! the thing being protected is the browser that will later be handed these bytes with that
-//! type on them.
+//! `docs/decisions/0014-what-a-file-has-to-be-to-be-attached.md` is the decision; what
+//! follows is the shape of it, where the code is.
 //!
-//! **Unknown means refused** (AGENTS.md rule 3). That is a real cost, stated where it is
-//! paid: a `.txt` file, a `.csv`, an `.md` and an SVG all have no magic number, so none of
-//! them can be attached. Serving them would mean either guessing `text/plain` for bytes that
-//! might be HTML, or serving `image/svg+xml` for a format that can carry script — both of
-//! which are the browser-side attack this rule exists to close. Text belongs in a page.
+//! There is no parameter for a declared `Content-Type` and no code path that looks at a
+//! filename extension, because a type that came from the request is a type the uploader
+//! chose, and the thing being protected is the browser that will later be handed these bytes
+//! with that type on them. What is left is the bytes, and they answer in two different ways.
+//!
+//! **A signature is a statement a format makes about itself.** [`sniff`] reads the leading
+//! bytes and matches them against a closed allowlist: a PNG says PNG in eight of them. It
+//! looks at a bounded prefix because that is where the statement is, and a format that makes
+//! no such statement is invisible to it.
+//!
+//! **Text makes no statement anywhere, so the question has to be a different one.** Not
+//! "does this begin like text" but "is ALL of this text" — every byte valid UTF-8, and no
+//! control character other than tab, newline and carriage return. That is a *validity check*
+//! and not a signature, and the difference is load-bearing: it is a property of the whole
+//! stream, so [`BlobWriter`] decides it as the chunks go past rather than from the head. A
+//! file whose first kilobyte is a licence header and whose remainder is a binary payload is
+//! not text, and only a check that sees all of it can say so.
+//!
+//! Three consequences, each deliberate:
+//!
+//! * **`text/plain` is what plain text, Markdown and CSV are all served as**, because
+//!   nothing in the bytes tells them apart. A `.csv` and a `.md` differ by convention and by
+//!   what a reader does with them, not by anything measurable here, and sniffing for commas
+//!   would be a guess dressed as a measurement. The filename the page carries is where
+//!   "this is a spreadsheet" is written down, and that is a fact about the attachment rather
+//!   than about the bytes.
+//! * **A byte order mark is accepted and never removed.** U+FEFF is valid UTF-8 and is not a
+//!   control character, so it needs no special case to pass — and it must not be stripped,
+//!   because the digest IS the address (D-16): a store that altered the bytes on the way in
+//!   would hand back a file whose hash the uploader cannot reproduce from their own copy.
+//!   UTF-16, which also carries a mark, is not valid UTF-8 and is refused rather than stored
+//!   as text nobody could read.
+//! * **Bytes that are really some other textual format are `text/plain` too** — an HTML
+//!   page, a shell script, a JSON document. This is not a hole. Markdown may legitimately
+//!   contain HTML, so refusing HTML would refuse Markdown; and being wrong costs nothing,
+//!   because the wiki never *calls* it HTML. `gw_api::routes::attachments` sends
+//!   `text/plain`, `X-Content-Type-Options: nosniff` so the browser may not decide otherwise,
+//!   and `Content-Disposition: attachment` so it is saved rather than rendered. Bytes that
+//!   are really a *binary* format cannot get here: anything with a known signature is typed
+//!   by it, and anything without one that is nonetheless text is, by definition,
+//!   indistinguishable from text.
+//!
+//! **Unknown still means refused** (AGENTS.md rule 3). What is refused is now what is
+//! neither: a WAV, a UTF-16 document, an object file, a file that stops mid-character.
+//!
+//! # SVG is the one image format that is also a program
+//!
+//! An SVG is XML that can carry `<script>`, event handlers and external references, and it
+//! is accepted here — stored exactly as it arrived. **Nothing sanitises it**, deliberately:
+//! stripping script out of XML is a losing game, and a half-sanitised file is worse than an
+//! honestly quarantined one, because it invites being trusted. What makes it safe is
+//! entirely on the way out, and lives in `gw_api::routes::attachments::content_disposition`:
+//! an SVG is **never** served inline, whatever else is, and the `nosniff` and
+//! `default-src 'none'; sandbox` headers back that up. The constraint for anything that ever
+//! renders an attachment in the interface: an SVG may be shown through `<img>` or a CSS
+//! background — contexts in which no browser executes it — and never through `<object>`,
+//! `<embed>`, `<iframe>`, or by putting its markup into this wiki's own DOM.
 //!
 //! # No parser runs here
 //!
@@ -38,6 +87,12 @@
 //! Office files is a known attack surface and belongs in a background job. The consequence
 //! is that an OOXML document (`.docx`) is `application/zip`, because that is what its first
 //! four bytes honestly say and telling the two apart needs a parser.
+//!
+//! [`looks_like_svg`] is held to the same rule and is the closest thing here to an
+//! exception, so its limits are written down where it is defined: it looks for a root
+//! element inside a bounded prefix and it resolves nothing, validates nothing and expands no
+//! entity. Everything it cannot answer within [`HEAD_BYTES`] is `text/plain`, which is the
+//! closed answer and costs nothing.
 //!
 //! # Why [`BlobStore`] is a struct and not a trait
 //!
@@ -71,8 +126,21 @@ use tokio::io::AsyncWriteExt;
 /// arrives so a chunked upload that declares nothing is refused as it goes.
 pub const MAX_ATTACHMENT_BYTES: u64 = 250 * 1024 * 1024;
 
-/// How many leading bytes [`sniff`] is given. The longest signature below is twelve.
-const SNIFF_BYTES: usize = 32;
+/// How many leading bytes are kept for typing.
+///
+/// A signature needs twelve at most. The rest is for [`looks_like_svg`], which has to see
+/// past an XML declaration, a comment and a DOCTYPE to find a root element — and which stops
+/// looking here rather than following a comment of arbitrary length. A kilobyte per upload
+/// in flight is nothing beside the 250 MB the upload itself may be.
+const HEAD_BYTES: usize = 1024;
+
+/// What text is served as, charset included.
+///
+/// The charset is not decoration: it is the one thing about these bytes that has been
+/// *proved* rather than assumed — [`TextScan`] validated every one of them as UTF-8 — and
+/// stating it is what stops a browser guessing an encoding under which the same bytes say
+/// something else.
+const TEXT_MEDIA_TYPE: &str = "text/plain; charset=utf-8";
 
 /// The media types this wiki will store, and the byte signatures that identify them.
 ///
@@ -83,10 +151,11 @@ const SNIFF_BYTES: usize = 32;
 /// `RIFF????WEBP` and ISO-BMFF's `????ftyp` need.
 type Signature = (&'static [(usize, u8)], &'static str);
 
-/// Take the leading bytes of a file and say what it is, or refuse.
+/// Take the leading bytes of a file and match them against the signature allowlist.
 ///
-/// `None` is the answer for every byte string this wiki does not serve, including an empty
-/// one and one too short to carry a signature. It is never "probably text".
+/// `None` means "no format claimed these bytes", including for an empty prefix and one too
+/// short to carry a signature. It is never "probably text" — text is not a signature, and
+/// [`TextScan`] answers that question over the whole stream instead.
 pub fn sniff(head: &[u8]) -> Option<&'static str> {
     /// `(offset, byte)` pairs that must all match.
     const SIGNATURES: &[Signature] = &[
@@ -164,6 +233,123 @@ pub fn sniff(head: &[u8]) -> Option<&'static str> {
                 .all(|(offset, byte)| head.get(*offset) == Some(byte))
         })
         .map(|(_, media_type)| *media_type)
+}
+
+/// Whether these leading bytes open an SVG document.
+///
+/// Deliberately shallow, and the shallowness is the point — the module header says no parser
+/// runs here. It skips a byte order mark and leading whitespace, and then asks one of two
+/// questions:
+///
+/// * does the document open with `<svg`, which is what an exported icon does; or
+/// * does it open with an XML declaration and mention `<svg` within [`HEAD_BYTES`], which is
+///   what an editor writes — a declaration, then a comment or a DOCTYPE, then the root.
+///
+/// It resolves no entity, reads no attribute and validates nothing. Being wrong in either
+/// direction is cheap and that is why so little machinery is justified: an SVG this does not
+/// recognise is `text/plain`, stored and served exactly as safely; and a text file this
+/// mistakes for an SVG is served as `image/svg+xml` under the same
+/// `Content-Disposition: attachment` a real one cannot escape either.
+fn looks_like_svg(head: &[u8]) -> bool {
+    let head = head.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(head);
+    let start = head
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(head.len());
+    let head = &head[start..];
+    if head.starts_with(b"<svg") {
+        return true;
+    }
+    head.starts_with(b"<?xml") && head.windows(4).any(|window| window == b"<svg")
+}
+
+/// The running answer to "is all of this text", kept across the chunks of one upload.
+///
+/// A signature is decided from the head; this cannot be, because the property is about every
+/// byte. So it is folded through the stream: each chunk is validated as UTF-8 and scanned
+/// for control characters, and the verdict can only ever go from true to false.
+///
+/// The awkward part is that a multi-byte character does not respect a chunk boundary. An
+/// incomplete sequence at the end of a chunk is ordinary and is carried into the next one;
+/// an incomplete sequence at the end of the FILE is a truncated file and is not text. The
+/// two look identical byte-for-byte, and [`TextScan::partial`] is what tells them apart.
+#[derive(Debug)]
+struct TextScan {
+    /// False once anything has disqualified the stream. Never returns to true.
+    textual: bool,
+    /// The tail of a character split across a chunk boundary — at most three bytes.
+    /// Non-empty when the upload ends means the file stops mid-character.
+    partial: Vec<u8>,
+}
+
+impl TextScan {
+    fn new() -> Self {
+        Self {
+            textual: true,
+            partial: Vec::new(),
+        }
+    }
+
+    /// Fold one chunk into the verdict.
+    fn push(&mut self, chunk: &[u8]) {
+        if !self.textual {
+            return;
+        }
+        let joined: std::borrow::Cow<'_, [u8]> = if self.partial.is_empty() {
+            std::borrow::Cow::Borrowed(chunk)
+        } else {
+            let mut joined = std::mem::take(&mut self.partial);
+            joined.extend_from_slice(chunk);
+            std::borrow::Cow::Owned(joined)
+        };
+        let bytes = joined.as_ref();
+
+        let (valid, tail) = match std::str::from_utf8(bytes) {
+            Ok(text) => (text, &bytes[bytes.len()..]),
+            // `error_len() == None` is the one recoverable failure: the input ran out
+            // part-way through a character, which is what a chunk boundary looks like.
+            // Anything else is a byte sequence that cannot be UTF-8 at all.
+            Err(error) if error.error_len().is_none() => {
+                let split = error.valid_up_to();
+                let valid = std::str::from_utf8(&bytes[..split])
+                    .expect("`valid_up_to` is by definition valid");
+                (valid, &bytes[split..])
+            }
+            Err(_) => {
+                self.textual = false;
+                return;
+            }
+        };
+
+        // Tab, newline and carriage return are how text is laid out; every other control
+        // character — a NUL, a bell, a C1 escape — is how a binary file that happens to
+        // decode gives itself away. `char::is_control` covers C0, DEL and C1 alike.
+        if valid
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+        {
+            self.textual = false;
+            return;
+        }
+
+        self.partial.clear();
+        self.partial.extend_from_slice(tail);
+    }
+
+    /// What the finished stream is, or `None` if it was never text.
+    ///
+    /// `head` is only consulted to tell an SVG from everything else; the *acceptance* was
+    /// decided by the fold above, over all of it.
+    fn media_type(&self, head: &[u8]) -> Option<&'static str> {
+        if !self.textual || !self.partial.is_empty() {
+            return None;
+        }
+        Some(if looks_like_svg(head) {
+            "image/svg+xml"
+        } else {
+            TEXT_MEDIA_TYPE
+        })
+    }
 }
 
 /// Bytes that are on the mount under their own digest, and everything the database records
@@ -270,7 +456,8 @@ pub enum BlobOutcome {
     Accepted(PendingBlob),
     /// Past [`MAX_ATTACHMENT_BYTES`] (D-17).
     TooLarge,
-    /// The leading bytes match nothing in [`sniff`]'s allowlist.
+    /// Neither a signature nor text: the leading bytes match nothing in [`sniff`]'s
+    /// allowlist, and the stream as a whole is not valid UTF-8 free of control characters.
     UnknownType,
     /// Nothing arrived. Refused rather than stored, because a zero-byte attachment is a
     /// failed upload that would otherwise look like a successful one in the `Anhänge` list.
@@ -381,7 +568,8 @@ impl BlobStore {
             temp: Some(temp),
             file: None,
             hasher: Sha256::new(),
-            head: Vec::with_capacity(SNIFF_BYTES),
+            head: Vec::with_capacity(HEAD_BYTES),
+            text: TextScan::new(),
             byte_size: 0,
             max_bytes,
             over: false,
@@ -408,6 +596,9 @@ pub struct BlobWriter {
     file: Option<tokio::fs::File>,
     hasher: Sha256,
     head: Vec<u8>,
+    /// The textual verdict, folded through the stream. See [`TextScan`] for why this cannot
+    /// be decided from `head` the way a signature is.
+    text: TextScan,
     byte_size: u64,
     max_bytes: u64,
     /// Set once the cap is passed. The write stops there; [`BlobWriter::finish`] is what
@@ -422,6 +613,17 @@ impl BlobWriter {
         self.max_bytes
     }
 
+    /// What has arrived, or `None` for bytes this wiki will not store.
+    ///
+    /// **The signature is asked first, and that ordering is a decision.** A format that makes
+    /// a statement about itself is taken at its word, so `%PDF-` is a PDF even though those
+    /// five bytes are also perfectly good text. Only what claims nothing falls through to the
+    /// textual check, which is the weaker, more general answer and belongs after the specific
+    /// one.
+    fn media_type(&self) -> Option<&'static str> {
+        sniff(&self.head).or_else(|| self.text.media_type(&self.head))
+    }
+
     /// Take the next chunk of the body.
     ///
     /// Once the cap is passed nothing more is written or hashed — the remaining bytes are
@@ -434,10 +636,11 @@ impl BlobWriter {
             self.over = true;
             return Ok(());
         }
-        if self.head.len() < SNIFF_BYTES {
-            let want = SNIFF_BYTES - self.head.len();
+        if self.head.len() < HEAD_BYTES {
+            let want = HEAD_BYTES - self.head.len();
             self.head.extend_from_slice(&chunk[..want.min(chunk.len())]);
         }
+        self.text.push(chunk);
         self.hasher.update(chunk);
 
         // Opened on the first chunk rather than in `writer()`, so a refused upload that never
@@ -472,7 +675,7 @@ impl BlobWriter {
         if self.byte_size == 0 {
             return Ok(BlobOutcome::Empty);
         }
-        let Some(media_type) = sniff(&self.head) else {
+        let Some(media_type) = self.media_type() else {
             return Ok(BlobOutcome::UnknownType);
         };
 
@@ -545,9 +748,28 @@ mod tests {
 
     /// The same, stopping where the permission check would be: accepted, but not published.
     async fn accept(store: &BlobStore, bytes: &[u8]) -> BlobOutcome {
+        accept_chunks(store, &[bytes]).await
+    }
+
+    /// An upload that arrives in more than one piece, which is what every real one does.
+    ///
+    /// It matters for the textual half of the typing and for nothing else: a signature is
+    /// decided from the head, so a chunk boundary cannot move it, while "all of this is
+    /// text" is a property of every byte and therefore of the boundaries too.
+    async fn accept_chunks(store: &BlobStore, chunks: &[&[u8]]) -> BlobOutcome {
         let mut writer = store.writer().unwrap();
-        writer.push(bytes).await.unwrap();
+        for chunk in chunks {
+            writer.push(chunk).await.unwrap();
+        }
         writer.finish().await.unwrap()
+    }
+
+    /// What an accepted upload was typed as, or `None` for a refusal.
+    fn typed(outcome: BlobOutcome) -> Option<&'static str> {
+        match outcome {
+            BlobOutcome::Accepted(pending) => Some(pending.describe().media_type),
+            _ => None,
+        }
     }
 
     fn refusal(outcome: BlobOutcome) -> String {
@@ -652,16 +874,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BlobStore::open(dir.path()).unwrap();
 
-        // Plain text, an SVG and an HTML document: three things a wiki plausibly wants to
-        // attach, all refused, all for the reason in the module header.
+        // Bytes that are neither a signature nor text. Each one is a real format a wiki
+        // might plausibly be handed, and each is refused because nothing here can say what
+        // it is: a WAV (RIFF without WEBP), a UTF-16 document, a compiled object file.
         for bytes in [
-            &b"just some words"[..],
-            &b"<svg xmlns=\"http://www.w3.org/2000/svg\"><script/></svg>"[..],
-            &b"<!doctype html><script>alert(1)</script>"[..],
+            &b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00"[..],
+            &b"\xff\xfeT\x00e\x00x\x00t\x00"[..],
+            &b"\x7fELF\x02\x01\x01\x00"[..],
+            // Valid UTF-8 up to the last byte, and then it stops mid-character.
+            &b"beinahe Text \xc3"[..],
+            // One control character that is not tab, newline or carriage return.
+            &b"eine Zeile\x07mit einer Glocke"[..],
         ] {
             assert_eq!(
                 refusal(accept(&store, bytes).await),
-                refusal(BlobOutcome::UnknownType)
+                refusal(BlobOutcome::UnknownType),
+                "{bytes:?}"
             );
         }
         assert!(stored(&store).is_empty(), "nothing may reach the mount");
@@ -771,5 +999,161 @@ mod tests {
         ] {
             assert_eq!(sniff(bytes), expected, "{bytes:?}");
         }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // The textual half: a validity check rather than a signature.
+    // ---------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn text_markdown_and_csv_are_all_one_type_because_the_bytes_do_not_say() {
+        // The honest answer, asserted rather than described: nothing in these bytes tells
+        // the three apart, so the wiki does not pretend it can. Sniffing for commas and
+        // calling it CSV would be a guess dressed as a measurement.
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(dir.path()).unwrap();
+        for bytes in [
+            &b"nur ein paar Worte\n"[..],
+            &b"# Ueberschrift\n\n- ein Punkt\n- noch einer\n"[..],
+            &b"Name,Wert\nBlutdruck,120/80\n"[..],
+            // A tab, a CRLF and a non-ASCII character are all ordinary text.
+            "Spalte\tWert\r\nGr\u{f6}\u{df}e\t42\r\n".as_bytes(),
+        ] {
+            assert_eq!(
+                typed(accept(&store, bytes).await),
+                Some("text/plain; charset=utf-8"),
+                "{bytes:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_svg_is_typed_as_the_image_it_is_and_not_as_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(dir.path()).unwrap();
+        for bytes in [
+            &b"<svg xmlns=\"http://www.w3.org/2000/svg\"><rect/></svg>"[..],
+            // What an editor writes: a declaration, a comment, then the root element.
+            &b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- Inkscape -->\n<svg/>"[..],
+            // A byte order mark and leading whitespace in front of it change nothing.
+            &b"\xef\xbb\xbf\n  <svg viewBox=\"0 0 1 1\"/>"[..],
+        ] {
+            assert_eq!(
+                typed(accept(&store, bytes).await),
+                Some("image/svg+xml"),
+                "{bytes:?}"
+            );
+        }
+
+        // And an SVG carrying script is stored exactly as given — never sanitised, never
+        // refused for its contents. What makes it safe is how it is SERVED; see
+        // `crates/gw-api/src/routes/attachments.rs`.
+        let dangerous = &b"<svg xmlns=\"http://www.w3.org/2000/svg\" onload=\"alert(1)\">\
+                           <script>alert(2)</script></svg>"[..];
+        let stored_blob = write(&store, dangerous).await.expect("stored as given");
+        assert_eq!(stored_blob.media_type, "image/svg+xml");
+        assert_eq!(
+            std::fs::read(store.path_for(&stored_blob.sha256).unwrap()).unwrap(),
+            dangerous,
+            "the bytes on the mount are the bytes that arrived, script and all"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signature_decides_before_the_text_check_ever_runs() {
+        // `%PDF-` is perfectly good text, and these bytes are a PDF. A format that makes a
+        // statement about itself is taken at its word before anything is inferred.
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(dir.path()).unwrap();
+        assert_eq!(
+            typed(accept(&store, b"%PDF-1.7\nnothing but text in here\n").await),
+            Some("application/pdf")
+        );
+    }
+
+    #[tokio::test]
+    async fn markup_is_stored_as_text_rather_than_refused_or_believed() {
+        // The deliberate consequence of accepting text, and the reason it is safe: Markdown
+        // may legitimately contain HTML, so refusing HTML would refuse Markdown. What stops
+        // it being dangerous is that the wiki never calls it HTML — `text/plain`, `nosniff`
+        // and a `Content-Disposition: attachment` are what the browser is handed.
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(dir.path()).unwrap();
+        assert_eq!(
+            typed(accept(&store, b"<!doctype html><script>alert(1)</script>").await),
+            Some("text/plain; charset=utf-8")
+        );
+    }
+
+    #[tokio::test]
+    async fn text_is_decided_over_every_byte_and_not_over_the_first_ones() {
+        // The difference in kind between this and a signature. A file whose first kilobyte
+        // is a licence header and whose remainder is a binary payload is not text, and only
+        // a check that sees the whole stream can say so.
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(dir.path()).unwrap();
+        let mut bytes = b"# Lizenz\n\nDieser Text ist harmlos.\n".repeat(40);
+        bytes.extend_from_slice(&[0x00, 0xff, 0xfe, 0x00]);
+        assert_eq!(
+            refusal(accept(&store, &bytes).await),
+            refusal(BlobOutcome::UnknownType)
+        );
+        assert!(stored(&store).is_empty());
+        assert_eq!(temporaries(&store), 0);
+    }
+
+    #[tokio::test]
+    async fn a_character_split_across_two_chunks_is_still_one_character() {
+        // An upload arrives in pieces and a multi-byte character does not respect them. The
+        // scan carries the tail of an incomplete sequence across the boundary; without that
+        // every chunked upload of non-ASCII text would be refused as "not UTF-8".
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(dir.path()).unwrap();
+        let text = "Gr\u{f6}\u{df}e und Ma\u{df}e \u{2014} \u{1f600}".as_bytes();
+        for split in 1..text.len() {
+            let (head, tail) = text.split_at(split);
+            assert_eq!(
+                typed(accept_chunks(&store, &[head, tail]).await),
+                Some("text/plain; charset=utf-8"),
+                "split at {split}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_that_ends_mid_character_is_not_text() {
+        // The other side of carrying the tail: an incomplete sequence at the END of the
+        // upload is a truncated file, not a chunk boundary, and must not be accepted.
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(dir.path()).unwrap();
+        assert_eq!(
+            refusal(accept_chunks(&store, &[b"Gr", b"\xc3"]).await),
+            refusal(BlobOutcome::UnknownType)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_byte_order_mark_is_accepted_and_never_removed() {
+        // Nothing on this path may alter the bytes: the digest IS the address, so a store
+        // that stripped a BOM would hand back a file whose hash the uploader cannot
+        // reproduce from their own copy.
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(dir.path()).unwrap();
+        let with_bom = b"\xef\xbb\xbfHallo\n";
+        let blob = write(&store, with_bom)
+            .await
+            .expect("a BOM is not a refusal");
+        assert_eq!(blob.media_type, "text/plain; charset=utf-8");
+        assert_eq!(blob.byte_size, with_bom.len() as i64);
+        assert_eq!(
+            std::fs::read(store.path_for(&blob.sha256).unwrap()).unwrap(),
+            with_bom
+        );
+        // UTF-16 carries a byte order mark too, and is not UTF-8: refused rather than
+        // stored as text nobody could read.
+        assert_eq!(
+            refusal(accept(&store, b"\xff\xfeH\x00a\x00l\x00l\x00o\x00").await),
+            refusal(BlobOutcome::UnknownType)
+        );
     }
 }
