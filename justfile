@@ -131,6 +131,12 @@ behaviour-fixture:
 # exactly what to run instead of failing with docker's own message, which names the image
 # but not the fix — an agent hit precisely this and worked around it by hand-symlinking a
 # different image's browser, which is not something to leave as folklore.
+#
+# EXPECT TO PULL IT AGAIN, PERIODICALLY, HAVING PULLED IT BEFORE. The homelab's Semaphore
+# `prune-docker` playbook runs fleet-wide every ~3 days and removes unreferenced images, and
+# this one is unreferenced by design — nothing runs it between harness runs. It vanished
+# exactly that way on 2026-09-01, a week after being pulled. That is the prune working as
+# intended, not a fault here and not a reason to keep a container alive to pin it.
 behaviour: behaviour-fixture
     #!/usr/bin/env bash
     set -euo pipefail
