@@ -1914,8 +1914,11 @@ const PURGE_PAGE = '/verweisbeispiel/verweist-zurueck';
  * resolves instantly — the assertion after it then reads the URL of the page that has not
  * navigated yet. That failure looked exactly like a broken form, and was not one.
  */
-async function submit(page, name) {
-  const button = page.getByRole('button', { name });
+async function submit(page, name, exact = false) {
+  // `exact` because a file input is a BUTTON in the accessibility tree and takes its name from
+  // its own label, so a substring match can resolve to two controls on one form. Group K found
+  // that; nothing in Group J needs it, and the default keeps those calls unchanged.
+  const button = page.getByRole('button', { name, exact });
   await button.waitFor({ state: 'visible', timeout: 10_000 });
   const before = page.url();
   await button.click();
@@ -2111,6 +2114,216 @@ await check('J6 a purge names every page it is about to destroy, and then destro
   );
   const weg = await page.request.get(BASE + PURGE_PAGE);
   assert(weg.status() === 404, `a purged page should be gone; it answered ${weg.status()}`);
+});
+
+// ---------------------------------------------------------------------------------------
+// Group K — attachments: what a page carries besides its words, and how it gets there
+//
+// Against `/rundgang`, where the fixture's identity (`sergej:editors`) holds **write** — the
+// same grant Group I's tagging check needs, and for the same reason: without it the upload
+// would 403 and this group would prove nothing while still reporting "ok" for having correctly
+// detected a refusal. `/start-hier` is the other half: no grant at all, so it is readable at
+// the public baseline and not writable, which is what K5 checks the withheld control against.
+//
+// **These checks really attach files**, and nothing detaches them — there is no detach control
+// in this interface yet (see the note in `PageAttachments.svelte`). `behaviour-fixture` deletes
+// and reseeds the database on every run, so the rows go with it; the bytes stay on the media
+// mount, which is exactly what ADR 0013 says happens and is bounded by the distinct files ever
+// uploaded. Two small probes.
+//
+// **What is NOT checked here is the inline placement.** D-15 also puts a file inside the prose;
+// that needs a new `BlockKind` and is its own piece of work. Nothing in this group looks in the
+// document, because there is nothing there to look for.
+//
+// What is also not checked is who may see which file. `Store::attachments_for` decides that,
+// per document, through the same body a page read ends in, and it is tested there — proving it
+// end to end would need an attachment on a page this identity cannot read, and putting one
+// there means a write this identity cannot make.
+// ---------------------------------------------------------------------------------------
+
+/** Write granted: the page Group K attaches to. */
+const ATTACH_PAGE = '/rundgang';
+/** No grant at all: readable at the public baseline, and not writable. */
+const READONLY_PAGE = '/start-hier';
+
+/**
+ * A PNG, as far as anything that types files by their bytes is concerned.
+ *
+ * Eight bytes of signature and a little padding. `gw_store::blobs::sniff` compares byte
+ * prefixes and runs no parser, so this is a PNG to the wiki — and the padding is there only so
+ * the size shown on the page is a number worth asserting.
+ */
+const PNG = Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  Buffer.alloc(120, 0x42)
+]);
+
+/** Bytes that are no known format and are not text either — 0xFF is not valid UTF-8. */
+const NONSENSE = Buffer.from([0x00, 0x01, 0x02, 0xff, 0xfe, 0x00, 0x03]);
+
+/** Choose a file for the one file field on the page and send it. */
+async function attach(page, name, mimeType, buffer) {
+  const feld = page.locator('#gw-anhang-datei');
+  await feld.waitFor({ state: 'visible', timeout: 10_000 });
+  await feld.setInputFiles({ name, mimeType, buffer });
+  await submit(page, 'Hochladen', true);
+}
+
+await check('K1 the Anhänge list and its upload are in the first response, before any script', async (page) => {
+  // A plain HTTP fetch: nothing renders and nothing hydrates. What comes back is what a reader
+  // with JavaScript switched off receives — which is where the list and the control have to
+  // be, because a control that only works once a bundle arrives is one that looks live and
+  // does nothing.
+  const response = await page.request.get(BASE + ATTACH_PAGE);
+  assert(response.ok(), `expected 200 from ${ATTACH_PAGE}, got ${response.status()}`);
+  const html = await response.text();
+
+  const region = html.match(/<section[^>]*id="gw-anhaenge"[\s\S]*?<\/section>/)?.[0];
+  assert(region !== undefined, 'no Anhänge section in the server-rendered HTML');
+  assert(/Anhänge/.test(region), 'the section does not name itself');
+  // Below the document: the list is a fact ABOUT the page, wanted once you have read it. The
+  // topics are the opposite case and sit under the title.
+  assert(
+    html.indexOf('id="gw-anhaenge"') > html.indexOf('<article'),
+    'the Anhänge section is not below the document'
+  );
+
+  // A real multipart form submission, not a click handler.
+  assert(
+    /<form[^>]*method="post"[^>]*action="\?\/anhaengen"/.test(region),
+    'attaching a file is not a real form submission'
+  );
+  assert(
+    region.includes('enctype="multipart/form-data"'),
+    'the upload form would not carry a file at all'
+  );
+  // Labelled, so the field can be reached and named rather than being a bare button.
+  assert(
+    /<label[^>]*for="gw-anhang-datei"/.test(region) &&
+      /<input[^>]*id="gw-anhang-datei"[^>]*type="file"/.test(region),
+    'the file field is not properly labelled'
+  );
+  // And it states no list of its own: `gw_store::blobs::sniff` owns the accepted set and it is
+  // being widened. An `accept` attribute here would refuse a file the wiki would have taken,
+  // before the request was made and with nothing in any log to say why.
+  assert(
+    !/accept=/.test(region),
+    'the upload field carries its own list of file types, which is a second answer that goes stale'
+  );
+});
+
+await check('K2 a file really attaches, and the page says what it is, how big, and who put it there', async (page) => {
+  const NAME = 'probe-bild.png';
+  await page.goto(BASE + ATTACH_PAGE, { waitUntil: 'domcontentloaded' });
+
+  // The declared type is deliberately WRONG. `gw_store::blobs::sniff` reads the bytes, and
+  // there is nowhere in the request for an uploader-chosen type to travel — so what the page
+  // shows afterwards must be `image/png`, whatever this says.
+  await attach(page, NAME, 'application/pdf', PNG);
+
+  assert(
+    page.url().endsWith('#gw-anhaenge'),
+    `a finished upload should come back to the Anhänge section, landed on ${page.url()}`
+  );
+  // Announced, not merely drawn: the fragment moves focus to the section on a real navigation,
+  // and a region that has just received focus is read out. Native form submission, no script.
+  await page.waitForFunction(() => document.readyState === 'complete', { timeout: 10_000 });
+  const focused = await page.evaluate(() => document.activeElement?.id ?? '');
+  assert(focused === 'gw-anhaenge', `the Anhänge section should take focus, got "${focused}"`);
+
+  const region = page.locator('#gw-anhaenge');
+  const text = await region.innerText();
+  assert(text.includes(NAME), `the list does not name the file that was just attached: ${text}`);
+  assert(/ist jetzt angehängt/.test(text), `the arrival is not stated: ${text}`);
+  // The type as the BYTES say it is, never as the upload claimed.
+  assert(text.includes('image/png'), `the list does not say what the bytes are: ${text}`);
+  assert(!text.includes('application/pdf'), `the list echoed the type the upload declared: ${text}`);
+  // Size and type in words, not an icon: what somebody needs before fetching it.
+  assert(/\bBild\b/.test(text), `the kind of file is not stated in German: ${text}`);
+  assert(/\d+(,\d)?\s?(B|kB|MB|GB)\b/.test(text), `the size is not stated: ${text}`);
+  assert(/Hochgeladen von/.test(text), `who attached it is not stated: ${text}`);
+
+  const status = await page.locator('#gw-anhaenge [role="status"]').first().innerText();
+  assert(status.includes(NAME), `the announcement does not name the file: ${status}`);
+
+  // And it is really attached, not merely drawn once: a fresh, scriptless request says so.
+  const wieder = await page.request.get(BASE + ATTACH_PAGE);
+  assert(
+    (await wieder.text()).includes(NAME),
+    'the file is gone from the page it was just attached to'
+  );
+});
+
+await check('K3 the download is a link that serves the bytes, addressed by page and never by hash', async (page) => {
+  // Uses the file K2 attached. The address is the API's own — D-16 makes a download authorised
+  // against the page it was reached through, which is only true while the page is in the
+  // address and the bytes are not.
+  const html = await (await page.request.get(BASE + ATTACH_PAGE)).text();
+  const region = html.match(/<section[^>]*id="gw-anhaenge"[\s\S]*?<\/section>/)?.[0];
+  assert(region !== undefined, 'no Anhänge section to take a download address from');
+  const href = region.match(/<a[^>]*href="(\/api\/attachment\/[^"]+)"/)?.[1];
+  assert(href !== undefined, 'the attachment is not offered as a link at all');
+
+  // The page is in the address; the content address is nowhere, on the page or in the link.
+  assert(href.includes(ATTACH_PAGE), `the download address does not name the page: ${href}`);
+  assert(!/[0-9a-f]{40,}/.test(href), `the download address carries a digest: ${href}`);
+  assert(
+    !/[0-9a-f]{64}/.test(region) && !/sha256/i.test(region),
+    'the rendered page carries a content address'
+  );
+
+  // A link, so a right-click saves it and hydration is irrelevant — and it really serves.
+  const datei = await page.request.get(BASE + href);
+  assert(datei.ok(), `the download should serve the file, got ${datei.status()}`);
+  assert(
+    datei.headers()['content-type'] === 'image/png',
+    `the download should be typed by its bytes, got ${datei.headers()['content-type']}`
+  );
+  assert(
+    datei.headers()['x-content-type-options'] === 'nosniff',
+    'the download lets the browser decide the bytes are something else'
+  );
+  const bytes = await datei.body();
+  assert(bytes.length === PNG.length, `expected ${PNG.length} bytes back, got ${bytes.length}`);
+});
+
+await check('K4 a file this wiki will not store is refused in the reader s own words', async (page) => {
+  // Bytes that are no known format and are not text either. WHICH types are accepted is the
+  // server's answer and is being widened, so this check asserts the SHAPE of the refusal —
+  // German framing carrying the server's own sentence — and never the sentence itself.
+  const NAME = 'probe-unbekannt.bin';
+  await page.goto(BASE + ATTACH_PAGE, { waitUntil: 'domcontentloaded' });
+  await attach(page, NAME, 'application/octet-stream', NONSENSE);
+
+  const alarm = page.locator('#gw-anhaenge [role="alert"]').first();
+  await alarm.waitFor({ state: 'visible', timeout: 10_000 });
+  const said = await alarm.innerText();
+  assert(/nichts angehängt/.test(said), `the refusal must promise that nothing was attached: ${said}`);
+  assert(
+    /Der Server nennt den Grund:/.test(said),
+    `the refusal must carry what the server said rather than a bare status: ${said}`
+  );
+  assert(!/^Fehler/.test(said.trim()), `a bare status code is not an explanation: ${said}`);
+
+  // The refusal removed nothing and attached nothing.
+  const html = await (await page.request.get(BASE + ATTACH_PAGE)).text();
+  assert(!html.includes(NAME), 'a refused upload was attached anyway');
+  assert(html.includes('probe-bild.png'), 'a refused upload took the existing list with it');
+});
+
+await check('K5 a page this reader may not write offers no way to attach anything', async (page) => {
+  // No grant on this path, so `group:editors` reaches it at the public baseline: readable, not
+  // writable. `may_write` comes off the same authorisation that produced the list (ADR 0010),
+  // so a control withheld on it is one the API would have refused — never a guess.
+  const response = await page.request.get(BASE + READONLY_PAGE);
+  assert(response.ok(), `expected 200 from ${READONLY_PAGE}, got ${response.status()}`);
+  const html = await response.text();
+
+  assert(!html.includes('?/anhaengen'), 'an upload control was offered on a page this reader may not write');
+  assert(
+    !/id="gw-anhang-datei"/.test(html),
+    'a file field was drawn on a page this reader may not write'
+  );
 });
 
 await browser.close();

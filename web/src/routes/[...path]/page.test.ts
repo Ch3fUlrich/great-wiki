@@ -5,6 +5,7 @@ import { ANONYMOUS, type Backlink, type DocumentView, type Me, type TreeNode } f
 import type { BoardNotice, BoardResponse, BoardTask } from '$lib/board';
 import type { Block } from '$lib/blocks/render';
 import type { SidebarMode, Topic, TopicSummary } from '$lib/topics';
+import type { Attachment } from '$lib/attachments';
 
 /**
  * The whole reader page, rendered exactly as the server renders it.
@@ -63,6 +64,23 @@ const alleThemen: TopicSummary[] = [
   { path: '/rundgang', name: 'Rundgang', display_path: 'Rundgang', documents: 3 }
 ];
 
+/**
+ * What `GET /api/attachments/{path}` says this page carries (D-15).
+ *
+ * `href` is the API's own, used verbatim: a download is authorised against the page it was
+ * reached through, which is only true while the page is in the address and the bytes are not.
+ */
+const anhaenge: Attachment[] = [
+  {
+    filename: 'Befund 2024.pdf',
+    media_type: 'application/pdf',
+    byte_size: 1_258_291,
+    uploaded_at: '2026-09-01 09:30:00',
+    uploaded_by_name: 'Sergej',
+    href: '/api/attachment/Befund%202024.pdf/rundgang/import-export'
+  }
+];
+
 const body: Block = {
   kind: 'doc',
   content: [{ kind: 'paragraph', content: [{ kind: 'text', text: 'Ein Satz.' }] }]
@@ -97,6 +115,10 @@ function html(
     seitenThemenFehler = null,
     seitenleiste = 'seiten',
     loeschen = false,
+    dateien = anhaenge,
+    anhaengeDarfSchreiben = false,
+    anhaengeFehler = null,
+    hochgeladen = null,
     form = null
   }: {
     me?: Me;
@@ -110,7 +132,11 @@ function html(
     seitenThemenFehler?: string | null;
     seitenleiste?: SidebarMode;
     loeschen?: boolean;
-    form?: { wo: 'thema' | 'loeschen'; fehler: string; getippt: string } | null;
+    dateien?: Attachment[];
+    anhaengeDarfSchreiben?: boolean;
+    anhaengeFehler?: string | null;
+    hochgeladen?: Attachment | null;
+    form?: { wo: 'thema' | 'loeschen' | 'anhang'; fehler: string; getippt: string } | null;
   } = {}
 ): string {
   return render(Page, {
@@ -138,7 +164,13 @@ function html(
         themen: alle,
         themenFehler: null,
         seitenThemen: themen,
-        seitenThemenFehler
+        seitenThemenFehler,
+        // D-15's list, from the one endpoint that authorises it and answers `may_write` off
+        // the same authorisation (ADR 0010).
+        anhaenge: dateien,
+        anhaengeDarfSchreiben,
+        anhaengeFehler,
+        hochgeladen
       },
       form
     }
@@ -585,5 +617,89 @@ describe('deleting the page you are reading', () => {
     });
     const themen = out.match(/<nav[^>]*aria-label="Themen dieser Seite"[\s\S]*?<\/nav>/)?.[0];
     expect(themen).toContain('Das ist kein Thema.');
+  });
+});
+
+/**
+ * The `Anhänge` section on the page (D-15).
+ *
+ * The component beside it proves what the section says; what is pinned here is that it is
+ * **on this page, in the first response**, that the upload control is offered on the same pair
+ * `Store::attach` checks, and that a refused upload is rendered where the upload is — not
+ * inside the topic field, which is a different control with a different permission.
+ *
+ * **Inline placement is deliberately not here and is not coming from this change.** D-15 also
+ * puts a file inside the prose; that needs a new `BlockKind` with four hand-maintained mirrors
+ * that fail silently, and it is its own piece of work. Nothing below reaches into the document.
+ */
+describe('what the page carries besides its words', () => {
+  it('renders the Anhänge section in the first response', () => {
+    const out = html();
+    expect(out).toContain('Anhänge');
+    expect(out).toContain('Befund 2024.pdf');
+    expect(out).toContain('id="gw-anhaenge"');
+  });
+
+  it('puts the list below the document, where a reader is finished with it', () => {
+    const out = html();
+    expect(out.indexOf('id="gw-anhaenge"')).toBeGreaterThan(out.indexOf('<article'));
+  });
+
+  it('makes each file a link to the address the API sent', () => {
+    // D-16: never one this page assembled, and never one carrying a content address.
+    const out = html();
+    expect(out).toContain('href="/api/attachment/Befund%202024.pdf/rundgang/import-export"');
+    expect(out).not.toMatch(/[0-9a-f]{40,}/);
+  });
+
+  it('offers the upload only to somebody who may write AND is signed in', () => {
+    // The pair `Store::attach` checks, and it checks the account FIRST — the row records who
+    // put the file there. A path carrying `anyone: write` is a public share link.
+    expect(html(container, { me: signedIn, anhaengeDarfSchreiben: true })).toContain('?/anhaengen');
+    expect(html(container, { me: ANONYMOUS, anhaengeDarfSchreiben: true })).not.toContain('?/anhaengen');
+    expect(html(container, { me: signedIn, anhaengeDarfSchreiben: false })).not.toContain('?/anhaengen');
+  });
+
+  it('says why the control is not there, rather than leaving a gap', () => {
+    // A control that is silently missing reads as a fault, not as an answer — the pattern
+    // `/papierkorb` established for its own withheld restore.
+    expect(html(container, { me: signedIn, anhaengeDarfSchreiben: false })).toContain('bearbeiten darf');
+    expect(html(container, { me: ANONYMOUS, anhaengeDarfSchreiben: true })).toContain('angemeldet');
+  });
+
+  it('renders a refused upload beside the upload, never in the topic field', () => {
+    // Three controls on one page, three permissions, one `form`. Without the discriminator the
+    // refusal was drawn under a heading about topics, saying the wrong thing about the wrong
+    // control — the defect `/projekte` already paid for once.
+    const fehler = 'Dieser Dateityp wird hier nicht gespeichert. Es wurde nichts angehängt.';
+    const out = html(container, {
+      me: signedIn,
+      anhaengeDarfSchreiben: true,
+      form: { wo: 'anhang', fehler, getippt: '' }
+    });
+    expect(out).toContain(fehler);
+    // The topics region is elsewhere in the page and must not have picked it up.
+    const themenRegion = out.slice(
+      out.indexOf('aria-label="Themen dieser Seite"'),
+      out.indexOf('id="gw-anhaenge"')
+    );
+    expect(themenRegion).not.toContain(fehler);
+  });
+
+  it('announces which file arrived, in the region the redirect points at', () => {
+    const out = html(container, { me: signedIn, anhaengeDarfSchreiben: true, hochgeladen: anhaenge[0] });
+    expect(out).toMatch(/role="status"/);
+    expect(out).toContain('ist jetzt angehängt');
+  });
+
+  it('never says a page carries nothing because the request failed', () => {
+    const out = html(container, {
+      dateien: [],
+      anhaengeDarfSchreiben: true,
+      me: signedIn,
+      anhaengeFehler: 'Die Anhänge dieser Seite konnten nicht geladen werden (Fehler 500).'
+    });
+    expect(out).not.toContain('Keine Anhänge');
+    expect(out).toContain('Fehler 500');
   });
 });

@@ -44,6 +44,24 @@ const seitenThemen = [
   { path: '/rundgang/tabellen', name: 'Tabellen', display_path: 'Rundgang/Tabellen' }
 ];
 
+/**
+ * What `GET /api/attachments/{path}` says this page carries.
+ *
+ * `href` comes off the wire and is used verbatim — D-16 makes a download authorised against
+ * the page it was reached through, which is only true while the page is in the address. There
+ * is no digest on the wire and there must not be one here either.
+ */
+const anhaenge = [
+  {
+    filename: 'Befund 2024.pdf',
+    media_type: 'application/pdf',
+    byte_size: 1_258_291,
+    uploaded_at: '2026-09-01 09:30:00',
+    uploaded_by_name: 'Sergej',
+    href: '/api/attachment/Befund%202024.pdf/rundgang/tabellen'
+  }
+];
+
 const projekt: Project = {
   id: 'p1',
   home_path: '/rundgang/tabellen',
@@ -96,6 +114,10 @@ function spyFetch(overrides: Record<string, Answer> = {}, schreiben?: Answer) {
     '/api/links/backlinks': { status: 200, body: { backlinks: [] } },
     '/api/board': { status: 200, body: board },
     '/api/topics/document': { status: 200, body: { topics: seitenThemen } },
+    // Plural: the LIST. `/api/attachment/…` (singular) is the upload, and the two are
+    // deliberately different prefixes rather than one with a literal segment inside it —
+    // `includes` would otherwise match the upload against the listing's answer.
+    '/api/attachments': { status: 200, body: { attachments: anhaenge, may_write: true } },
     ...overrides
   };
   const sent: { url: string; method: string; body: string | undefined }[] = [];
@@ -140,9 +162,15 @@ interface Loaded {
   seitenThemenFehler: string | null;
 }
 
-/** The parts of an action event the two topic actions read. */
+/**
+ * The parts of an action event the actions on this page read.
+ *
+ * A real `FormData`, exactly as a browser submits one — including a `File`, which is what the
+ * upload arrives as. A click handler could not pass any of this, which is the point: every
+ * control on this page has to work before a bundle arrives.
+ */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function actionEvent(fetchFn: typeof fetch, fields: Record<string, string>): any {
+function actionEvent(fetchFn: typeof fetch, fields: Record<string, string | File>): any {
   const form = new FormData();
   for (const [name, value] of Object.entries(fields)) form.append(name, value);
   return {
@@ -158,9 +186,9 @@ function actionEvent(fetchFn: typeof fetch, fields: Record<string, string>): any
 
 /** Run an action and give back whatever it threw or returned, whichever it was. */
 async function runAction(
-  which: 'themaHinzufuegen' | 'themaEntfernen' | 'loeschen',
+  which: 'themaHinzufuegen' | 'themaEntfernen' | 'loeschen' | 'anhaengen',
   fetchFn: typeof fetch,
-  fields: Record<string, string>
+  fields: Record<string, string | File>
 ) {
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -426,5 +454,195 @@ describe('putting the page in the Papierkorb', () => {
     const { returned: thema } = await runAction('themaHinzufuegen', zweit, { thema: 'Neu' });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     expect((thema as any).data.wo).toBe('thema');
+  });
+});
+
+/**
+ * The `Anhänge` list, and the upload beside it (D-15).
+ *
+ * **One request, and it decides nothing.** `GET /api/attachments/{path}` authorises the list
+ * through the same body a page read ends in, and answers `may_write` off that very
+ * authorisation (ADR 0010). This loader carries both and computes neither — a second question
+ * about who may attach here would be a second answer, and the second answer is the one that
+ * gets it wrong.
+ *
+ * **A failure is stated and never takes the page down.** The list is an addition to a page,
+ * exactly as the board and the chips are. But an empty list and a failed request are different
+ * things, and rendering the first for the second would say this page carries nothing — which
+ * is a claim about the page, and the one claim this list exists to make truthfully.
+ *
+ * **The upload is a real form action.** The browser submits multipart, this action unpacks the
+ * file and forwards the bytes; the address carries the name. Nothing about it needs JavaScript.
+ */
+describe('what a page carries besides its words', () => {
+  it('asks the one listing endpoint, once, for this page', async () => {
+    const { urls, fetchFn } = spyFetch();
+    await runLoad(fetchFn);
+    const asked = urls.filter((url) => url.includes('/api/attachments'));
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toContain('/api/attachments/rundgang/tabellen');
+  });
+
+  it('carries the list and the write verdict it was answered with', async () => {
+    const { fetchFn } = spyFetch();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const data = (await runLoad(fetchFn)) as any;
+    expect(data.anhaenge).toEqual(anhaenge);
+    expect(data.anhaengeDarfSchreiben).toBe(true);
+    expect(data.anhaengeFehler).toBeNull();
+  });
+
+  it('withholds the write verdict when the API did not send one', async () => {
+    // Fail closed (AGENTS.md rule 3): an API that says nothing is an API this cannot ask, and
+    // a control offered on a missing field is a control offered on a guess.
+    const { fetchFn } = spyFetch({
+      '/api/attachments': { status: 200, body: { attachments: [] } }
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const data = (await runLoad(fetchFn)) as any;
+    expect(data.anhaengeDarfSchreiben).toBe(false);
+  });
+
+  it('never takes the page down when that request fails, and says what happened', async () => {
+    const { fetchFn } = spyFetch({ '/api/attachments': { status: 500, body: {} } });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const data = (await runLoad(fetchFn)) as any;
+    expect(data.doc.path).toBe('/rundgang/tabellen');
+    expect(data.anhaenge).toEqual([]);
+    expect(data.anhaengeFehler).toContain('500');
+    // And no upload control offered off the back of a failure.
+    expect(data.anhaengeDarfSchreiben).toBe(false);
+  });
+
+  it('names what has just arrived from the list itself, never from the address bar', async () => {
+    // The discipline `/papierkorb` applies to its own `?geloescht=`: a notice saying a file is
+    // attached while the list beside it does not show that file is the interface contradicting
+    // its own data.
+    const { fetchFn } = spyFetch();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const da = (await runLoad(fetchFn, '?hochgeladen=Befund%202024.pdf')) as any;
+    expect(da.hochgeladen?.filename).toBe('Befund 2024.pdf');
+
+    const { fetchFn: zweite } = spyFetch();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const erfunden = (await runLoad(zweite, '?hochgeladen=gibt-es-nicht.pdf')) as any;
+    expect(erfunden.hochgeladen).toBeNull();
+  });
+});
+
+describe('attaching a file to the page you are reading', () => {
+  const datei = (name = 'befund.pdf', bytes = new Uint8Array([0x25, 0x50, 0x44, 0x46])) =>
+    new File([bytes], name);
+
+  it('posts the bytes to the address that names this page and this file', async () => {
+    const { sent, fetchFn } = spyFetch({}, { status: 201, body: { filename: 'befund.pdf' } });
+    await runAction('anhaengen', fetchFn, { datei: datei() });
+
+    const call = sent.find((one) => one.method === 'POST');
+    // Filename first, page last — a `{*path}` catch-all must be the final segment of a route.
+    expect(call?.url).toContain('/api/attachment/befund.pdf/rundgang/tabellen');
+    // And no content address anywhere in it: D-16 authorises a download against the page.
+    expect(call?.url).not.toMatch(/[0-9a-f]{40,}/);
+  });
+
+  it('sends the file itself, with nothing wrapped around it', async () => {
+    const { sent, fetchFn } = spyFetch({}, { status: 201, body: {} });
+    const file = datei();
+    await runAction('anhaengen', fetchFn, { datei: file });
+    const call = sent.find((one) => one.method === 'POST');
+    // Not multipart and not JSON: the API reads the request body as the file, and there is
+    // deliberately nowhere in it for an uploader-chosen type to travel.
+    expect(call?.body).toBeInstanceOf(Blob);
+  });
+
+  it('comes back to the attachments of the page it was attached to', async () => {
+    const { fetchFn } = spyFetch({}, { status: 201, body: {} });
+    const { thrown } = await runAction('anhaengen', fetchFn, { datei: datei() });
+    // Post, redirect, get — so a reload does not offer to attach the file a second time. The
+    // fragment is what makes it ANNOUNCED rather than merely drawn: the browser moves focus to
+    // the section and a region that has just received focus is read out. No script involved.
+    expect(isRedirect(thrown) && (thrown as { location: string }).location).toBe(
+      '/rundgang/tabellen?hochgeladen=befund.pdf#gw-anhaenge'
+    );
+  });
+
+  it('refuses an empty field itself rather than asking the API about it', async () => {
+    const { sent, fetchFn } = spyFetch();
+    const { returned } = await runAction('anhaengen', fetchFn, {});
+    expect(isActionFailure(returned)).toBe(true);
+    expect(sent.some((call) => call.method === 'POST')).toBe(false);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((returned as any).data.wo).toBe('anhang');
+  });
+
+  it('refuses a file with no bytes in it, without a round trip', async () => {
+    const { sent, fetchFn } = spyFetch();
+    const { returned } = await runAction('anhaengen', fetchFn, {
+      datei: datei('leer.pdf', new Uint8Array())
+    });
+    expect(isActionFailure(returned)).toBe(true);
+    expect(sent.some((call) => call.method === 'POST')).toBe(false);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((returned as any).data.fehler).toContain('leer.pdf');
+  });
+
+  it('passes on what the API said about a type it will not store', async () => {
+    // The accepted set is `gw_store::blobs::sniff`'s and is being widened. Quoting it is the
+    // only way this sentence cannot go stale, and "Fehler 415" is a refusal nobody can act on.
+    const { returned } = await runAction(
+      'anhaengen',
+      spyFetch({}, { status: 415, body: { error: 'this wiki stores images, PDFs' } }).fetchFn,
+      { datei: datei('notizen.txt') }
+    );
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const data = (returned as any).data;
+    expect(data.fehler).toContain('this wiki stores images, PDFs');
+    expect(data.fehler).toContain('Es wurde nichts angehängt.');
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((returned as any).status).toBe(415);
+  });
+
+  it('passes on what the API said about a file that is too large', async () => {
+    const { returned } = await runAction(
+      'anhaengen',
+      spyFetch({}, { status: 413, body: { error: 'an attachment may be at most 250 MB' } }).fetchFn,
+      { datei: datei('scan.pdf') }
+    );
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((returned as any).data.fehler).toContain('an attachment may be at most 250 MB');
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((returned as any).status).toBe(413);
+  });
+
+  it('passes on the name the API says is already taken', async () => {
+    const { returned } = await runAction(
+      'anhaengen',
+      spyFetch({}, { status: 409, body: { error: '`befund.pdf` is already attached to this page' } })
+        .fetchFn,
+      { datei: datei() }
+    );
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((returned as any).data.fehler).toContain('already attached');
+  });
+
+  it('keeps a refusal out of the topic field, which is a different control', async () => {
+    // Two controls on one page, three permissions, one `form`. Without the discriminator a
+    // refused upload was rendered inside the topic field, under a heading about topics.
+    const { returned } = await runAction(
+      'anhaengen',
+      spyFetch({}, { status: 403, body: { error: 'forbidden' } }).fetchFn,
+      { datei: datei() }
+    );
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((returned as any).data.wo).toBe('anhang');
+  });
+
+  it('reports a request that never got an answer as 503, not as a cheerful 200', async () => {
+    const fetchFn = vi.fn(async () => {
+      throw new TypeError('fetch failed');
+    }) as unknown as typeof fetch;
+    const { returned } = await runAction('anhaengen', fetchFn, { datei: datei() });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((returned as any).status).toBe(503);
   });
 });

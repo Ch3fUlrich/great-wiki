@@ -4,6 +4,7 @@
   import BlockView from '$lib/components/BlockView.svelte';
   import Board from '$lib/components/Board.svelte';
   import Breadcrumb from '$lib/components/Breadcrumb.svelte';
+  import PageAttachments from '$lib/components/PageAttachments.svelte';
   import PageMeta from '$lib/components/PageMeta.svelte';
   import PageTopics from '$lib/components/PageTopics.svelte';
   import Subpages from '$lib/components/Subpages.svelte';
@@ -99,7 +100,13 @@
    * control. The same split `/projekte` makes between its create form and its delete.
    */
   const loeschFehler = $derived(form?.wo === 'loeschen' ? form.fehler : null);
-  const themaFehler = $derived(form?.wo === 'loeschen' ? null : (form?.fehler ?? null));
+  const anhangFehler = $derived(form?.wo === 'anhang' ? form.fehler : null);
+  // Matched POSITIVELY on its own name, not by excluding the others. It used to be
+  // `wo !== 'loeschen'`, which quietly made the topic field the home of every refusal nobody
+  // had claimed yet — so the third control added to this page (the upload) would have had its
+  // sentence drawn under a heading about topics. The exclusion form is a bug that arrives
+  // later, on somebody else's change.
+  const themaFehler = $derived(form?.wo === 'thema' ? form.fehler : null);
 
   /**
    * `null` means "whatever the URL said". The control is a real link to `?edit=1`, so it
@@ -349,6 +356,38 @@
       <p class="tafel-fehler" role="alert">{data.boardFehler}</p>
     {/if}
 
+    <!-- D-15: what this page carries besides its words, and the control that adds to it.
+
+         BELOW the document, deliberately. The list is the authority on what is attached — a
+         file cut out of the prose is still attached, which is the point of the decision — but
+         it is a fact ABOUT the page rather than part of it, and it is what you want when you
+         have finished reading. The topics sit under the title for the opposite reason: they
+         say what you are about to read.
+
+         Not in the context column beside it either: an attachment is fetched, opened and
+         added to, and 19rem of chrome is not the place for a 40 MB scan and a file field.
+
+         The two halves of the permission are handed over SEPARATELY rather than composed
+         here, because the section has to say which one is missing: `Store::attach` wants write
+         on the page and a signed-in, active account, and it checks the account first — the row
+         records who put the file there. `anhaengeDarfSchreiben` is the attachments endpoint's
+         own `may_write`, not the document's: the verdict from the very read that produced this
+         list (ADR 0010), so the control offered and the refusal that would follow pressing it
+         are one answer.
+
+         **Not inline in the prose, and that is not an omission.** D-15 also puts a file inside
+         the paragraph explaining it; that needs a new `BlockKind`, which is `#[non_exhaustive]`
+         with four hand-maintained mirrors that fail silently — one of them destroyed a
+         checklist in the CRDT and broadcast the deletion. It is its own piece of work, and
+         nothing here reaches into `data.body`. -->
+    <PageAttachments
+      anhaenge={data.anhaenge ?? []}
+      darfSchreiben={data.anhaengeDarfSchreiben === true}
+      angemeldet={data.me?.authenticated === true}
+      fehler={anhangFehler ?? data.anhaengeFehler ?? null}
+      hochgeladen={data.hochgeladen ?? null}
+    />
+
   </main>
 
   <!-- A plain `<div>`, not an `<aside>`. Everything in it is already its own landmark with
@@ -534,6 +573,7 @@
   .page > :global(.crumbs),
   .page > h1,
   .page > :global(.themen),
+  .page > :global(.anhaenge),
   .page > .editbar,
   .page > .loeschen,
   .page > .notice,

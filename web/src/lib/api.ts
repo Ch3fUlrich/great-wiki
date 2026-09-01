@@ -247,6 +247,19 @@ export async function apiSend<T>(
     return { status: 0, data: null, failure: { status: 0, message: null } };
   }
 
+  return answer<T>(res);
+}
+
+/**
+ * What a response came to: the data, or the refusal and the words it carried.
+ *
+ * Shared by {@link apiSend} and {@link apiUpload} so that a refusal is read the same way
+ * whatever the request body was. Dropping `{"error": "…"}` is how a 409 that names a way out
+ * becomes a bare "Fehler", and two copies of this is two places for that to happen in.
+ */
+async function answer<T>(
+  res: Response
+): Promise<{ status: number; data: T | null; failure: ApiFailure | null }> {
   const text = await res.text();
   if (!res.ok) {
     let message: string | null = null;
@@ -262,6 +275,50 @@ export async function apiSend<T>(
   // A 204 and an empty body are both legitimate for a DELETE.
   const data = text ? (JSON.parse(text) as T) : null;
   return { status: res.status, data, failure: null };
+}
+
+/**
+ * The one call whose body is **bytes**: attaching a file to a page.
+ *
+ * `POST /api/attachment/{filename}/{page}` takes the file and nothing else — no multipart, no
+ * JSON envelope, no declared type. That is not minimalism, and it is why this cannot be a
+ * `body:` on {@link apiSend}, which would JSON-encode the file: a `Content-Type` in the
+ * request is a type the *uploader* chose, and `gw_api::routes::attachments` records that the
+ * only way to be sure it is never echoed back is for there to be nowhere to put one. The name
+ * travels in the address, so it is in the log line and in the audit row without anything
+ * having to parse a body to find it.
+ *
+ * `application/octet-stream` is sent deliberately rather than letting `fetch` derive a header
+ * from the Blob: undici fills in a Blob's own `type` when the request names none, and that
+ * type is the browser's guess from the file extension — precisely the value that must not
+ * travel. Declaring "bytes" declares nothing.
+ *
+ * It shares `base()` and `proxySecret()` with the other two calls and must go on doing so: a
+ * second spelling of the attestation is the defect `api.test.ts` was written about.
+ *
+ * Used from a **form action**, where the browser's own multipart submission is unpacked and
+ * the file is forwarded — so the upload works with JavaScript switched off.
+ */
+export async function apiUpload<T>(
+  fetchFn: typeof fetch,
+  path: string,
+  cookie: string | null,
+  bytes: Blob
+): Promise<{ status: number; data: T | null; failure: ApiFailure | null }> {
+  const headers: Record<string, string> = { 'content-type': 'application/octet-stream' };
+  if (cookie) headers.cookie = cookie;
+  const secret = proxySecret();
+  if (secret) headers['X-GW-Proxy'] = secret;
+
+  let res: Response;
+  try {
+    res = await fetchFn(`${base()}${path}`, { method: 'POST', headers, body: bytes });
+  } catch {
+    // Status 0 is "no answer at all", kept apart from 5xx for the reason `apiSend` gives.
+    return { status: 0, data: null, failure: { status: 0, message: null } };
+  }
+
+  return answer<T>(res);
 }
 
 export function parseBody(doc: StoredDocument): Block {
