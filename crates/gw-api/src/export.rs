@@ -178,6 +178,14 @@ pub async fn run(store: &Store, principal: &Principal, content_dir: &Path) -> Re
             }
         };
 
+        // Through the permission-checked accessor a second time, exactly as the body above
+        // was: `store.document_topics_for` asks the same question about the same page, and
+        // taking the topics from an unchecked lookup on the strength of the read that just
+        // succeeded is the shortcut every aggregate view in this system refuses.
+        let topics = store
+            .document_topics_for(principal, &path)
+            .await?
+            .unwrap_or_default();
         let meta = FileMeta {
             title: doc.title.clone(),
             doc_type: doc.doc_type.clone(),
@@ -185,6 +193,7 @@ pub async fn run(store: &Store, principal: &Principal, content_dir: &Path) -> Re
             language: doc.language.clone(),
             sort_key: doc.sort_key,
             slug: doc.slug.clone(),
+            tags: topics.into_iter().map(|t| t.display_path).collect(),
         };
         let rendered = match render_file(&meta, &body) {
             Ok(rendered) => rendered,
@@ -336,6 +345,18 @@ pub struct FileMeta {
     pub language: String,
     pub sort_key: i64,
     pub slug: String,
+    /// The topics this page is filed under, as [`gw_store::Topic::display_path`] spells
+    /// them — `Medizin/Darm`, not `/medizin/darm`.
+    ///
+    /// Named `tags` because that is the frontmatter key, which is also the table's name;
+    /// the domain word is *topic*, and the design's own data model draws that line the same
+    /// way. [`gw_core::SeedMeta::tags`] is the other end of the same string.
+    ///
+    /// **The order is part of the contract**, and it is the store's order (canonical path)
+    /// rather than anything decided here. [`render_file`] re-imports its own output and
+    /// compares this list against what came back; a list rendered in a different order than
+    /// it was read in would refuse the page, and one refused page fails the whole export.
+    pub tags: Vec<String>,
 }
 
 /// The whole file — frontmatter and body — or the reason it cannot be written.
@@ -376,6 +397,11 @@ pub fn render_file(meta: &FileMeta, body: &Block) -> Result<String, String> {
         || reimported_meta.language != meta.language
         || reimported_meta.sort_key != meta.sort_key
         || reimported_meta.slug.as_deref().map(slugify) != Some(meta.slug.clone())
+        // Compared verbatim and IN ORDER. A topic decides which listings a page turns up in,
+        // so a file that came back filed under something else is a file that quietly moves
+        // the page in front of a different audience — the same class of change as
+        // `visibility`, which is why it is checked in the same place and not more gently.
+        || reimported_meta.tags != meta.tags
     {
         return Err(
             "its frontmatter re-imports as different metadata, which would move or \
@@ -501,6 +527,19 @@ fn frontmatter(meta: &FileMeta) -> Result<String, String> {
     put("slug", meta.slug.clone().into());
     put("language", meta.language.clone().into());
     put("sort_key", meta.sort_key.into());
+    // Written even when it is empty, for the reason above one step smaller: `tags: []` is
+    // how somebody reading an exported file learns the key exists at all. There is no
+    // silent-demotion argument here — an absent `tags` and an empty one mean the same thing
+    // — so this is about the format documenting itself, not about safety.
+    put(
+        "tags",
+        serde_yaml::Value::Sequence(
+            meta.tags
+                .iter()
+                .map(|tag| serde_yaml::Value::from(tag.as_str()))
+                .collect(),
+        ),
+    );
 
     let yaml = serde_yaml::to_string(&serde_yaml::Value::Mapping(map))
         .map_err(|e| format!("its metadata cannot be written as YAML ({e})"))?;

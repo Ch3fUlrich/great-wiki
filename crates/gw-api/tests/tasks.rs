@@ -67,6 +67,30 @@ async fn page(store: &Store, parent: Option<&str>, title: &str, body: Block) -> 
                 visibility: Visibility::Restricted,
                 body,
                 sort_key: 0,
+                topics: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap()
+}
+
+/// A page carrying one topic, which is the only way a topic comes into existence: there is
+/// no pre-creation step, by decision, so a topic exists because a page is about it.
+async fn topic(store: &Store, parent: Option<&str>, title: &str, topic: &str) -> String {
+    store
+        .create_document(
+            Author::Import,
+            &NewDocument {
+                parent_path: parent.map(str::to_string),
+                doc_type: DocumentType::Page,
+                title: title.into(),
+                slug: None,
+                language: "de".into(),
+                visibility: Visibility::Restricted,
+                body: empty_body(),
+                sort_key: 0,
+                topics: vec![topic.to_string()],
             },
             None,
         )
@@ -116,6 +140,9 @@ struct Fixture {
 async fn fixture() -> Fixture {
     let store = Store::open("sqlite::memory:").await.unwrap();
     page(&store, None, "Projekt", empty_body()).await;
+    // A topic that really exists, because `set_project_tag` refuses one that does not: the
+    // column has no foreign key behind it and the writer is what stands in for one.
+    topic(&store, Some("/projekt"), "Themenseite", "Thema").await;
     let offen = page(&store, Some("/projekt"), "Offen", empty_body()).await;
     let geheim = page(&store, Some("/projekt"), "Geheim", empty_body()).await;
 
@@ -1930,17 +1957,30 @@ async fn retagging_and_deleting_a_project_need_write_on_its_home_page() {
     let f = fixture().await;
     let uri = format!("/api/projects/{}", f.project);
 
-    let (status, _) = patch(&f.store, Some("leser"), &uri, json!({"tag_id": "thema"})).await;
+    let (status, _) = patch(&f.store, Some("leser"), &uri, json!({"topic": "Thema"})).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     let (status, _) = delete(&f.store, Some("leser"), &uri).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     let (status, _) = delete(&f.store, Some("fremder"), &uri).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    let (status, body) = patch(&f.store, Some("chef"), &uri, json!({"tag_id": "thema"})).await;
+    let (status, body) = patch(&f.store, Some("chef"), &uri, json!({"topic": "Thema"})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["tag_id"], json!("thema"));
-    let (status, body) = patch(&f.store, Some("chef"), &uri, json!({"tag_id": null})).await;
+    assert!(
+        body["tag_id"].is_string(),
+        "the project now points at a topic: {body}"
+    );
+    // And a topic nobody typed is refused rather than stored: there is no foreign key
+    // behind this column, so this refusal is the constraint.
+    let (status, _) = patch(
+        &f.store,
+        Some("chef"),
+        &uri,
+        json!({"topic": "Gibt Es Nicht"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) = patch(&f.store, Some("chef"), &uri, json!({"topic": null})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["tag_id"], Value::Null);
     let (status, body) = patch(&f.store, Some("chef"), &uri, json!({})).await;
@@ -2134,7 +2174,7 @@ async fn may_write_on_the_wire_agrees_with_what_a_write_actually_does() {
             &f.store,
             who,
             &format!("/api/projects/{}", f.project),
-            json!({ "tag_id": "marke" }),
+            json!({ "topic": "Thema" }),
         )
         .await;
         let changed_the_project = changed_the_project == StatusCode::OK;

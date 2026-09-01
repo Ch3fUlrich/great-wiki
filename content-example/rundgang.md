@@ -4,6 +4,7 @@ type: page
 visibility: public
 language: de
 sort_key: 1
+tags: [Rundgang]
 ---
 
 # Rundgang

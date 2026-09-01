@@ -53,6 +53,7 @@ async fn page(
                 visibility,
                 body: body(text),
                 sort_key: 0,
+                topics: Vec::new(),
             },
             None,
         )

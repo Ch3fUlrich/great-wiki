@@ -354,17 +354,28 @@ pub struct BoardQuery {
 #[derive(Debug, Deserialize)]
 pub struct NewProject {
     pub home_path: String,
+    /// The topic that pulls in documents from elsewhere (D-3), by name — `Medizin/Darm` or
+    /// `/medizin/darm`, the two spellings [`gw_store::Topic`] has — or absent for none.
+    ///
+    /// **A name and not the `tag_id` this used to take.** A topic's id is deliberately not
+    /// on the wire, so an id was a value no caller could obtain; and the column has no
+    /// foreign key behind it (`0011_tags.sql` records why SQLite cannot add one here), so
+    /// the store resolves the name and refuses one that names no topic. That refusal is the
+    /// constraint, and it is the reason this field changed shape rather than being left as
+    /// a string the database would have stored whatever it said.
     #[serde(default)]
-    pub tag_id: Option<String>,
+    pub topic: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ProjectChange {
-    /// The tag that pulls in documents from elsewhere (D-3), or `null` for none. Absent is
-    /// not "leave it alone" but "you named nothing" — a project has one changeable field, so
-    /// a change that omits it is a request with no content.
+    /// The topic that pulls in documents from elsewhere (D-3), by name, or `null` for none.
+    /// Absent is not "leave it alone" but "you named nothing" — a project has one changeable
+    /// field, so a change that omits it is a request with no content.
+    ///
+    /// See [`NewProject::topic`] for why this is a name rather than an id.
     #[serde(default, deserialize_with = "present")]
-    pub tag_id: Option<Option<String>>,
+    pub topic: Option<Option<String>>,
 }
 
 /// A new card on a board.
@@ -583,7 +594,7 @@ pub async fn create_project(
 
     let project = state
         .store
-        .create_project(&principal, &path, some_text(body.tag_id).as_deref())
+        .create_project(&principal, &path, some_text(body.topic).as_deref())
         .await
         .map_err(ApiError::Internal)?
         .ok_or(ApiError::Forbidden)?;
@@ -603,14 +614,14 @@ pub async fn set_tag(
     Json(body): Json<ProjectChange>,
 ) -> Result<Json<ProjectView>, ApiError> {
     let principal = state.principal(&jar).await;
-    let Some(tag) = body.tag_id else {
+    let Some(topic) = body.topic else {
         return Err(ApiError::Invalid(NOTHING_TO_CHANGE.into()));
     };
-    let tag = some_text(tag);
+    let topic = some_text(topic);
 
     if !state
         .store
-        .set_project_tag(&principal, &id, tag.as_deref())
+        .set_project_tag(&principal, &id, topic.as_deref())
         .await
         .map_err(ApiError::Internal)?
     {

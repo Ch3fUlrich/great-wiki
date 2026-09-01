@@ -71,6 +71,7 @@ async fn page(store: &Store, slug: &str, title: &str, visibility: Visibility, bo
                 visibility,
                 body,
                 sort_key: 0,
+                topics: Vec::new(),
             },
             None,
         )

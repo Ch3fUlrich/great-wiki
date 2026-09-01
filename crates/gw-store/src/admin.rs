@@ -995,6 +995,7 @@ mod tests {
                     visibility,
                     body,
                     sort_key: 0,
+                    topics: Vec::new(),
                 },
                 None,
             )

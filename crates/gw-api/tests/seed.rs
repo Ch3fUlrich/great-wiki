@@ -1036,3 +1036,119 @@ async fn a_page_holding_a_checkbox_is_not_republished_on_every_run() {
         assert_eq!(report.count(Outcome::Updated), 0, "run {run}: {report}");
     }
 }
+
+// Topics: what a page is about, stated in frontmatter and kept in the database
+// ---------------------------------------------------------------------------------------
+
+/// The topics on `path`, as the file spells them.
+async fn topics_of(store: &Store, path: &str) -> Vec<String> {
+    store
+        .document_topics_for(&admin(), path)
+        .await
+        .unwrap()
+        .expect("the page is readable")
+        .into_iter()
+        .map(|t| t.display_path)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_file_states_the_topics_its_page_is_filed_under() {
+    let dir = corpus(&[(
+        "laborwerte.md",
+        "---\ntitle: Laborwerte\ntags: [Medizin/Darm, Ernährung]\n---\nText.\n",
+    )]);
+    let (store, report) = seed(dir.path()).await;
+
+    assert!(report.is_complete(), "{report}");
+    assert!(
+        report.notes.is_empty(),
+        "`tags` is read, not reported: {report}"
+    );
+    assert_eq!(
+        topics_of(&store, "/laborwerte").await,
+        ["Ernährung", "Medizin/Darm"]
+    );
+}
+
+#[tokio::test]
+async fn a_topic_nothing_can_be_keyed_from_is_a_skip_that_names_it() {
+    // Skipped rather than silently dropped: a page that quietly loses a topic is a page
+    // that quietly stops appearing where somebody filed it.
+    let dir = corpus(&[(
+        "notiz.md",
+        "---\ntitle: Notiz\ntags: [\"🧬\"]\n---\nText.\n",
+    )]);
+    let (store, report) = seed(dir.path()).await;
+
+    assert!(!report.is_complete(), "{report}");
+    let reason = reason_for(&report, "notiz.md");
+    assert!(reason.contains('🧬'), "{reason}");
+    assert!(
+        fetch(&store, "/notiz").await.is_none(),
+        "nothing is half-created: {report}"
+    );
+}
+
+#[tokio::test]
+async fn a_file_that_changes_only_its_topics_updates_them_and_files_no_revision() {
+    let files = |tags: &str| {
+        vec![(
+            "notiz.md",
+            format!("---\ntitle: Notiz\ntags: [{tags}]\n---\nText.\n"),
+        )]
+    };
+    let first = files("Darm");
+    let first: Vec<(&str, &str)> = first.iter().map(|(a, b)| (*a, b.as_str())).collect();
+    let store = loaded(&first).await;
+    let who = autorin(&store, "/notiz").await;
+    assert_eq!(topics_of(&store, "/notiz").await, ["Darm"]);
+    let revisions_before = store.revisions_for(&who, "/notiz").await.unwrap().len();
+
+    let second = files("Darm, Leber");
+    let second: Vec<(&str, &str)> = second.iter().map(|(a, b)| (*a, b.as_str())).collect();
+    let report = again(&store, &second, &who, true).await;
+
+    assert!(report.is_complete(), "{report}");
+    assert_eq!(report.count(Outcome::Updated), 1, "{report}");
+    assert_eq!(topics_of(&store, "/notiz").await, ["Darm", "Leber"]);
+    assert_eq!(
+        store.revisions_for(&who, "/notiz").await.unwrap().len(),
+        revisions_before,
+        "a topic is not prose, so re-filing a page files no version of it"
+    );
+}
+
+#[tokio::test]
+async fn a_file_stating_the_same_topics_in_another_spelling_is_unchanged() {
+    // `Darm` and `darm` are one topic, so a file that says the second must not report a
+    // change — nor need write access to say nothing.
+    let store = loaded(&[("notiz.md", "---\ntitle: Notiz\ntags: [Darm]\n---\nText.\n")]).await;
+    let leser = granted(&store, "leser", "/notiz", Permission::Read).await;
+    let report = again(
+        &store,
+        &[("notiz.md", "---\ntitle: Notiz\ntags: [darm]\n---\nText.\n")],
+        &leser,
+        true,
+    )
+    .await;
+
+    assert!(report.is_complete(), "{report}");
+    assert_eq!(report.count(Outcome::Unchanged), 1, "{report}");
+}
+
+#[tokio::test]
+async fn refiling_a_page_needs_write_on_it() {
+    let store = loaded(&[("notiz.md", "---\ntitle: Notiz\ntags: [Darm]\n---\nText.\n")]).await;
+    let leser = granted(&store, "leser", "/notiz", Permission::Read).await;
+    let report = again(
+        &store,
+        &[("notiz.md", "---\ntitle: Notiz\ntags: [Leber]\n---\nText.\n")],
+        &leser,
+        true,
+    )
+    .await;
+
+    assert!(!report.is_complete(), "{report}");
+    assert_eq!(topics_of(&store, "/notiz").await, ["Darm"]);
+}

@@ -66,6 +66,7 @@ async fn page(store: &Store, parent: Option<&str>, title: &str, slug: &str) -> S
                 visibility: Visibility::Restricted,
                 body: empty_body(),
                 sort_key: 0,
+                topics: Vec::new(),
             },
             None,
         )

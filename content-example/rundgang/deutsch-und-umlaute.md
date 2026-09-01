@@ -4,6 +4,7 @@ type: research
 visibility: public
 language: de
 sort_key: 2
+tags: [Rundgang/Umlaute]
 ---
 
 # Größe und Maß — Deutsch im System

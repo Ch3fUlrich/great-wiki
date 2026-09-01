@@ -53,6 +53,7 @@ async fn seed_store(store: &Store) {
                 visibility: Visibility::Public,
                 body: body_block(),
                 sort_key: 0,
+                topics: Vec::new(),
             },
             None,
         )

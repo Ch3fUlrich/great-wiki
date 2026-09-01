@@ -348,6 +348,20 @@ async fn load_one(
         }
     }
 
+    // Checked here, before the create/update split, so that "🧬 cannot be a topic" is the
+    // skip reason rather than an insert failure with the same words wrapped in another
+    // sentence — and so that the update path below has the canonical set it needs to tell a
+    // re-filing from a no-op without writing anything.
+    let mut canonical_topics = HashSet::new();
+    for stated in &meta.tags {
+        match gw_store::canonical_topic(stated) {
+            Ok(path) => {
+                canonical_topics.insert(path);
+            }
+            Err(reason) => return skip(reason),
+        }
+    }
+
     let mut conversion = markdown::convert(body);
     drop_duplicate_title_heading(&mut conversion.doc, &meta.title);
     let new = NewDocument {
@@ -359,6 +373,9 @@ async fn load_one(
         visibility: meta.visibility,
         body: conversion.doc,
         sort_key: meta.sort_key,
+        // Verbatim, as the file spells them: `gw_store` resolves them, and a topic that is
+        // new is created by the same transaction that creates the page.
+        topics: meta.tags.clone(),
     };
 
     let path = match new.resolved_path() {
@@ -390,7 +407,17 @@ async fn load_one(
                 "updating needs an account to attribute the edit to".to_string(),
             );
         };
-        match update_one(store, principal, &path, &new, rel, &mut notes).await? {
+        match update_one(
+            store,
+            principal,
+            &path,
+            &new,
+            &canonical_topics,
+            rel,
+            &mut notes,
+        )
+        .await?
+        {
             Ok(outcome) => outcome,
             Err(reason) => return skip_at(&path, reason),
         }
@@ -446,6 +473,7 @@ async fn update_one(
     principal: &Principal,
     path: &str,
     new: &NewDocument,
+    canonical_topics: &HashSet<String>,
     rel: &Path,
     notes: &mut Vec<String>,
 ) -> Result<std::result::Result<Outcome, String>> {
@@ -512,8 +540,55 @@ async fn update_one(
     // revisions after three runs — which is precisely the no-op revision the paragraph
     // above forbids. Sharing the reduction with the exporter rather than writing a second
     // one keeps one answer to "what can markdown state"; two would drift.
-    if export::comparable(&stored) == export::comparable(&new.body) {
+    // Compared as CANONICAL paths, never as the spellings either side happens to hold: a
+    // file saying `darm` where the wiki holds `Darm` states the same topic, and calling that
+    // a change would re-file every page on every run and report an edit nobody made.
+    let filed_now: HashSet<String> = store
+        .document_topics_for(principal, path)
+        .await?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|topic| topic.path)
+        .collect();
+    let refiled = &filed_now != canonical_topics;
+    let rewritten = export::comparable(&stored) != export::comparable(&new.body);
+
+    if !rewritten && !refiled {
         return Ok(Ok(Outcome::Unchanged));
+    }
+
+    // The topics first, and separately, because they are not part of the revision: a page
+    // whose words are unchanged and whose filing is not writes no version of itself (see
+    // `Store::set_document_topics`). Refused on the same terms a body would be — which
+    // listings a page appears in is an edit of that page — and reported as a skip rather
+    // than applied by halves.
+    if refiled {
+        match store
+            .set_document_topics(principal, path, &new.topics)
+            .await?
+        {
+            gw_store::TopicOutcome::Done(_) => {}
+            gw_store::TopicOutcome::Refused => {
+                return Ok(Err(format!(
+                    "`{path}` exists and this file would file it under different topics, but \
+                     `{}` may not write it — which listings a page appears in is an edit of \
+                     that page, and writing is only ever an explicit grant",
+                    principal.username
+                )))
+            }
+            // Unreachable: `load_one` canonicalises every stated topic before this function
+            // is called, and a topic that parses there parses here. Written out rather than
+            // unwrapped all the same, because an `expect` in an importer is a panic over
+            // somebody else's file.
+            gw_store::TopicOutcome::Rejected(reason) => return Ok(Err(reason)),
+        }
+    }
+
+    if !rewritten {
+        // Only the filing changed. `Updated` is still the honest word — the wiki now says
+        // something different about this page — and the history correctly holds no new
+        // version of it, because nobody wrote one.
+        return Ok(Ok(Outcome::Updated));
     }
 
     let summary = format!("importiert aus {}", rel.display());

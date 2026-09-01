@@ -5,6 +5,7 @@ visibility: public
 language: de
 sort_key: 2
 slug: verweisbeispiel
+tags: [Verweise]
 ---
 
 # Verweisbeispiel

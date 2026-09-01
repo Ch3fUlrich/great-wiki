@@ -10,8 +10,8 @@ use serde::Deserialize;
 use thiserror::Error;
 
 /// The frontmatter keys this milestone understands. Anything else is reported rather than
-/// rejected: `tags:` and `status:` are real columns in §4 that later milestones will read,
-/// and failing on them now would make content unwritable ahead of the code.
+/// rejected: `status:` is a real column in §4 that a later milestone will read, and failing
+/// on it now would make content unwritable ahead of the code.
 const KNOWN_KEYS: &[&str] = &[
     "title",
     "type",
@@ -19,6 +19,7 @@ const KNOWN_KEYS: &[&str] = &[
     "slug",
     "language",
     "sort_key",
+    "tags",
 ];
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -93,6 +94,16 @@ pub struct SeedMeta {
     pub slug: Option<String>,
     pub language: String,
     pub sort_key: i64,
+    /// The topics this file states, **verbatim and in the order it states them**.
+    ///
+    /// Not canonicalised, not sorted and not deduplicated here: this crate has no database
+    /// and cannot know which topic a name resolves to. `gw_store::topics` does that.
+    ///
+    /// The order is load-bearing rather than incidental. `gw_api::export::render_file`
+    /// re-imports the file it just rendered and compares the metadata against what came out
+    /// of the database; a list that came back in a different order would refuse the page,
+    /// and one refused page fails the whole export.
+    pub tags: Vec<String>,
     /// Keys present in the file that this milestone does not read. Surfaced so a typo
     /// (`visibilty:`) is visible in the seeder's output instead of quietly failing closed.
     pub unknown_keys: Vec<String>,
@@ -113,6 +124,31 @@ struct Raw {
     language: String,
     #[serde(default)]
     sort_key: i64,
+    #[serde(default, deserialize_with = "one_or_many")]
+    tags: Vec<String>,
+}
+
+/// `tags: Darm` and `tags: [Darm, Ernährung]` both mean a list of topics.
+///
+/// The bare form is what somebody writes when there is only one, and reading it as the
+/// one-element list it obviously means costs nothing. What this deliberately does **not**
+/// do is accept a non-string: `tags: [2026]` is a mistake, and a topic named `2026`
+/// stringified out of it is a topic nobody typed. serde's own error carries through
+/// [`FrontmatterError::Invalid`], which names the file.
+fn one_or_many<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(single) => vec![single],
+        OneOrMany::Many(many) => many,
+    })
 }
 
 fn default_type() -> DocumentType {
@@ -187,6 +223,7 @@ impl SeedMeta {
                 .filter(|s| !s.is_empty()),
             language: raw.language,
             sort_key: raw.sort_key,
+            tags: raw.tags,
             unknown_keys,
         })
     }
@@ -328,10 +365,53 @@ mod tests {
 
     #[test]
     fn future_keys_are_reported_but_do_not_reject_the_file() {
-        // `tags` and `status` are real columns in the design's data model. Rejecting them
-        // now would make content unwritable ahead of the code that reads them.
-        let meta = parse("---\ntitle: T\ntags: [a, b]\nstatus: draft\n---\n").unwrap();
-        assert_eq!(meta.unknown_keys, vec!["status", "tags"]);
+        // `status` is a real column in the design's data model. Rejecting it now would make
+        // content unwritable ahead of the code that reads it.
+        let meta = parse("---\ntitle: T\nstatus: draft\n---\n").unwrap();
+        assert_eq!(meta.unknown_keys, vec!["status"]);
+    }
+
+    #[test]
+    fn topics_are_read_in_the_order_the_file_states_them() {
+        // The ORDER matters and is not cosmetic: `gw_api::export::render_file` re-imports
+        // its own output and compares it against what came out of the database, so a list
+        // that came back reordered would refuse the page and fail the whole export.
+        let meta = parse("---\ntitle: T\ntags: [Medizin/Darm, Ernährung]\n---\n").unwrap();
+        assert_eq!(meta.tags, vec!["Medizin/Darm", "Ernährung"]);
+        assert!(meta.unknown_keys.is_empty(), "{:?}", meta.unknown_keys);
+    }
+
+    #[test]
+    fn a_file_stating_no_topics_carries_none() {
+        assert!(parse("---\ntitle: T\n---\n").unwrap().tags.is_empty());
+    }
+
+    #[test]
+    fn an_empty_topic_list_is_the_same_as_none() {
+        assert!(parse("---\ntitle: T\ntags: []\n---\n")
+            .unwrap()
+            .tags
+            .is_empty());
+    }
+
+    #[test]
+    fn a_single_topic_may_be_written_without_a_list() {
+        // `tags: Darm` is what somebody types when there is only one, and reading it as the
+        // one-element list it obviously means costs nothing. The alternative is an error
+        // about YAML types for a file that says exactly what it means.
+        assert_eq!(
+            parse("---\ntitle: T\ntags: Darm\n---\n").unwrap().tags,
+            ["Darm"]
+        );
+    }
+
+    #[test]
+    fn a_topic_that_is_not_text_is_an_error_that_names_the_file() {
+        // Fails closed rather than stringifying: `tags: [2026]` is a mistake, and a topic
+        // called `2026` invented out of it is a topic nobody typed.
+        let err = parse("---\ntitle: T\ntags: [Darm, 2026]\n---\n").unwrap_err();
+        assert!(matches!(err, FrontmatterError::Invalid { .. }), "{err:?}");
+        assert!(err.to_string().contains("handbuch/erste-schritte.md"));
     }
 
     #[test]

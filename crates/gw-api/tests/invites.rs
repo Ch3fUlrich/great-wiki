@@ -85,6 +85,7 @@ fn page(parent: Option<&str>, title: &str, visibility: Visibility) -> NewDocumen
         visibility,
         body: body_block(),
         sort_key: 0,
+        topics: Vec::new(),
     }
 }
 

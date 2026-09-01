@@ -17,6 +17,21 @@ pub struct NewDocument {
     pub visibility: Visibility,
     pub body: Block,
     pub sort_key: i64,
+    /// The topics this page is about, **as somebody typed them** — `Medizin/Darm`, not
+    /// `/medizin/darm`. Resolved and created by [`crate::topics`] inside the same
+    /// transaction as the document and its first revision.
+    ///
+    /// Here rather than in a second call after the insert, and that is the whole reason it
+    /// is on this struct: creating a document is the one write in this crate that takes an
+    /// [`crate::Author`] instead of a principal — the operator import path, which has
+    /// nobody to check a permission against — so a topic applied afterwards would need
+    /// either a permission check the importer cannot satisfy or a second, unchecked door
+    /// into an existing page's topics. Riding along with the create needs neither: you can
+    /// only state topics for a page you are creating, in the transaction that creates it.
+    ///
+    /// A topic that is not usable as one fails the whole create, exactly as a colliding
+    /// path does. Half a page is not an outcome this function has.
+    pub topics: Vec<String>,
 }
 
 impl NewDocument {
@@ -149,6 +164,12 @@ impl Store {
             self.public_origin.as_ref(),
         )
         .await?;
+
+        // Inside the same transaction, so a topic that is not usable as one takes the page
+        // and the revision with it rather than leaving a document nobody asked for. The
+        // topics are created here if they are new — there is no pre-creation step, by
+        // decision — and `crate::topics` is the only thing that parses one.
+        crate::topics::apply_stated(&mut tx, &id, &doc.topics).await?;
 
         tx.commit().await?;
         Ok(id)
@@ -304,6 +325,7 @@ mod tests {
             visibility: Visibility::Public,
             body: body(text),
             sort_key: 0,
+            topics: Vec::new(),
         }
     }
 

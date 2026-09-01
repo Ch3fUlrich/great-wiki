@@ -261,6 +261,7 @@ async fn seed() -> Arc<Store> {
                     visibility,
                     body: body_block(),
                     sort_key: 0,
+                    topics: Vec::new(),
                 },
                 None,
             )

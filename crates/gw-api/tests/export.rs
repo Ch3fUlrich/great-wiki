@@ -63,6 +63,18 @@ async fn snapshot(store: &Store, principal: &Principal) -> BTreeMap<String, serd
             .await
             .unwrap()
             .expect("the tree listed it, so it is readable");
+        // Topics travel in frontmatter, so they are part of what "the same document came
+        // back" means. `display_path` is the string the file states, and comparing it is
+        // what would catch an export that dropped one, spelled one differently, or
+        // reordered them — any of which re-imports as a page filed under something else.
+        let topics: Vec<String> = store
+            .document_topics_for(principal, &path)
+            .await
+            .unwrap()
+            .expect("the tree listed it, so it is readable")
+            .iter()
+            .map(|t| t.display_path.clone())
+            .collect();
         out.insert(
             path,
             serde_json::json!({
@@ -74,6 +86,7 @@ async fn snapshot(store: &Store, principal: &Principal) -> BTreeMap<String, serd
                 "slug": doc.slug,
                 "parent_path": doc.parent_path,
                 "body": serde_json::from_str::<serde_json::Value>(&doc.body).unwrap(),
+                "topics": topics,
             }),
         );
     }
@@ -301,6 +314,7 @@ async fn a_document_markdown_cannot_hold_is_refused_and_no_file_is_written() {
                 visibility: Visibility::Public,
                 body,
                 sort_key: 0,
+                topics: Vec::new(),
             },
             None,
         )
@@ -359,6 +373,7 @@ async fn a_heading_that_repeats_the_title_is_refused_rather_than_dropped_on_the_
                 visibility: Visibility::Public,
                 body,
                 sort_key: 0,
+                topics: Vec::new(),
             },
             None,
         )
@@ -487,6 +502,7 @@ fn one_document_can_be_rendered_without_a_store_or_a_filesystem() {
         language: "de".into(),
         sort_key: 3,
         slug: "groesse-und-mass".into(),
+        tags: Vec::new(),
     };
     let body: Block = serde_json::from_str(
         r#"{"kind":"doc","content":[{"kind":"paragraph",
@@ -538,6 +554,7 @@ fn a_link_carrying_the_editors_own_attributes_still_exports() {
         language: "de".into(),
         sort_key: 0,
         slug: "verweise".into(),
+        tags: Vec::new(),
     };
     let body: Block = serde_json::from_str(
         r#"{"kind":"doc","content":[{"kind":"paragraph","content":[
@@ -595,6 +612,7 @@ fn a_task_carrying_the_id_the_store_minted_still_exports() {
         language: "de".into(),
         sort_key: 0,
         slug: "einkauf".into(),
+        tags: Vec::new(),
     };
     let body: Block = serde_json::from_str(
         r#"{"kind":"doc","content":[{"kind":"taskList","content":[
@@ -652,6 +670,7 @@ fn a_task_item_that_states_no_checked_at_all_is_refused_rather_than_guessed_at()
         language: "de".into(),
         sort_key: 0,
         slug: "einkauf".into(),
+        tags: Vec::new(),
     };
     let body: Block = serde_json::from_str(
         r#"{"kind":"doc","content":[{"kind":"taskList","content":[
@@ -690,6 +709,7 @@ fn a_link_whose_address_markdown_would_mangle_is_refused_rather_than_truncated()
         language: "de".into(),
         sort_key: 0,
         slug: "quellen".into(),
+        tags: Vec::new(),
     };
     let body: Block = serde_json::from_str(
         r#"{"kind":"doc","content":[{"kind":"paragraph","content":[
@@ -702,4 +722,105 @@ fn a_link_whose_address_markdown_would_mangle_is_refused_rather_than_truncated()
         export::render_file(&meta, &body).is_err(),
         "an address markdown cannot state must be refused, not silently truncated"
     );
+}
+
+// --- topics ----------------------------------------------------------------------------
+
+/// The frontmatter key is `tags` and the domain word is *topic*, deliberately: the design's
+/// own data model spells the tables `tags` / `document_tags` and calls the thing a topic,
+/// and `SeedMeta` reserved the key for exactly this before anything read it. What matters
+/// here is that the file says `tags:` and that what comes back out of it is what went in.
+#[test]
+fn a_pages_topics_are_stated_in_its_frontmatter_and_re_import_unchanged() {
+    let meta = export::FileMeta {
+        title: "Laborwerte".into(),
+        doc_type: "page".into(),
+        visibility: "public".into(),
+        language: "de".into(),
+        sort_key: 0,
+        slug: "laborwerte".into(),
+        tags: vec!["Ernährung".into(), "Medizin/Darm".into()],
+    };
+    let body: Block = serde_json::from_str(
+        r#"{"kind":"doc","content":[{"kind":"paragraph",
+             "content":[{"kind":"text","text":"Ein Satz."}]}]}"#,
+    )
+    .unwrap();
+
+    // `render_file` re-imports its own output and compares the metadata, so a file that
+    // came back with different topics would be REFUSED rather than returned. Getting a
+    // file at all is therefore already half the assertion.
+    let file = export::render_file(&meta, &body).expect("this document is expressible");
+    assert!(file.contains("tags:"), "{file}");
+    assert!(file.contains("Medizin/Darm"), "{file}");
+    assert!(file.contains("Ernährung"), "{file}");
+
+    // And the file the exporter wrote is the file the importer reads: parsed back with the
+    // same function `seed` uses, the list is identical, in order.
+    let (yaml, _) = gw_core::split_frontmatter(&file);
+    let back = gw_core::SeedMeta::parse(yaml, "the file just rendered").unwrap();
+    assert_eq!(back.tags, meta.tags);
+}
+
+#[test]
+fn a_page_about_nothing_still_states_the_key() {
+    // Nothing is omitted "because it is the default" — the rule `frontmatter` already
+    // follows for `visibility` and `slug`. Here the reason is smaller and still real: an
+    // exported file is the only documentation of the format most people will ever read, and
+    // a key that appears only on pages that happen to use it is a key nobody discovers.
+    let meta = export::FileMeta {
+        title: "Ohne".into(),
+        doc_type: "page".into(),
+        visibility: "public".into(),
+        language: "de".into(),
+        sort_key: 0,
+        slug: "ohne".into(),
+        tags: Vec::new(),
+    };
+    let body: Block = serde_json::from_str(r#"{"kind":"doc","content":[]}"#).unwrap();
+    let file = export::render_file(&meta, &body).unwrap();
+    assert!(file.contains("tags: []"), "{file}");
+}
+
+#[tokio::test]
+async fn a_pages_topics_survive_export_and_a_second_import() {
+    let store = Store::open("sqlite::memory:").await.unwrap();
+    store
+        .create_document(
+            Author::Import,
+            &NewDocument {
+                parent_path: None,
+                doc_type: DocumentType::Page,
+                title: "Laborwerte".into(),
+                slug: None,
+                language: "de".into(),
+                visibility: Visibility::Public,
+                body: serde_json::from_str(
+                    r#"{"kind":"doc","content":[{"kind":"paragraph",
+                         "content":[{"kind":"text","text":"Ein Satz."}]}]}"#,
+                )
+                .unwrap(),
+                sort_key: 0,
+                topics: vec!["Medizin/Darm".into(), "Ernährung".into()],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let before = snapshot(&store, &admin()).await;
+    assert_eq!(
+        before["/laborwerte"]["topics"],
+        serde_json::json!(["Ernährung", "Medizin/Darm"]),
+        "the fixture must actually carry topics, or this proves nothing"
+    );
+
+    let out = tempfile::tempdir().unwrap();
+    let report = export_to(&store, &admin(), out.path()).await;
+    assert!(report.is_complete(), "{report}");
+
+    let reloaded = Store::open("sqlite::memory:").await.unwrap();
+    let reload = seed::run(&reloaded, out.path()).await.unwrap();
+    assert!(reload.is_complete(), "{reload}");
+    assert_eq!(snapshot(&reloaded, &admin()).await, before);
 }

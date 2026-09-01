@@ -1134,11 +1134,17 @@ impl Store {
     /// A page can be the home of only one project; a second attempt on the same page is an
     /// error rather than a silent second project, because the `UNIQUE` constraint is what
     /// makes "which project is this page the home of" a question with one answer.
+    ///
+    /// **A `tag_id` naming no topic is refused**, with the same `None` as everything else
+    /// here. `projects.tag_id` has no foreign key behind it — `0011_tags.sql` records why
+    /// SQLite cannot add one to this table without destroying every standalone card on the
+    /// way — so this is where "you cannot point at something that is not there" is enforced,
+    /// and nothing is written when it fails.
     pub async fn create_project(
         &self,
         principal: &Principal,
         home_path: &str,
-        tag_id: Option<&str>,
+        topic: Option<&str>,
     ) -> Result<Option<Project>> {
         let Some(home) = self
             .document_for(principal, home_path, Action::Write)
@@ -1146,11 +1152,15 @@ impl Store {
         else {
             return Ok(None);
         };
+        let tag_id = match self.resolved_topic(topic).await? {
+            Some(tag_id) => tag_id,
+            None => return Ok(None),
+        };
         let id = uuid::Uuid::now_v7().to_string();
         sqlx::query("INSERT INTO projects (id, home_doc, tag_id) VALUES (?1, ?2, ?3)")
             .bind(&id)
             .bind(&home.id)
-            .bind(tag_id)
+            .bind(tag_id.as_deref())
             .execute(&self.pool)
             .await?;
         self.project_for(principal, &id).await
@@ -1236,18 +1246,26 @@ impl Store {
     /// The home page itself is deliberately not changeable: a project IS its home subtree
     /// (D-3), so re-homing one is not an edit, it is a different project — and doing it
     /// silently would move every anchored card on the board at once.
+    ///
+    /// **A `tag_id` naming no topic is refused**, the same `false` as everything else here,
+    /// and for the reason [`Store::create_project`] states: `projects.tag_id` has no foreign
+    /// key behind it, so the two writers are where a dangling reference is stopped.
     pub async fn set_project_tag(
         &self,
         principal: &Principal,
         project_id: &str,
-        tag_id: Option<&str>,
+        topic: Option<&str>,
     ) -> Result<bool> {
         if !self.may_administer_project(principal, project_id).await? {
             return Ok(false);
         }
+        let tag_id = match self.resolved_topic(topic).await? {
+            Some(tag_id) => tag_id,
+            None => return Ok(false),
+        };
         let done = sqlx::query("UPDATE projects SET tag_id = ?2 WHERE id = ?1")
             .bind(project_id)
-            .bind(tag_id)
+            .bind(tag_id.as_deref())
             .execute(&self.pool)
             .await?;
         Ok(done.rows_affected() > 0)
@@ -1269,6 +1287,20 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(done.rows_affected() > 0)
+    }
+
+    /// The topic id `topic` names, wrapped so that "none was asked for" and "the one asked
+    /// for does not exist" are different answers.
+    ///
+    /// `Ok(Some(None))` is "no topic, as asked"; `Ok(None)` is "that topic does not exist",
+    /// which both callers turn into their ordinary refusal. Untangled here rather than at
+    /// two call sites, because the nesting is exactly where somebody writes `unwrap_or` and
+    /// silently stores no topic where one was asked for.
+    async fn resolved_topic(&self, topic: Option<&str>) -> Result<Option<Option<String>>> {
+        let Some(topic) = topic else {
+            return Ok(Some(None));
+        };
+        Ok(self.topic_id_for(topic).await?.map(Some))
     }
 
     /// Whether the caller may Write the project's home page — the one gate both project
@@ -1625,6 +1657,7 @@ mod tests {
                     visibility: vis,
                     body: empty_body(),
                     sort_key: 0,
+                    topics: Vec::new(),
                 },
                 None,
             )
@@ -1654,6 +1687,25 @@ mod tests {
             .add_grant(path, Subject::Principal(who.id.clone()), permission)
             .await
             .unwrap();
+    }
+
+    /// A topic to point a project at, inserted directly.
+    ///
+    /// These tests are about projects, and making one the ordinary way needs a page, a
+    /// write grant and `Store::set_document_topics`. What they DO need is a topic that
+    /// really exists: `set_project_tag` refuses an id naming none, because
+    /// `projects.tag_id` has no foreign key behind it (`0011_tags.sql` says why) and the
+    /// writers are where a dangling reference is stopped instead.
+    async fn topic(store: &Store, path: &str, name: &str) -> String {
+        let id = uuid::Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO tags (id, path, name) VALUES (?1, ?2, ?3)")
+            .bind(&id)
+            .bind(path)
+            .bind(name)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        id
     }
 
     fn anchored(doc_id: &str) -> TaskHome {
@@ -1992,12 +2044,13 @@ mod tests {
         assert_eq!(read.home_title, "Projekt");
         assert_eq!(read.tag_id, None);
 
+        let darm = topic(&store, "/darm", "Darm").await;
         assert!(store
-            .set_project_tag(&chef, &project, Some("thema-darm"))
+            .set_project_tag(&chef, &project, Some("Darm"))
             .await
             .unwrap());
         let tagged = store.project_for(&chef, &project).await.unwrap().unwrap();
-        assert_eq!(tagged.tag_id.as_deref(), Some("thema-darm"));
+        assert_eq!(tagged.tag_id.as_deref(), Some(darm.as_str()));
 
         let listed = store.projects_for(&chef).await.unwrap();
         assert_eq!(listed, vec![tagged]);
@@ -2016,6 +2069,7 @@ mod tests {
         grant(&store, "/projekt", &leser, Permission::Read).await;
         page(&store, None, "Zweites", Visibility::Restricted).await;
         grant(&store, "/zweites", &leser, Permission::Read).await;
+        topic(&store, "/thema", "Thema").await;
 
         assert!(
             store
@@ -2027,7 +2081,7 @@ mod tests {
         );
         assert!(
             !store
-                .set_project_tag(&leser, &project, Some("thema"))
+                .set_project_tag(&leser, &project, Some("Thema"))
                 .await
                 .unwrap(),
             "read on the home page was enough to retag the project"
@@ -2045,7 +2099,7 @@ mod tests {
             .unwrap()
             .is_some());
         assert!(store
-            .set_project_tag(&chef, &project, Some("thema"))
+            .set_project_tag(&chef, &project, Some("Thema"))
             .await
             .unwrap());
         assert!(store.delete_project(&chef, &project).await.unwrap());
@@ -3814,6 +3868,7 @@ mod tests {
                         "- [ ] Stuhlprobe einschicken\n- [x] Termin bestätigt\n",
                     ),
                     sort_key: 0,
+                    topics: Vec::new(),
                 },
                 None,
             )
@@ -4186,6 +4241,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        topic(&store, "/marke", "Marke").await;
 
         let mut seen = Vec::new();
         for who in [&chef, &leserin, &chefin, &niemand] {
@@ -4231,7 +4287,7 @@ mod tests {
                 TaskOutcome::Done(_)
             );
             let changed_the_project = store
-                .set_project_tag(who, &project.id, Some("marke"))
+                .set_project_tag(who, &project.id, Some("Marke"))
                 .await
                 .unwrap();
 

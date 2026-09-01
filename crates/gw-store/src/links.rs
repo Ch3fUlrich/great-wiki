@@ -590,6 +590,7 @@ mod tests {
                     visibility,
                     body: body_linking_to(&[]),
                     sort_key: 0,
+                    topics: Vec::new(),
                 },
                 None,
             )
@@ -863,6 +864,7 @@ mod tests {
                     visibility: Visibility::Public,
                     body: body_linking_to(&[]),
                     sort_key: 0,
+                    topics: Vec::new(),
                 },
                 None,
             )
@@ -880,6 +882,7 @@ mod tests {
                     visibility: Visibility::Public,
                     body: body_linking_to(&[]),
                     sort_key: 0,
+                    topics: Vec::new(),
                 },
                 None,
             )
@@ -897,6 +900,7 @@ mod tests {
                     visibility: Visibility::Public,
                     body: body_linking_to(&[]),
                     sort_key: 0,
+                    topics: Vec::new(),
                 },
                 None,
             )
@@ -1095,6 +1099,7 @@ mod tests {
                     visibility: Visibility::Public,
                     body: body_linking_to_hrefs(&["/ziel-a"]),
                     sort_key: 0,
+                    topics: Vec::new(),
                 },
                 None,
             )
@@ -1123,6 +1128,7 @@ mod tests {
                     visibility: Visibility::Restricted,
                     body: body_linking_to_hrefs(&["/ziel"]),
                     sort_key: 0,
+                    topics: Vec::new(),
                 },
                 None,
             )
@@ -1174,6 +1180,7 @@ mod tests {
                     visibility: Visibility::Public,
                     body: body_linking_to_hrefs(&["/ziel"]),
                     sort_key: 0,
+                    topics: Vec::new(),
                 },
                 None,
             )
@@ -1221,6 +1228,7 @@ mod tests {
                     visibility,
                     body,
                     sort_key: 0,
+                    topics: Vec::new(),
                 },
                 None,
             )

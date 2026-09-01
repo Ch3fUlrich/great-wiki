@@ -111,6 +111,7 @@ async fn the_permission_question_is_asked_once_per_document_not_once_per_edge() 
                         visibility: Visibility::Public,
                         body: empty_body(),
                         sort_key: 0,
+                        topics: Vec::new(),
                     },
                     None,
                 )

@@ -350,6 +350,18 @@ pub async fn source(
     }
     let body = parse_body(&revision)?;
 
+    // The page's topics as they are NOW, not as they were when this revision was published.
+    // Topics are not versioned — they are not prose, so no revision records them (see
+    // `Store::set_document_topics`) — and there is nothing older to show. What this view
+    // answers is "what would this version export as", and an export made today carries
+    // today's topics, so this is that file rather than a reconstruction nothing could
+    // produce.
+    let topics = state
+        .store
+        .document_topics_for(&principal, &path)
+        .await
+        .map_err(ApiError::Internal)?
+        .unwrap_or_default();
     let meta = FileMeta {
         title: document.title.clone(),
         doc_type: document.doc_type.clone(),
@@ -357,6 +369,7 @@ pub async fn source(
         language: document.language.clone(),
         sort_key: document.sort_key,
         slug: document.slug.clone(),
+        tags: topics.into_iter().map(|t| t.display_path).collect(),
     };
 
     // `render_file` refuses a tree markdown cannot hold rather than writing a lossy file.

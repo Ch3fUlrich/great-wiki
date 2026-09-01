@@ -49,6 +49,7 @@ async fn insert(store: &Store, parent: Option<&str>, slug: &str, title: &str, vi
                 visibility: vis,
                 body: body(),
                 sort_key: 0,
+                topics: Vec::new(),
             },
             None,
         )

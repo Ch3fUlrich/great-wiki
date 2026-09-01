@@ -4,6 +4,7 @@ type: page
 visibility: public
 language: de
 sort_key: 3
+tags: [Rundgang/Tabellen, Format]
 ---
 
 # Tabellen — was heute passiert

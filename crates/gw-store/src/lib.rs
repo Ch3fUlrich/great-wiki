@@ -10,6 +10,7 @@ pub mod principals;
 pub mod revisions;
 pub mod sessions;
 pub mod tasks;
+pub mod topics;
 
 pub use acl::{Baseline, DocumentAccess};
 pub use admin::MembershipOutcome;
@@ -25,6 +26,10 @@ pub use principals::TeamSummary;
 pub use revisions::{Author, Revision, IMPORT_AUTHOR_ID, IMPORT_AUTHOR_NAME};
 pub use sessions::SESSION_TTL_SECONDS;
 pub use tasks::{NewTask, Project, Task, TaskHome, TaskOutcome, TaskPage, TaskStatus, TaskUpdate};
+pub use topics::{
+    canonical_topic, Topic, TopicDocument, TopicListing, TopicOutcome, TopicSummary,
+    MAX_TOPIC_DEPTH, MAX_TOPIC_NAME_CHARS,
+};
 
 use anyhow::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -137,6 +142,7 @@ mod tests {
             visibility: vis,
             body: body("hallo"),
             sort_key: 0,
+            topics: Vec::new(),
         }
     }
 

@@ -179,6 +179,7 @@ mod tests {
                     visibility,
                     body: body("hallo"),
                     sort_key: 0,
+                    topics: Vec::new(),
                 },
                 None,
             )
