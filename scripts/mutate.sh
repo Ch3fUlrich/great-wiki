@@ -956,6 +956,122 @@ mutation crates/gw-api/src/routes/docs.rs killed \
   's|                may_write: access.may_write,|                may_write: true,|' \
   'may_write: a page read carries the verdict the accessor gave, not a constant'
 
+# --- the trash: the first thing in this system that can destroy something ---------------
+#
+# Everything above this line was built so that nothing could be lost. `purge` is the one
+# operation that loses data, and `trash` is the one that makes a page disappear from the
+# wiki without losing it — so the two questions worth breaking on purpose are **who may do
+# which of them**, and **what a delete or a purge actually reaches**.
+#
+# None of these can pass vacuously. The store fixture grants write per page (there is no
+# baseline that confers write, D-M2-8) and the API fixture holds three separate people —
+# `schreiber` with write, `leser` with read, `chefin` with admin — so a mutation that
+# removes a gate is always tested against somebody who must still be refused.
+mutation crates/gw-store/src/trash.rs killed \
+  '/pub async fn trash_document/,/^    }$/ s/            .document_access_with_baseline(principal, path, Action::Write, baseline)/            .document_access_with_baseline(principal, path, Action::Read, baseline)/' \
+  'trash: deleting a page follows WRITE on it, not merely being able to read it'
+# The account, and not merely the write bit. `can()` answers an `Anyone` grant before it
+# looks at whether the caller signed in — that is what a public share link is — so on a path
+# carrying `anyone: write` the write verdict alone would let a request that has not said who
+# it is empty the wiki into a Papierkorb that cannot say who did it. The range keeps this off
+# `restore_document`, which carries the identical line for the same reason.
+mutation crates/gw-store/src/trash.rs killed \
+  '/pub async fn trash_document/,/^    }$/ s/        if !principal.is_authenticated() || !principal.active {/        if false {/' \
+  'trash: deleting needs a signed-in, active account even where anyone may write'
+# The subtree half of the same gate. A page goes to the trash with everything under it, so
+# a subtree somebody deliberately fenced off with its own grants must not be swept away by
+# whoever writes the page above it — grants do not union up the tree, so write at `/a` says
+# nothing about `/a/b` once `/a/b` carries its own.
+mutation crates/gw-store/src/trash.rs killed \
+  '/for member in self.live_subtree/,/^        }$/ s/                .is_none()/                .is_some()/' \
+  'trash: a delete needs write on every page it moves, not only on the one named'
+# THE CASCADE. `Store::tree` builds a child list by matching `parent_path` against a parent
+# it has already emitted, so a page whose parent is in the trash is not filtered out — it is
+# unreachable: gone from the navigation and from the markdown export, still readable at its
+# own address and still on its board. This mutation moves only the named page and leaves
+# exactly that hole.
+mutation crates/gw-store/src/trash.rs killed \
+  's/             WHERE {SUBTREE} AND deleted_at IS NULL"/             WHERE path = ?1 AND deleted_at IS NULL"/' \
+  'trash: a page goes to the trash with its whole subtree, or the tree has a hole in it'
+# And the other half of that statement: a page somebody threw away LAST week must keep its
+# own entry rather than being quietly adopted into this one, or restoring the parent brings
+# back a delete that was deliberate. That is "it came back", the mirror of the outcome D-8
+# exists to prevent.
+mutation crates/gw-store/src/trash.rs killed \
+  's/             WHERE {SUBTREE} AND deleted_at IS NULL"/             WHERE {SUBTREE}"/' \
+  'trash: a page already in the trash keeps its own entry rather than joining this one'
+# The restore, keyed on the entry rather than on the path prefix — same property, other
+# direction.
+mutation crates/gw-store/src/trash.rs killed \
+  's/             deleted_by = NULL, deleted_by_name = NULL WHERE deleted_root = ?1",/             deleted_by = NULL, deleted_by_name = NULL WHERE deleted_root = ?1 OR ?1 IS NOT NULL",/' \
+  'trash: a restore puts back the entry it names, not everything in the Papierkorb'
+mutation crates/gw-store/src/trash.rs killed \
+  's/            if !self.document_exists(parent).await? {/            if false {/' \
+  'trash: a page is not restored under a parent that is still in the trash'
+# The listing is an aggregate view, so it is a disclosure surface: every row says a page
+# exists and what it is called. Asking with an admin baseline is what "filter it afterwards"
+# looks like from the inside.
+mutation crates/gw-store/src/trash.rs killed \
+  's/                    .trashed_document_access(principal, &member, Action::Read, baseline)/                    .trashed_document_access(principal, \&member, Action::Read, crate::Baseline::Admin)/' \
+  'trash: the listing authorises each page at the reach of the CALLER, not an admin baseline'
+mutation crates/gw-store/src/trash.rs killed \
+  's/                        may_restore &= access.may_write;/                        may_restore \&= true;/' \
+  'trash: "you may put this back" is the write verdict, not the read that listed it'
+mutation crates/gw-store/src/trash.rs killed \
+  's/                    None => may_restore = false,/                    None => {}/' \
+  'trash: an entry holding a page the caller cannot see offers no restore'
+# The lookup the whole trash view rests on. Pointed at live rows instead, the Papierkorb
+# authorises the wrong table and answers nothing at all.
+mutation crates/gw-store/src/documents.rs killed \
+  's/            WHERE path = ?1 AND deleted_at IS NOT NULL/            WHERE path = ?1 AND deleted_at IS NULL/' \
+  'trash: the trash accessor reads the trashed row, not the live one'
+# The schema half. Four columns are one fact; a row with only `deleted_at` set is invisible
+# in the tree, belongs to no entry, and can never be restored or found again.
+mutation crates/gw-store/migrations/0012_trash.sql killed \
+  's/    WHERE (NEW.deleted_at IS NULL) <> (NEW.deleted_root IS NULL)/    WHERE 0 AND (NEW.deleted_at IS NULL) <> (NEW.deleted_root IS NULL)/' \
+  'trash: the schema refuses a row that is only half-way into the Papierkorb'
+
+# --- purge: the only operation in this system that loses data ---------------------------
+#
+# D-14 makes it the SECOND, deliberate act, and the whole of that is the gate: `schreiber`
+# may delete `/raum/notiz` and may put it back, and must still be refused when they ask for
+# it to be destroyed. The mutation is the gate replaced by "is there a caller at all", which
+# is what every plausible wrong version of this looks like.
+mutation crates/gw-api/src/routes/trash.rs killed \
+  's/    let actor = path_admin(&state, &jar, &path).await?;/    let actor = state.principal(\&jar).await;/' \
+  'purge: destroying a page needs admin on it — write is deliberately not enough'
+mutation crates/gw-store/src/trash.rs killed \
+  's/        if in_trash == 0 {/        if false {/' \
+  'purge: only a page already in the trash can be destroyed, never a live one'
+# A live page inside the subtree would be destroyed without ever having been deleted: no
+# trash, no restore, no second act. It cannot arise through this module, which is why the
+# test that kills this builds the state by hand.
+mutation crates/gw-store/src/trash.rs killed \
+  's/        if live > 0 {/        if false {/' \
+  'purge: a subtree that still holds a live page is refused rather than destroyed'
+# The report. It is the only thing standing between an administrator and a destruction they
+# did not mean, so a number that does not come from the destruction itself is worthless.
+mutation crates/gw-store/src/trash.rs killed \
+  's/            revisions: before.revisions - after.revisions,/            revisions: 0,/' \
+  'purge: the report counts the history it destroyed, measured across the DELETE itself'
+mutation crates/gw-store/src/trash.rs killed \
+  's/        prune_empty_topics(&mut tx).await?;/        ();/' \
+  'purge: a topic no page carries any more goes with the pages that carried it'
+# The preview IS the purge, rolled back (ADR 0012). Commit it and the description of a
+# destruction becomes the destruction.
+mutation crates/gw-store/src/trash.rs killed \
+  '/if mode == Purge::Preview {/,/^        }$/ s/            tx.rollback().await?;/            tx.commit().await?;/' \
+  'purge: a preview describes the purge and then does not happen'
+# Recorded as `equivalent` and NOT as a gap. Nothing in this schema can make the two
+# disagree today: the DELETE removes exactly its own predicate's rows and `RETURNING` hands
+# them all back. It exists for the change that WOULD break it — a foreign key on
+# `deleted_root` with ON DELETE CASCADE, which `0012_trash.sql` explains at length — where an
+# entry's members are deleted before the outer statement reaches them and the purge silently
+# under-reports itself. If this ever starts being killed, that change has been made.
+mutation crates/gw-store/src/trash.rs equivalent \
+  's/            destroyed == pages.len() as i64,/            true,/' \
+  'purge: the report names as many pages as the DELETE destroyed — unobservable until deleted_root gains a cascade'
+
 # --- crash recovery ------------------------------------------------------------------
 #
 # A trap does not survive SIGKILL, and a killed run leaves the mutated file in place.
@@ -1146,6 +1262,9 @@ probe_for() {
     # including the two disclosure tests, so the probe is exact rather than a whole-crate
     # build of six binaries.
     crates/gw-api/src/routes/tasks.rs) echo "-p gw-api --test tasks" ;;
+    # The trash endpoints, including the purge gate. One integration binary covers all
+    # four, so the probe is exact rather than a whole-crate build of seven binaries.
+    crates/gw-api/src/routes/trash.rs) echo "-p gw-api --test trash" ;;
     *) echo "" ;;
   esac
 }

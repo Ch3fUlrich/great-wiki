@@ -110,7 +110,16 @@ pub(crate) async fn instance_admin(
 /// An instance admin passes as well, and that is not a shortcut: D-M2-1 gives `admins`
 /// instance administration, and the first grant on a fresh subtree has to be writable by
 /// somebody who holds no grant there yet — otherwise no space could ever be delegated.
-async fn path_admin(state: &AppState, jar: &CookieJar, path: &str) -> Result<Principal, ApiError> {
+///
+/// `pub(crate)` because `super::trash` gates a purge with it. That is the point of it being
+/// this function and not another one with the same shape: "who administers this page" has
+/// one answer, and destroying a page is an administrative act on it exactly as publishing it
+/// is (ADR 0012).
+pub(crate) async fn path_admin(
+    state: &AppState,
+    jar: &CookieJar,
+    path: &str,
+) -> Result<Principal, ApiError> {
     let principal = state.principal(jar).await;
     if !principal.is_authenticated() || !principal.active {
         return Err(ApiError::Forbidden);

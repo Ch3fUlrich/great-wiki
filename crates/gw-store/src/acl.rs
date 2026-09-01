@@ -383,10 +383,12 @@ impl Store {
 
     /// [`Store::document_access`], with the caller's baseline already resolved.
     ///
-    /// **This is the whole body of `document_for`**, and `document_for` is the same call
+    /// **This is the way in that `document_for` takes**, and `document_for` is the same call
     /// with the write verdict dropped. That direction matters: the read a handler already
     /// performs is what produces the bit, so there is one authorisation here rather than a
-    /// read and a separate "could I also write this" that could answer differently.
+    /// read and a separate "could I also write this" that could answer differently. The
+    /// verdict itself is [`Store::access_to`], one function down, which every accessor in
+    /// this crate ends in.
     ///
     /// `pub(crate)` for the reason [`Store::document_for_with_baseline`] is: outside this
     /// crate the accessor resolves its own baseline, and cannot be handed somebody else's.
@@ -400,8 +402,59 @@ impl Store {
         let Some(document) = self.document_by_path_unchecked(path).await? else {
             return Ok(None);
         };
+        self.access_to(principal, document, action, baseline).await
+    }
+
+    /// The same question, asked about a page that is **in the trash**.
+    ///
+    /// The Papierkorb is an aggregate view and therefore a disclosure surface, so it has to
+    /// authorise every page in it exactly as a page read does — and it cannot, because
+    /// [`Store::document_by_path_unchecked`] refuses a soft-deleted row on purpose. This is
+    /// how it asks anyway without a second answer existing: the ROW LOOKUP differs and
+    /// nothing else does. Both spellings end in [`Store::access_to`], which is the only place
+    /// in this crate where a visibility and a set of grants become a verdict.
+    ///
+    /// D-14's "its ACL still applies" is a property of that arrangement rather than a rule
+    /// written here: grants hang off a PATH, `grants_for_path` never looks at `documents`, and
+    /// a page in the trash still sits at its path. A page you could not see before it was
+    /// deleted is not one you can see in the trash.
+    ///
+    /// `pub(crate)`, and the baseline is a parameter for the same reason it is above: the
+    /// listing resolves it once for the whole walk, and a baseline belonging to somebody else
+    /// is a hole that reads like an optimisation.
+    pub(crate) async fn trashed_document_access(
+        &self,
+        principal: &Principal,
+        path: &str,
+        action: Action,
+        baseline: Baseline,
+    ) -> Result<Option<DocumentAccess>> {
+        let Some(document) = self.document_by_path_in_trash(path).await? else {
+            return Ok(None);
+        };
+        self.access_to(principal, document, action, baseline).await
+    }
+
+    /// The verdict itself, on a row somebody has already found.
+    ///
+    /// **This is the whole of the authorisation in this crate.** `document_for`,
+    /// `document_for_id`, `document_access`, `governing_document` and the Papierkorb are all
+    /// ways in; the difference between them is which row they hand over, never what is
+    /// decided about it. Splitting the lookup from the decision is what let the trash
+    /// authorise a soft-deleted page without a second copy of the rules — and what stops the
+    /// next view that needs an unusual row from writing one.
+    ///
+    /// The grants come from the document's OWN path rather than from whatever the caller
+    /// asked with, so a row and the policy applied to it cannot be about different pages.
+    async fn access_to(
+        &self,
+        principal: &Principal,
+        document: StoredDocument,
+        action: Action,
+        baseline: Baseline,
+    ) -> Result<Option<DocumentAccess>> {
         let visibility = Visibility::from_str(&document.visibility).unwrap_or_default();
-        let grants = self.grants_for_path(path).await?;
+        let grants = self.grants_for_path(&document.path).await?;
         if !permits(principal, action, visibility, &grants, baseline) {
             return Ok(None);
         }

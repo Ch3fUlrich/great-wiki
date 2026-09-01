@@ -5,6 +5,7 @@ pub mod links;
 pub mod revisions;
 pub mod tasks;
 pub mod topics;
+pub mod trash;
 pub mod tree;
 
 use crate::auth::{OidcClient, OidcConfig};
@@ -352,12 +353,19 @@ pub fn build_router(state: AppState) -> Router {
             get(|| async { Json(serde_json::json!({"status": "ok"})) }),
         )
         .route("/api/tree", get(tree::get_tree))
-        .route("/api/documents/{*path}", get(docs::get_document))
+        // One resource, two verbs: reading a page and moving it to the trash are the
+        // same address, and the method already says which. See `trash`'s header for
+        // why the other three trash operations live under their own prefix instead.
+        .route(
+            "/api/documents/{*path}",
+            get(docs::get_document).delete(trash::delete_document),
+        )
         .merge(collab::routes())
         .merge(links::routes())
         .merge(revisions::routes())
         .merge(tasks::routes())
         .merge(topics::routes())
+        .merge(trash::routes())
         .merge(admin::routes())
         .merge(crate::auth::routes())
         .merge(crate::view_as::routes())

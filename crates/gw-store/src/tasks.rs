@@ -2645,11 +2645,14 @@ mod tests {
             1
         );
 
-        sqlx::query("UPDATE documents SET deleted_at = datetime('now') WHERE id = ?1")
-            .bind(&unterseite)
-            .execute(&store.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE documents SET deleted_at = datetime('now'), deleted_root = id, \
+             deleted_by = 'test', deleted_by_name = 'Test' WHERE id = ?1",
+        )
+        .bind(&unterseite)
+        .execute(&store.pool)
+        .await
+        .unwrap();
 
         assert!(
             store

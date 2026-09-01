@@ -719,7 +719,7 @@ async fn ensure_topic(conn: &mut sqlx::SqliteConnection, segments: &[Segment]) -
 ///
 /// A document in the trash still counts as carrying its topics: `deleted_at` is reversible,
 /// and a topic dropped while a page sits in the trash would not come back with it.
-async fn prune_empty_topics(conn: &mut sqlx::SqliteConnection) -> Result<()> {
+pub(crate) async fn prune_empty_topics(conn: &mut sqlx::SqliteConnection) -> Result<()> {
     loop {
         let done = sqlx::query(
             "DELETE FROM tags WHERE id IN ( \
@@ -1465,11 +1465,14 @@ mod tests {
             .await
             .unwrap();
 
-        sqlx::query("UPDATE documents SET deleted_at = datetime('now') WHERE id = ?1")
-            .bind(&id)
-            .execute(&store.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE documents SET deleted_at = datetime('now'), deleted_root = id, \
+             deleted_by = 'test', deleted_by_name = 'Test' WHERE id = ?1",
+        )
+        .bind(&id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
 
         assert!(store.topic_for(&chef, "/darm").await.unwrap().is_none());
         assert_eq!(

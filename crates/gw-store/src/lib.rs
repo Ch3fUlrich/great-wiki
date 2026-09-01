@@ -11,6 +11,7 @@ pub mod revisions;
 pub mod sessions;
 pub mod tasks;
 pub mod topics;
+pub mod trash;
 
 pub use acl::{Baseline, DocumentAccess};
 pub use admin::MembershipOutcome;
@@ -29,6 +30,9 @@ pub use tasks::{NewTask, Project, Task, TaskHome, TaskOutcome, TaskPage, TaskSta
 pub use topics::{
     canonical_topic, Topic, TopicDocument, TopicListing, TopicOutcome, TopicSummary,
     MAX_TOPIC_DEPTH, MAX_TOPIC_NAME_CHARS,
+};
+pub use trash::{
+    Purge, PurgeOutcome, PurgeReport, PurgedPage, TrashEntry, TrashOutcome, TrashSummary,
 };
 
 use anyhow::Result;
@@ -954,11 +958,14 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::query("UPDATE documents SET deleted_at = datetime('now') WHERE id = ?1")
-            .bind(&id)
-            .execute(&store.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE documents SET deleted_at = datetime('now'), deleted_root = id, \
+             deleted_by = 'test', deleted_by_name = 'Test' WHERE id = ?1",
+        )
+        .bind(&id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
 
         assert!(store
             .document_by_path_unchecked("/temporaer")

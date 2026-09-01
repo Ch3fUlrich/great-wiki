@@ -129,6 +129,26 @@ impl Store {
 
         let mut tx = self.pool.begin().await?;
 
+        // A page in the trash still occupies its path — `documents.path` is UNIQUE across
+        // every row, soft-deleted ones included, which is exactly what makes a restore
+        // always safe. The INSERT below would therefore fail anyway; it would fail with
+        // SQLite's own words about a constraint, on a path `document_exists` has just told
+        // the caller is free (it answers only about LIVE rows, deliberately, so that a
+        // deleted page does not keep choosing 403 over 404). Naming the real reason is the
+        // difference between "restore it or purge it" and a seeder that looks broken.
+        let occupied: Option<(String,)> = sqlx::query_as(
+            "SELECT title FROM documents WHERE path = ?1 AND deleted_at IS NOT NULL",
+        )
+        .bind(&path)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((title,)) = occupied {
+            anyhow::bail!(
+                "the page «{title}» is in the trash at {path}: restore it or purge it before \
+                 creating another page there"
+            );
+        }
+
         // The UNIQUE constraint on `path` is what turns a slug collision into an error
         // instead of a silent overwrite. Do NOT add ON CONFLICT here.
         sqlx::query(
@@ -191,6 +211,33 @@ impl Store {
             SELECT id, path, parent_path, slug, doc_type, title, language, visibility, body, sort_key
             FROM documents
             WHERE path = ?1 AND deleted_at IS NULL
+            "#,
+        )
+        .bind(path)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// A document that is IN THE TRASH, with NO permission check whatsoever.
+    ///
+    /// The mirror of [`Store::document_by_path_unchecked`], and crate-private for the same
+    /// reason with the same warning: it is a row, not an answer about who may see one. Its
+    /// only caller is [`Store::trashed_document_access`], which puts it straight into the
+    /// authorisation body every other accessor ends in.
+    ///
+    /// `IS NOT NULL` rather than "no filter at all": the Papierkorb and the wiki are two
+    /// different listings, and a lookup that answered both would let a caller reach a live
+    /// page through the trash's own accessor.
+    pub(crate) async fn document_by_path_in_trash(
+        &self,
+        path: &str,
+    ) -> Result<Option<StoredDocument>> {
+        let row = sqlx::query_as::<_, StoredDocument>(
+            r#"
+            SELECT id, path, parent_path, slug, doc_type, title, language, visibility, body, sort_key
+            FROM documents
+            WHERE path = ?1 AND deleted_at IS NOT NULL
             "#,
         )
         .bind(path)
