@@ -132,3 +132,39 @@ Not a milestone. Graphify ingestion (`graph.json` → the same graph tables as d
 document→symbol links attach to **M9**, since that is when the graph tables and views exist.
 Serena enrichment attaches to **M3**, since that is when the editor can resolve a reference
 as it is typed. Both are additive; neither blocks anything.
+
+## Owner's re-ordering, 2026-09-02
+
+Two answers that change what the milestones above are worth, recorded here because the
+original ordering was written when neither was known.
+
+### Other people are coming, soon
+
+The wiki has had one account since it existed, and several planned features are only worth
+anything with more than one person in them: comments and notifications (M6), task assignment
+and its "who may assign whom" rule, the read-only board card, the whole `may_write` bit.
+Each was built correctly anyway — the permission model has never assumed a single user —
+but they have never been *exercised* by a second person.
+
+Family members are expected shortly. That promotes M6 above where it sat, and it makes one
+unglamorous thing urgent that is on no milestone at all: **the invite flow has 42 tests and
+has never been walked end to end by a real second human.** A first invitation that fails is
+the worst possible first impression of a wiki somebody was asked to trust with medical
+notes. Walk it before they arrive, not after.
+
+It also means the disclosure decisions stop being theoretical. ADR 0009 (who may learn a
+card's assignee), ADR 0011 (what a topic discloses) and the per-document filtering in every
+aggregate view were all written against a threat model with exactly one person in it. They
+are about to have a second.
+
+### M7 is search first; the assistant is a separate decision
+
+M7 as written is "Search & AI" — full-text search *and* a RAG assistant answering with
+citations. Those are different in size, in risk and in what they depend on, and the owner
+wants the first without committing to the second.
+
+So: permission-aware full-text search, and stop. The retrieval half is the hard part and it
+is shared with any assistant built later, so nothing is wasted by deferring the model.
+Searching *inside* attachments is explicitly not in this — it needs sandboxed extraction in a
+background job, which the roadmap already flags as an attack surface, and it can be added to
+a working search rather than delaying one.
