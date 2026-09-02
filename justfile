@@ -38,6 +38,8 @@ lint:
     {{node}} cd web && npm run check
     ./scripts/scan-secrets.sh --self-test
     ./scripts/scan-secrets.sh scan
+    ./scripts/check-html-sinks.sh --self-test
+    ./scripts/check-html-sinks.sh scan
 
 # A production build catches what neither the type check nor the tests do: an adapter
 # or SSR failure that only appears when the app is actually compiled. CI runs it, so
@@ -167,7 +169,15 @@ behaviour: behaviour-fixture
     export GW_DATABASE_URL="sqlite://$PWD/{{behaviour_db}}"
     export GW_MEDIA_DIR="$PWD/{{behaviour_media}}"
     export GW_DEV_IDENTITY="sergej:editors"
-    export GW_BIND="127.0.0.1:8092"
+    # Overridable because 8092 is not reliably free on this machine, whatever
+    # `gw-api/src/config.rs` says about it: another project on coding.vm binds it, and
+    # when it is up this recipe refuses to run at all. `GW_BEHAVIOUR_PORT=8093 just
+    # behaviour` is the escape. The refusal below is right and stays — the point is to
+    # have somewhere else to go, not to share a port with a server whose database
+    # nothing can ask about.
+    api_port="${GW_BEHAVIOUR_PORT:-8092}"
+    export GW_BIND="127.0.0.1:${api_port}"
+    export GW_API="http://127.0.0.1:${api_port}"
     base="${SHOT_BASE:-http://127.0.0.1:5173}"
 
     # This recipe owns the dev stack for the run rather than sharing whatever is already on
@@ -175,11 +185,12 @@ behaviour: behaviour-fixture
     # actually pointed at it, and there is no way to ask an already-running process which
     # database it opened. Refuse loudly rather than test against a server that might be
     # serving a developer's own data/great-wiki.db under a passing-looking green run.
-    if curl -sS -o /dev/null -m 2 "http://127.0.0.1:8092/"; then
-      echo "Something is already answering on 127.0.0.1:8092 (likely \`just dev\` against" >&2
-      echo "your own data/great-wiki.db). This recipe starts its own backend against the" >&2
-      echo "behaviour fixture and cannot tell that one apart from a real dev server, so it" >&2
-      echo "will not share the port. Stop the other one first, then re-run \`just behaviour\`." >&2
+    if curl -sS -o /dev/null -m 2 "http://127.0.0.1:${api_port}/"; then
+      echo "Something is already answering on 127.0.0.1:${api_port} (likely \`just dev\` against" >&2
+      echo "your own data/great-wiki.db, or another project — 8092 is not reserved to this" >&2
+      echo "one). This recipe starts its own backend against the behaviour fixture and cannot" >&2
+      echo "tell that one apart from a real dev server, so it will not share the port." >&2
+      echo "Stop it, or pick another port: GW_BEHAVIOUR_PORT=8093 just behaviour" >&2
       exit 1
     fi
     if curl -sS -o /dev/null -m 2 "$base"; then

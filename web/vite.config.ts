@@ -2,6 +2,15 @@ import adapter from '@sveltejs/adapter-node';
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
 
+/**
+ * Where the dev proxy sends `/api` and `/auth`.
+ *
+ * `GW_BEHAVIOUR_PORT` is the same variable `just behaviour` takes, so the harness and the
+ * proxy it drives cannot end up pointing at different ports — which is exactly what
+ * happened when only one of them was made overridable.
+ */
+const apiTarget = `http://127.0.0.1:${process.env.GW_BEHAVIOUR_PORT ?? '8092'}`;
+
 export default defineConfig({
 	plugins: [
 		sveltekit({
@@ -146,8 +155,14 @@ export default defineConfig({
 			// answers immediately. Caddy proxies WebSockets natively, so production would
 			// never have shown this and the editor would have looked broken only in
 			// development, which is the worst place for a difference to live.
-			'/api': { target: 'http://127.0.0.1:8092', changeOrigin: true, ws: true },
-			'/auth': { target: 'http://127.0.0.1:8092', changeOrigin: true }
+			// The port is overridable for the same reason `just behaviour` makes it
+			// overridable: 8092 is not reliably free on this machine — another project on
+			// coding.vm binds it — and a proxy still pointing at 8092 while the API listens
+			// elsewhere fails in the least helpful way available. The app loads, the page
+			// renders, and every call answers "Der Server antwortet nicht": six behaviour
+			// checks went red that way, none of them naming a port.
+			'/api': { target: apiTarget, changeOrigin: true, ws: true },
+			'/auth': { target: apiTarget, changeOrigin: true }
 		}
 	}
 });
