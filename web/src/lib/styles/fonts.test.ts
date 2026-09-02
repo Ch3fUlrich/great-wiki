@@ -98,13 +98,24 @@ describe('the three typeface choices', () => {
 });
 
 describe('every font value goes through a custom property', () => {
-  // ADR 0005: a hard-coded family is one a theme author can never override. fonts.css
-  // is the single exception — naming families is what an @font-face is for.
+  // ADR 0005: a hard-coded family is one a theme author can never override. Two files are
+  // exempt, and for the same underlying reason — in neither is the family a design choice:
+  //
+  //   - fonts.css, because naming families is what an @font-face is for;
+  //   - katex.css, because it is KaTeX's own stylesheet vendored byte for byte, and the
+  //     faces it names ARE the typesetting. `KaTeX_Math` is not a theme's serif; the
+  //     glyph metrics KaTeX computes its layout from belong to that exact file, so a
+  //     theme substituting another family would not restyle the maths, it would move
+  //     every symbol off the position it was placed at. `styles/katex.test.ts` holds it
+  //     identical to the package, which is also what stops this exemption widening.
+  const VENDORED = 'katex.css';
+
   function sources(dir: URL): URL[] {
     return readdirSync(dir).flatMap((entry) => {
       const child = new URL(entry, dir);
       if (statSync(child).isDirectory()) return sources(new URL(`${entry}/`, dir));
-      return /\.(css|svelte)$/.test(entry) && entry !== 'fonts.css' ? [child] : [];
+      const own = entry !== 'fonts.css' && entry !== VENDORED;
+      return /\.(css|svelte)$/.test(entry) && own ? [child] : [];
     });
   }
 
@@ -124,12 +135,32 @@ describe('every font value goes through a custom property', () => {
 });
 
 describe('the shipped font files', () => {
-  const referenced = [...fonts.matchAll(/url\('(\/fonts\/[^']+)'\)/g)].map((m) => m[1]);
-  const unique = [...new Set(referenced)];
+  /**
+   * The READING faces: the four families this interface sets prose and code in.
+   *
+   * `fonts.css` is the whole of that system, which is why this reads it rather than a
+   * TypeScript copy of the mapping.
+   */
+  const unique = [...new Set([...fonts.matchAll(/url\('(\/fonts\/[^']+)'\)/g)].map((m) => m[1]))];
+
+  /**
+   * …and every face this application serves, reading and typesetting alike.
+   *
+   * The maths faces are declared in `katex.css`, which is KaTeX's own stylesheet vendored
+   * byte for byte (`styles/katex.test.ts` holds it identical to the package). They are
+   * NOT reading faces and the distinction is load-bearing below: they draw ∑, ∫ and √ at
+   * metrics KaTeX lays a formula out from, and they contain no German prose at all — so
+   * the ẞ rule that every reading face must pass is not a rule they could pass, or should.
+   */
+  const katex = readFileSync(new URL('./katex.css', STYLES), 'utf8');
+  const alle = [
+    ...new Set([...[...katex.matchAll(/url\('(\/fonts\/[^']+)'\)/g)].map((m) => m[1]), ...unique])
+  ];
 
   it('exist, and every one of them is referenced', () => {
     expect(unique.length).toBeGreaterThan(0);
-    for (const href of unique) {
+    expect(alle.length).toBeGreaterThan(unique.length);
+    for (const href of alle) {
       const file = new URL(href.replace('/fonts/', ''), FONTS_DIR);
       expect(statSync(file).size, `${href} is empty`).toBeGreaterThan(0);
     }
@@ -139,23 +170,43 @@ describe('the shipped font files', () => {
       .map((p) => `/fonts/${p.split(/[\\/]/).join('/')}`)
       .sort();
     // Dead weight in static/ is bytes in the image that nothing ever serves.
-    expect(shipped).toEqual([...unique].sort());
+    expect(shipped).toEqual([...alle].sort());
   });
 
-  it('each sit beside their licence, because the fonts are OFL and this repo is MIT', () => {
+  it('each sit beside the licence they are actually under', () => {
+    // Three of the four reading families are OFL and this repository is MIT, so the OFL.txt
+    // beside the binaries is what keeps condition 5 satisfied — the carve-out at the top of
+    // the root LICENSE says so. KaTeX's faces are the exception and are named here rather
+    // than exempted: they ship under KaTeX's own MIT licence, which is a DIFFERENT MIT
+    // grant from this repository's, so a copy of it still has to travel with the files.
+    const LICENCES: Record<string, { file: string; says: string }> = {
+      'ibm-plex-sans': { file: 'OFL.txt', says: 'SIL OPEN FONT LICENSE' },
+      'ibm-plex-mono': { file: 'OFL.txt', says: 'SIL OPEN FONT LICENSE' },
+      literata: { file: 'OFL.txt', says: 'SIL OPEN FONT LICENSE' },
+      'jetbrains-mono': { file: 'OFL.txt', says: 'SIL OPEN FONT LICENSE' },
+      katex: { file: 'LICENSE', says: 'MIT License' }
+    };
+
     const families = readdirSync(FONTS_DIR).filter((entry) =>
       statSync(new URL(entry, FONTS_DIR)).isDirectory()
     );
     expect(families.length).toBeGreaterThan(0);
+    // Both directions: a new family must be named here, and a name here must be a family.
+    expect(families.sort()).toEqual(Object.keys(LICENCES).sort());
     for (const family of families) {
-      const licence = readFileSync(new URL(`${family}/OFL.txt`, FONTS_DIR), 'utf8');
-      expect(licence, `${family}/OFL.txt is not the OFL`).toContain('SIL OPEN FONT LICENSE');
+      const { file, says } = LICENCES[family];
+      const licence = readFileSync(new URL(`${family}/${file}`, FONTS_DIR), 'utf8');
+      expect(licence, `${family}/${file} does not say what it should`).toContain(says);
     }
   });
 
   // The one that matters on a German site. `web/scripts/check-fonts.py` does this more
   // thoroughly with fontTools; this runs in `npm test`, so it holds without anyone
   // having to remember to install a Python package.
+  //
+  // The READING faces only. A maths face has no ẞ and must not: `KaTeX_Math` is a
+  // typesetting alphabet, it is never used to set a German word, and demanding a capital
+  // sharp s of it would be demanding a glyph nothing would ever ask it to draw.
   it('all contain a real ẞ (U+1E9E), not two S in a trench coat', () => {
     for (const href of unique) {
       const file = new URL(href.replace('/fonts/', ''), FONTS_DIR);

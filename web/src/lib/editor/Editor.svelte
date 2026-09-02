@@ -55,6 +55,8 @@
   import { Field } from '@ark-ui/svelte/field';
   import BlockView from '$lib/components/BlockView.svelte';
   import type { Block } from '$lib/blocks/render';
+  import type { Formulas } from '$lib/blocks/maths';
+  import type { Fences } from '$lib/blocks/code';
   import type { Attachment } from '$lib/attachments';
   import { CONTENT_FIELD, contentExtensions } from './extensions';
   import {
@@ -86,6 +88,20 @@
      * reader sees, from the same addresses the API built.
      */
     anhaenge?: Attachment[];
+    /**
+     * The page's typeset formulas, for the same reason `anhaenge` is here: the reading
+     * fallback below is the same `BlockView` the reader gets, and it must show the same
+     * page. Nothing in the editing surface uses them — TipTap shows a ` ```math ` fence as
+     * the source it is, which is what editing a formula means.
+     */
+    formeln?: Formulas | null;
+    /**
+     * The page's tokenised code blocks, for the same reason `formeln` is here: the reading
+     * fallback below is the same `BlockView` the reader gets, and it must show the same
+     * page. Nothing in the editing surface uses them — TipTap shows a fence as the source
+     * it is, which is what editing code means.
+     */
+    fences?: Fences | null;
     /** The document's own language, so the editing surface reads as the page does. */
     language: string;
     /** Whoever is editing, for the presence caret. */
@@ -94,7 +110,17 @@
     onLeave: () => void;
   }
 
-  let { path, title, body, anhaenge = [], language, editorName, onLeave }: Props = $props();
+  let {
+    path,
+    title,
+    body,
+    anhaenge = [],
+    formeln = null,
+    fences = null,
+    language,
+    editorName,
+    onLeave
+  }: Props = $props();
 
   let session = $state<SessionState>('connecting');
   let ready = $state(false);
@@ -422,7 +448,7 @@
 
   {#if !ready}
     <article class="prose" lang={language}>
-      <BlockView block={body} {anhaenge} />
+      <BlockView block={body} {anhaenge} {formeln} {fences} />
     </article>
   {/if}
 </section>

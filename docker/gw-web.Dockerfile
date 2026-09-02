@@ -51,37 +51,22 @@ RUN npm run build
 
 # --- The assertion that lets the runtime stage carry no node_modules --------
 # As configured today the server bundle imports nothing but `node:` builtins and
-# its own relative chunks: `@ark-ui/svelte` is listed in `ssr.noExternal` and is
-# compiled in. So `node_modules` is dead weight in the runtime image — and not
-# harmless dead weight, because `npm ci --omit=dev` pulls `svelte` in as a
-# transitive dependency and that ships the SVELTE COMPILER in a production image.
+# its own relative chunks: `@ark-ui/svelte` and `shiki` are listed in
+# `ssr.noExternal` and are compiled in. So `node_modules` is dead weight in the
+# runtime image — and not harmless dead weight, because `npm ci --omit=dev` pulls
+# `svelte` in as a transitive dependency and that ships the SVELTE COMPILER in a
+# production image.
 #
 # But "nothing is external" is a property of the CURRENT vite config, not a law.
 # If it ever stops being true the failure is `ERR_MODULE_NOT_FOUND` on the first
-# request in production. So it is checked HERE, where it is cheap and loud.
+# request in production.
 #
-# Anchored at column 0 on purpose: rollup emits real import statements there,
-# while the bundle's JSDoc blocks are full of lines like
-# `* import { mount } from 'svelte';` that are documentation, not code.
-# `build/client/` is excluded — those files are served to browsers, not executed
-# by node.
-RUN set -eu; \
-    external="$( \
-      find build -name '*.js' -not -path 'build/client/*' \
-        -exec grep -hE "^(import|export)[^']*from '[^']+'" {} + \
-      | grep -oE "from '[^']+'" \
-      | cut -d"'" -f2 \
-      | grep -vE '^(node:|\.)' \
-      | sort -u || true )"; \
-    if [ -n "$external" ]; then \
-      echo "REFUSING: the server bundle imports packages this image will not contain:" >&2; \
-      echo "$external" >&2; \
-      echo "Either add them to ssr.noExternal in web/vite.config.ts so they are" >&2; \
-      echo "compiled in, or restore an 'npm ci --omit=dev' stage and copy" >&2; \
-      echo "node_modules into the runtime — but check what that drags in first." >&2; \
-      exit 1; \
-    fi; \
-    echo "server bundle is self-contained: node: builtins and relative chunks only"
+# The check itself moved into `web/scripts/check-server-bundle.sh` so that
+# `just build` can run the SAME one — it used to live only here, and that meant a
+# missing `ssr.noExternal` entry passed every gate command green and failed at
+# image build, after review. Two copies of a gate are two gates with two opinions
+# (`scripts/scan-secrets.sh` says the same thing about itself), so there is one.
+RUN sh scripts/check-server-bundle.sh
 
 # ---------------------------------------------------------------------------
 #  Runtime

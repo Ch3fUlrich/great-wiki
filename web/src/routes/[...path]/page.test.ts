@@ -4,6 +4,8 @@ import Page from './+page.svelte';
 import { ANONYMOUS, type Backlink, type DocumentView, type Me, type TreeNode } from '$lib/api';
 import type { BoardNotice, BoardResponse, BoardTask } from '$lib/board';
 import type { Block } from '$lib/blocks/render';
+import { typesetDocument } from '$lib/server/maths';
+import { highlightDocument } from '$lib/server/highlight';
 import type { SidebarMode, Topic, TopicSummary } from '$lib/topics';
 import type { Attachment } from '$lib/attachments';
 
@@ -151,6 +153,13 @@ function html(
         hier: doc.path,
         doc,
         body: koerper,
+        // Typeset through the real module rather than stubbed, so this fixture cannot
+        // disagree with what `+page.server.ts` would actually hand the page. A body with
+        // no ```math fence in it produces an empty map and costs nothing.
+        formeln: typesetDocument(koerper),
+        // And its fences, through the real walker for the same reason: a fixture that
+        // stubbed this could not tell whether the page passes what the load produced.
+        fences: highlightDocument(koerper),
         tree,
         backlinks,
         edit,
@@ -769,5 +778,53 @@ describe('a file placed in the prose (D-15)', () => {
     });
     expect(out).toContain('weg.png');
     expect(out).not.toContain('/api/attachment/weg.png');
+  });
+});
+
+describe('a display formula on the page being read', () => {
+  /** A body holding one ```math fence, as the importer stores one. */
+  const mitFormel: Block = {
+    kind: 'doc',
+    content: [
+      {
+        kind: 'codeBlock',
+        attrs: { language: 'math' },
+        content: [{ kind: 'text', text: 'E = mc^2' }]
+      }
+    ]
+  };
+
+  it('arrives typeset in the first response, with no script involved', () => {
+    // The last seam of this feature, and the only one nothing else covers: the loader
+    // typesets (`server.test.ts`) and `BlockView` draws what it is handed
+    // (`BlockView.test.ts`), but whether this page actually hands one to the other is only
+    // visible here. Without it a formula would render as its own TeX source on every page
+    // in the wiki, and every other test would still be green.
+    const out = html(container, { koerper: mitFormel });
+    expect(out).toContain('class="katex-display"');
+    // Twice over: drawn, and as MathML for a screen reader, carrying the author's own TeX.
+    expect(out).toContain('<annotation encoding="application/x-tex">E = mc^2</annotation>');
+  });
+
+  /** A body holding one ```sql fence, as the importer stores one. */
+  const mitCode: Block = {
+    kind: 'doc',
+    content: [
+      {
+        kind: 'codeBlock',
+        attrs: { language: 'sql' },
+        content: [{ kind: 'text', text: 'SELECT id FROM documents;' }]
+      }
+    ]
+  };
+
+  it('arrives coloured in the first response, with no highlighter in the browser', () => {
+    // The same seam for the same reason, on the feature that has two halves in two files: the
+    // loader tokenises and the component looks the answer up by a key both sides build from
+    // the fence's language and text. If the two ever disagreed about that key, every listing
+    // in the wiki would render uncoloured and every other test here would stay green.
+    const out = html(container, { koerper: mitCode });
+    expect(out).toContain('--token-hell');
+    expect(out).toContain('SELECT');
   });
 });

@@ -11,6 +11,15 @@ OFL.txt sits beside its font files in web/static/fonts/<family>/. Condition 5 of
 OFL requires that these files remain entirely under the OFL: they are not relicensed
 by being distributed here, and this MIT grant does not extend to them.
 
+The maths faces are the exception, and are not OFL:
+
+    KaTeX_*                         Copyright (c) 2013-2020 Khan Academy
+                                    and other contributors
+
+They are KaTeX's own typefaces, copied unchanged from npm `katex`, and are under
+KaTeX's MIT licence — a separate grant from this one, whose text sits beside them in
+web/static/fonts/katex/LICENSE. See web/scripts/vendor-katex.mjs for how they got there.
+
 IBM's licence reserves the name "Plex". Under the OFL, subsetting a font is
 Modification, and a Modified Version may not use a Reserved Font Name. The IBM Plex
 files here are therefore shipped exactly as IBM published them; see the note at the

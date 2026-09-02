@@ -44,8 +44,21 @@ lint:
 # A production build catches what neither the type check nor the tests do: an adapter
 # or SSR failure that only appears when the app is actually compiled. CI runs it, so
 # this must too.
-build:
+#
+# It ends on `verify-server-bundle` because `npm run build` alone does not: a package the
+# runtime image will not contain can reach the server bundle and every gate command still
+# passes green. See that recipe.
+build: && verify-server-bundle
     {{node}} cd web && npm run build
+
+# Refuse a server bundle that imports a package the production image has no node_modules
+# to satisfy. The same script `docker/gw-web.Dockerfile` runs, so this cannot drift from
+# it — and running it here is what stops the failure appearing only at image build, which
+# is after review and after the gate.
+#
+# Needs `web/build` to exist, which is why `build` runs it rather than `lint`.
+verify-server-bundle:
+    {{node}} cd web && sh scripts/check-server-bundle.sh
 
 # The fixture `behaviour` tests against: a throwaway SQLite database, seeded fresh from
 # `content-example` and granted write access, every time this runs.

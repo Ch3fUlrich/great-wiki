@@ -19,6 +19,8 @@ import {
   TRASH_REGION_ID
 } from '$lib/trash';
 import { boardPath, describeEmbeddedBoard, noticeFor, type BoardResponse } from '$lib/board';
+import { typesetDocument } from '$lib/server/maths';
+import { highlightDocument } from '$lib/server/highlight';
 import {
   describeSetTopics,
   describeTopics,
@@ -39,6 +41,46 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
 
   if (status === 403) error(403, 'You do not have access to this page.');
   if (!data) error(404, 'Page not found.');
+
+  const body = parseBody(data);
+
+  /**
+   * The page's ` ```math ` fences, typeset by KaTeX — **here, and not in the component that
+   * draws them.**
+   *
+   * A Svelte component renders on the server and again in the browser while it hydrates, so
+   * a component that called KaTeX would put the whole library — about 272 kB — into every
+   * reader's bundle in order to re-derive markup that reader was already sent. Doing it in
+   * this load puts KaTeX under `$lib/server/`, which SvelteKit refuses to let any
+   * client-reachable module import: the guarantee that no maths library reaches a reader is
+   * a build error rather than a promise. The formula is in the first response, typeset, and
+   * works with JavaScript switched off.
+   *
+   * It never fails the page. Every call is capped and caught inside `typesetDocument` —
+   * this is the shared server, and `Store::open` holds `max_connections(1)`, so a slow load
+   * is a lever on the whole deployment rather than on one tab. A formula that could not be
+   * set renders as its own source with a line saying which limit stopped it.
+   */
+  const formeln = typesetDocument(body);
+
+  /**
+   * The page's fenced code blocks, tokenised by Shiki — **here, and not in the component
+   * that draws them**, for both of `formeln`'s reasons and a third.
+   *
+   * The library and its eight grammars are 609 kB raw. A component that called the
+   * highlighter would render on the server and again while hydrating, so every reader of
+   * every page — this wiki is overwhelmingly prose — downloaded all of it and re-derived
+   * tokens they had already been sent, on their own main thread. `$lib/server/` is what
+   * makes that a build error rather than a promise.
+   *
+   * And the caps only mean something here. Per-fence limits cannot see how many fences a
+   * page has: measured before this moved, a page of five 20 000-character fences answered
+   * in 51.98 s and held every other reader's page load behind it for the same time, on a
+   * server whose `Store::open` keeps `max_connections(1)`. `highlightDocument` bounds the
+   * page rather than the block, and never fails it: over a limit, a fence renders as
+   * ordinary code with a line saying which one.
+   */
+  const codeBloecke = highlightDocument(body);
 
   // Own endpoint, own prefix (`/api/links/backlinks/{*path}`, not a suffix under
   // `/api/documents`) — see `gw-api/src/routes/links.rs` for why. Already filtered to what
@@ -169,7 +211,9 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
   // write is settled by the collaboration socket, which is the only thing that knows.
   return {
     doc: data,
-    body: parseBody(data),
+    body,
+    formeln,
+    fences: codeBloecke,
     // The tree is NOT fetched here any more: the shell renders it on every view, so
     // `+layout.server.ts` asks for it once and this page reads the same answer through the
     // merged `data`. Two requests for one filtered tree was two chances for the breadcrumb

@@ -45,6 +45,38 @@ pub fn slugify(input: &str) -> String {
 }
 ```
 
+## Formeln
+
+Ein Codeblock mit der Sprache math wird nicht abgedruckt, sondern gesetzt — und zwar
+beim Seitenaufbau auf dem Server. Im Browser läuft dafür nichts: mit abgeschaltetem
+JavaScript steht die Formel genauso da.
+
+```math
+\mathrm{eGFR} = 141 \cdot \left(\frac{S_\mathrm{Kr}}{\kappa}\right)^{\alpha} \cdot 0{,}993^{\text{Alter}}
+```
+
+## Diagramme
+
+Ein Codeblock mit der Sprache mermaid wird gezeichnet. Das passiert im Browser und
+nicht auf dem Server — anders als bei den Formeln, denn der Zeichner braucht dafür
+die Seite selbst. Ohne JavaScript steht hier deshalb der Quelltext des Diagramms.
+
+Gezeichnet wird zweimal, einmal hell und einmal dunkel; ein Bild kann der
+Farbeinstellung nicht folgen, also liegen beide bereit und das Stylesheet zeigt das
+passende.
+
+Ein `<br>` in einer Beschriftung bricht die Zeile um — das steht hier absichtlich im
+Beispiel, weil genau dieser Fall lange ein kaputtes Bild ergeben hat.
+
+```mermaid
+graph TD;
+  Markdown[Markdown-Datei] --> Import[Import];
+  Import --> DB[(Datenbank)];
+  DB --> Seite["Seite im<br>Browser"];
+  DB --> Export[Export];
+  Export --> Markdown;
+```
+
 ## Wo die Grenze liegt
 
 **Fett** und *kursiv* siehst du hier nicht — der Text bleibt erhalten, die

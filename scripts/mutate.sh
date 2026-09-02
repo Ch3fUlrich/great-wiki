@@ -1374,6 +1374,25 @@ mutation crates/gw-api/src/export.rs killed \
   's/        let alt = self.escape(alt);/        let alt = alt.to_string();/' \
   'placements: a description is escaped, so markup in it stays text'
 
+# --- the export round trip's three allow-lists ----------------------------------------
+#
+# Each one forgives an attribute markdown has no spelling for, and each one is a safety net
+# rather than a live code path — which is exactly why they need mutating. A narrowing is
+# invisible until the day something writes the attribute, and by then the round-trip check
+# that was supposed to notice has already been switched off. `TASK_ITEM_ATTRS` proved that:
+# emptying it broke no test until one was written for it.
+#
+# Emptying `CODE_BLOCK_ATTRS` must be caught by the fence whose language its own markdown
+# would lose (`tests/export.rs`), and widening it to keep everything must be caught by the
+# fence carrying a stray attribute — the failure a writer can cause from the collaboration
+# socket, which costs the owner one page out of every backup, permanently.
+mutation crates/gw-api/src/export.rs killed \
+  's/^const CODE_BLOCK_ATTRS: \[&str; 1\] = \["language"\];/const CODE_BLOCK_ATTRS: [\&str; 0] = [];/' \
+  'export: a fence keeps its language through the round-trip comparison'
+mutation crates/gw-api/src/export.rs killed \
+  's/            .retain(|key, _| CODE_BLOCK_ATTRS.contains(\&key.as_str()));/            .retain(|_, _| true);/' \
+  'export: a fence carrying an undeclared attribute is reduced, not refused'
+
 # --- crash recovery ------------------------------------------------------------------
 #
 # A trap does not survive SIGKILL, and a killed run leaves the mutated file in place.

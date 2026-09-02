@@ -4,6 +4,8 @@ import { actions, load } from './+page.server';
 import type { DocumentView } from '$lib/api';
 import type { BoardNotice, BoardResponse, BoardTask } from '$lib/board';
 import type { Project } from '$lib/projects';
+import { fenceKey } from '$lib/blocks/code';
+import { FENCE_CHARACTER_LIMIT } from '$lib/server/highlight';
 
 /**
  * The reader page's loader, and specifically D-12's **second placement**: the board embedded
@@ -644,5 +646,109 @@ describe('attaching a file to the page you are reading', () => {
     const { returned } = await runAction('anhaengen', fetchFn, { datei: datei() });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     expect((returned as any).status).toBe(503);
+  });
+});
+
+describe('the formulas on the page', () => {
+  /** A body holding one ```math fence, as the importer stores one. */
+  function withFormula(tex: string): string {
+    return JSON.stringify({
+      kind: 'doc',
+      content: [
+        { kind: 'codeBlock', attrs: { language: 'math' }, content: [{ kind: 'text', text: tex }] }
+      ]
+    });
+  }
+
+  /**
+   * The load's answer, for a document whose body is `body`.
+   *
+   * The whole point of this block: the typesetting happens HERE, in the load, and not in the
+   * component that draws it — a component renders again in the browser while it hydrates, so
+   * calling KaTeX in one would put 272 kB of library into every reader's bundle to re-derive
+   * markup already sent. `$lib/server/maths` is where it lives, which SvelteKit refuses to
+   * let client code import at all. Nothing else in this suite would notice if this loader
+   * stopped calling it: the page would simply print every formula as TeX source.
+   */
+  async function loaded(body: string) {
+    const { fetchFn } = spyFetch({ '/api/documents': { status: 200, body: { ...doc, body } } });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return (await load(loadEvent(fetchFn))) as any;
+  }
+
+  it('typesets them while the page is loaded, and hands them down with the page', async () => {
+    const data = await loaded(withFormula('E = mc^2'));
+    expect(data.formeln).toBeInstanceOf(Map);
+    // Keyed by the fence's own text — the same string `codeText(block)` gives `BlockView`,
+    // which is what lets the reader find it again.
+    expect(data.formeln.get('E = mc^2')).toEqual({
+      kind: 'typeset',
+      html: expect.stringContaining('katex-display')
+    });
+  });
+
+  it('answers a page with no formula on it with nothing, rather than with work', async () => {
+    const data = await loaded(JSON.stringify({ kind: 'doc', content: [] }));
+    expect(data.formeln.size).toBe(0);
+  });
+
+  it('never fails the page over a formula', async () => {
+    // A load that threw would be a 500 for the whole route — and that route is also the only
+    // way to edit the page that caused it. This input overflows KaTeX's parser, which throws
+    // a RangeError straight past `throwOnError: false`.
+    const data = await loaded(withFormula('{'.repeat(2000) + '}'.repeat(2000)));
+    expect(data.doc.path).toBe('/rundgang/tabellen');
+    expect([...data.formeln.values()][0].kind).toBe('source');
+  });
+});
+
+describe('the code blocks on the page', () => {
+  /** A body holding one fenced code block, as the importer stores one. */
+  function withFence(text: string, language: string): string {
+    return JSON.stringify({
+      kind: 'doc',
+      content: [
+        { kind: 'codeBlock', attrs: { language }, content: [{ kind: 'text', text }] }
+      ]
+    });
+  }
+
+  /**
+   * The load's answer, for a document whose body is `body`.
+   *
+   * The whole point of this block, and it is the formulas' point arrived at from a second
+   * direction: the tokenising happens HERE and not in the component that draws it. A
+   * component renders again in the browser while it hydrates, so calling Shiki in one put the
+   * library and eight grammars — 609 kB raw — into every reader's bundle AND re-ran the
+   * tokeniser on the reader's own thread to re-derive what they had been sent. It also meant
+   * nothing could see how many fences a page had: five 20 000-character fences answered in
+   * 51.98 s, with every other reader queued behind them.
+   */
+  async function loaded(body: string) {
+    const { fetchFn } = spyFetch({ '/api/documents': { status: 200, body: { ...doc, body } } });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return (await load(loadEvent(fetchFn))) as any;
+  }
+
+  it('tokenises them while the page is loaded, and hands them down with the page', async () => {
+    const data = await loaded(withFence('SELECT id FROM documents;', 'sql'));
+    expect(data.fences).toBeInstanceOf(Map);
+    const fence = data.fences.get(fenceKey('SELECT id FROM documents;', 'sql'));
+    expect(fence.kind).toBe('highlighted');
+    expect(fence.tokens.some((token: { light: string | null }) => token.light !== null)).toBe(true);
+  });
+
+  it('answers a page with no code on it with nothing, rather than with work', async () => {
+    const data = await loaded(JSON.stringify({ kind: 'doc', content: [] }));
+    expect(data.fences.size).toBe(0);
+  });
+
+  it('never fails the page over a fence', async () => {
+    // A load that threw would be a 500 for the whole route — and that route is also the only
+    // way to edit the page that caused it. A fence past every cap must cost colour and
+    // nothing else.
+    const data = await loaded(withFence('x'.repeat(FENCE_CHARACTER_LIMIT + 1), 'rust'));
+    expect(data.doc.path).toBe('/rundgang/tabellen');
+    expect([...data.fences.values()][0].kind).toBe('plain');
   });
 });

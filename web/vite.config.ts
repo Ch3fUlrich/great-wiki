@@ -137,7 +137,37 @@ export default defineConfig({
 		// `ERR_UNKNOWN_FILE_EXTENSION: Unknown file extension ".svelte"` — a 500 on any
 		// page using an Ark component, with nothing in the browser console to say why.
 		// `noExternal` puts the package through Vite's Svelte pipeline instead.
-		noExternal: ['@ark-ui/svelte']
+		//
+		// Shiki is here for a different reason, and it is a DEPLOYMENT one: the production
+		// web image ships no node_modules at all, and docker/gw-web.Dockerfile refuses a
+		// server bundle that imports any bare specifier — "REFUSING: the server bundle
+		// imports packages this image will not contain". The highlighter is imported by
+		// `$lib/server/highlight`, which `[...path]/+page.server.ts` calls, so `shiki/core`
+		// and `shiki/engine/javascript` are in the SERVER bundle — deliberately, exactly as
+		// KaTeX is: a component that called the tokeniser would also put 609 kB of grammars
+		// in every reader's browser to re-derive tokens already sent, and would re-run them
+		// on the reader's own thread while hydrating.
+		//
+		// That check runs ONLY inside `docker build`. `npm run build`, `just lint`, `just
+		// test` and `just agent-ci` all pass with the entry missing, and the failure appears
+		// at image build — after review. `just verify-server-bundle` is the same assertion,
+		// runnable here.
+		//
+		// KaTeX is here for the same deployment reason and by a different route: it is
+		// imported by `$lib/server/maths`, which `[...path]/+page.server.ts` calls, so it is
+		// in the SERVER bundle only — deliberately, because a component that called it would
+		// also put 272 kB of it in every reader's browser to re-derive markup already sent.
+		// Being server-only is exactly what makes this entry necessary: the runtime image
+		// has no node_modules for the import to resolve against.
+		//
+		// MERMAID IS DELIBERATELY ABSENT, and adding it would be the mistake. It is the only
+		// one of the three that must never be in the server bundle at all: it measures text by
+		// appending to `document.body`, so it cannot run during server rendering, and it is by
+		// a wide margin the largest package here. It is reached instead through the
+		// `browser`-guarded dynamic import in `$lib/blocks/mermaid` — the same shape
+		// `loadEditor` uses — which rollup drops entirely from the SSR build, so `noExternal`
+		// has nothing to inline and a page with no diagram on it downloads none of it.
+		noExternal: ['@ark-ui/svelte', 'shiki', 'katex']
 	},
 	server: {
 		host: true, // bind 0.0.0.0 — Caddy is on another host

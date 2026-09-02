@@ -724,6 +724,91 @@ fn a_link_whose_address_markdown_would_mangle_is_refused_rather_than_truncated()
     );
 }
 
+#[test]
+fn a_code_block_carrying_a_second_attribute_is_reduced_rather_than_refused() {
+    // The `LINK_ATTRS` disaster, arriving where diagrams, formulas and highlighted
+    // listings have just given people a reason to write fences.
+    //
+    // Nothing validates a block attribute on the write path: `read_attributes` in
+    // `gw-collab` copies whatever the Yjs element carries and `publish_revision`
+    // serialises the tree as given, which `doc.rs`'s own fixture demonstrates by
+    // round-tripping a paragraph carrying `{"": "leer", "größe": 1, "a b": "c"}`. So
+    // anybody with write access on ONE page can store a second attribute on a fence over
+    // the collaboration socket. Without a reduction the exported markdown re-imports as
+    // `{language}` alone, the trees differ, `render_file` refuses — and `run()` pushes a
+    // `Refused` and continues, so that page is silently missing from every export
+    // directory from then on while `FIDELITY_WARNING` leaves a sentence there calling the
+    // directory a faithful copy of the database. A document that cannot be exported
+    // cannot be exported later either: it is permanent.
+    //
+    // Markdown has a spelling for exactly one thing about a fence — the language on its
+    // info string. Everything else a fence could carry (a theme, line numbers, a cached
+    // drawing, a parse-error flag) is renderer or component state and has no home in a
+    // file, which is why the allow-list has one entry and why adding a second DECLARED
+    // attribute in the editor's schema is still refused: ProseMirror would mint it onto
+    // every block it touches, the reduction would then drop it from both sides, and the
+    // backup would quietly omit it instead of loudly refusing the page.
+    let meta = export::FileMeta {
+        title: "Ablauf".into(),
+        doc_type: "page".into(),
+        visibility: "public".into(),
+        language: "de".into(),
+        sort_key: 0,
+        slug: "ablauf".into(),
+        tags: Vec::new(),
+    };
+    let body: Block = serde_json::from_str(
+        r#"{"kind":"doc","content":[{"kind":"codeBlock",
+             "attrs":{"language":"mermaid","theme":"dark","zeilen":3},
+             "content":[{"kind":"text","text":"graph TD;\n  A-->B;"}]}]}"#,
+    )
+    .unwrap();
+
+    let file = export::render_file(&meta, &body).unwrap_or_else(|e| {
+        panic!("a fence carrying a stray attribute must still export, and this one did not: {e}")
+    });
+    assert!(file.contains("```mermaid"), "{file}");
+    assert!(file.contains("  A-->B;"), "{file}");
+}
+
+#[test]
+fn a_code_block_whose_language_its_own_markdown_would_lose_is_refused() {
+    // Pins `language` INTO the reduction's allow-list, the way the two tests above pin
+    // `checked` and `href`. Verified by mutation: emptying `CODE_BLOCK_ATTRS` breaks
+    // nothing else in this file, because the test above differs only by attributes the
+    // reduction is supposed to discard.
+    //
+    // A comma is the shape that pins it. The importer keeps the info string's FIRST
+    // comma- or space-separated token (`markdown.rs`), so a stored `rust,ignore` is
+    // written onto the fence whole and comes back as `rust` — everything else about the
+    // block is identical, so the language is the only thing left that differs. A language
+    // containing whitespace or a backtick cannot pin it: `Renderer::code` refuses those
+    // outright, before any comparison happens.
+    //
+    // Refusing is right: a fence that says it is one language and re-reads as another is
+    // not the same block, and this module's rule is that nothing is quietly degraded.
+    let meta = export::FileMeta {
+        title: "Ablauf".into(),
+        doc_type: "page".into(),
+        visibility: "public".into(),
+        language: "de".into(),
+        sort_key: 0,
+        slug: "ablauf".into(),
+        tags: Vec::new(),
+    };
+    let body: Block = serde_json::from_str(
+        r#"{"kind":"doc","content":[{"kind":"codeBlock",
+             "attrs":{"language":"rust,ignore"},
+             "content":[{"kind":"text","text":"let x = 1;"}]}]}"#,
+    )
+    .unwrap();
+
+    assert!(
+        export::render_file(&meta, &body).is_err(),
+        "a fence whose language markdown cannot state must be refused, not quietly changed"
+    );
+}
+
 // --- topics ----------------------------------------------------------------------------
 
 /// The frontmatter key is `tags` and the domain word is *topic*, deliberately: the design's

@@ -2490,6 +2490,159 @@ await check('K7 detaching a file leaves the prose exactly as it was, and the pag
   assert(!region.includes(NAME), 'the Anhänge list still shows a file that was detached');
 });
 
+// ---------------------------------------------------------------------------------------
+// Group L — a diagram is a picture, and it is the one the reader's theme calls for
+//
+// The step this group exists for could not be checked anywhere else. Mermaid needs the DOM to
+// measure text, so it never runs on the server and no `svelte/server` render in `vitest` can
+// see a drawn diagram at all — every one of those tests can only assert the fence's own source.
+// So this is the only place that answers whether the thing actually draws.
+//
+// Against `/rundgang/was-schon-geht`, which `content-example` seeds with one ```mermaid fence.
+// It needs no grant: these checks only read.
+//
+// ONE HONEST LIMITATION, because it is the shape of failure this feature is most likely to
+// have. This harness drives `npm run dev`, and SvelteKit adds `'unsafe-inline'` to `style-src`
+// in development (see `web/src/lib/csp.ts`), so the CSS-injection barrier ADR 0018 relies on is
+// NOT in force here. A green run says the diagram draws and that no console error was raised;
+// it does not say the production policy admits it. That is verified against a production build
+// by hand, and ADR 0018 says so.
+const DIAGRAM_PAGE = '/rundgang/was-schon-geht';
+
+await check('L1 a diagram is text in the first response and a picture after it', async (page) => {
+  // The half a reader with JavaScript switched off keeps. It also pins the other direction:
+  // the server must NOT have drawn anything, because mermaid cannot run there — a data URI in
+  // the first response would mean the library had reached the server bundle, which is the
+  // failure `web/scripts/check-server-bundle.sh` exists to catch at build time.
+  const first = await (await page.request.get(BASE + DIAGRAM_PAGE)).text();
+  // The PROSE, not the whole document: `app.html` carries a `data:image/svg+xml` favicon, and
+  // asserting against the page as a whole made this fail for a reason that has nothing to do
+  // with diagrams — which is the same trap K7 avoids by cutting the article out first.
+  const artikel = first.match(/<article[^>]*class="prose[\s\S]*?<\/article>/)?.[0] ?? '';
+  assert(artikel.includes('graph TD;'), 'the diagram source is not in the first response');
+  assert(
+    !artikel.includes('data:image/svg+xml'),
+    'the server drew a diagram — mermaid must never be on the server rendering path'
+  );
+
+  const klagen = [];
+  page.on('console', (message) => {
+    if (message.type() === 'error') klagen.push(message.text());
+  });
+  page.on('pageerror', (err) => klagen.push(String(err)));
+
+  await page.goto(BASE + DIAGRAM_PAGE, { waitUntil: 'networkidle' });
+  const bilder = page.locator('article.prose img[src^="data:image/svg+xml"]');
+  // Generous: mermaid is fetched only when a diagram is on screen, and in DEV that is a great
+  // many separate module requests.
+  await bilder.first().waitFor({ state: 'visible', timeout: 60_000 });
+
+  const anzahl = await bilder.count();
+  assert(anzahl === 2, `D-24 draws once per theme, so there should be two images, not ${anzahl}`);
+
+  // `naturalWidth` is non-zero only when the browser accepted the address AND decoded the
+  // bytes, so it answers the policy question and the "is it really an SVG" question at once.
+  const breite = await bilder.first().evaluate((el) => el.naturalWidth);
+  assert(breite > 0, 'the picture is in the markup and the browser did not display it');
+
+  // The two really are two renders. Identical sources would mean one theme was drawn twice,
+  // which is the failure D-24 exists to prevent and which looks fine until somebody switches
+  // the site to dark.
+  const beide = await bilder.evaluateAll((els) => els.map((el) => el.getAttribute('src')));
+  assert(beide[0] !== beide[1], 'both images are the same drawing — the theme did not change');
+
+  // And the source is the description, since the text inside a picture is not text any more.
+  const alt = await bilder.first().getAttribute('alt');
+  assert(alt?.includes('graph TD;'), `the image has no description of the diagram: ${alt}`);
+
+  // One expected complaint is filtered, by name, and it is worth knowing about. In PRODUCTION
+  // every diagram logs `Refused to apply inline style … style-src 'self' 'nonce-…'`: mermaid
+  // inserts a `<style>` element while it measures text, and refusing an injected style element
+  // is precisely what that directive is for. Verified by hand against a production build — the
+  // drawing is unaffected, because that `<style>` is serialised into the returned SVG and is
+  // the image's own business once it is inside the `<img>`. It does not appear HERE, because
+  // SvelteKit adds `'unsafe-inline'` to `style-src` in development; the exclusion is written
+  // down so that a green run in dev is not read as a promise about production.
+  const echte = klagen.filter((zeile) => !/Refused to apply inline style/.test(zeile));
+  assert(echte.length === 0, `the browser complained while drawing: ${echte.join(' | ')}`);
+});
+
+await check('L2 the picture shown is the one drawn for the theme in force', async (page) => {
+  // The whole of what the two images buy. An `<img>` cannot follow `prefers-color-scheme` or
+  // the site's own control, so the stylesheet has to choose — and a wrong rule here is
+  // invisible in the light theme, which is the one everything else is checked in.
+  await page.goto(BASE + DIAGRAM_PAGE, { waitUntil: 'networkidle' });
+  const hell = page.locator('article.prose img.hell');
+  const dunkel = page.locator('article.prose img.dunkel');
+  await hell.waitFor({ state: 'visible', timeout: 60_000 });
+  assert(await dunkel.isHidden(), 'the dark drawing is shown on a light page');
+
+  await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'));
+  await dunkel.waitFor({ state: 'visible', timeout: 5_000 });
+  assert(await hell.isHidden(), 'the light drawing is still shown after switching to dark');
+});
+
+await check('L3 a label with the documented line break is a picture, not a broken image', async (page) => {
+  // The bug this check exists for, and the reason it is HERE rather than in `vitest`: it is
+  // the pure case of something that works only because no browser was involved.
+  //
+  // Mermaid renders an `htmlLabels` label as HTML inside a `<foreignObject>` and serialises
+  // the finished SVG with `innerHTML` — the HTML serialiser — so `A[Erste Zeile<br>Zweite
+  // Zeile]`, the documented and canonical Mermaid line break, comes back with a `<br>` that
+  // has no closing tag. That is well-formed HTML and it is NOT well-formed XML, and
+  // `data:image/svg+xml` is parsed as strict XML: the address does not decode, and the reader
+  // gets a broken-image glyph in place of a diagram whose source was perfectly good. Chromium,
+  // Firefox and WebKit all agreed; `DOMParser` on the decoded source answered *"Opening and
+  // ending tag mismatch: br line 1 and p"*. `<br/>` behaved identically, because the HTML
+  // serialiser normalises it back.
+  //
+  // Nothing in the unit suites could see it — none of them decodes an image — and the seeded
+  // diagram had no `<br>` in it. So the corpus now has one, `mermaidConfig` sets
+  // `htmlLabels: false` so that the break is drawn as `<tspan>`s instead, and every address is
+  // put through the browser's own decoder before it reaches the page. This asserts both
+  // halves: that the example still holds the case, and that it draws.
+  const first = await (await page.request.get(BASE + DIAGRAM_PAGE)).text();
+  // `&lt;br>`, not `&lt;br&gt;`: Svelte's text escaping replaces `&` and `<` and leaves `>`
+  // alone, which is correct and is the kind of detail that makes an assertion about escaped
+  // markup fail for the wrong reason.
+  assert(
+    first.includes('&lt;br>'),
+    'the seeded diagram no longer contains a <br> label — the case this check exists for is gone'
+  );
+
+  await page.goto(BASE + DIAGRAM_PAGE, { waitUntil: 'networkidle' });
+  const bilder = page.locator('article.prose img[src^="data:image/svg+xml"]');
+  await bilder.first().waitFor({ state: 'visible', timeout: 60_000 });
+
+  // EVERY drawing, not merely the first: the two are separate renders and a serialisation
+  // fault would take both, but a theme-specific one would take only one.
+  const breiten = await bilder.evaluateAll((els) => els.map((el) => el.naturalWidth));
+  assert(breiten.length === 2, `expected two drawings, got ${breiten.length}`);
+  assert(
+    breiten.every((breite) => breite > 0),
+    `a drawing did not decode — the <br> case is back: ${breiten.join(', ')}`
+  );
+
+  // And the break really is drawn rather than dropped: with `htmlLabels: false` mermaid puts
+  // each line in its own `<tspan>`, so the decoded source carries two of them where the label
+  // was one string. Read out of the address rather than out of the DOM — the picture is an
+  // `<img>` and its markup is deliberately unreachable from this page.
+  const quelle = decodeURIComponent(
+    (await bilder.first().getAttribute('src'))?.replace(/^data:image\/svg\+xml;charset=utf-8,/, '') ??
+      ''
+  );
+  assert(!quelle.includes('<br>'), 'the drawing still carries an unclosed <br>');
+  // Word by word rather than as one string: mermaid lays a text label out one word per
+  // `<tspan>`, so `Seite im` is not a contiguous run in the markup even though it is one line
+  // on the screen. What matters is that BOTH halves of the broken label were drawn — a break
+  // that had been mishandled by truncation would lose the second one silently.
+  const fehlend = ['Seite', 'Browser'].filter((wort) => !quelle.includes(wort));
+  assert(
+    fehlend.length === 0,
+    `the label lost ${fehlend.join(', ')} — decoded drawing begins: ${quelle.slice(0, 300)}`
+  );
+});
+
 await browser.close();
 
 // ---------------------------------------------------------------------------------------

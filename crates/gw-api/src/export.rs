@@ -431,6 +431,33 @@ pub fn render_file(meta: &FileMeta, body: &Block) -> Result<String, String> {
 /// nothing in the importer, the renderer below or `BlockView` reads any other key.
 const LINK_ATTRS: [&str; 2] = ["href", "doc"];
 
+/// The attributes of a `codeBlock` that markdown has a spelling for.
+///
+/// Exactly one, and there is no second: an info string states a language and states
+/// nothing else. A theme, line numbers, a highlight range, a cached drawing, a
+/// parse-error flag — everything a fence renderer might want to remember — lives in the
+/// renderer or in component state, because a file has nowhere to put it and the exporter
+/// would have to refuse a page it could not write back.
+///
+/// This is a safety net for what a WRITER can do, not a licence for what the schema may
+/// declare. Nothing validates a block attribute on the write path: `read_attributes`
+/// (`gw-collab`) copies whatever the Yjs element carries and `publish_revision`
+/// (`gw-store`) serialises the tree as given, so anyone with write access on one page can
+/// store `{"language":"rust","x":1}` on a fence over the collaboration socket. Without
+/// this list that page is refused from every export from then on — permanently, since a
+/// document that cannot be exported cannot be exported later either — and `run()` writes
+/// the rest of the wiki anyway, so the symptom is a backup that is quietly missing a page
+/// while `FIDELITY_WARNING` calls the directory a faithful copy of the database.
+///
+/// Declaring a second attribute in the editor's schema is still refused, and the
+/// allow-list is why the refusal has to be stated rather than assumed: ProseMirror's
+/// `computeAttrs` mints a declared attribute onto every block the editor touches, this
+/// reduction would then drop it from both sides, the comparison would pass, and the
+/// attribute would be **silently absent** from the exported markdown instead of loudly
+/// refusing. A backup that quietly omits a theme is better than one that omits a page and
+/// worse than one that is correct.
+const CODE_BLOCK_ATTRS: [&str; 1] = ["language"];
+
 /// The attributes of a `taskItem` that markdown has a spelling for.
 ///
 /// Exactly one. `[x]` and `[ ]` say `checked` and say nothing else, and every other key a
@@ -489,9 +516,19 @@ const TASK_ITEM_ATTRS: [&str; 1] = ["checked"];
 ///
 /// The same care about what it hides applies: this is an allow-list keeping `checked` and
 /// discarding everything else, so a key nobody has thought of is invisible here too. That
-/// is the right trade only while `checked` stays the sole thing GFM's `[x]` states. Block
-/// kinds other than `taskItem` are compared with their attributes whole — a `heading` that
-/// has grown a stray key is still refused.
+/// is the right trade only while `checked` stays the sole thing GFM's `[x]` states.
+///
+/// # And a third, for a fence that has grown an attribute nobody declared
+///
+/// [`CODE_BLOCK_ATTRS`] keeps `language` and discards the rest, arrived at from the same
+/// direction as `href`: not because anything here writes a second attribute, but because
+/// anyone with write access on one page can put one there over the collaboration socket,
+/// and the cost of that is a page permanently missing from the owner's backup. Diagrams,
+/// formulas and highlighted listings are all `codeBlock` with a `language`, so this is
+/// now the block people have a reason to write.
+///
+/// Block kinds other than `taskItem` and `codeBlock` are compared with their attributes
+/// whole — a `heading` that has grown a stray key is still refused.
 pub(crate) fn comparable(block: &Block) -> serde_json::Value {
     let mut copy = block.clone();
     reduce(&mut copy);
@@ -503,6 +540,11 @@ fn reduce(block: &mut Block) {
         block
             .attrs
             .retain(|key, _| TASK_ITEM_ATTRS.contains(&key.as_str()));
+    }
+    if block.kind == BlockKind::CodeBlock {
+        block
+            .attrs
+            .retain(|key, _| CODE_BLOCK_ATTRS.contains(&key.as_str()));
     }
     for mark in &mut block.marks {
         if mark.kind == MarkKind::Link {

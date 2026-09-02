@@ -32,18 +32,23 @@
 # pattern list below records what was found and what was verified against the compiler,
 # rather than restating the claim.
 #
-# And one that is not in our source at all: `mermaid.render(id, text, container)`.
-# Handing that function a container makes IT perform the write on your behalf, so the
-# sink is inside a dependency and no grep for our own spellings would ever see it. Hence
-# a hand-written grep checking a library's call signature, which looks odd and is
-# deliberate: the two-argument form returns a string and is the shape D-19 requires.
+# And one whose SINK is not in our source at all: `mermaid.render(id, text, container)`.
+# Handing that function a container makes IT perform the write on your behalf — verified in
+# `mermaid@11.17.2`, whose first act on the container it is given is
+# `svgContainingElement.innerHTML = ""` — so the sink is inside a dependency and no grep for
+# our own spellings would ever see it. Hence a hand-written grep checking a library's call
+# signature, which looks odd and is deliberate: the two-argument form returns a string and is
+# the shape D-19 requires. `web/src/lib/blocks/mermaid.ts` is the caller this now watches, and
+# `web/src/lib/blocks/diagram.test.ts` asserts the same rule from the other side, so removing
+# either one still leaves the other red.
 #
 # WHAT IT DOES NOT COVER, HONESTLY
 # --------------------------------
 #  - Tests are not scanned. `BlockView.test.ts` asserts that these very strings are
 #    ABSENT from rendered output, so it necessarily contains one of them; a test does
 #    not ship in the page. That is a class exclusion, not an exemption — the named
-#    exemption list below is empty and says what would be allowed to join it.
+#    exemption list below is still empty, and the one construction this reader is
+#    allowed to make is permitted as a LINE rather than as a file. See PERMITTED.
 #  - Only TRACKED files are read, because this is `git grep` (as the secret scan is). A
 #    brand-new file is invisible until it is `git add`ed, which is before it can be
 #    committed and therefore before it can be reviewed or deployed.
@@ -112,12 +117,44 @@ readonly MERMAID_CALL='render\([^)]*,[^)]*,'
 
 # Files allowed to hold one of the above, each with the reason it is safe.
 #
-# EMPTY, and that is the true state of the tree: the reader constructs no HTML today.
-# One entry is expected — the KaTeX leaf component, which renders a formula to HTML
-# during SSR — and it must arrive in the SAME commit as the file it exempts, with a doc
-# comment on that component saying what makes its input safe. An exemption added ahead
-# of its file is a hole nobody is looking at.
+# STILL EMPTY, and it is meant to stay that way. This list was written expecting one
+# entry — the KaTeX leaf, which renders a formula to HTML during server rendering — and
+# when that component arrived it did not get one. See PERMITTED below for what it got
+# instead and why that is not the same thing.
 readonly EXEMPT=()
+
+# The one construction in this reader that is allowed to put a string into the page as
+# markup, matched as a WHOLE LINE rather than as a filename.
+#
+# WHY THIS IS NOT AN ENTRY IN `EXEMPT`
+# ------------------------------------
+# Exempting a file switches this check off for that file: every spelling above, on every
+# line, for as long as the file exists. That is a large door to open for one expression,
+# and it opens widest exactly where the danger is greatest — the file that is exempt is
+# by definition the file that already handles generated markup, so it is the file where
+# a second sink would be least surprising to write and least likely to be noticed.
+#
+# A line-exact permission grants what was actually argued for and nothing else. In
+# `MathView.svelte`, `formel.html` is KaTeX's output for one ` ```math ` fence, produced
+# in `$lib/server/maths` — where `trust` is never passed, so `\href`, `\url`,
+# `\includegraphics` and the whole `\html…` family are refused, and where the author's own
+# text reaches the page only through KaTeX's escaping. That is the argument, and it is an
+# argument about ONE VALUE. So this permits that value, on its own line, in that file:
+#
+#   - the same expression in any other file is still a finding (the path is in the pattern);
+#   - any other expression in that file is still a finding (the value is in the pattern);
+#   - any other sink in that file — `innerHTML`, `insertAdjacentHTML`, a `srcdoc` — is
+#     still a finding, because only this one spelling is written down;
+#   - anything else on the line is still a finding (the pattern is anchored at both ends).
+#
+# The self-test plants all four cases, so narrowing them back fails by name.
+#
+# The cost, stated: a rename or a reformat of that one line turns this red, and the fix is
+# to edit this list. That is the intended failure — a check that keeps passing while the
+# thing it describes moves is a check that has stopped describing anything.
+readonly PERMITTED=(
+  '^web/src/lib/components/MathView\.svelte:[0-9]+:[[:space:]]*\{@html formel\.html\}$'
+)
 
 # Run one git-grep pass, distinguishing "found nothing" from "failed to run".
 #
@@ -151,6 +188,19 @@ is_exempt() {
   return 1
 }
 
+# Is this `path:line:text` finding the one construction PERMITTED names?
+#
+# The whole finding is matched, path and line and text together, which is what makes the
+# permission narrower than an exemption: `grep -qE` against a pattern anchored at both
+# ends admits exactly the argued-for line and nothing that merely resembles it.
+is_permitted() {
+  local pattern
+  for pattern in ${PERMITTED[@]+"${PERMITTED[@]}"}; do
+    printf '%s\n' "$1" | grep -qE "$pattern" && return 0
+  done
+  return 1
+}
+
 scan_only() {
   local -a findings=()
   local line hits file visible sink_args=()
@@ -167,7 +217,7 @@ scan_only() {
   hits="$(grep_pass "${sink_args[@]}")" || return 2
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    is_exempt "$line" || findings+=("$line")
+    is_exempt "$line" || is_permitted "$line" || findings+=("$line")
   done <<<"$hits"
 
   # The dependency's own sink, file by file: only where mermaid is mentioned at all.
@@ -176,7 +226,8 @@ scan_only() {
     grep -qi 'mermaid' "$file" || continue
     while IFS= read -r line; do
       [ -n "$line" ] || continue
-      is_exempt "$file:$line" || findings+=("$file:$line   [three-argument mermaid render]")
+      is_exempt "$file:$line" || is_permitted "$file:$line" ||
+        findings+=("$file:$line   [three-argument mermaid render]")
     done < <(grep -nE "$MERMAID_CALL" "$file" || true)
   done < <(git ls-files -- "${SCOPE[@]}")
 
@@ -188,8 +239,9 @@ scan_only() {
     echo "not know, which is why nothing here sanitises anything. Keep it that way: return"
     echo "a STRING and put it in a text position, or an attribute (an <img src>), rather"
     echo "than parsing it as markup. If a component genuinely must render generated HTML,"
-    echo "confine it to one leaf, document what makes its input safe, and add that file to"
-    echo "EXEMPT in this script in the same commit."
+    echo "confine it to one leaf, document what makes its input safe, and add the LINE — not"
+    echo "the file — to PERMITTED in this script in the same commit. Read what that list says"
+    echo "about why it is a line and not a file before adding to it."
     return 1
   fi
 
@@ -251,6 +303,15 @@ self_test() {
   printf "for (const forbidden of ['srcdoc', '<script']) expect(out).not.toContain(forbidden);\n" \
     > "$dir/BlockView.test.ts"
 
+  # The permitted construction, and the three ways of nearly being it. All four live in
+  # one file at the real path, because the permission is a LINE and not a file — which is
+  # only demonstrable by showing the same file being read both ways at once.
+  printf '<div class="formel">\n    {@html formel.html}\n</div>\n<p>{@html etwasAnderes}</p>\nel.innerHTML = ziel;\n' \
+    > "$dir/MathView.svelte"
+  # …and the same line somewhere else, which must still be a finding: the path is part of
+  # the pattern, so a second component cannot inherit the permission by copying the line.
+  printf '<div>\n    {@html formel.html}\n</div>\n'            > "$dir/planted_math_elsewhere.svelte"
+
   git -C "$tmp" add -A
   cd "$tmp"
   set +e
@@ -270,7 +331,8 @@ self_test() {
   for planted in planted_html.svelte planted_inner.ts planted_outer.ts planted_adjacent.ts \
     planted_unsafe.ts planted_fragment.ts planted_write.ts planted_srcdoc.svelte \
     planted_function.ts planted_eval.ts planted_mermaid.ts planted_bind.svelte \
-    planted_bracket.ts planted_assign.ts planted_parser.ts planted_spaced.svelte; do
+    planted_bracket.ts planted_assign.ts planted_parser.ts planted_spaced.svelte \
+    planted_math_elsewhere.svelte; do
     rc=0
     grep -q "$planted" <<<"$output" || rc=1
     note "$planted" "$rc"
@@ -283,6 +345,20 @@ self_test() {
     grep -q "$planted" <<<"$output" && rc=1
     note "$planted" "$rc"
   done
+
+  # The permitted line, asserted line by line rather than by filename: the same file holds
+  # the one construction that is allowed and two that are not, which is the whole claim
+  # PERMITTED makes about being narrower than an exemption.
+  echo "The permitted construction, in the file that argued for it:"
+  rc=0
+  grep -q 'MathView\.svelte:[0-9]*:.*formel\.html' <<<"$output" && rc=1
+  note "the argued-for line is not a finding" "$rc"
+  rc=0
+  grep -q 'etwasAnderes' <<<"$output" || rc=1
+  note "another expression in the SAME file still is" "$rc"
+  rc=0
+  grep -q 'el.innerHTML = ziel' <<<"$output" || rc=1
+  note "another sink in the SAME file still is" "$rc"
 
   rc=0
   [ "$status" -eq 1 ] || rc=1

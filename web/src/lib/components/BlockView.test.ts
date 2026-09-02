@@ -2,12 +2,25 @@ import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import BlockView from './BlockView.svelte';
 import type { Block, MarkKind } from '$lib/blocks/render';
+import { DIAGRAM_CHARACTER_LIMIT } from '$lib/blocks/diagram';
+import type { Formulas } from '$lib/blocks/maths';
+import type { Fences } from '$lib/blocks/code';
+import { typesetDocument } from '$lib/server/maths';
+import { highlightDocument } from '$lib/server/highlight';
 import type { Attachment } from '$lib/attachments';
 
 /// The component's markup, without the hydration markers Svelte interleaves — they are an
 /// implementation detail and would make every assertion about structure unreadable.
-function html(block: Block, anhaenge: Attachment[] = []): string {
-  return render(BlockView, { props: { block, anhaenge } }).body.replace(/<!--.*?-->/g, '');
+function html(
+  block: Block,
+  anhaenge: Attachment[] = [],
+  formeln: Formulas | null = null,
+  fences: Fences | null = null
+): string {
+  return render(BlockView, { props: { block, anhaenge, formeln, fences } }).body.replace(
+    /<!--.*?-->/g,
+    ''
+  );
 }
 
 /// A single formatted leaf, standalone: `BlockView` accepts any block kind at its root,
@@ -510,34 +523,229 @@ describe('a code block', () => {
     content: [{ kind: 'text', text }]
   });
 
+  /**
+   * What a reader would actually see: the rendered markup with its tags taken off.
+   *
+   * A highlighted fence is one `<span>` per coloured run, so the listing is no longer one
+   * contiguous string in the output — but every character of it, whitespace included, must
+   * still be there and still be in order, which is what this asks.
+   */
+  const printed = (out: string): string => out.replace(/<[^>]*>/g, '');
+
+  /**
+   * The page as the route renders it: the walk `+page.server.ts` does, then the component.
+   *
+   * Both halves, deliberately. Tokenising moved out of `CodeView` and into the page's
+   * `load` — so that the highlighter never reaches a reader's browser and so that the caps
+   * can see how many fences a page has — which means a fence is coloured only if the walker
+   * and the component agree on the key it is filed under. A test that stubbed one side
+   * would pass while they disagreed, and a disagreement renders every listing on the site
+   * uncoloured.
+   */
+  const seite = (block: Block): string => html(block, [], null, highlightDocument(block));
+
   it('keeps every newline and every space the author typed', () => {
     const source = 'fn main() {\n    println!("hallo");\n}';
-    const out = html(fence(source, 'rust'));
-    expect(out).toContain('<pre><code>');
+    const out = seite(fence(source, 'rust'));
+    expect(out).toMatch(/<pre[^>]*><code/);
     // Exact, not `contains('println')`: the bug was one line with the indentation gone, and
     // that passes any assertion that only asks whether the words are present.
-    expect(out).toContain('fn main() {\n    println!("hallo");\n}');
+    expect(printed(out)).toContain('fn main() {\n    println!("hallo");\n}');
+  });
+
+  it('colours a language it knows, through style attributes rather than markup', () => {
+    const out = seite(fence('fn main() {}', 'rust'));
+    // Two custom properties per run and no `color:` declaration: an inline `color` would
+    // beat the stylesheet, and the stylesheet is the only thing that knows which theme the
+    // reader is in. See CodeView.svelte.
+    expect(out).toMatch(/style="--token-hell: #[0-9A-Fa-f]{3,8}; --token-dunkel: #[0-9A-Fa-f]{3,8};"/);
+    // Nothing but hex literals reaches a style attribute — ADR 0007 admits `style-src-attr`
+    // on the grounds that the renderer emits no authored CSS into one.
+    for (const style of out.match(/style="[^"]*"/g) ?? []) {
+      expect(style).toMatch(/^style="(--token-(hell|dunkel): #[0-9A-Fa-f]{3,8}; ?)+"$/);
+    }
   });
 
   it('keeps the newlines a diagram is delimited by, which are the whole of its syntax', () => {
     // `graph TD; A-->B;` on one line is not the same source as two lines, and a renderer
     // handed the collapsed form draws nothing. This is why the fix is a step zero rather
     // than part of the diagram work.
-    const out = html(fence('graph TD;\n  A-->B;', 'mermaid'));
-    expect(out).toContain('graph TD;\n  A-->B;');
+    const out = seite(fence('graph TD;\n  A-->B;', 'mermaid'));
+    expect(printed(out)).toContain('graph TD;\n  A-->B;');
   });
 
   it('escapes what it prints rather than putting it into the page as markup', () => {
     // The reader constructs no HTML from stored content, and a fence is the one place where
     // somebody would obviously try. Svelte escapes the interpolation; this pins it, because
     // the branch now reads the text leaves itself instead of going through a helper.
-    const out = html(fence('<script>alert(1)</script>', 'html'));
+    const out = seite(fence('<script>alert(1)</script>', 'html'));
     expect(out).not.toContain('<script');
     expect(out).toContain('&lt;script');
   });
 
+  it('escapes a highlighted fence too, run by run', () => {
+    // The same question asked on the other branch: highlighting splits the text into runs
+    // and interpolates each one, so the escaping has to survive the split.
+    const out = seite(fence('let s = "<script>alert(1)</script>";', 'rust'));
+    expect(out).not.toContain('<script');
+    expect(out).toContain('&lt;script');
+  });
+
+  it('names a language it does not know, and says nothing about a fence that names none', () => {
+    // D-25. The label answers three questions at once for an author who wrote ```kotlin and
+    // saw no colour; a fence that stated no language has nothing to answer.
+    expect(seite(fence('fun main() {}', 'kotlin'))).toContain('Unbekannte Sprache: kotlin');
+    expect(seite(fence('irgendwas'))).not.toContain('Unbekannte Sprache');
+    expect(seite(fence('fn main() {}', 'rust'))).not.toContain('Unbekannte Sprache');
+  });
+
+  it('prints an unknown language as text, never as part of the markup', () => {
+    // `attrs.language` is arbitrary over the collab socket. It is a key looked up in an
+    // allow-list and a string printed as text; it never becomes a class, an attribute name
+    // or a style value.
+    const out = seite(fence('x', '"><img src=x onerror=alert(1)>'));
+    expect(out).not.toContain('<img');
+    expect(out).toContain('&lt;img');
+  });
+
   it('renders an empty fence as an empty block rather than as nothing', () => {
-    const out = html({ kind: 'codeBlock', attrs: { language: 'text' } });
-    expect(out).toContain('<pre><code></code></pre>');
+    const out = seite({ kind: 'codeBlock', attrs: { language: 'text' } });
+    expect(out).toMatch(/<pre[^>]*><code[^>]*><\/code><\/pre>/);
+  });
+});
+
+describe('a display formula', () => {
+  const formula = (text: string): Block => ({
+    kind: 'codeBlock',
+    attrs: { language: 'math' },
+    content: [{ kind: 'text', text }]
+  });
+
+  /// The page's formulas, typeset exactly as the page's own `load` would typeset them —
+  /// through the real module rather than a hand-written map, so that the two halves of this
+  /// feature are tested against each other rather than against a fixture that agrees with
+  /// whichever half was written last.
+  const typeset = (block: Block): Formulas => typesetDocument(block);
+
+  it('typesets a ```math fence and leaves every other fence to the highlighter', () => {
+    const block = formula('E = mc^2');
+    const out = html(block, [], typeset(block));
+    expect(out).toContain('class="katex-display"');
+    // MathML as well as the visual markup, so a screen reader is given the formula rather
+    // than a picture of one — and the author's own TeX inside it, escaped.
+    expect(out).toContain('<annotation encoding="application/x-tex">E = mc^2</annotation>');
+    expect(out).not.toContain('<pre');
+  });
+
+  it('shows the source, and says nothing, where nothing typeset the page', () => {
+    // The editor renders this same component while TipTap mounts, with no page load behind
+    // it. Being refused and never being asked are different states: this one draws the
+    // fence and explains nothing, because no limit was reached.
+    const out = html(formula('E = mc^2'));
+    expect(out).toMatch(/<pre[^>]*><code/);
+    expect(out).toContain('E = mc^2');
+    expect(out).not.toContain('Nicht gesetzt');
+    expect(out).not.toContain('katex');
+    // And not through the highlighter's own explanation either — `math` is not a language
+    // this wiki cannot colour, it is one it typesets.
+    expect(out).not.toContain('Unbekannte Sprache');
+  });
+
+  it('shows the source and names the limit where a formula was refused', () => {
+    const huge = 'x + '.repeat(5_000);
+    const block = formula(huge);
+    const out = html(block, [], typeset(block));
+    expect(out).toMatch(/<pre[^>]*><code/);
+    expect(out).toContain('Nicht gesetzt');
+    expect(out).toContain('20.000 Zeichen');
+    expect(out).not.toContain('katex-display');
+  });
+
+  it('escapes a refused formula’s own source, exactly as a code block does', () => {
+    // The refusal path prints the author's text, and it goes through `CodeView` precisely so
+    // that the escaping is the one already tested rather than a second copy of it.
+    const bomb = '{'.repeat(2000) + '}'.repeat(2000);
+    const block = formula(`${bomb}<script>alert(1)</script>`);
+    const out = html(block, [], typeset(block));
+    expect(out).not.toContain('<script');
+    expect(out).toContain('&lt;script');
+  });
+
+  it('puts nothing into the page that KaTeX did not typeset', () => {
+    // The one place in this reader where a string becomes markup, so the question is asked
+    // here as well as at the typesetter: an author's angle brackets come back escaped, and
+    // no tag in the answer carries an event handler.
+    const block = formula('</span><img src=x onerror=alert(1)>');
+    const out = html(block, [], typeset(block));
+    expect(out).not.toContain('<img');
+    expect(out).not.toMatch(/<[^>]*\son[a-z]+\s*=/);
+    expect(out).toContain('&lt;/span&gt;&lt;img');
+  });
+
+  it('draws each formula on a page from the one the page typeset for it', () => {
+    const page: Block = {
+      kind: 'doc',
+      content: [formula('a^2'), { kind: 'paragraph', content: [{ kind: 'text', text: 'und' }] }, formula('b^2')]
+    };
+    const out = html(page, [], typeset(page));
+    expect(out.match(/katex-display/g)).toHaveLength(2);
+    expect(out).toContain('>a</span>');
+    expect(out).toContain('und');
+  });
+});
+
+describe('a diagram', () => {
+  const diagram = (text: string): Block => ({
+    kind: 'codeBlock',
+    attrs: { language: 'mermaid' },
+    content: [{ kind: 'text', text }]
+  });
+
+  const source = 'graph TD;\n  A-->B;';
+
+  it('is served as its own source, legibly, before anything is drawn', () => {
+    // Mermaid runs in the reader's browser (D-19: it needs the DOM to measure text, so it can
+    // never be on the server rendering path), and every render this suite can reach is a
+    // server render. So what a first response holds is what a reader with JavaScript switched
+    // off keeps: the diagram's own text, in a `<pre>`, with the newlines that ARE its syntax.
+    const out = html(diagram(source));
+    expect(out).toMatch(/<pre[^>]*><code/);
+    expect(out.replace(/<[^>]*>/g, '')).toContain(source);
+    expect(out).not.toContain('<img');
+  });
+
+  it('says nothing about limits while it has merely not been drawn yet', () => {
+    // Being refused and never having been asked are different states. The same distinction
+    // `MathView` makes for a page nobody typeset, and for the same reason: a sentence about a
+    // limit that was never reached is a false explanation.
+    const out = html(diagram(source));
+    expect(out).not.toContain('Nicht gezeichnet');
+    expect(out).not.toContain('konnte nicht');
+  });
+
+  it('is not offered to the highlighter as a language this wiki does not know', () => {
+    // `mermaid` is not one of the eight grammars, so without its own branch the fence would
+    // draw the D-25 label — an explanation that is both true and misleading, because the wiki
+    // does know what a mermaid fence is.
+    expect(html(diagram(source))).not.toContain('Unbekannte Sprache');
+  });
+
+  it('shows the source and names the limit where the diagram is too big', () => {
+    // D-22, and it is answered in the FIRST response rather than after hydration: the cap is
+    // a property of the text, so nothing has to run for the reader to be told.
+    const out = html(diagram('x'.repeat(DIAGRAM_CHARACTER_LIMIT + 1)));
+    expect(out).toMatch(/<pre[^>]*><code/);
+    expect(out).toContain('Nicht gezeichnet');
+    expect(out).toContain('10.000');
+    expect(out).not.toContain('<img');
+  });
+
+  it('escapes the diagram s own source rather than putting it into the page as markup', () => {
+    // Every byte of a diagram is text somebody with write access to one page typed. It goes
+    // through `CodeView` precisely so that the escaping is the one already tested rather than
+    // a second copy of it.
+    const out = html(diagram('graph TD;\n  A["<script>alert(1)</script>"]-->B;'));
+    expect(out).not.toContain('<script');
+    expect(out).toContain('&lt;script');
   });
 });

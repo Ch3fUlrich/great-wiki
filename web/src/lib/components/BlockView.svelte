@@ -11,7 +11,13 @@
     sizeText,
     type Attachment
   } from '$lib/attachments';
+  import { isDiagramFence } from '$lib/blocks/diagram';
+  import { isMathFence, type Formulas } from '$lib/blocks/maths';
+  import type { Fences } from '$lib/blocks/code';
   import Self from './BlockView.svelte';
+  import CodeView from './CodeView.svelte';
+  import DiagramView from './DiagramView.svelte';
+  import MathView from './MathView.svelte';
   import TableView from './TableView.svelte';
 
   interface Props {
@@ -32,34 +38,76 @@
      * means. It never guesses an address from the name.
      */
     anhaenge?: Attachment[];
+    /**
+     * Every ` ```math ` fence on this page, typeset by the page's own `load`.
+     *
+     * **Passed down for the same reason `anhaenge` is, plus one of its own.** KaTeX is
+     * called in `$lib/server/maths`, which SvelteKit refuses to let any client-reachable
+     * module import — so the library never reaches the reader's browser and a formula is in
+     * the first response, typeset, with JavaScript switched off. A component that called
+     * KaTeX itself would render on the server and AGAIN while hydrating, which is how about
+     * 272 kB of maths library ends up in a bundle to re-derive markup already sent.
+     *
+     * `null` by default, and that is the honest state for every caller with no page load
+     * behind it — the editor renders this component while TipTap mounts. A fence then shows
+     * its own source and says nothing, because being refused and never being asked are
+     * different states and must not be reported as the same one.
+     */
+    formeln?: Formulas | null;
+    /**
+     * Every fenced code block on this page, tokenised by the page's own `load`.
+     *
+     * Here for exactly `formeln`'s reasons, arrived at the same way. Shiki is called in
+     * `$lib/server/highlight`, which SvelteKit refuses to let any client-reachable module
+     * import — so the highlighter and its eight grammars never reach the reader's browser,
+     * a listing is coloured in the first response and with JavaScript switched off, and the
+     * per-page caps are applied where the page is, rather than one block at a time where
+     * nothing can see how many there are.
+     *
+     * `null` by default, and honest for every caller with no page load behind it: a fence
+     * then renders exactly as typed and says nothing.
+     */
+    fences?: Fences | null;
   }
 
-  let { block, anhaenge = [] }: Props = $props();
+  let { block, anhaenge = [], formeln = null, fences = null }: Props = $props();
 </script>
 
-<!-- Only known kinds render. An unknown block is skipped rather than emitted raw, which
-     is why there is no sanitisation step here: no untrusted HTML is ever constructed. -->
+<!-- Only known kinds render. An unknown block is skipped rather than emitted raw, which is
+     why there is no sanitisation step here: no untrusted HTML is ever constructed.
+
+     One qualification, and it is the whole of it. `MathView` puts KaTeX's own output into
+     the page as markup — the single exception in this reader, kept to one leaf on purpose,
+     with the three things that make its input safe written on that component and a
+     line-exact permission in `scripts/check-html-sinks.sh` rather than a file exemption.
+     Nothing else here constructs markup from anything, and the exemption list in that
+     script is still empty.
+
+     `DiagramView` is deliberately NOT a second one. Mermaid also hands back a string of
+     markup, and it goes into an `<img src>` as a data URI — an attribute rather than
+     markup — which is the containment ADR 0014 already requires for an uploaded SVG. -->
+
 {#if block.kind === 'doc'}
-  {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} />{/each}
+  {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}
 {:else if block.kind === 'paragraph'}
-  <p>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} />{/each}</p>
+  <p>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}</p>
 {:else if block.kind === 'heading'}
   {@const level = Math.min(6, Math.max(1, Number(block.attrs?.level ?? 1)))}
   {@const id = slugify(plainText(block))}
   <svelte:element this={`h${level}`} {id}>
-    {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} />{/each}
+    {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}
   </svelte:element>
 {:else if block.kind === 'bulletList'}
-  <ul>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} />{/each}</ul>
+  <ul>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}</ul>
 {:else if block.kind === 'orderedList'}
-  <ol>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} />{/each}</ol>
+  <ol>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}</ol>
 {:else if block.kind === 'listItem'}
-  <li>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} />{/each}</li>
+  <li>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}</li>
 {:else if block.kind === 'taskList'}
   <!-- A checklist. `data-type` is the attribute TipTap's own `TaskList` puts on its `<ul>`,
        so the editor and the reader can be styled by one rule instead of two that drift. -->
   <ul class="task-list" data-type="taskList">
-    {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} />{/each}
+    {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}
   </ul>
 {:else if block.kind === 'taskItem'}
   {@const checked = block.attrs?.checked === true}
@@ -81,17 +129,33 @@
        every line beneath it as well. -->
   <li class="task-item" data-type="taskItem" data-checked={checked}>
     <input type="checkbox" {checked} disabled aria-label={plainText(block.content?.[0] ?? block)} />
-    <div>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} />{/each}</div>
+    <div>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}</div>
   </li>
 {:else if block.kind === 'blockquote'}
-  <blockquote>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} />{/each}</blockquote>
+  <blockquote>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}</blockquote>
 {:else if block.kind === 'codeBlock'}
   <!-- `codeText`, never `plainText`: the whitespace IS the content of a fence, and
        `plainText` collapses it — see its own doc comment for why widening THAT is not the
-       fix. `<pre>` is what makes the browser honour what is printed here, and the text is
-       interpolated rather than assembled into markup, so a fence full of angle brackets is
-       escaped like any other text leaf. -->
-  <pre><code>{codeText(block)}</code></pre>
+       fix.
+
+       ```math is typeset, ```mermaid is drawn, and everything else is printed — and that is
+       the only difference between the three branches: all of them are `BlockKind::CodeBlock`
+       carrying a `language`, and none of them adds a kind, an attribute or a mirror (D-18).
+       `isMathFence` is asked here and by the walker that filled `formeln`, so the two cannot
+       disagree about which fence is a formula — if they could, a fence one of them claimed
+       would silently render as neither.
+
+       `CodeView` owns the `<pre>`, the highlighting and the note about a language this wiki
+       does not know; `MathView` owns the one place in this reader where a string becomes
+       markup, and its doc comment says what makes that safe; `DiagramView` owns the pair of
+       `<img>` a diagram is drawn into and the library that never reaches this server. -->
+  {#if isMathFence(block.attrs?.language)}
+    <MathView source={codeText(block)} {formeln} />
+  {:else if isDiagramFence(block.attrs?.language)}
+    <DiagramView source={codeText(block)} />
+  {:else}
+    <CodeView text={codeText(block)} language={block.attrs?.language} {fences} />
+  {/if}
 {:else if block.kind === 'table'}
   <!-- TableView owns the scroll box, the sticky header and — once it has mounted in a
        browser — sorting and filtering. It renders no cell content itself: `nested` hands
@@ -99,14 +163,14 @@
        no import cycle between the two components. -->
   <TableView {block} child={nested} />
 {:else if block.kind === 'tableRow'}
-  <tr>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} />{/each}</tr>
+  <tr>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}</tr>
 {:else if block.kind === 'tableHeader'}
   <th scope="col" style:text-align={alignOf(block)}
-    >{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} />{/each}</th
+    >{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}</th
   >
 {:else if block.kind === 'tableCell'}
   <td style:text-align={alignOf(block)}
-    >{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} />{/each}</td
+    >{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}</td
   >
 {:else if block.kind === 'attachment'}
   <!-- A file placed in the prose (D-15). Three outcomes, and which one applies is decided by
@@ -176,7 +240,7 @@
   {@render marked(block.text ?? '', block.marks ?? [])}
 {/if}
 
-{#snippet nested(child: Block)}<Self block={child} {anhaenge} />{/snippet}
+{#snippet nested(child: Block)}<Self block={child} {anhaenge} {formeln} {fences} />{/snippet}
 
 <!-- A leaf's `marks`, applied outermost first — the order `gw_core::MARK_ORDER` already
      sorted them into (see `render.ts`'s `Block.marks` doc). Recursing one mark at a time
