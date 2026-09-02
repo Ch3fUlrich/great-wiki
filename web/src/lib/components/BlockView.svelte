@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { Block, Mark } from '$lib/blocks/render';
   import { slugify } from '$lib/slug';
-  import { placedFile, plainText, safeHref } from '$lib/blocks/render';
+  import { codeText, placedFile, plainText, safeHref } from '$lib/blocks/render';
   import { alignOf } from '$lib/blocks/table';
   import {
     attachmentNamed,
@@ -86,7 +86,12 @@
 {:else if block.kind === 'blockquote'}
   <blockquote>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} />{/each}</blockquote>
 {:else if block.kind === 'codeBlock'}
-  <pre><code>{plainText(block)}</code></pre>
+  <!-- `codeText`, never `plainText`: the whitespace IS the content of a fence, and
+       `plainText` collapses it — see its own doc comment for why widening THAT is not the
+       fix. `<pre>` is what makes the browser honour what is printed here, and the text is
+       interpolated rather than assembled into markup, so a fence full of angle brackets is
+       escaped like any other text leaf. -->
+  <pre><code>{codeText(block)}</code></pre>
 {:else if block.kind === 'table'}
   <!-- TableView owns the scroll box, the sticky header and — once it has mounted in a
        browser — sorting and filtering. It renders no cell content itself: `nested` hands

@@ -21,6 +21,28 @@
 //! like deleting it and writing a new one, which is the difference between "somebody tidied
 //! this" and "somebody rewrote this".
 //!
+//! **Whitespace inside a fence is a Struktur change and not a Prosa one**, and that split is
+//! a decision rather than an omission. Every mode used to read a block's text through
+//! [`Block::plain_text`], which collapses every run of whitespace — the right answer for
+//! prose, and the wrong one for a code block, where the whitespace IS the content:
+//! ` ```mermaid ` needs its newlines to draw anything at all, and a revision that flattened
+//! one changed no fingerprint and was therefore reported by no mode at all. So
+//! [`diff_structure`]'s fingerprint reads [`Block::diff_text`], which is `plain_text`
+//! everywhere except inside a code block, where the text is taken verbatim.
+//!
+//! [`diff_prose`] is deliberately left alone: it tokenises on whitespace by construction, so
+//! a pure re-indentation adds and removes no word, and making it see one would mean inventing
+//! a "word" that is a run of spaces. A preview is left alone for the same reason in reverse —
+//! it is a one-line label in a list of changes, so it stays collapsed.
+//!
+//! **And [`diff_design`] is left alone on purpose too, which is less obvious**, because it
+//! also aligns blocks by kind-plus-text. It keeps the collapsed text (`design_key`, as
+//! against `fingerprint`): it compares only the pairs its alignment calls equal, so
+//! sharpening its key would make a reflowed fence stop it descending — and an author who
+//! retypes ` ```rust ` as ` ```mermaid ` while re-laying-out the source would lose the
+//! language change from every tab. One tab per half is the answer: Struktur reports the
+//! fence, Gestaltung reports the language.
+//!
 //! **Identical documents produce nothing in any mode.** No mode emits unchanged context, so
 //! an empty result means an empty result — the three lists are what changed and nothing
 //! else, and a caller can test them for emptiness without knowing how they were built.
@@ -325,8 +347,46 @@ enum Slot {
 /// Deliberately NOT the whole serialised block. Attributes are excluded so that a heading
 /// whose level changed stays the same heading — otherwise every design change would also be
 /// reported as a structural rewrite, and the two modes would say the same thing twice.
+///
+/// The text is [`Block::diff_text`] rather than [`Block::plain_text`], which is the whole
+/// of the difference between "a code block changed" and "Keine Änderungen": see this
+/// module's docs.
 fn fingerprint(block: &Block) -> String {
-    format!("{:?}\u{1}{}", block.kind, block.plain_text())
+    alignment_key(block, &block.diff_text())
+}
+
+/// The same key for [`compare_design`], and the one difference is [`Block::plain_text`].
+///
+/// **Not a duplicate of [`fingerprint`], and it must not be folded into it.** The two
+/// functions answer different questions and a review caught the first draft of this file
+/// conflating them:
+///
+/// - `fingerprint` asks *"is this the same block, down to the whitespace a diagram is
+///   delimited by?"*. Sharpening it is the entire point of [`Block::diff_text`].
+/// - `design_key` asks *"is this the same block, closely enough that comparing its
+///   attributes tells the reader something?"*, and the answer there wants the **blunter**
+///   key, because [`compare_design`] recurses only into the pairs its alignment calls
+///   equal.
+///
+/// Give the design walk the sharp key and reflowing a fence stops it descending: an edit
+/// that changes ` ```rust ` to ` ```mermaid ` *and* re-lays-out the source — one edit, and
+/// the obvious one now that a language decides between a drawing, a formula and a listing —
+/// loses the language change from every tab, and a fence re-indented beside a heading hides
+/// that heading's `level`. Both are pinned by tests below.
+///
+/// The cost of the split is that one edit can now be reported twice, once per tab: Struktur
+/// says the code block changed and Gestaltung says its language did. That is the correct
+/// pair of statements about that edit — each tab answering for its own half — and it is
+/// what the reader saw before [`Block::diff_text`] existed.
+fn design_key(block: &Block) -> String {
+    alignment_key(block, &block.plain_text())
+}
+
+/// Kind and text, joined by `\u{1}` so that a block whose text starts where another's kind
+/// name ends cannot collide with it. Shared by both keys above so that the *shape* of the
+/// two stays identical and only the text function differs.
+fn alignment_key(block: &Block, text: &str) -> String {
+    format!("{:?}\u{1}{text}", block.kind)
 }
 
 /// Enough of a block's text to recognise it, and no more.
@@ -344,8 +404,10 @@ fn preview(block: &Block) -> String {
 /// Walks both trees together and reports, for every pair of blocks the two documents agree
 /// on, the attributes that differ and the inline formatting that differs.
 ///
-/// **Only aligned pairs are compared**, and alignment is the same fingerprint sequence
-/// [`diff_structure`] uses. Zipping children by position instead would produce a cascade of
+/// **Only aligned pairs are compared**, and alignment is `design_key` — the same shape of
+/// key [`diff_structure`] uses, deliberately reading [`Block::plain_text`] where the
+/// structure mode reads [`Block::diff_text`]; `design_key`'s own docs say why the design
+/// walk wants the blunter one. Zipping children by position instead would produce a cascade of
 /// nonsense from a single insertion — insert a paragraph at the top and every block below it
 /// pairs with its neighbour, so a page of alternating headings and paragraphs would report
 /// dozens of attribute changes for one added line. A block that was added, removed or moved
@@ -394,8 +456,8 @@ fn compare_design(x: &Block, y: &Block, out: &mut Vec<DesignChange>) {
         });
     }
 
-    let fps_x: Vec<String> = x.content.iter().map(fingerprint).collect();
-    let fps_y: Vec<String> = y.content.iter().map(fingerprint).collect();
+    let fps_x: Vec<String> = x.content.iter().map(design_key).collect();
+    let fps_y: Vec<String> = y.content.iter().map(design_key).collect();
     for op in capture_diff_slices(Algorithm::Myers, &fps_x, &fps_y) {
         let DiffOp::Equal {
             old_index,
@@ -711,6 +773,152 @@ mod tests {
         assert_eq!(structure.len(), 1);
         assert_eq!(structure[0].kind, ChangeKind::Added);
         assert!(diff_design(&a, &b).is_empty());
+    }
+
+    // --- fences, where the whitespace is the content ------------------------------------
+
+    /// A document holding one fenced block with the given source.
+    fn fenced(source: &str) -> Block {
+        doc(&format!(
+            r#"{{"kind":"doc","content":[{{"kind":"codeBlock","attrs":{{"language":"mermaid"}},
+                 "content":[{{"kind":"text","text":{}}}]}}]}}"#,
+            serde_json::Value::String(source.to_string())
+        ))
+    }
+
+    #[test]
+    fn reindenting_a_fence_is_a_structural_change_rather_than_nothing_at_all() {
+        // The revision that destroys a diagram. Both versions hold the same words in the
+        // same order, so `plain_text` — and therefore the fingerprint, before this — could
+        // not tell them apart, and all three tabs answered "Keine Änderungen" about the
+        // edit that broke the page.
+        let a = fenced("graph TD;\n  A-->B;\n  B-->C;");
+        let b = fenced("graph TD; A-->B; B-->C;");
+        let structure = diff_structure(&a, &b);
+        assert_eq!(structure.len(), 1, "{structure:?}");
+        assert_eq!(structure[0].kind, ChangeKind::Changed);
+        assert_eq!(structure[0].block, crate::block::BlockKind::CodeBlock);
+    }
+
+    #[test]
+    fn a_fence_that_did_not_change_is_still_reported_as_no_change() {
+        // The other half: reading a fence verbatim must not make every unchanged one look
+        // rewritten, which is what a fingerprint that carried, say, the whole serialised
+        // block would do.
+        let a = fenced("graph TD;\n  A-->B;");
+        assert!(diff_structure(&a, &a).is_empty());
+        assert!(diff_prose(&a, &a).is_empty());
+        assert!(diff_design(&a, &a).is_empty());
+    }
+
+    #[test]
+    fn reindenting_a_fence_is_deliberately_not_a_prose_change() {
+        // Stated as a test rather than left to be discovered, because it looks like an
+        // omission and is a decision: `diff_prose` tokenises on whitespace by construction,
+        // so a pure re-indentation adds and removes no word at all. It is a Struktur
+        // change, and the interface says so.
+        let a = fenced("graph TD;\n  A-->B;");
+        let b = fenced("graph TD;\n\tA-->B;");
+        assert!(diff_prose(&a, &b).is_empty());
+        assert_eq!(diff_structure(&a, &b).len(), 1);
+    }
+
+    #[test]
+    fn changing_a_fences_language_is_still_a_design_change_and_not_a_rewrite() {
+        // The fingerprint excludes attributes, and reading the text verbatim must not
+        // change that: ```rust becoming ```mermaid is one line in the Gestaltung tab, not a
+        // block removed and another added.
+        let a = doc(
+            r#"{"kind":"doc","content":[{"kind":"codeBlock","attrs":{"language":"rust"},
+                 "content":[{"kind":"text","text":"let x = 1;\n"}]}]}"#,
+        );
+        let b = doc(
+            r#"{"kind":"doc","content":[{"kind":"codeBlock","attrs":{"language":"mermaid"},
+                 "content":[{"kind":"text","text":"let x = 1;\n"}]}]}"#,
+        );
+        assert!(diff_structure(&a, &b).is_empty());
+        let design = diff_design(&a, &b);
+        assert_eq!(design.len(), 1);
+        assert_eq!(design[0].attribute, "language");
+        assert_eq!(design[0].before.as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn a_fences_language_change_survives_a_reflow_in_the_same_edit() {
+        // The test above holds the text identical, which is the easy half. This is the edit
+        // somebody actually makes: ```rust becomes ```mermaid AND the source is reflowed
+        // onto separate lines in the one revision. The two modes must each answer for their
+        // own half — Struktur that the block changed, Gestaltung that the language did —
+        // and they can only do that because `compare_design` aligns on `plain_text` while
+        // `diff_structure` aligns on `diff_text`. Align them both on `diff_text` and this
+        // returns `[]`: the language change is then reported by no tab at all, which is the
+        // regression an adversarial review caught in this file's first draft.
+        let a = doc(
+            r#"{"kind":"doc","content":[{"kind":"codeBlock","attrs":{"language":"rust"},
+                 "content":[{"kind":"text","text":"graph TD; A-->B;"}]}]}"#,
+        );
+        let b = doc(
+            r#"{"kind":"doc","content":[{"kind":"codeBlock","attrs":{"language":"mermaid"},
+                 "content":[{"kind":"text","text":"graph TD;\n  A-->B;"}]}]}"#,
+        );
+        let structure = diff_structure(&a, &b);
+        assert_eq!(structure.len(), 1, "{structure:?}");
+        assert_eq!(structure[0].kind, ChangeKind::Changed);
+        let design = diff_design(&a, &b);
+        assert_eq!(design.len(), 1, "{design:?}");
+        assert_eq!(design[0].block, crate::block::BlockKind::CodeBlock);
+        assert_eq!(design[0].attribute, "language");
+        assert_eq!(design[0].before.as_deref(), Some("rust"));
+        assert_eq!(design[0].after.as_deref(), Some("mermaid"));
+    }
+
+    #[test]
+    fn a_reflowed_fence_does_not_hide_a_design_change_in_the_block_beside_it() {
+        // The same asymmetry one level down, and the more dangerous shape of it, because
+        // here the block whose attribute changed is not the fence at all. `compare_design`
+        // descends only into pairs its alignment calls equal, so a blockquote holding both
+        // a re-indented fence and a heading that went 2→3 would hide the heading's level
+        // change if the design walk read the fence verbatim. The control is the same edit
+        // with a paragraph in place of the fence: it reports the level change either way,
+        // because prose is collapsed on both alignment keys.
+        let with_fence = |level: u8, source: &str| {
+            doc(&format!(
+                r#"{{"kind":"doc","content":[{{"kind":"blockquote","content":[
+                     {{"kind":"heading","attrs":{{"level":{level}}},
+                       "content":[{{"kind":"text","text":"Titel"}}]}},
+                     {{"kind":"codeBlock","attrs":{{"language":"mermaid"}},
+                       "content":[{{"kind":"text","text":{}}}]}}]}}]}}"#,
+                serde_json::Value::String(source.to_string())
+            ))
+        };
+        let a = with_fence(2, "graph TD;\n  A-->B;");
+        let b = with_fence(3, "graph TD;\n\tA-->B;");
+        let design = diff_design(&a, &b);
+        assert_eq!(design.len(), 1, "{design:?}");
+        assert_eq!(design[0].block, crate::block::BlockKind::Heading);
+        assert_eq!(design[0].attribute, "level");
+        assert_eq!(design[0].before.as_deref(), Some("2"));
+        assert_eq!(design[0].after.as_deref(), Some("3"));
+        // …and Struktur still reports the edit, so neither half of it is lost. It names the
+        // BLOCKQUOTE, because `diff_structure` compares direct children only — "das Zitat
+        // hat sich geändert" rather than an anonymous change two levels down. Without
+        // `diff_text` that line would not exist at all: the quote's collapsed text is
+        // identical on both sides.
+        let structure = diff_structure(&a, &b);
+        assert_eq!(structure.len(), 1, "{structure:?}");
+        assert_eq!(structure[0].kind, ChangeKind::Changed);
+        assert_eq!(structure[0].block, crate::block::BlockKind::Blockquote);
+    }
+
+    #[test]
+    fn a_fences_preview_is_still_one_line() {
+        // `preview` stays on `plain_text` deliberately: it is a label in a list of changes,
+        // and a three-line one would break the layout of every row beside it.
+        let a = doc(r#"{"kind":"doc"}"#);
+        let b = fenced("graph TD;\n  A-->B;");
+        let changes = diff_structure(&a, &b);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].text, "graph TD; A-->B;");
     }
 
     #[test]

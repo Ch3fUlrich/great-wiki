@@ -156,6 +156,33 @@ export function plainText(block: Block): string {
   return out.replace(/\s+/g, ' ').trim();
 }
 
+/**
+ * A code block's text exactly as it was typed — every newline, every space of indentation.
+ *
+ * **Not `plainText`, and `plainText` must not be widened to do this.** That function ends
+ * `.replace(/\s+/g, ' ').trim()`, and it is a byte-for-byte mirror of
+ * `gw_core::Block::plain_text`: it feeds every heading anchor id, the outline, a table's
+ * column labels and (at M7) the search index, with shared cases duplicated in both test
+ * suites so that a drift between the two turns one of them red. Collapsing whitespace is
+ * exactly right for prose — a mark boundary must not put a full stop off the end of its
+ * word — and exactly wrong for a fence, where the whitespace IS the content: it made every
+ * code block on the site one line with its indentation gone, and would hand a diagram
+ * renderer `graph TD; A-->B;`, which parses as nothing.
+ *
+ * So the two questions are asked separately. `gw_core::Block::diff_text` is the server-side
+ * counterpart: the structural diff reads a fence this same verbatim way, so a revision that
+ * only reindents one is reported rather than swallowed.
+ *
+ * Leaves are concatenated with NOTHING between them. One fence can reach the reader as more
+ * than one text leaf, and a separator would insert a character the author never typed into
+ * the middle of a line of code.
+ */
+export function codeText(block: Block): string {
+  let out = block.text ?? '';
+  for (const child of block.content ?? []) out += codeText(child);
+  return out;
+}
+
 export function outline(block: Block): Heading[] {
   const out: Heading[] = [];
   const walk = (b: Block) => {

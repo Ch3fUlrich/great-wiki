@@ -489,3 +489,55 @@ describe('a placed file', () => {
     expect(out).toContain('src="/api/attachment/befund.png/rundgang"');
   });
 });
+
+// --- code blocks -------------------------------------------------------------------------
+//
+// Whitespace IS the content here, and it used to be thrown away: the code branch rendered
+// `plainText(block)`, whose last act is `.replace(/\s+/g, ' ').trim()`, so every fenced
+// block on the site arrived as one line with its indentation gone. Nothing caught it
+// because until now no test in this suite rendered a `codeBlock` at all.
+//
+// `plainText` is NOT the place to fix that — it is a byte-for-byte mirror of
+// `gw_core::Block::plain_text` that feeds heading anchor ids, the outline and a table's
+// column labels — so the code branch reads the block's text leaves itself, through
+// `codeText`.
+
+describe('a code block', () => {
+  /** A fence as `gw_core::markdown` imports one: the info string's first word, and the text. */
+  const fence = (text: string, language?: string): Block => ({
+    kind: 'codeBlock',
+    attrs: language ? { language } : undefined,
+    content: [{ kind: 'text', text }]
+  });
+
+  it('keeps every newline and every space the author typed', () => {
+    const source = 'fn main() {\n    println!("hallo");\n}';
+    const out = html(fence(source, 'rust'));
+    expect(out).toContain('<pre><code>');
+    // Exact, not `contains('println')`: the bug was one line with the indentation gone, and
+    // that passes any assertion that only asks whether the words are present.
+    expect(out).toContain('fn main() {\n    println!("hallo");\n}');
+  });
+
+  it('keeps the newlines a diagram is delimited by, which are the whole of its syntax', () => {
+    // `graph TD; A-->B;` on one line is not the same source as two lines, and a renderer
+    // handed the collapsed form draws nothing. This is why the fix is a step zero rather
+    // than part of the diagram work.
+    const out = html(fence('graph TD;\n  A-->B;', 'mermaid'));
+    expect(out).toContain('graph TD;\n  A-->B;');
+  });
+
+  it('escapes what it prints rather than putting it into the page as markup', () => {
+    // The reader constructs no HTML from stored content, and a fence is the one place where
+    // somebody would obviously try. Svelte escapes the interpolation; this pins it, because
+    // the branch now reads the text leaves itself instead of going through a helper.
+    const out = html(fence('<script>alert(1)</script>', 'html'));
+    expect(out).not.toContain('<script');
+    expect(out).toContain('&lt;script');
+  });
+
+  it('renders an empty fence as an empty block rather than as nothing', () => {
+    const out = html({ kind: 'codeBlock', attrs: { language: 'text' } });
+    expect(out).toContain('<pre><code></code></pre>');
+  });
+});

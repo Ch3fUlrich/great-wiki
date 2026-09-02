@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { outline, placedFile, plainText, safeHref, type Block } from './render';
+import { codeText, outline, placedFile, plainText, safeHref, type Block } from './render';
 
 const doc: Block = {
   kind: 'doc',
@@ -159,5 +159,47 @@ describe('placedFile', () => {
       attrs: { filename: 'a.png', alt: 'x', href: '/api/attachment/a.png/seite', sha256: 'ab'.repeat(32) }
     });
     expect(Object.keys(placed ?? {}).sort()).toEqual(['alt', 'filename']);
+  });
+});
+
+describe('codeText', () => {
+  // The counterpart to `plainText`, and deliberately not a widening of it: `plainText` is a
+  // byte-for-byte mirror of `gw_core::Block::plain_text` (the search index, every heading
+  // anchor id, a table's column labels), and the whitespace it collapses is exactly the
+  // whitespace a fence's content consists of. `gw_core::Block::diff_text` is the server-side
+  // counterpart of this one — the structural diff reads a fence the same verbatim way, so a
+  // revision that reindents one is reported rather than swallowed.
+
+  it('gives back a fence exactly as it was typed, newlines and indentation and all', () => {
+    const source = 'fn main() {\n\tprintln!("hallo");\n}\n';
+    expect(codeText({ kind: 'codeBlock', content: [{ kind: 'text', text: source }] })).toBe(source);
+  });
+
+  it('collapses nothing, which is the whole difference from plainText', () => {
+    const block: Block = {
+      kind: 'codeBlock',
+      content: [{ kind: 'text', text: 'graph TD;\n  A-->B;' }]
+    };
+    expect(codeText(block)).toBe('graph TD;\n  A-->B;');
+    expect(plainText(block)).toBe('graph TD; A-->B;');
+  });
+
+  it('joins several leaves with nothing between them', () => {
+    // One fence can reach the reader as more than one text leaf — the CRDT stores a code
+    // block's content as text and nothing says it arrives in a single run. A separator here
+    // would insert a character the author never typed, in the middle of a line of code.
+    expect(
+      codeText({
+        kind: 'codeBlock',
+        content: [
+          { kind: 'text', text: 'let x = 1;\n' },
+          { kind: 'text', text: 'let y = 2;\n' }
+        ]
+      })
+    ).toBe('let x = 1;\nlet y = 2;\n');
+  });
+
+  it('reads an empty fence as empty rather than as missing', () => {
+    expect(codeText({ kind: 'codeBlock' })).toBe('');
   });
 });

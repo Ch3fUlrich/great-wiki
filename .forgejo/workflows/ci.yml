@@ -157,3 +157,21 @@ jobs:
 
       - name: Fail if a credential-shaped value is committed
         run: ./scripts/scan-secrets.sh scan
+
+  containment:
+    runs-on: docker
+    container:
+      image: node:24-bookworm
+    steps:
+      # Same shape as the secret scan above and for the same reasons: `git grep` over
+      # the working tree, no history needed, and the gate proves it can still fail
+      # before its verdict is believed. What it guards is `BlockView.svelte`'s claim
+      # that the reader constructs no untrusted HTML — the reason nothing in the
+      # reader sanitises anything, and the reason an SVG attachment is safe to show.
+      - uses: actions/checkout@v4
+
+      - name: The sink check catches every spelling it claims to
+        run: ./scripts/check-html-sinks.sh --self-test
+
+      - name: Fail if stored content could reach the DOM as markup
+        run: ./scripts/check-html-sinks.sh scan

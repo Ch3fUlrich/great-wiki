@@ -17,7 +17,11 @@ use serde::{Deserialize, Serialize};
 /// 3. **The CRDT fixtures** (`crates/gw-collab/src/fixtures.rs`), which are what prove a
 ///    kind survives the Y.Doc conversion at all.
 /// 4. **The exporter** (`gw_api::export`), which at least refuses loudly — but a refusal
-///    fails the whole export run, so "loudly" still means the owner's backup stops working.
+///    does **not** stop the run: `run()` records the page as refused and writes every other
+///    one (`gw_api::export::run`), and only the CLI's exit code fails afterwards
+///    (`gw-api/src/main.rs`, via `ExportReport::is_complete`). That is worse rather than
+///    better — what the owner is left with is a directory that exists, is quietly missing
+///    pages, and looks finished.
 ///
 /// A fifth is softer and still worth doing: `web/src/lib/history.ts`'s `BLOCK_LABEL` names
 /// every kind in German for the revision diff, and falls back to the raw name rather than
@@ -276,6 +280,73 @@ impl Block {
         }
     }
 
+    /// The same text, except that a **code block's is taken verbatim**.
+    ///
+    /// [`crate::diff`] fingerprints a block as its kind plus this string, and it cannot use
+    /// [`Block::plain_text`] for that: `plain_text` ends by collapsing every run of
+    /// whitespace, so a revision that re-indents a fence — or destroys the newlines a
+    /// diagram is delimited by, which is the difference between a drawing and nothing at
+    /// all — produces an identical fingerprint, and all three history tabs then report
+    /// "Keine Änderungen" about the edit that broke the page.
+    ///
+    /// **A second function rather than a widening of the first**, because `plain_text` is a
+    /// byte-for-byte contract with `web/src/lib/blocks/render.ts::plainText` and feeds the
+    /// search index, the embedding chunker, every heading anchor id and the seeder's exact
+    /// title comparison. All of those want the collapsed form, one of them lives in another
+    /// language, and two test suites exist to keep the pair identical.
+    ///
+    /// Outside a fence this IS `plain_text`: prose is collapsed the same way and blocks are
+    /// separated the same way, which `diff_text_is_plain_text_wherever_no_fence_is_involved`
+    /// pins against the shared cases so the copy of the boundary rule below cannot drift
+    /// from the original.
+    ///
+    /// **Exactly one caller: [`crate::diff::diff_structure`]'s fingerprint.** The other two
+    /// modes stay on `plain_text`, and both refusals are decisions rather than oversights —
+    /// [`crate::diff::diff_prose`] tokenises on whitespace and would have to invent a "word"
+    /// that is a run of spaces, and [`crate::diff::diff_design`] compares only the pairs its
+    /// alignment calls equal, so a sharper key there would make a reflowed fence hide its
+    /// own `language` change and the `level` of a heading standing beside it. An earlier
+    /// draft of this comment claimed the fingerprint was the only reader of *any* block
+    /// text and lost that second effect; both are now pinned by tests, so before widening
+    /// this to a third caller, read `design_key` in that module.
+    pub fn diff_text(&self) -> String {
+        let mut segments: Vec<String> = Vec::new();
+        let mut prose = String::new();
+        self.collect_diff_text(&mut prose, &mut segments);
+        push_collapsed(&mut prose, &mut segments);
+        segments.join(" ")
+    }
+
+    /// [`Block::collect_text`]'s walk, interrupted at every code block.
+    ///
+    /// Prose accumulates in `prose` and is collapsed as one segment whenever a fence
+    /// interrupts it, so a fence's own text can be filed beside it untouched. With no fence
+    /// anywhere there is exactly one segment and one collapse, which is what makes this
+    /// equal to [`Block::plain_text`] for every document that holds no code.
+    fn collect_diff_text(&self, prose: &mut String, out: &mut Vec<String>) {
+        if self.kind == BlockKind::CodeBlock {
+            push_collapsed(prose, out);
+            let mut verbatim = String::new();
+            self.collect_text(&mut verbatim);
+            if !verbatim.is_empty() {
+                out.push(verbatim);
+            }
+            return;
+        }
+        if let Some(t) = &self.text {
+            prose.push_str(t);
+        }
+        let mut previous: Option<BlockKind> = None;
+        for child in &self.content {
+            // The same boundary rule as `collect_text`, and it has to stay the same one.
+            if child.kind != BlockKind::Text || previous.is_some_and(|p| p != BlockKind::Text) {
+                prose.push(' ');
+            }
+            child.collect_diff_text(prose, out);
+            previous = Some(child.kind);
+        }
+    }
+
     /// Extract the heading outline, with an ASCII anchor id for each.
     ///
     /// The id goes through `slugify`, so a German heading yields a fragment that needs no
@@ -305,6 +376,17 @@ impl Block {
         for child in &self.content {
             child.collect_headings(out);
         }
+    }
+}
+
+/// Collapse the prose gathered so far into one segment, exactly as [`Block::plain_text`]
+/// collapses a whole document, and file it. Nothing is filed for an empty run, so a fence
+/// at the start or the end of a block never produces a leading or trailing separator.
+fn push_collapsed(prose: &mut String, out: &mut Vec<String>) {
+    let collapsed = prose.split_whitespace().collect::<Vec<_>>().join(" ");
+    prose.clear();
+    if !collapsed.is_empty() {
+        out.push(collapsed);
     }
 }
 
@@ -380,6 +462,179 @@ mod tests {
             let block: Block = serde_json::from_str(json).unwrap();
             assert_eq!(&block.plain_text(), expected);
         }
+    }
+
+    // --- the diff's text, which is `plain_text` everywhere except inside a fence ----------
+
+    /// A fenced block as the importer stores one: the info string's first word, and text
+    /// whose newlines and indentation are the whole of its meaning.
+    fn fence(text: &str) -> Block {
+        serde_json::from_str(&format!(
+            r#"{{"kind":"codeBlock","attrs":{{"language":"mermaid"}},
+                 "content":[{{"kind":"text","text":{}}}]}}"#,
+            serde_json::Value::String(text.to_string())
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn diff_text_is_plain_text_wherever_no_fence_is_involved() {
+        // The mirror, pinned. `diff_text` repeats `collect_text`'s boundary rule so that it
+        // can interrupt it at a code block, and this is what stops the copy drifting from
+        // the original — which would put a different string in front of the structure diff
+        // than in front of the search index, for prose that has nothing to do with code.
+        for (json, expected) in PLAIN_TEXT_CASES {
+            let block: Block = serde_json::from_str(json).unwrap();
+            assert_eq!(&block.diff_text(), expected);
+        }
+        let doc = sample();
+        assert_eq!(doc.diff_text(), doc.plain_text());
+    }
+
+    #[test]
+    fn a_fence_keeps_its_whitespace_in_diff_text_and_loses_it_in_plain_text() {
+        // Both halves asserted together, because the split is the decision: the search
+        // index and every anchor id want the collapsed form, and the structural diff wants
+        // the typed one. `graph TD; A-->B;` on one line parses as nothing.
+        let block = fence("graph TD;\n  A-->B;");
+        assert_eq!(block.diff_text(), "graph TD;\n  A-->B;");
+        assert_eq!(block.plain_text(), "graph TD; A-->B;");
+    }
+
+    #[test]
+    fn a_fence_inside_a_quote_keeps_its_whitespace_too() {
+        // A code block is not a top-level-only kind — the editor's schema admits one inside
+        // a blockquote or a list item — so the verbatim rule has to survive the recursion,
+        // and the prose around it still has to collapse the way it always did.
+        let doc = Block {
+            kind: BlockKind::Doc,
+            attrs: serde_json::Map::new(),
+            content: vec![Block {
+                kind: BlockKind::Blockquote,
+                attrs: serde_json::Map::new(),
+                content: vec![
+                    serde_json::from_str(
+                        r#"{"kind":"paragraph","content":[{"kind":"text","text":"So   geht   es"}]}"#,
+                    )
+                    .unwrap(),
+                    fence("a\n  b"),
+                ],
+                text: None,
+                marks: Vec::new(),
+            }],
+            text: None,
+            marks: Vec::new(),
+        };
+        assert_eq!(doc.diff_text(), "So geht es a\n  b");
+    }
+
+    #[test]
+    fn an_empty_fence_reads_as_empty_rather_than_as_a_stray_separator() {
+        let empty: Block =
+            serde_json::from_str(r#"{"kind":"codeBlock","attrs":{"language":"rust"}}"#).unwrap();
+        assert_eq!(empty.diff_text(), "");
+        assert_eq!(empty.diff_text(), empty.plain_text());
+    }
+
+    /// The `BlockKind` twin of `markdown.rs`'s
+    /// `the_canonical_order_places_every_mark_kind_exactly_once`, and the only thing in Rust
+    /// that notices a variant being added at all.
+    #[test]
+    fn adding_a_block_kind_trips_this_test_and_names_what_else_must_change() {
+        // The match is exhaustive on purpose. `BlockKind` is `#[non_exhaustive]`, but that
+        // only binds OTHER crates — inside this one, adding a kind stops this test
+        // compiling until somebody has read the list below. Nothing else in the workspace
+        // does: there is no exhaustive match on this enum anywhere, and the exporter's
+        // dispatch carries a wildcard arm by design, so a Rust-only addition otherwise
+        // passes `cargo test --workspace`, `npm run check` and `npx vitest run` green while
+        // the editor's deletion path is live on the kind nobody taught it about.
+        const EVERY_KIND: &[BlockKind] = &[
+            BlockKind::Doc,
+            BlockKind::Paragraph,
+            BlockKind::Heading,
+            BlockKind::BulletList,
+            BlockKind::OrderedList,
+            BlockKind::ListItem,
+            BlockKind::TaskList,
+            BlockKind::TaskItem,
+            BlockKind::Blockquote,
+            BlockKind::CodeBlock,
+            BlockKind::Table,
+            BlockKind::TableRow,
+            BlockKind::TableHeader,
+            BlockKind::TableCell,
+            BlockKind::Attachment,
+            BlockKind::Text,
+        ];
+        for kind in EVERY_KIND {
+            match kind {
+                BlockKind::Doc
+                | BlockKind::Paragraph
+                | BlockKind::Heading
+                | BlockKind::BulletList
+                | BlockKind::OrderedList
+                | BlockKind::ListItem
+                | BlockKind::TaskList
+                | BlockKind::TaskItem
+                | BlockKind::Blockquote
+                | BlockKind::CodeBlock
+                | BlockKind::Table
+                | BlockKind::TableRow
+                | BlockKind::TableHeader
+                | BlockKind::TableCell
+                | BlockKind::Attachment
+                | BlockKind::Text => {}
+            }
+        }
+
+        // The WIRE name, not the Rust one: `camelCase` is what every mirror keys off — the
+        // editor looks a node up by it, the reader's union is written in it, the CRDT
+        // stores it — so renaming a variant without renaming the serialisation is the same
+        // bug as adding one.
+        let names: Vec<String> = EVERY_KIND
+            .iter()
+            .map(|kind| {
+                serde_json::to_value(kind)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "doc",
+                "paragraph",
+                "heading",
+                "bulletList",
+                "orderedList",
+                "listItem",
+                "taskList",
+                "taskItem",
+                "blockquote",
+                "codeBlock",
+                "table",
+                "tableRow",
+                "tableHeader",
+                "tableCell",
+                "attachment",
+                "text",
+            ],
+            "A `BlockKind` was added, removed or renamed. It has four mirrors outside Rust's \
+             type system and they must move in the SAME change (see this enum's doc \
+             comment): 1. the editor's node list, `web/src/lib/editor/extensions.ts` — the \
+             dangerous one, because TipTap DELETES an element whose name it does not know, \
+             broadcasts the deletion to everyone else editing and files it as a revision, \
+             and it deletes any attribute the schema does not declare; 2. the reader, \
+             `web/src/lib/blocks/render.ts`'s union and `BlockView.svelte`, which skip what \
+             they do not know; 3. the CRDT fixtures, `crates/gw-collab/src/fixtures.rs`, \
+             which are what prove a kind survives the Y.Doc at all; 4. the exporter, \
+             `gw_api::export`, which refuses loudly — and a refusal is a page missing from \
+             the owner's backup. A fifth is softer: `web/src/lib/history.ts`'s \
+             `BLOCK_LABEL`, the German name in the revision diff. Then add the new wire \
+             name here."
+        );
     }
 
     #[test]

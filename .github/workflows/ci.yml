@@ -77,3 +77,19 @@ jobs:
 
       - name: Fail if a credential-shaped value is committed
         run: ./scripts/scan-secrets.sh scan
+
+  containment:
+    runs-on: ubuntu-latest
+    if: ${{ github.server_url == 'https://github.com' }}
+    steps:
+      # Same shape as the secret scan and for the same reason: `git grep` over the
+      # working tree, no history, and the gate proves it can still fail before its
+      # verdict is believed. What it guards is `BlockView.svelte`'s claim that the
+      # reader constructs no untrusted HTML — the reason nothing sanitises anything.
+      - uses: actions/checkout@v4
+
+      - name: The sink check catches every spelling it claims to
+        run: ./scripts/check-html-sinks.sh --self-test
+
+      - name: Fail if stored content could reach the DOM as markup
+        run: ./scripts/check-html-sinks.sh scan
