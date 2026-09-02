@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { outline, plainText, safeHref, type Block } from './render';
+import { outline, placedFile, plainText, safeHref, type Block } from './render';
 
 const doc: Block = {
   kind: 'doc',
@@ -115,3 +115,49 @@ describe('safeHref', () => {
   });
 });
 
+describe('placedFile', () => {
+  // A placement is a REFERENCE to a row in the page's `Anhänge` list, so everything this
+  // reads is a name to look up rather than an address to fetch. There is no `href` in a
+  // block and there must not be one: a download is authorised against the page it was
+  // reached through (D-16), and an address stored in a document is an address that outlives
+  // the permission that produced it.
+
+  it('reads the file and the description a placement carries', () => {
+    expect(
+      placedFile({ kind: 'attachment', attrs: { filename: 'befund.png', alt: 'Röntgenbild' } })
+    ).toEqual({ filename: 'befund.png', alt: 'Röntgenbild' });
+  });
+
+  it('reads an empty description as empty rather than as missing', () => {
+    // `alt: ""` is what `![](anhang:befund.png)` imports as and what the editor's schema
+    // fills a missing one in with, so the two agree — see `gw_core::BlockKind::Attachment`.
+    expect(placedFile({ kind: 'attachment', attrs: { filename: 'a.png', alt: '' } })).toEqual({
+      filename: 'a.png',
+      alt: ''
+    });
+    expect(placedFile({ kind: 'attachment', attrs: { filename: 'a.png' } })).toEqual({
+      filename: 'a.png',
+      alt: ''
+    });
+  });
+
+  it('names no file rather than an empty one when the block does not say', () => {
+    // An empty name would be looked up in the list and would match nothing, which draws the
+    // "not attached" sentence about a file nobody ever named. A malformed block draws
+    // nothing at all instead.
+    for (const attrs of [undefined, {}, { filename: '' }, { filename: '   ' }, { filename: 7 }]) {
+      expect(placedFile({ kind: 'attachment', attrs }), JSON.stringify(attrs)).toBeNull();
+    }
+  });
+
+  it('carries no address of any kind', () => {
+    // Pins the SHAPE, not just today's fields: a placement that grew an `href` or a digest
+    // would be an address a page's body could hand out, which is the one thing D-16 exists
+    // to make impossible.
+    const placed = placedFile({
+      kind: 'attachment',
+      attrs: { filename: 'a.png', alt: 'x', href: '/api/attachment/a.png/seite', sha256: 'ab'.repeat(32) }
+    });
+    expect(Object.keys(placed ?? {}).sort()).toEqual(['alt', 'filename']);
+  });
+});

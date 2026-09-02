@@ -5,11 +5,114 @@
 //! obeys everywhere: **text is never dropped**. A construct the M1 block schema cannot
 //! represent yet keeps its text in the nearest block that *can* hold it, and says so in
 //! `Conversion::notes` — a silent loss is the one outcome that cannot be detected later.
+//!
+//! # Placing a file in the prose (D-15)
+//!
+//! One construct is read as something other than what CommonMark calls it: an image whose
+//! destination names a file on *this* page becomes a [`crate::BlockKind::Attachment`]. Both
+//! halves of that syntax live here — [`attachment_destination`] writes it and
+//! [`attachment_reference`] reads it — so the exporter cannot drift away from the importer,
+//! and the two rules that decide when it applies are stated on
+//! [`Builder::placement_is_possible`] and [`Builder::settle_placements`]: the reference must
+//! stand **alone in its own paragraph** and that paragraph must be at the **top level** of
+//! the document. Anywhere else it is an ordinary image and degrades exactly as one.
 
 use crate::block::{Block, BlockKind, Mark, MarkKind};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use std::collections::BTreeMap;
 use std::fmt;
+
+/// What an image destination has to say to be a reference to a file on this page.
+///
+/// A scheme, not a shape. The obvious alternative — reading any destination with no slash
+/// in it (`![x](befund.png)`) as an attachment — is a *guess*, and this project has already
+/// written down why it does not make those: `gw_store::blobs` refuses to sniff a `.csv` by
+/// looking for commas, because a guess dressed as a measurement is the same mistake as
+/// trusting what an upload declared. Here the guess would be worse than useless: every
+/// markdown file anybody has ever imported holding a relative image would silently acquire
+/// a reference to a file that was never attached, and the page would then say so on screen.
+///
+/// So a placement is a *statement*. `anhang:` is German because this wiki is, the same way
+/// its routes are (`/papierkorb`, `/themen`), and it is what somebody reading an exported
+/// file sees rather than a bare filename that looks like a broken relative link.
+pub const ATTACHMENT_SCHEME: &str = "anhang:";
+
+/// The markdown destination that names `filename` as a file on this page.
+///
+/// The *writing* half of one agreement whose *reading* half is [`attachment_reference`],
+/// and both live here rather than in `gw_api::export` for the reason [`crate::MARK_ORDER`]
+/// does: two copies of one rule in two crates stop agreeing the day one of them is edited,
+/// and what that costs is an export that refuses every page holding a picture — which is
+/// the owner's backup path, failing on the first refusal.
+///
+/// `gw_store::attachments::canonical_filename` admits everything but `/`, `\`, `"` and
+/// control characters, so a name can hold spaces, brackets and unbalanced parentheses —
+/// none of which a bare CommonMark destination can carry. The angle-bracket form can carry
+/// all of them, so it is used for anything that is not plainly safe without it, and `<`,
+/// `>` and `\` inside it are backslash-escaped, which the parser undoes on the way back.
+/// Nothing is percent-encoded: pulldown-cmark does not decode, so `%20` would come back as
+/// three characters of the filename.
+///
+/// `None` for a name this syntax cannot carry back unchanged — one holding a character
+/// [`attachment_reference`] refuses, or padded with spaces it would trim off. No name a
+/// page can really give a file is in that set, so `None` means a hand-written body rather
+/// than an ordinary page; the exporter turns it into a refusal that names the page, which
+/// is this module's rule everywhere: nothing is quietly degraded.
+pub fn attachment_destination(filename: &str) -> Option<String> {
+    // Asked of the READER rather than restated as a second list of characters, so the two
+    // halves cannot drift: this writes a destination only for a name that one would read
+    // back. What it is asked about is the *unwrapped* name, because the angle brackets and
+    // their escapes belong to the parser — that half is proved by
+    // `every_name_a_page_can_give_a_file_survives_being_written_and_read_back`, which goes
+    // through the real parser rather than through a second copy of its rules written here.
+    if filename.trim() != filename
+        || attachment_reference(&format!("{ATTACHMENT_SCHEME}{filename}")) != Some(filename)
+    {
+        return None;
+    }
+    let plain = !filename
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '<' | '>' | '(' | ')' | '\\'));
+    let written = if plain {
+        format!("{ATTACHMENT_SCHEME}{filename}")
+    } else {
+        let mut out = String::with_capacity(filename.len() + ATTACHMENT_SCHEME.len() + 2);
+        out.push('<');
+        out.push_str(ATTACHMENT_SCHEME);
+        for c in filename.chars() {
+            if matches!(c, '<' | '>' | '\\') {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out.push('>');
+        out
+    };
+    Some(written)
+}
+
+/// The file an image destination names, or `None` for a destination that names none.
+///
+/// The reading half of [`attachment_destination`]. It refuses exactly what
+/// `gw_store::attachments::canonical_filename` refuses — `/`, `\`, `"`, control characters,
+/// `.` and `..`, and a name that is empty or only spaces — so a destination this accepts is
+/// a name a page could really give a file. It is deliberately **not** a permission check
+/// and not an existence check: this crate has no store, exactly as it has none to resolve a
+/// link's `doc` target with, and whether the file is actually attached is a question only
+/// the page's `Anhänge` list can answer.
+pub fn attachment_reference(dest: &str) -> Option<&str> {
+    let name = dest.strip_prefix(ATTACHMENT_SCHEME)?.trim();
+    if name.is_empty() || name == "." || name == ".." {
+        return None;
+    }
+    if name
+        .chars()
+        .any(|c| c == '/' || c == '\\' || c == '"' || c.is_control())
+    {
+        return None;
+    }
+    Some(name)
+}
 
 /// A markdown construct the M1 block schema cannot represent, and what became of it.
 ///
@@ -19,7 +122,14 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum Unsupported {
-    /// An image. The alt text survives as text; the source URL does not.
+    /// An image that is **not** a placement: its alt text survives as text and its
+    /// destination does not.
+    ///
+    /// Narrower than it was. An image whose destination names a file on this page —
+    /// `![Befund](anhang:befund.png)`, see [`ATTACHMENT_SCHEME`] — and which stands alone
+    /// in its own top-level paragraph is a [`crate::BlockKind::Attachment`] and no loss at
+    /// all. What is still reported is a picture from somewhere this wiki does not store,
+    /// and a reference standing where a placement cannot go.
     Image,
     /// A link whose destination could not be carried.
     ///
@@ -72,7 +182,10 @@ impl Unsupported {
     /// say so rather than describing a loss that stopped happening.
     pub fn disposition(self) -> &'static str {
         match self {
-            Unsupported::Image => "alt text kept, source URL dropped — M5 adds media",
+            Unsupported::Image => {
+                "alt text kept, source dropped — a file on this page is placed instead: \
+                 `![Beschreibung](anhang:datei.png)` on a line of its own"
+            }
             Unsupported::LinkTarget => "NEVER REPORTED: link destinations survive as marks",
             Unsupported::InlineMarks => "NEVER REPORTED: emphasis survives as marks",
             Unsupported::HorizontalRule => "dropped; it carries no text — M4 adds the rule block",
@@ -169,12 +282,28 @@ struct Table {
     in_head: bool,
 }
 
+/// An attachment reference between its `Start(Image)` and `End(Image)`.
+struct Placing {
+    filename: String,
+    /// The alt text as it arrives. Plain: a description is what a screen reader is handed
+    /// and what a card is labelled with, and neither has anywhere to put emphasis.
+    alt: String,
+}
+
 struct Builder {
     stack: Vec<Frame>,
     /// Fenced and indented code arrives as one `Text` event per line. They are joined here
     /// rather than becoming one text leaf each, because separate leaves lose the newlines
     /// and a code block without its line breaks is not the same code block.
     code: Option<String>,
+    /// The attachment reference currently open, and the description accumulating inside it.
+    ///
+    /// An image's alt text arrives as ordinary inline events between `Start(Image)` and
+    /// `End(Image)`, so this diverts them the way [`Builder::code`] diverts a fence's lines
+    /// — otherwise the description would land in the paragraph as prose, which is exactly
+    /// what happens to an image that names no attachment and is exactly what must not
+    /// happen to one that does.
+    placing: Option<Placing>,
     table: Option<Table>,
     losses: BTreeMap<Unsupported, usize>,
     /// The marks currently open, in the order the source opened them. `Start(Tag::Strong |
@@ -194,6 +323,7 @@ impl Builder {
                 implicit: false,
             }],
             code: None,
+            placing: None,
             table: None,
             losses: BTreeMap::new(),
             active: Vec::new(),
@@ -242,12 +372,105 @@ impl Builder {
             return; // never pop the doc
         }
         let frame = self.stack.pop().expect("length checked above");
-        self.top().content.push(frame.block);
+        let block = self.settle_placements(frame.block);
+        self.top().content.push(block);
+    }
+
+    /// Decide what the attachment references inside a closing paragraph actually are.
+    ///
+    /// A **placement** is an image reference standing alone in its own paragraph, and it
+    /// becomes a block in that paragraph's place. A reference that shares its paragraph —
+    /// `![x](anhang:a.png) und dann`, or two of them on adjacent lines, which a soft break
+    /// puts a space between — is not a placement, and degrades to exactly what an ordinary
+    /// image degrades to: its description as text, counted as an [`Unsupported::Image`].
+    ///
+    /// Only the "alone in its paragraph" half is decided here. The **top level** half is
+    /// [`Self::placement_is_possible`]'s, asked before the description is diverted, and it is
+    /// asked in exactly one place on purpose: two copies of one rule stop agreeing the day
+    /// either is edited, and this one decides whether a page can ever be exported again. So
+    /// nothing here re-checks the depth — an [`crate::BlockKind::Attachment`] can only exist
+    /// in a top-level paragraph, because that is the only place one is ever built.
+    ///
+    /// **Alone in its paragraph** matters because markdown has no other way to say "this is a
+    /// block": an image is inline, so a paragraph is what separates `![x](anhang:a.png)` from
+    /// `siehe ![x](anhang:a.png) hier`. A reference that shared its paragraph would have to be
+    /// an inline node, which `Block` has no room for and the exporter's mark machinery has no
+    /// way to write.
+    ///
+    /// The degraded form is merged into its neighbours by the same rule
+    /// [`Self::marked_text`] follows, so it is not merely *similar* to what an ordinary image
+    /// produces — it is the same tree, leaf for leaf. It has to be: the exporter re-imports
+    /// its own output and compares, so a paragraph that came back split into three leaves
+    /// instead of one would refuse the page.
+    fn settle_placements(&mut self, mut block: Block) -> Block {
+        if block.kind != BlockKind::Paragraph
+            || !block
+                .content
+                .iter()
+                .any(|c| c.kind == BlockKind::Attachment)
+        {
+            return block;
+        }
+        if block.content.len() == 1 {
+            return block.content.pop().expect("length checked above");
+        }
+
+        let mut merged: Vec<Block> = Vec::with_capacity(block.content.len());
+        for child in block.content.drain(..) {
+            let child = if child.kind == BlockKind::Attachment {
+                self.note(Unsupported::Image);
+                let mut leaf = self::block(BlockKind::Text);
+                leaf.text = Some(
+                    child
+                        .attrs
+                        .get("alt")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+                leaf
+            } else {
+                child
+            };
+            match merged.last_mut() {
+                Some(prev)
+                    if prev.kind == BlockKind::Text
+                        && child.kind == BlockKind::Text
+                        && prev.marks == child.marks =>
+                {
+                    prev.text
+                        .get_or_insert_with(String::new)
+                        .push_str(child.text.as_deref().unwrap_or_default());
+                }
+                _ => merged.push(child),
+            }
+        }
+        block.content = merged;
+        block
     }
 
     fn close_implicit(&mut self) {
         while self.stack.last().is_some_and(|f| f.implicit) {
             self.pop();
+        }
+    }
+
+    /// Whether an attachment reference starting here could be a placement at all.
+    ///
+    /// A placement is a top-level block written as an image alone in its own paragraph, so
+    /// the stack has to be exactly the document and that paragraph, and nothing may have
+    /// been written into the paragraph yet. Asked *before* the description is diverted, so
+    /// a reference in a position that can never hold a placement — inside a sentence, a
+    /// list item, a blockquote, a table cell — takes the ordinary image path untouched,
+    /// keeping whatever emphasis its description carried.
+    ///
+    /// It cannot see what comes *after*, so `![x](anhang:a.png) und dann` still starts a
+    /// placement that [`Self::settle_placements`] then degrades. That is the one shape
+    /// where a description loses its emphasis, and it is reported as an image loss.
+    fn placement_is_possible(&mut self) -> bool {
+        self.stack.len() == 2 && {
+            let top = self.top();
+            top.kind == BlockKind::Paragraph && top.content.is_empty()
         }
     }
 
@@ -287,6 +510,16 @@ impl Builder {
     /// one document became two different trees, only one of which the exporter can write
     /// back. The sort is stable, so marks of the same kind keep their source nesting.
     fn marked_text(&mut self, s: &str, mut marks: Vec<Mark>) {
+        // An image's description is plain text — CommonMark renders the inline content of
+        // `![…]` as its plain string — so the marks are dropped here rather than carried.
+        // That is the format's own rule and not a loss this converter invents; the only
+        // place it can be *observed* as one is a reference that started a paragraph and had
+        // something follow it, which degrades (see `settle_placements`) and would then have
+        // been emphasised text before. Reported as an image either way.
+        if let Some(placing) = self.placing.as_mut() {
+            placing.alt.push_str(s);
+            return;
+        }
         if let Some(code) = self.code.as_mut() {
             code.push_str(s);
             return;
@@ -500,7 +733,18 @@ impl Builder {
                 }
                 self.open(b);
             }
-            Tag::Image { .. } => self.note(Unsupported::Image),
+            // An image is a file placed in the prose (D-15) when its destination names one
+            // and it can stand where a placement may stand; anything else is a picture from
+            // somewhere this wiki does not store, and keeps the behaviour it always had.
+            Tag::Image { dest_url, .. } => match attachment_reference(&dest_url) {
+                Some(filename) if self.placement_is_possible() => {
+                    self.placing = Some(Placing {
+                        filename: filename.to_string(),
+                        alt: String::new(),
+                    })
+                }
+                _ => self.note(Unsupported::Image),
+            },
             // This crate has no store, so a markdown link can never be resolved to a
             // document id here — `[text](/darm/labor)` becomes an external href exactly
             // like `[text](https://example.org)`, regardless of how internal it looks.
@@ -550,7 +794,25 @@ impl Builder {
             TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough | TagEnd::Link => {
                 self.active.pop();
             }
-            // Images open no frame and push no mark, so they close neither.
+            // An image that named an attachment becomes a block here; one that did not
+            // opened no frame and pushed no mark, so it closes neither.
+            TagEnd::Image => {
+                if let Some(placing) = self.placing.take() {
+                    let mut placement = block(BlockKind::Attachment);
+                    placement
+                        .attrs
+                        .insert("filename".into(), serde_json::Value::from(placing.filename));
+                    // Written even when it is empty, for the reason `checked` is: an empty
+                    // description and no description are the same thing to a reader and two
+                    // different documents to `render_file`'s comparison — and the editor's
+                    // schema fills a missing one in with `''`, so leaving it out here would
+                    // make every placement the editor touched differ from the imported one.
+                    placement
+                        .attrs
+                        .insert("alt".into(), serde_json::Value::from(placing.alt));
+                    self.top().content.push(placement);
+                }
+            }
             _ => {}
         }
     }
@@ -635,7 +897,9 @@ fn block(kind: BlockKind) -> Block {
 #[cfg(test)]
 mod tests {
     use crate::block::{Block, BlockKind, MarkKind};
-    use crate::markdown::{convert, markdown_to_blocks, Unsupported};
+    use crate::markdown::{
+        attachment_destination, attachment_reference, convert, markdown_to_blocks, Unsupported,
+    };
 
     fn keys(md: &str) -> Vec<&'static str> {
         convert(md)
@@ -1438,5 +1702,256 @@ mod tests {
             (0..crate::MARK_ORDER.len()).collect::<Vec<_>>(),
             "a kind is listed twice, so one of its ranks is unreachable"
         );
+    }
+
+    // --- inline attachments (D-15) -------------------------------------------------------
+
+    /// The block an attachment placement produces, or `None` if the doc holds no placement
+    /// at that position.
+    fn placement(doc: &Block, at: usize) -> Option<&Block> {
+        doc.content
+            .get(at)
+            .filter(|b| b.kind == BlockKind::Attachment)
+    }
+
+    #[test]
+    fn an_image_naming_an_attachment_becomes_a_block_of_its_own() {
+        let doc = markdown_to_blocks("![Befund vom März](anhang:befund.png)\n");
+        let block = placement(&doc, 0).expect("a lone attachment reference is a placement");
+        assert_eq!(
+            block.attrs.get("filename").and_then(|v| v.as_str()),
+            Some("befund.png")
+        );
+        assert_eq!(
+            block.attrs.get("alt").and_then(|v| v.as_str()),
+            Some("Befund vom März")
+        );
+        // A reference, not a possession: it is a top-level block, not text in a paragraph.
+        assert_eq!(doc.content.len(), 1);
+        assert!(block.content.is_empty(), "a placement holds no content");
+    }
+
+    #[test]
+    fn a_placement_states_an_empty_description_rather_than_leaving_it_out() {
+        // The same rule `checked` follows: an attribute that vanishes at its default makes
+        // two different documents into one, and here it would also make the editor's
+        // schema (which fills `alt` in with `''`) disagree with this converter's output —
+        // which `gw_api::export::render_file` turns into a page that can never be exported.
+        let doc = markdown_to_blocks("![](anhang:befund.png)\n");
+        let block = placement(&doc, 0).expect("a description is not what makes it a placement");
+        assert_eq!(block.attrs.get("alt").and_then(|v| v.as_str()), Some(""));
+        assert_eq!(
+            block.attrs.keys().collect::<Vec<_>>(),
+            vec!["alt", "filename"],
+            "a placement grew an attribute the editor's schema does not declare"
+        );
+    }
+
+    #[test]
+    fn a_placement_is_no_loss_and_reports_none() {
+        assert!(keys("![a](anhang:befund.png)\n").is_empty());
+    }
+
+    #[test]
+    fn an_ordinary_image_is_still_dropped_to_its_alt_text_and_reported() {
+        // Unchanged, deliberately. A destination that does not say `anhang:` is a picture
+        // from somewhere else, and this wiki stores no such thing — so guessing that
+        // `![x](bild.png)` meant an attachment would invent a reference the author never
+        // wrote, on every markdown file anybody has ever imported.
+        let doc = markdown_to_blocks("![Ein Diagramm](/media/a.png)\n");
+        assert_eq!(doc.content[0].kind, BlockKind::Paragraph);
+        assert_eq!(doc.plain_text(), "Ein Diagramm");
+        assert!(keys("![Ein Diagramm](/media/a.png)\n").contains(&"image"));
+    }
+
+    #[test]
+    fn a_reference_inside_a_sentence_degrades_to_exactly_what_an_image_degrades_to() {
+        // A placement is a paragraph of its own. Anywhere else the reference is not a
+        // placement at all and falls back to the behaviour every other image has — which
+        // has to be the SAME tree, leaf for leaf, or a page holding one would export as
+        // something that re-imports differently.
+        let placed = markdown_to_blocks("Text ![a](anhang:x.png) mehr\n");
+        let plain = markdown_to_blocks("Text ![a](/media/x.png) mehr\n");
+        assert_eq!(json(&placed), json(&plain));
+        assert_eq!(placed.plain_text(), "Text a mehr");
+        assert!(keys("Text ![a](anhang:x.png) mehr\n").contains(&"image"));
+    }
+
+    #[test]
+    fn two_references_on_adjacent_lines_are_one_paragraph_and_therefore_neither_is_placed() {
+        // A soft break puts a space between them, so the paragraph holds three children and
+        // not one. Both degrade, and to exactly what two ordinary images degrade to.
+        let placed = markdown_to_blocks("![a](anhang:x.png)\n![b](anhang:y.png)\n");
+        let plain = markdown_to_blocks("![a](/x.png)\n![b](/y.png)\n");
+        assert_eq!(json(&placed), json(&plain));
+        assert_eq!(placed.plain_text(), "a b");
+        // And BOTH are reported, exactly as two ordinary images are. A reference that
+        // degrades has lost its destination, and a loss nobody is told about is the one
+        // outcome this converter's header says cannot be detected later.
+        //
+        // The COUNT, not just the key. One of these two takes the ordinary image path at
+        // `Start` (the second one, which is not the first thing in its paragraph) and the
+        // other is reported by `settle_placements` when it degrades — so `keys` alone says
+        // "image" whichever of the two reports it, and would pass with one of them silent.
+        assert_eq!(
+            convert("![a](anhang:x.png)\n![b](anhang:y.png)\n").notes,
+            convert("![a](/x.png)\n![b](/y.png)\n").notes
+        );
+        assert_eq!(
+            convert("![a](anhang:x.png)\n![b](anhang:y.png)\n")
+                .notes
+                .iter()
+                .find(|n| n.construct == Unsupported::Image)
+                .map(|n| n.count),
+            Some(2),
+            "a reference that degraded was not counted as the image it fell back to"
+        );
+    }
+
+    #[test]
+    fn a_reference_in_a_sentence_keeps_the_emphasis_in_its_description() {
+        // A reference standing where a placement can never go never becomes one, so its
+        // description flows into the paragraph as ordinary inline events and keeps whatever
+        // marks it carried — exactly as an ordinary image's does. That is what
+        // `placement_is_possible` buys by asking BEFORE the description is diverted rather
+        // than unwinding a placement afterwards: CommonMark renders an image's description as
+        // plain text, so a placement that had to be degraded can only give back plain text.
+        let placed = markdown_to_blocks("Text ![**fett**](anhang:x.png) mehr\n");
+        let plain = markdown_to_blocks("Text ![**fett**](/media/x.png) mehr\n");
+        assert_eq!(json(&placed), json(&plain));
+        let marked: Vec<&Block> = collect_text_leaves(&placed)
+            .into_iter()
+            .filter(|leaf| !leaf.marks.is_empty())
+            .collect();
+        assert_eq!(
+            marked.len(),
+            1,
+            "the emphasis in the description was flattened"
+        );
+        assert_eq!(marked[0].text.as_deref(), Some("fett"));
+    }
+
+    #[test]
+    fn a_degraded_reference_merges_into_its_neighbours_only_where_the_marks_agree() {
+        // Degrading has to produce the SAME tree an ordinary image produces, leaf for leaf,
+        // or the exporter's round-trip comparison refuses the page — and "the same tree"
+        // includes where the leaf boundaries are. `marked_text` merges two neighbouring
+        // leaves only when their marks match, so this must too: merging across a mark
+        // boundary would swallow the emphasis of the words beside the picture.
+        let placed = markdown_to_blocks("![a](anhang:x.png) **fett**\n");
+        let plain = markdown_to_blocks("![a](/media/x.png) **fett**\n");
+        assert_eq!(json(&placed), json(&plain));
+        let leaves = collect_text_leaves(&placed);
+        assert_eq!(leaves.len(), 2, "the two runs were fused into one");
+        assert!(leaves[0].marks.is_empty());
+        assert_eq!(leaves[1].text.as_deref(), Some("fett"));
+        assert!(!leaves[1].marks.is_empty(), "the bold run lost its mark");
+    }
+
+    #[test]
+    fn a_reference_below_the_top_level_degrades_rather_than_placing() {
+        // The editor's schema admits `attachment` in `doc` and nowhere else, so a placement
+        // read back inside a list item, a table cell or a blockquote would be a tree the
+        // editor deletes on open. Both halves of that rule live here and in
+        // `extensions.ts`, and this is the half that keeps the importer from writing one.
+        for md in [
+            "- ![a](anhang:x.png)\n",
+            "> ![a](anhang:x.png)\n",
+            "| Kopf |\n|---|\n| ![a](anhang:x.png) |\n",
+            "1. ![a](anhang:x.png)\n",
+        ] {
+            let doc = markdown_to_blocks(md);
+            let mut kinds = Vec::new();
+            fn walk(b: &Block, out: &mut Vec<BlockKind>) {
+                out.push(b.kind);
+                for c in &b.content {
+                    walk(c, out);
+                }
+            }
+            walk(&doc, &mut kinds);
+            assert!(
+                !kinds.contains(&BlockKind::Attachment),
+                "{md:?} placed an attachment somewhere the editor cannot hold one"
+            );
+            assert!(
+                doc.plain_text().ends_with('a'),
+                "{md:?} lost the description as well: {:?}",
+                doc.plain_text()
+            );
+        }
+    }
+
+    #[test]
+    fn a_placement_serialises_under_the_editors_own_name() {
+        // The wire name IS the CRDT element tag and the TipTap node name, so this is the
+        // string `extensions.ts` has to register. Asserted rather than assumed, the same
+        // way `taskList` is.
+        let doc = markdown_to_blocks("![a](anhang:x.png)\n");
+        assert_eq!(
+            json(&doc)["content"][0]["type"],
+            serde_json::Value::Null,
+            "a Block serialises `kind`, not ProseMirror's `type`"
+        );
+        assert_eq!(json(&doc)["content"][0]["kind"], "attachment");
+    }
+
+    #[test]
+    fn every_name_a_page_can_give_a_file_survives_being_written_and_read_back() {
+        // The two halves of one agreement, in the crate that owns both, for the reason
+        // `MARK_ORDER` lives here rather than in the exporter: a destination this writes and
+        // a destination this reads back are the same statement, and two copies of it in two
+        // crates stop agreeing the day one is edited. What that costs is an export that
+        // refuses every page holding a picture.
+        //
+        // The names are what `gw_store::attachments::canonical_filename` actually admits —
+        // it refuses only `/`, `\`, `"` and control characters — so spaces, brackets,
+        // parentheses and umlauts all have to go through a markdown destination and come
+        // back unchanged.
+        for name in [
+            "befund.png",
+            "Befund 2024.pdf",
+            "a(b).png",
+            "a)b.png",
+            "a<b>c.svg",
+            "Röntgen Größe.png",
+            "a b (2).csv",
+            "100%.png",
+            "a'b.png",
+            "#tag.png",
+        ] {
+            let dest = attachment_destination(name)
+                .unwrap_or_else(|| panic!("`{name}` is a name a page can really give a file"));
+            let md = format!("![x]({dest})\n");
+            let doc = markdown_to_blocks(&md);
+            let block = placement(&doc, 0)
+                .unwrap_or_else(|| panic!("{md:?} did not come back as a placement"));
+            assert_eq!(
+                block.attrs.get("filename").and_then(|v| v.as_str()),
+                Some(name),
+                "{md:?} came back naming a different file"
+            );
+        }
+    }
+
+    #[test]
+    fn a_destination_that_names_no_attachment_is_not_one() {
+        for dest in [
+            "bild.png",
+            "/media/a.png",
+            "https://example.org/a.png",
+            "anhang:",
+            "anhang:  ",
+            "anhang:.",
+            "anhang:..",
+            "anhang:a/b.png",
+            "anhang:a\\b.png",
+            "anhang:a\"b.png",
+        ] {
+            assert_eq!(
+                attachment_reference(dest),
+                None,
+                "`{dest}` was read as a reference to a file"
+            );
+        }
     }
 }

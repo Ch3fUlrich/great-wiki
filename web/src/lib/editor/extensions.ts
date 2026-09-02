@@ -64,9 +64,10 @@
  * not assumed). They are therefore as pinned as the declared ones, and adding them to
  * `package.json` would only give the resolver a second place to disagree with itself.
  */
-import { getSchema } from '@tiptap/core';
+import { getSchema, Node } from '@tiptap/core';
 import type { Extensions } from '@tiptap/core';
 import StarterKit from '@tiptap/starter-kit';
+import { Document } from '@tiptap/extension-document';
 import { Table, TableCell, TableHeader, TableRow } from '@tiptap/extension-table';
 import { TaskItem, TaskList } from '@tiptap/extension-list';
 import { Bold } from '@tiptap/extension-bold';
@@ -183,6 +184,112 @@ const Task = TaskItem.extend({
 });
 
 /**
+ * A file placed in the prose (D-15): `gw_core::BlockKind::Attachment`.
+ *
+ * # Two attributes, and no third
+ *
+ * `filename` and `alt`, which is exactly what `gw_core::markdown` writes and exactly what
+ * `gw_api::export` compares. Both hazards the module docs above describe apply here at once
+ * and in opposite directions:
+ *
+ * - **Undeclared is deleted.** `filename` is half of the address a download is authorised
+ *   through (D-16) and the only thing in the block that says which file it is. An attribute
+ *   this schema does not declare is removed from the Y.Doc on the first edit that touches the
+ *   node, so a placement would quietly become a picture of nothing — with no way left to say
+ *   which picture it had been.
+ * - **Over-declared is minted.** There is deliberately no reduction for a placement in
+ *   `gw_api::export` (see `a_placement_is_compared_with_its_attributes_whole_…` in
+ *   `crates/gw-api/tests/export.rs`): its attributes are compared whole, so a third one
+ *   declared here would be filled in with its default by ProseMirror's `computeAttrs`,
+ *   written onto the wire by `marksToAttributes`, copied into `Block::attrs`, and would then
+ *   refuse the page on export — permanently, and on the owner's backup path. That is exactly
+ *   what stock `Link`'s four extra attributes really did.
+ *
+ * `alt` defaults to `''` rather than `null`, because the importer writes it even when it is
+ * empty and the two sides have to agree: a `null` default would put `alt: null` on every
+ * placement the editor touched, against the `alt: ""` markdown re-imports as.
+ *
+ * `rendered: false` on neither, unlike a task's `id`: both are document content rather than
+ * database identity, and both belong in the editor's own DOM so the author can see which
+ * file is placed.
+ *
+ * # Its own group, so it can only stand where the importer will read one back
+ *
+ * `group: 'attachment'` and NOT `'block'`, with `Doc` below widening only the document's
+ * content expression to admit it. That is not tidiness — it is the schema half of a rule
+ * whose other half is in `gw_core::markdown`, and the two must agree exactly:
+ *
+ * - A placement is written as an image standing alone in its own paragraph, and the importer
+ *   reads one back **only at the top level of the document**. A placement anywhere else
+ *   exports to markdown that re-imports as a paragraph of text, so `render_file` refuses the
+ *   page and `export` fails the whole run on the first refusal.
+ * - `listItem`'s content expression is `paragraph block*`, so a placement as an item's first
+ *   child is a node ProseMirror cannot build — and `createNodeFromYElement` answers that by
+ *   **deleting the element from the CRDT**, which is the silent destruction the module docs
+ *   above exist to prevent.
+ * - A `tableCell` in markdown is one paragraph and nothing else, so a placement in one is a
+ *   page the exporter refuses outright.
+ *
+ * With `group: 'block'` the editor would happily let somebody drag a picture into a list item
+ * or a table cell and produce any of those. With its own group the schema simply will not
+ * hold it, which is the only kind of prevention that does not depend on remembering.
+ *
+ * # `atom`, `draggable`, and no marks
+ *
+ * `atom: true` because it has no content to edit — everything about it is in its attributes —
+ * and `content` is therefore left unset. `draggable: true` so it can be moved without being
+ * cut and re-inserted. `marks: ''` because `gw-collab` writes a leaf's marks as Yjs *text*
+ * formatting attributes (`doc.rs::mark_key_of`) and has nowhere to put a mark on an element:
+ * a bolded placement would sync, publish, and lose the mark in silence.
+ */
+const Attachment = Node.create({
+  name: 'attachment',
+  group: 'attachment',
+  atom: true,
+  draggable: true,
+  marks: '',
+  addAttributes: () => ({
+    filename: {
+      default: '',
+      parseHTML: (element: HTMLElement) => element.getAttribute('data-filename') ?? ''
+    },
+    alt: { default: '', parseHTML: (element: HTMLElement) => element.getAttribute('data-alt') ?? '' }
+  }),
+  // `data-*` rather than `src`/`alt` on a real `<img>`, and that is the safe choice rather
+  // than the lazy one. The editor has no permission-checked address to put in a `src` — the
+  // one the reader uses is built by the API for a list this component never fetched — and a
+  // node view that guessed one would be this interface assembling an address, which D-16 says
+  // it may not. So the editor shows WHICH file is placed, in words, and the reader shows the
+  // picture. `parseHTML` matches the same attribute, so copying a placement inside the editor
+  // keeps it.
+  parseHTML: () => [{ tag: 'figure[data-attachment]' }],
+  renderHTML: ({ HTMLAttributes }) => [
+    'figure',
+    {
+      'data-attachment': '',
+      'data-filename': HTMLAttributes.filename,
+      'data-alt': HTMLAttributes.alt,
+      class: 'gw-ed-datei'
+    },
+    ['figcaption', {}, `📎 ${HTMLAttributes.filename}${HTMLAttributes.alt ? ` — ${HTMLAttributes.alt}` : ''}`]
+  ]
+});
+
+/**
+ * TipTap's `Document`, widened by exactly one group so a placement has somewhere to go.
+ *
+ * `content: 'block+'` is the stock expression, and `attachment` is deliberately not in the
+ * `block` group — see `Attachment` above for the three ways that would lose or refuse a
+ * page. This is the *only* place it is admitted, and `StarterKit.configure({ document: false })`
+ * below is what stops the stock one being registered alongside it.
+ *
+ * `@tiptap/extension-document` is not named in `package.json`. It arrives as
+ * `@tiptap/starter-kit`'s own dependency, pinned by it to the same exact 3.30.0 (checked in
+ * `package-lock.json`), exactly as the six marks imported above do.
+ */
+const Doc = Document.extend({ content: '(block|attachment)+' });
+
+/**
  * The Yjs fragment the document lives in.
  *
  * `gw-collab`'s `CONTENT_FIELD`, and NOT `@tiptap/extension-collaboration`'s default, which
@@ -214,6 +321,7 @@ export const SERVER_BLOCK_KINDS = [
   'tableRow',
   'tableHeader',
   'tableCell',
+  'attachment',
   'text'
 ] as const satisfies readonly BlockKind[];
 
@@ -246,7 +354,11 @@ type _EveryKindIsNamed = AssertNever<Exclude<BlockKind, (typeof SERVER_BLOCK_KIN
  */
 export function contentExtensions(): Extensions {
   return [
+    // `Doc` above replaces it, widened to admit a placement. Everything else about the stock
+    // Document is kept by extending it rather than writing a new one.
+    Doc,
     StarterKit.configure({
+      document: false,
       bold: false,
       italic: false,
       strike: false,
@@ -295,6 +407,9 @@ export function contentExtensions(): Extensions {
     // The stock declaration is exactly one attribute short, and `Task` above adds it: a
     // task's `id`, which is what the board holds its record by. See its doc comment.
     Task.configure({ nested: true }),
+    // A file placed in the prose. Its own group, admitted only by `Doc` above — see its doc
+    // comment for why `block` would be three different kinds of data loss.
+    Attachment,
     // The five marks the server can store, `Strong`/`Em` renamed per the module docs above;
     // `Strike`, `Code` and `Anchor` keep TipTap's own names because those already agree with
     // `MarkKind`'s serde names. `Anchor` is `Link` with its attribute declaration trimmed to

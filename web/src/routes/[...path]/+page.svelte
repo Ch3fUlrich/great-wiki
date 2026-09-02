@@ -301,7 +301,7 @@
       {#await loadEditor()}
         <p class="editor-loading" role="status">Der Editor wird geladen …</p>
         <article class="prose" lang={data.doc.language}>
-          <BlockView block={data.body} />
+          <BlockView block={data.body} anhaenge={data.anhaenge ?? []} />
         </article>
       {:then module}
         {@const Editor = module.default}
@@ -309,6 +309,7 @@
           path={data.doc.path}
           title={data.doc.title}
           body={data.body}
+          anhaenge={data.anhaenge ?? []}
           language={data.doc.language}
           {editorName}
           onLeave={() => (toggled = false)}
@@ -318,12 +319,12 @@
           Der Editor konnte nicht geladen werden. Die Seite selbst ist unverändert.
         </p>
         <article class="prose" lang={data.doc.language}>
-          <BlockView block={data.body} />
+          <BlockView block={data.body} anhaenge={data.anhaenge ?? []} />
         </article>
       {/await}
     {:else}
       <article class="prose" lang={data.doc.language}>
-        <BlockView block={data.body} />
+        <BlockView block={data.body} anhaenge={data.anhaenge ?? []} />
       </article>
     {/if}
 

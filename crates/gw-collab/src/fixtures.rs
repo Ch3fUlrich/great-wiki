@@ -110,7 +110,37 @@ pub fn one_per_kind() -> Vec<(&'static str, Block)> {
 
     cases.push(("table / row / header / cell", aligned_table()));
 
+    cases.push(("attachment", placed_files()));
+
     cases
+}
+
+/// Two files placed in the prose (D-15), shaped around what makes a placement fragile.
+///
+/// A placement is an atom: no children, and its whole meaning is in two attributes that
+/// nothing on the page spells out. `filename` is half of the address a download is
+/// authorised through (D-16) — lose it and the picture is gone with no way to say which one
+/// it was — and `alt` is written even when empty, for the reason a task's `checked` is: an
+/// empty description and no description are the same thing to a reader and two different
+/// documents to `gw_api::export`'s comparison, which refuses the page rather than guessing.
+///
+/// One of them is deliberately NOT a picture. What a placement looks like is decided when it
+/// is read, from the media type the bytes were sniffed as, so the CRDT carries the same two
+/// attributes for a CSV as for a PNG and nothing here may start to differ between them.
+pub fn placed_files() -> Block {
+    fn placed(filename: &str, alt: &str) -> Block {
+        let b = with_attr(
+            block(BlockKind::Attachment),
+            "filename",
+            Value::from(filename),
+        );
+        with_attr(b, "alt", Value::from(alt))
+    }
+    doc(vec![
+        paragraph("Der Befund vom März:"),
+        placed("befund.png", "Röntgenbild, seitlich"),
+        placed("laborwerte.csv", ""),
+    ])
 }
 
 /// A checklist: an unticked line with a ticked one nested under it, then a ticked line.
@@ -330,6 +360,7 @@ const ELEMENT_KINDS: &[BlockKind] = &[
     BlockKind::TableRow,
     BlockKind::TableHeader,
     BlockKind::TableCell,
+    BlockKind::Attachment,
 ];
 
 /// Strings chosen for the ways text breaks conversions: empty, markup, entities, quotes,
@@ -457,6 +488,7 @@ impl Coverage {
             "tablecell",
             "tasklist",
             "taskitem",
+            "attachment",
             "text",
         ] {
             assert!(self.kinds.contains(expected), "never generated {expected}");

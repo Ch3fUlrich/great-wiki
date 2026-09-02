@@ -5,11 +5,25 @@ use serde::{Deserialize, Serialize};
 ///
 /// `#[non_exhaustive]`, so adding one is not a breaking change for downstream matches —
 /// **and that is the hazard, not the convenience.** Nothing fails to compile when a variant
-/// is added, while three hand-maintained mirrors of this enum sit outside Rust entirely:
-/// the editor's node list, the reader's renderer, and the CRDT fixtures. The editor's is
-/// the dangerous one — TipTap deletes an element whose node name it does not know and the
-/// deletion is then published — so adding a variant here means updating all three, and the
-/// exporter, which at least refuses loudly. Adding `TaskList` cost exactly this.
+/// is added, while four hand-maintained mirrors of this enum sit outside Rust's type system:
+///
+/// 1. **The editor's node list** (`web/src/lib/editor/extensions.ts`), which is the
+///    dangerous one — TipTap *deletes* an element whose node name it does not know, and the
+///    deletion is broadcast to every other editor and filed as a revision by the next
+///    sweep. It also deletes any attribute the schema does not declare, so a kind's
+///    attributes have to be declared there in the same change.
+/// 2. **The reader's renderer** (`web/src/lib/blocks/render.ts`'s `BlockKind` union and
+///    `BlockView.svelte`), which skips what it does not know — silent, but not destructive.
+/// 3. **The CRDT fixtures** (`crates/gw-collab/src/fixtures.rs`), which are what prove a
+///    kind survives the Y.Doc conversion at all.
+/// 4. **The exporter** (`gw_api::export`), which at least refuses loudly — but a refusal
+///    fails the whole export run, so "loudly" still means the owner's backup stops working.
+///
+/// A fifth is softer and still worth doing: `web/src/lib/history.ts`'s `BLOCK_LABEL` names
+/// every kind in German for the revision diff, and falls back to the raw name rather than
+/// rendering nothing.
+///
+/// Adding `TaskList` cost exactly this, and adding `Attachment` cost it again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
@@ -61,6 +75,45 @@ pub enum BlockKind {
     TableHeader,
     /// A body cell (`td`).
     TableCell,
+    /// A file placed in the prose: an image where it belongs, or a card for everything
+    /// else. D-15's other half, and a **reference** rather than a possession.
+    ///
+    /// It carries exactly two attributes and no third may be added without the editor's
+    /// schema being widened in the same change (`web/src/lib/editor/extensions.ts`):
+    ///
+    /// * `filename` — the name the file has *on this page*. Not a path, not a URL and
+    ///   above all **not a digest**: a download is authorised against the page it was
+    ///   reached through (D-16), and an address built from a content hash is the one thing
+    ///   that would bypass that check. The page half of the pair is where the block *is* —
+    ///   this is a top-level block of one document's body, so "which page" is never in
+    ///   question and never stored, which is also what stops a reference outliving a move.
+    /// * `alt` — what the picture shows, written even when it is empty, for the reason
+    ///   [`BlockKind::TaskItem`]'s `checked` is: an empty description and no description
+    ///   are the same thing to a reader and two different documents to a comparison.
+    ///
+    /// **A block here does not attach anything and never has.** The `attachments` table is
+    /// the authority on what a page carries (D-15), nothing derives a row from
+    /// `documents.body`, and so cutting this block out of a paragraph leaves the file
+    /// exactly where it was. The converse is a state this system genuinely has: a block
+    /// naming a file that is not attached, which the reader states plainly rather than
+    /// rendering as a broken picture. `gw_store::attachments`' header is the other end.
+    ///
+    /// **It contributes nothing to [`Block::plain_text`]**, and that is deliberate rather
+    /// than an oversight: `alt` is an attribute, like a heading's `level`, and `plain_text`
+    /// is a byte-for-byte contract with `web/src/lib/blocks/render.ts` that feeds the search
+    /// index, the chunker and every anchor id. Two consequences worth knowing before somebody
+    /// changes it. A description is not searchable; and [`crate::diff`] fingerprints a block
+    /// by kind plus text, so two placements look alike to the structure diff and swapping one
+    /// picture for another shows up as a *design* change (`filename: a.png → b.png`) instead.
+    ///
+    /// **Top-level only.** Markdown writes it as an image standing alone in its own
+    /// paragraph, and the importer only reads one back at the root of the document; the
+    /// editor's schema admits it in `doc` and nowhere else, so a list item, a table cell
+    /// and a blockquote can none of them hold one. Both halves are stated in
+    /// [`crate::markdown`] and in `extensions.ts`, and they have to agree: a placement the
+    /// exporter writes somewhere the importer will not read one back is a page that can
+    /// never be exported again.
+    Attachment,
     Text,
 }
 

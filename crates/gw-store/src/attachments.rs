@@ -10,9 +10,13 @@
 //! and it is why publishing a revision runs no reconciliation over this table the way
 //! [`crate::tasks`] does over cards.
 //!
-//! The consequence for whoever builds the inline block: it refers to an attachment by
-//! **(page, filename)**, which is exactly the address a download uses. There is no rename,
-//! so that reference cannot be broken by one.
+//! The inline block exists now — `gw_core::BlockKind::Attachment` — and it refers to an
+//! attachment by **filename**, on the page whose body holds it. That pair is exactly the
+//! address a download uses, and the page half is never stored because it is never in
+//! question: a placement is a top-level block of one document. There is no rename here, so
+//! the reference cannot be broken by one; what *can* happen is a detach, which leaves the
+//! block exactly where it was and is the state the reader states in words rather than
+//! rendering as a broken picture.
 //!
 //! # A download is authorised against the page (D-16)
 //!

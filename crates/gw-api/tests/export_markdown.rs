@@ -664,3 +664,94 @@ fn boxes(block: &Block) -> Vec<bool> {
     walk(block, &mut out);
     out
 }
+
+// --- placed files (D-15) -----------------------------------------------------------------
+//
+// The construct with the narrowest round trip in the whole format, and the reason is worth
+// stating: an image is the ONE thing `gw_core::markdown` reads as something other than what
+// CommonMark calls it. `![Beschreibung](anhang:datei.png)` alone in a top-level paragraph is
+// a block referring to a file on this page; the very same characters inside a sentence, or
+// inside a list item, are an ordinary image and lose their destination. So a renderer that
+// writes a placement the importer will not read back as one does not merely format oddly —
+// it produces a page that can never be exported again, and `export` fails the whole run on
+// the first refusal.
+
+#[test]
+fn a_placed_file_survives() {
+    survives("![Befund vom März](anhang:befund.png)\n");
+}
+
+#[test]
+fn a_placed_file_with_no_description_survives() {
+    // `alt: ""` is written rather than left out, so this is also the case that proves the
+    // exporter states an empty description rather than dropping the brackets.
+    survives("![](anhang:befund.png)\n");
+}
+
+#[test]
+fn a_placed_file_that_is_not_a_picture_survives_the_same_way() {
+    // One syntax for every kind of file. What a placement LOOKS like is decided when it is
+    // read, from the media type the bytes were sniffed as — never from the name, and
+    // therefore never from anything markdown could carry.
+    survives("![Laborwerte als Tabelle](anhang:laborwerte.csv)\n");
+}
+
+#[test]
+fn a_placed_file_between_prose_keeps_its_neighbours_and_its_place() {
+    survives(
+        "# Befunde\n\nDer Befund vom März:\n\n![Befund vom März](anhang:befund.png)\n\n\
+         Und der Text danach.\n",
+    );
+}
+
+#[test]
+fn two_placed_files_in_a_row_stay_two_blocks() {
+    // Two placements are two paragraphs on the way out and must come back as two blocks,
+    // not as one paragraph holding two references — which is what a single newline between
+    // them would produce, and which degrades both of them to text.
+    let (before, after, rendered) = round_trip("![eins](anhang:a.png)\n\n![zwei](anhang:b.png)\n");
+    assert_eq!(before, after, "--- exported ---\n{rendered}\n---");
+    assert_eq!(
+        before["content"].as_array().map(Vec::len),
+        Some(2),
+        "two placements collapsed into one block: {before}"
+    );
+}
+
+#[test]
+fn a_name_markdown_would_mangle_survives_being_written_and_read_back() {
+    // Spaces, brackets and unbalanced parentheses are all legal in a filename —
+    // `gw_store::attachments::canonical_filename` refuses only `/`, `\`, `"` and control
+    // characters — and none of them can go in a bare CommonMark destination.
+    for name in [
+        "Befund 2024.pdf",
+        "a(b).png",
+        "a)b.png",
+        "a<b>c.svg",
+        "Röntgen Größe.png",
+        "100%.png",
+    ] {
+        let dest = gw_core::markdown::attachment_destination(name).expect("a real filename");
+        let md = format!("![x]({dest})\n");
+        let (before, after, rendered) = round_trip(&md);
+        assert_eq!(before, after, "`{name}` --- exported ---\n{rendered}\n---");
+        assert_eq!(
+            before["content"][0]["attrs"]["filename"], name,
+            "`{name}` did not survive the first import"
+        );
+    }
+}
+
+#[test]
+fn a_description_that_would_read_as_markup_is_escaped() {
+    // The description goes through the same escaping a paragraph's text does, so brackets
+    // and asterisks in it come back as themselves rather than closing the image early.
+    survives("![Ein \\[eckiger\\] \\*Fall\\*](anhang:a.png)\n");
+}
+
+#[test]
+fn a_reference_inside_a_sentence_is_still_an_ordinary_image_and_still_round_trips() {
+    // It never became a placement, so what is stored is the paragraph with the description
+    // as text — and that is what has to come back.
+    survives("Siehe ![das Bild](anhang:a.png) dort.\n");
+}

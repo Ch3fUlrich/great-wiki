@@ -191,6 +191,78 @@ export function kindText(mediaType: string): string {
   return 'Datei';
 }
 
+// --- Placing a file in the prose (D-15) ---------------------------------------------------
+
+/**
+ * The row an inline placement refers to, or `null` when this page carries no such file.
+ *
+ * **The list is the authority (D-15), and this is that rule in one function.** A block in the
+ * body is a *reference*; whether the file is attached is a fact about the `attachments` table
+ * and about nothing else. So a placement is resolved against the list the page already
+ * fetched — not against a second request, and above all not against an address built from the
+ * name. Three things follow from doing it this way, and each of them is the point:
+ *
+ * - **The address is the API's own.** `Attachment.href` names the page and does not name the
+ *   bytes, which is the whole of D-16. This interface never assembles one.
+ * - **What the file IS comes from the bytes.** `media_type` was sniffed by
+ *   `gw_store::blobs::sniff`, so whether a placement renders as a picture is decided by the
+ *   file's contents and never by its extension. Renaming a PDF to `.png` changes nothing.
+ * - **"Not attached" is answerable at all.** Detaching a file leaves any block that named it
+ *   exactly where it was — that is D-15's consequence, stated from the other side — and this
+ *   returning `null` is how the reader gets to say so rather than drawing a broken picture.
+ *
+ * Matched on the exact name the store recorded. `canonical_filename` trims and otherwise
+ * keeps a name verbatim, and case matters on the mount, so nothing is folded here: two files
+ * differing only in case are two files.
+ */
+export function attachmentNamed(anhaenge: Attachment[], filename: string): Attachment | null {
+  return anhaenge.find((anhang) => anhang.filename === filename) ?? null;
+}
+
+/**
+ * Whether a file is shown where it was placed, rather than offered as a card to download.
+ *
+ * The owner's decision: **pictures are shown, everything else is a labelled card.** A PDF is
+ * not a picture here even though the download serves it inline — a page of prose with a
+ * viewer embedded in the middle of it is not what "place a file in the text" was asked for.
+ *
+ * **`image/svg+xml` is a picture and takes this branch, and that is safe for exactly one
+ * reason: the only mechanism this interface ever renders a picture through is `<img src>`.**
+ * An SVG is XML that can carry `<script>`, event handlers and external references — the one
+ * image format that is also a program — and it is stored exactly as uploaded, because
+ * `gw_store::blobs` says why nothing sanitises it. No browser executes script in an `<img>`
+ * or in a CSS `background-image`; every other way of showing one does. `<object>`, `<embed>`
+ * and `<iframe>` all run it, and putting the markup into this wiki's own DOM runs it **in
+ * this origin, with the session cookie in reach**. ADR 0014 and
+ * `gw_api::routes::attachments::content_disposition` state the same constraint from the
+ * server's side, which is where the file is also given `Content-Disposition: attachment`,
+ * `nosniff` and `default-src 'none'; sandbox` — so an `<iframe>` pointed at it would download
+ * rather than render even if somebody wrote one.
+ *
+ * Deliberately NOT a list of image types. The accepted set is the server's and is being
+ * widened; a table here would be a second answer that goes stale silently, which is the same
+ * argument `kindText` above makes and the same one the upload field makes by carrying no
+ * `accept` attribute.
+ */
+export function isPicture(mediaType: string): boolean {
+  return mediaType.startsWith('image/');
+}
+
+/**
+ * What a placement says when the file it names is not attached to this page.
+ *
+ * Stated, never drawn as a broken picture. A missing `<img>` renders as an icon and the alt
+ * text, which reads as "the network failed" — and the truth is different and actionable: the
+ * page still refers to a file, and the `Anhänge` list below does not carry it. That happens
+ * for two ordinary reasons, and neither is a fault: somebody detached the file (which
+ * deliberately does not touch the prose), or the page was imported from markdown that named
+ * a file nobody has uploaded yet.
+ */
+export function describeMissingPlacement(filename: string, alt: string): string {
+  const was = alt.trim() === '' ? '' : ` — ${alt.trim()}`;
+  return `»${filename}«${was}: an dieser Seite hängt keine Datei dieses Namens. Sie wurde entfernt oder noch nicht hochgeladen.`;
+}
+
 /** The sentence for a status nothing else has wording for. Nothing the server said is lost. */
 function generic(status: number, clause: string, server: string | null): string {
   const detail = server ? ` Der Server meldet: ${server}` : '';

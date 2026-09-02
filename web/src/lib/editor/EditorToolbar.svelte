@@ -23,6 +23,7 @@
   import { ToggleGroup } from '@ark-ui/svelte/toggle-group';
   import type { Editor } from '@tiptap/core';
   import { safeHref } from '$lib/blocks/render';
+  import { kindText, type Attachment } from '$lib/attachments';
   import { normalizeLinkAddress } from './linkAddress';
 
   interface Props {
@@ -37,9 +38,24 @@
      * actually lands on rather than leaving that for `gw_store::links::wiki_path` to guess.
      */
     path: string;
+    /**
+     * What is attached to this page, as `GET /api/attachments/{path}` answered it — the only
+     * things that can be placed in the text.
+     *
+     * **Handed down from the page rather than fetched here**, so there is one answer to
+     * "what does this page carry" and one authorisation behind it; a second request would be
+     * a second retrieval path for something already read, which is what AGENTS.md rule 2
+     * warns about even where the answer would agree.
+     *
+     * **The list is also the whole of the control.** D-15 makes the `Anhänge` list the
+     * authority on what is attached and the inline block a reference to it, so placing a
+     * file is *choosing one from the list* — never typing a name, which would let somebody
+     * write a reference to a file that is not there without ever being told.
+     */
+    anhaenge?: Attachment[];
   }
 
-  let { editor, enabled, path }: Props = $props();
+  let { editor, enabled, path, anhaenge = [] }: Props = $props();
 
   /**
    * One entry per control: what it is called, whether it is on, and what pressing it does.
@@ -204,6 +220,36 @@
     }
   ] as const;
 
+  /**
+   * Put a file into the text where the caret is (D-15).
+   *
+   * A command rather than a toggle, which is why it is not in `CONTROLS` above and why the
+   * buttons sit outside the ToggleGroup: "this block IS a heading" is a state a toggle can
+   * describe, and "insert a picture here" is not one.
+   *
+   * The description is asked for with `window.prompt`, exactly as the Link control asks for
+   * an address, and for the same reason and with the same honesty: this is a toolbar, not a
+   * media dialogue, and `place` is the only thing that would change the day somebody builds
+   * one. Cancelling inserts nothing. An empty answer inserts a placement with an empty
+   * description, which is a real state the importer also produces (`![](anhang:a.png)`) —
+   * the reader falls back to the filename rather than leaving the picture unnamed.
+   */
+  function place(e: Editor, anhang: Attachment) {
+    const typed = window.prompt(
+      `Wie würden Sie »${anhang.filename}« jemandem beschreiben, der die Datei nicht sehen ` +
+        'kann? Der Text steht später als Alternativtext am Bild. (Kann leer bleiben.)',
+      ''
+    );
+    if (typed === null) return;
+    e.chain()
+      .focus()
+      .insertContent({
+        type: 'attachment',
+        attrs: { filename: anhang.filename, alt: typed.trim() }
+      })
+      .run();
+  }
+
   let active = $state<string[]>([]);
 
   /** Read the pressed set out of the editor, which is the only thing that knows it. */
@@ -285,6 +331,39 @@
   </ToggleGroup.Root>
 </div>
 
+<!-- The files this page carries, each one a button that puts it where the caret is.
+     Deliberately NOT inside the toolbar above: those are toggles under Ark's roving
+     tabindex, these are commands, and a screen reader arrowing through a set of states
+     should not land on an action.
+
+     Rendered only when there is something to place. A row saying »Keine Dateien« on every
+     page in the wiki is furniture paid for by everybody who never attached one — and the
+     `Anhänge` section under the page is where a file is added, which is also where somebody
+     who came looking for this will already be.
+
+     The names are the files' own, from the list the page read. Nothing here builds an
+     address and nothing here can name a file that is not attached: a placement is a
+     reference to a row in that list (D-15), and choosing from it is what keeps the two in
+     step. -->
+{#if anhaenge.length > 0}
+  <div class="gw-ed-dateien">
+    <p id="gw-ed-dateien-label">Datei einfügen</p>
+    <div class="gw-ed-dateiliste" role="group" aria-labelledby="gw-ed-dateien-label">
+      {#each anhaenge as anhang (anhang.filename)}
+        <button
+          type="button"
+          class="gw-ed-datei-btn"
+          disabled={!enabled}
+          title={`${anhang.filename} — ${kindText(anhang.media_type)}`}
+          onclick={() => editor && place(editor, anhang)}
+        >
+          {anhang.filename}
+        </button>
+      {/each}
+    </div>
+  </div>
+{/if}
+
 <style>
   /* `:global`, because Ark renders these elements itself and Svelte's scoping attribute
      never reaches them — the same reason `Dialog.svelte` gives. */
@@ -313,6 +392,52 @@
   :global(.gw-ed-tool:disabled) {
     opacity: 0.55;
     cursor: default;
+  }
+
+  :global(.gw-ed-dateien) {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--space-1) var(--space-2);
+  }
+
+  :global(.gw-ed-dateien > p) {
+    color: var(--ink-muted);
+    font-size: var(--text-sm);
+  }
+
+  :global(.gw-ed-dateiliste) {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+  }
+
+  /* The same shape as a block control, because it sits beside them and does the same kind of
+     thing — but never in the pressed state, because it has none: it is an act, not a state. */
+  :global(.gw-ed-datei-btn) {
+    font: inherit;
+    font-size: var(--text-sm);
+    font-family: var(--font-mono);
+    padding: var(--space-1) var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg);
+    color: var(--accent);
+    cursor: pointer;
+    max-inline-size: 20rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  :global(.gw-ed-datei-btn:hover:not(:disabled)) {
+    background: var(--accent-soft);
+  }
+
+  :global(.gw-ed-datei-btn:disabled) {
+    opacity: 0.55;
+    cursor: default;
+    color: var(--ink-muted);
   }
 
   /* Pressed reads as pressed by TWO means, not by tint alone: the accent border and the

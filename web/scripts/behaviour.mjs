@@ -2131,9 +2131,14 @@ await check('J6 a purge names every page it is about to destroy, and then destro
 // mount, which is exactly what ADR 0013 says happens and is bounded by the distinct files ever
 // uploaded. Two small probes.
 //
-// **What is NOT checked here is the inline placement.** D-15 also puts a file inside the prose;
-// that needs a new `BlockKind` and is its own piece of work. Nothing in this group looks in the
-// document, because there is nothing there to look for.
+// **K6 and K7 are the inline placement** — D-15's other half, and they are deliberately the
+// end of this group rather than a group of their own: they need a file to be attached, and K2
+// is what attaches one. K6 places it through the editor, publishes, and reads the page back
+// with no script running; K7 then detaches the file through the API and checks the prose is
+// untouched, which is the consequence D-15 states and the one nothing else can prove end to
+// end. K6 is also the only check anywhere that exercises the CRDT deletion path in a real
+// browser: `extensions.test.ts` drives `@tiptap/y-tiptap` directly and is the finer
+// instrument, but it cannot see a page that survives being edited, published and re-read.
 //
 // What is also not checked is who may see which file. `Store::attachments_for` decides that,
 // per document, through the same body a page read ends in, and it is tested there — proving it
@@ -2147,16 +2152,20 @@ const ATTACH_PAGE = '/rundgang';
 const READONLY_PAGE = '/start-hier';
 
 /**
- * A PNG, as far as anything that types files by their bytes is concerned.
+ * A real 1x1 red PNG, 69 bytes: signature, IHDR, IDAT, IEND.
  *
- * Eight bytes of signature and a little padding. `gw_store::blobs::sniff` compares byte
- * prefixes and runs no parser, so this is a PNG to the wiki — and the padding is there only so
- * the size shown on the page is a number worth asserting.
+ * `gw_store::blobs::sniff` compares byte prefixes and runs no parser, so eight bytes of
+ * signature and some padding would be a PNG to the wiki — and that is what this was. It is a
+ * decodable image now because K6 asserts the browser really DISPLAYS it, which needs the
+ * bytes to survive the whole path and then be a picture at the end of it: an `<img>` whose
+ * source the Content-Security-Policy refused, or whose address was wrong, looks exactly like
+ * one whose bytes will not decode, and `naturalWidth` is the only thing that tells the three
+ * apart from inside the page.
  */
-const PNG = Buffer.concat([
-  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-  Buffer.alloc(120, 0x42)
-]);
+const PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC',
+  'base64'
+);
 
 /** Bytes that are no known format and are not text either — 0xFF is not valid UTF-8. */
 const NONSENSE = Buffer.from([0x00, 0x01, 0x02, 0xff, 0xfe, 0x00, 0x03]);
@@ -2311,6 +2320,9 @@ await check('K4 a file this wiki will not store is refused in the reader s own w
   assert(html.includes('probe-bild.png'), 'a refused upload took the existing list with it');
 });
 
+/** The description K6 types into the editor's prompt, and reads back off the page. */
+const PLACED_ALT = 'Röntgenbild, seitlich';
+
 await check('K5 a page this reader may not write offers no way to attach anything', async (page) => {
   // No grant on this path, so `group:editors` reaches it at the public baseline: readable, not
   // writable. `may_write` comes off the same authorisation that produced the list (ADR 0010),
@@ -2324,6 +2336,158 @@ await check('K5 a page this reader may not write offers no way to attach anythin
     !/id="gw-anhang-datei"/.test(html),
     'a file field was drawn on a page this reader may not write'
   );
+});
+
+await check('K6 a file placed in the editor survives the CRDT, the publish and the reload', async (page) => {
+  // The end-to-end proof of D-15's other half, and of the mirror that destroys data. It uses
+  // the file K2 attached, places it with the editor's own control, publishes, and then reads
+  // the page back with `page.request` — a plain fetch, nothing hydrated — so what is asserted
+  // is what a reader with JavaScript switched off receives.
+  //
+  // Every silent failure this feature can have is on this path. A block kind the editor's
+  // schema does not name is DELETED from the Y.Doc by `createNodeFromYElement`'s catch and the
+  // deletion is published; an attribute the schema does not declare is removed by
+  // `updateYFragment` on the first edit that touches the node. Neither throws and neither is
+  // logged: the page simply comes back one picture shorter, or with a picture that no longer
+  // says which file it is.
+  const NAME = 'probe-bild.png';
+  await page.goto(BASE + ATTACH_PAGE + '?edit=1', { waitUntil: 'networkidle' });
+  const region = page.locator('section[aria-label="Seite bearbeiten"]');
+  await region.waitFor({ state: 'visible', timeout: 10_000 });
+
+  const head = region.locator('.gw-ed-status-head');
+  const settled = await until(
+    async () => {
+      const saw = (await head.textContent())?.trim() ?? '';
+      return { ok: saw.length > 0 && !saw.includes('wird geöffnet'), saw };
+    },
+    'the editing session never settled into an answer',
+    10_000
+  );
+  // A check that cannot run must fail rather than exit quietly — Group E's own comment
+  // records what months of that cost.
+  assert(
+    settled.saw.includes('Verbunden'),
+    `K6 needs a live editing session on ${ATTACH_PAGE} and there isn't one — headline says ` +
+      `"${settled.saw}". Is the behaviour fixture's write grant missing?`
+  );
+
+  // The control IS the list: placing a file means choosing one that is attached, never typing
+  // a name — so a reference to a file that is not there cannot be written by accident.
+  const button = region.getByRole('button', { name: NAME });
+  await button.waitFor({ state: 'visible', timeout: 10_000 });
+
+  // The description is asked for with a prompt, exactly as the Link control asks for an
+  // address. Playwright dismisses a dialog nobody handles, so this has to be armed first.
+  page.once('dialog', (dialog) => dialog.accept(PLACED_ALT));
+
+  // The document is emptied first, so the placement is the whole of it and the assertions
+  // below cannot pass on prose that happened to be there already. `Mod-a` and `Backspace` are
+  // both ProseMirror commands acting on `state.selection` inside one synchronous keydown —
+  // see E7 for why a selection built by moving the native caret is not safe here.
+  const surface = region.locator('[contenteditable="true"]');
+  await surface.click();
+  await page.keyboard.press('Control+a');
+  await page.keyboard.press('Backspace');
+  await button.click();
+
+  // In the editor's own DOM first: if the schema could not build the node, it is already gone
+  // here, before anything is published.
+  const placed = region.locator('figure[data-attachment]');
+  await placed.waitFor({ state: 'visible', timeout: 10_000 });
+  assert(
+    (await placed.getAttribute('data-filename')) === NAME,
+    'the placed block does not name the file it was made from'
+  );
+
+  const publish = region.getByRole('button', { name: 'Veröffentlichen' });
+  await publish.click();
+  await until(
+    async () => {
+      const saw = (await region.locator('.gw-ed-note').first().textContent())?.trim() ?? '';
+      return { ok: /gespeichert|veröffentlicht/i.test(saw), saw };
+    },
+    'the editor never confirmed the publish',
+    15_000
+  );
+
+  // And now the reader's side, with nothing hydrated: the picture is in the first response, at
+  // the address the API built, and the description that was typed is its alt text.
+  const html = await (await page.request.get(BASE + ATTACH_PAGE)).text();
+  const article = html.match(/<article[^>]*class="prose[\s\S]*?<\/article>/)?.[0] ?? '';
+  assert(article !== '', 'the page came back without a document at all');
+  assert(
+    article.includes(`src="/api/attachment/${NAME}${ATTACH_PAGE}"`),
+    `the picture is not in the document, or not at the API's own address: ${article}`
+  );
+  assert(article.includes(`alt="${PLACED_ALT}"`), `the description did not survive: ${article}`);
+  // The address names the page and never the bytes (D-16), on the reading path as much as in
+  // the `Anhänge` list K3 checks.
+  assert(!/[0-9a-f]{40,}/.test(article), `the document carries a content address: ${article}`);
+  // An SVG would have to render this way too, so nothing here may ever become a mechanism that
+  // executes what it renders. `BlockView.test.ts` asserts that on an SVG specifically; this is
+  // the same rule stated where a real browser can see it.
+  for (const forbidden of ['<object', '<embed', '<iframe']) {
+    assert(
+      !article.toLowerCase().includes(forbidden),
+      `the document renders a file through ${forbidden}`
+    );
+  }
+
+  // And it is really ON SCREEN, which the markup alone cannot say. Three different failures
+  // produce an `<img>` that renders nothing and none of them appears in the HTML: the
+  // Content-Security-Policy refusing the address (`img-src` is `'self' data:` and this is a
+  // same-origin `/api/…` path — Group G is where the policy itself is checked, and this is
+  // the one place anything asserts that a picture survives it), a download the API refuses,
+  // and bytes that are not a picture. `naturalWidth` is non-zero only when the browser
+  // fetched it AND decoded it, so it answers all three at once.
+  await page.goto(BASE + ATTACH_PAGE, { waitUntil: 'networkidle' });
+  const bild = page.locator(`article.prose img[src="/api/attachment/${NAME}${ATTACH_PAGE}"]`);
+  await bild.waitFor({ state: 'visible', timeout: 10_000 });
+  const width = await bild.evaluate((el) => el.naturalWidth);
+  assert(
+    width > 0,
+    'the picture is in the markup and the browser did not display it — the policy refused ' +
+      'the address, the download failed, or the bytes are not an image'
+  );
+});
+
+await check('K7 detaching a file leaves the prose exactly as it was, and the page says so', async (page) => {
+  // D-15's consequence, and the half that is easy to get backwards: the LIST is the authority
+  // on what is attached, and a block in the body is a reference to it. So taking the file away
+  // must not touch the document — and the page must then say the file is missing rather than
+  // drawing a broken picture, which reads as a network fault and sends whoever investigates to
+  // the wrong place.
+  //
+  // Through the API, because there is no detach control in this interface yet. That is the one
+  // thing in this group that reaches past the browser's own controls, and it is what lets the
+  // check exist at all.
+  const NAME = 'probe-bild.png';
+  const before = await (await page.request.get(BASE + ATTACH_PAGE)).text();
+  assert(
+    before.includes(`src="/api/attachment/${NAME}${ATTACH_PAGE}"`),
+    'K7 needs the placement K6 published, and the page does not have one'
+  );
+
+  const gone = await page.request.delete(`${BASE}/api/attachment/${NAME}${ATTACH_PAGE}`);
+  assert(gone.ok(), `the detach should have worked, got ${gone.status()}`);
+
+  const html = await (await page.request.get(BASE + ATTACH_PAGE)).text();
+  const article = html.match(/<article[^>]*class="prose[\s\S]*?<\/article>/)?.[0] ?? '';
+  // The block is still there — it is still the page's own prose — and it now names the file it
+  // cannot find instead of pointing at an address that would answer 404.
+  assert(article.includes(NAME), `the reference to the file was destroyed with it: ${article}`);
+  assert(
+    !article.includes(`src="/api/attachment/${NAME}`),
+    `the page still offers an address for a file it no longer carries: ${article}`
+  );
+  assert(
+    /entfernt|hochgeladen/.test(article),
+    `the page does not say why the file is missing: ${article}`
+  );
+  // And the list agrees, because the list is what was actually changed.
+  const region = html.match(/<section[^>]*id="gw-anhaenge"[\s\S]*?<\/section>/)?.[0] ?? '';
+  assert(!region.includes(NAME), 'the Anhänge list still shows a file that was detached');
 });
 
 await browser.close();

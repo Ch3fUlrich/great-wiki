@@ -55,6 +55,7 @@
   import { Field } from '@ark-ui/svelte/field';
   import BlockView from '$lib/components/BlockView.svelte';
   import type { Block } from '$lib/blocks/render';
+  import type { Attachment } from '$lib/attachments';
   import { CONTENT_FIELD, contentExtensions } from './extensions';
   import {
     HISTORY_WARNING,
@@ -76,6 +77,15 @@
     title: string;
     /** The body as the server rendered it, shown until the session is live. */
     body: Block;
+    /**
+     * What this page carries besides its words, as the page already read it.
+     *
+     * Two uses, one list. The toolbar offers each of them as something to place in the text
+     * (D-15), and the reading fallback below resolves a placement already in the body against
+     * it — so the picture the author sees before the editor mounts is the same picture the
+     * reader sees, from the same addresses the API built.
+     */
+    anhaenge?: Attachment[];
     /** The document's own language, so the editing surface reads as the page does. */
     language: string;
     /** Whoever is editing, for the presence caret. */
@@ -84,7 +94,7 @@
     onLeave: () => void;
   }
 
-  let { path, title, body, language, editorName, onLeave }: Props = $props();
+  let { path, title, body, anhaenge = [], language, editorName, onLeave }: Props = $props();
 
   let session = $state<SessionState>('connecting');
   let ready = $state(false);
@@ -330,7 +340,7 @@
 <section class="gw-ed" aria-label="Seite bearbeiten">
   <div class="gw-ed-bar">
     <div class="gw-ed-bar-row">
-      <EditorToolbar {editor} enabled={ready && mayType(session)} {path} />
+      <EditorToolbar {editor} enabled={ready && mayType(session)} {path} {anhaenge} />
 
       <div class="gw-ed-actions">
         {#if peers.length > 0}
@@ -412,7 +422,7 @@
 
   {#if !ready}
     <article class="prose" lang={language}>
-      <BlockView block={body} />
+      <BlockView block={body} {anhaenge} />
     </article>
   {/if}
 </section>

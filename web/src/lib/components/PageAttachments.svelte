@@ -24,11 +24,13 @@
   The same goes for the size cap, which is `MAX_ATTACHMENT_BYTES` and not a number in this
   file. A refusal is framed in German and carries the server's own words inside it.
 
-  **What is deliberately NOT here: the inline placement.** D-15 puts a file inline in the prose
-  as well as in this list. That needs a new `BlockKind`, which is `#[non_exhaustive]` with four
-  hand-maintained mirrors that fail silently — one of them once destroyed a checklist in the
-  CRDT and broadcast the deletion. It is its own piece of work. Nothing in this component
-  reaches into the document, and nothing here should start to.
+  **The inline placement is elsewhere, and must stay elsewhere.** D-15 also puts a file inside
+  the prose, and that now exists: `gw_core::BlockKind::Attachment`, rendered by `BlockView`
+  against this very list. Nothing in this component reaches into the document and nothing here
+  may start to — the direction of the dependency is the whole of D-15. The list is the
+  authority, a block in the body is a *reference* to a row in it, and the day this section
+  derived an entry from the words of a page, cutting a picture out of a paragraph would detach
+  the file.
 -->
 <script lang="ts">
   import {

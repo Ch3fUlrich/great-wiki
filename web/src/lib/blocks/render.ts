@@ -16,6 +16,10 @@ export type BlockKind =
   // whichever kind of cell it holds. That is how ProseMirror models it, and it is what
   // lets the renderer choose `th` over `td` from the cell alone.
   | 'table' | 'tableRow' | 'tableHeader' | 'tableCell'
+  // A file placed in the prose (D-15). An atom: no content, and its whole meaning is the two
+  // attributes `placedFile` below reads. A reference to a row in the page's `Anhänge` list,
+  // never a possession — see `gw_core::BlockKind::Attachment`.
+  | 'attachment'
   | 'text';
 
 // Mirrors `gw_core::MarkKind` — the wire name IS the Yjs attribute key `gw-collab` reads and
@@ -98,6 +102,36 @@ export interface Heading {
   level: number;
   text: string;
   id: string;
+}
+
+/** What an `attachment` block says: which file on this page, and what it shows. */
+export interface PlacedFile {
+  /** The name the file has **on the page this block is in**. Never a path and never a hash. */
+  filename: string;
+  /** What the picture shows. May be empty; the reader falls back to the filename. */
+  alt: string;
+}
+
+/**
+ * The file an `attachment` block places, or `null` for a block that names none.
+ *
+ * **The page half of the address is where the block IS**, and is deliberately not stored:
+ * a placement is a top-level block of one document's body, so "which page" is never in
+ * question, and a stored page name would be an address that outlives a move. That matters
+ * beyond tidiness — a download is authorised against the page it was reached through (D-16),
+ * so the only address this interface may ever use is the `href` the API built for THIS
+ * page's list. Nothing here assembles one, which is why this returns a name to look up
+ * rather than a URL to fetch.
+ *
+ * `null` rather than a guess for a block whose `filename` is missing or is not a string.
+ * The renderer draws nothing for it: a placement that cannot say which file it means is a
+ * malformed block, and inventing an empty name would ask the list for a file called "".
+ */
+export function placedFile(block: Block): PlacedFile | null {
+  const filename = block.attrs?.filename;
+  if (typeof filename !== 'string' || filename.trim() === '') return null;
+  const alt = block.attrs?.alt;
+  return { filename, alt: typeof alt === 'string' ? alt : '' };
 }
 
 // A byte-for-byte mirror of `Block::plain_text` in crates/gw-core/src/block.rs, down to

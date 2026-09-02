@@ -151,6 +151,10 @@ export const BLOCK_LABEL: Record<string, string> = {
   tableRow: 'Tabellenzeile',
   tableHeader: 'Kopfzelle',
   tableCell: 'Tabellenzelle',
+  // A file placed in the prose (D-15). »Datei« rather than »Bild«: a placement carries a
+  // name and a description and says nothing about what the file is — whether it shows as a
+  // picture is decided when it is read, from the media type the bytes were sniffed as.
+  attachment: 'Datei',
   text: 'Text'
 };
 
@@ -166,6 +170,12 @@ export const ATTRIBUTE_LABEL: Record<string, string> = {
   alignment: 'Ausrichtung',
   start: 'Beginnt bei',
   checked: 'Erledigt',
+  // The two a placement carries. A changed `filename` is the whole of "this shows a
+  // different file now", and it is the only place a revision can say so: a placement has no
+  // text, so `diff_structure` fingerprints every one of them alike and only the design diff
+  // can tell two apart.
+  filename: 'Datei',
+  alt: 'Bildbeschreibung',
   marks: 'Formatierung'
 };
 

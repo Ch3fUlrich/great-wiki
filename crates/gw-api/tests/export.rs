@@ -824,3 +824,160 @@ async fn a_pages_topics_survive_export_and_a_second_import() {
     assert!(reload.is_complete(), "{reload}");
     assert_eq!(snapshot(&reloaded, &admin()).await, before);
 }
+
+// --- placed files (D-15) -----------------------------------------------------------------
+
+/// The metadata every placement test below shares. Its content is irrelevant to them; only
+/// the body differs.
+fn befund_meta() -> export::FileMeta {
+    export::FileMeta {
+        title: "Befunde".into(),
+        doc_type: "page".into(),
+        visibility: "public".into(),
+        language: "de".into(),
+        sort_key: 0,
+        slug: "befunde".into(),
+        tags: Vec::new(),
+    }
+}
+
+#[test]
+fn a_page_that_places_a_file_exports_and_re_imports_as_the_same_page() {
+    // `render_file` is the whole of the check: it re-imports its own output and compares the
+    // trees, so getting a file back at all already says the placement survived. The
+    // assertions on the text are there to pin the SYNTAX, which is the half a reader of an
+    // exported file sees and the half `gw_core::markdown` has to be able to read back.
+    let body: Block = serde_json::from_str(
+        r#"{"kind":"doc","content":[
+             {"kind":"paragraph","content":[{"kind":"text","text":"Der Befund vom März:"}]},
+             {"kind":"attachment","attrs":{"filename":"befund.png","alt":"Befund vom März"}},
+             {"kind":"paragraph","content":[{"kind":"text","text":"Und danach."}]}]}"#,
+    )
+    .unwrap();
+
+    let file = export::render_file(&befund_meta(), &body)
+        .unwrap_or_else(|e| panic!("a page that places a file must still export: {e}"));
+    assert!(
+        file.contains("![Befund vom März](anhang:befund.png)"),
+        "{file}"
+    );
+    // A reference and nothing else: no type, no size, and above all no content address —
+    // D-16 makes a download authorised against the page it was reached through, and a digest
+    // in an exported file is a digest somebody can hold.
+    assert!(!file.contains("image/png"), "{file}");
+    assert!(!holds_a_content_address(&file), "{file}");
+}
+
+/// Whether the text holds a run of hex long enough to be a content address.
+fn holds_a_content_address(s: &str) -> bool {
+    let mut run = 0usize;
+    for c in s.chars() {
+        run = if c.is_ascii_hexdigit() { run + 1 } else { 0 };
+        if run >= 40 {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+fn a_placement_is_compared_with_its_attributes_whole_and_no_reduction_forgives_them() {
+    // The counterpart of `LINK_ATTRS` and `TASK_ITEM_ATTRS`, arrived at from the other side:
+    // there is deliberately NO reduction for a placement, because there is nothing to
+    // forgive. Those two exist because the EDITOR mints attributes `gw_core::markdown` never
+    // writes — stock TipTap `Link` declares five, and a task carries the store's uuid — and a
+    // byte-equal comparison then refused every page holding one, permanently, on the owner's
+    // backup path.
+    //
+    // `web/src/lib/editor/extensions.ts` declares exactly `filename` and `alt` on its
+    // `attachment` node, which is exactly what the importer writes, so the two sides agree by
+    // construction and a third attribute can only arrive from something that has gone wrong.
+    // This test is what makes that a decision rather than an accident: add a reduction here
+    // and it goes red, so the day somebody widens the editor's declaration they have to come
+    // back and say why.
+    let body: Block = serde_json::from_str(
+        r#"{"kind":"doc","content":[
+             {"kind":"attachment",
+              "attrs":{"filename":"befund.png","alt":"Befund","width":640}}]}"#,
+    )
+    .unwrap();
+    assert!(
+        export::render_file(&befund_meta(), &body).is_err(),
+        "an attribute markdown cannot state must be refused, not quietly dropped"
+    );
+}
+
+#[test]
+fn a_placement_that_names_no_file_is_refused_rather_than_written_as_an_empty_picture() {
+    for attrs in [r#"{"alt":"Befund"}"#, r#"{"filename":"","alt":""}"#] {
+        let body: Block = serde_json::from_str(&format!(
+            r#"{{"kind":"doc","content":[{{"kind":"attachment","attrs":{attrs}}}]}}"#
+        ))
+        .unwrap();
+        assert!(
+            export::render_file(&befund_meta(), &body).is_err(),
+            "a placement naming no file must be refused: {attrs}"
+        );
+    }
+}
+
+#[test]
+fn a_description_holding_a_line_break_is_refused_the_way_a_paragraph_is() {
+    // Markdown has no way to put a newline inside `![…]` that survives a re-import — the
+    // same refusal a paragraph gets, and reached through the same escaping pass so the two
+    // cannot answer differently.
+    let body: Block = serde_json::from_str(
+        r#"{"kind":"doc","content":[
+             {"kind":"attachment","attrs":{"filename":"a.png","alt":"eins\nzwei"}}]}"#,
+    )
+    .unwrap();
+    assert!(export::render_file(&befund_meta(), &body).is_err());
+}
+
+#[test]
+fn a_placement_the_importer_could_never_read_back_is_refused_by_name() {
+    // A filename with a slash in it: `canonical_filename` refuses one, so no page can carry
+    // it, and `attachment_destination` therefore has no way to write it. The refusal names
+    // the file rather than exporting a destination that would re-import as a relative image.
+    let body: Block = serde_json::from_str(
+        r#"{"kind":"doc","content":[
+             {"kind":"attachment","attrs":{"filename":"a/b.png","alt":""}}]}"#,
+    )
+    .unwrap();
+    let refusal = export::render_file(&befund_meta(), &body)
+        .expect_err("a name no page can give a file must be refused");
+    assert!(refusal.contains("a/b.png"), "{refusal}");
+}
+
+#[test]
+fn a_placement_nested_where_the_importer_will_not_read_one_is_refused_rather_than_written() {
+    // The editor's schema admits `attachment` in `doc` and nowhere else, and the importer
+    // reads one back only at the top level — so a body with one inside a blockquote can only
+    // have been hand-written. It exports as `> ![…](anhang:…)`, which re-imports as a
+    // paragraph of text, and the comparison refuses the page. Loud, which is the rule; the
+    // point of pinning it is that "loud" must not quietly become "silently different".
+    let body: Block = serde_json::from_str(
+        r#"{"kind":"doc","content":[{"kind":"blockquote","content":[
+             {"kind":"attachment","attrs":{"filename":"a.png","alt":"x"}}]}]}"#,
+    )
+    .unwrap();
+    assert!(export::render_file(&befund_meta(), &body).is_err());
+}
+
+#[test]
+fn a_placement_naming_a_file_nothing_is_attached_to_still_exports_exactly_as_written() {
+    // The deliberate answer to the one state D-15 makes possible: the list is the authority
+    // on what is attached, so a block naming a file that is not there is a REFERENCE that
+    // resolves to nothing — not a broken document. This module has no store and must not
+    // acquire one to answer it; the reader is where that question gets asked, against the
+    // page's own `Anhänge` list. So the exporter writes it exactly as it stands, and a page
+    // whose file was detached is still a page that can be backed up.
+    let body: Block = serde_json::from_str(
+        r#"{"kind":"doc","content":[
+             {"kind":"attachment","attrs":{"filename":"gibtsnicht.png","alt":"Fehlt"}}]}"#,
+    )
+    .unwrap();
+    let file = export::render_file(&befund_meta(), &body)
+        .expect("a reference to a file that is not attached is not a broken document");
+    assert!(file.contains("![Fehlt](anhang:gibtsnicht.png)"), "{file}");
+}

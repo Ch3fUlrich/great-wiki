@@ -28,6 +28,8 @@ Ehrlichkeit ist hier nützlicher als ein guter Eindruck:
 - **Bearbeiten im Browser.** Diese Seiten kommen aus Markdown-Dateien. Der Editor
   ist der nächste große Abschnitt.
 - **Suche.** Noch nicht gebaut.
-- **Bilder, Videos, Diagramme, Formeln.** Noch nicht gebaut.
+- **Diagramme und Formeln.** Noch nicht gebaut. Bilder und andere Dateien lassen sich
+  anhängen und im Text platzieren — ein Bild wird dort gezeigt, wo es steht, alles andere
+  wird zu einer Karte zum Herunterladen.
 - **Anmeldung in der Anwendung selbst.** Du bist über Authelia hereingekommen,
   nicht über great-wiki. Deshalb siehst du gerade *alles*.

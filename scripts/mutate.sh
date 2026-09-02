@@ -1297,6 +1297,83 @@ mutation crates/gw-store/src/reclaim.rs killed \
   's/                "blobs.reclaim",/                "blobs.aufraeumen",/' \
   'reclaim: a sweep that destroyed bytes writes the audit row an administrator reads back'
 
+# --- placing a file in the prose: the syntax nothing else can check -----------------------
+#
+# D-15 puts a file inline as well as in the `Anhänge` list, and the block that does it is
+# `gw_core::BlockKind::Attachment` — a kind with four hand-maintained mirrors outside Rust's
+# type system, one of which DELETES what it does not recognise from the live CRDT. None of
+# that is reachable from a shell script. What is reachable, and is where the whole feature
+# actually breaks, is the markdown syntax: `gw_api::export::render_file` re-imports its own
+# output and compares, so an importer and an exporter that disagree by one character produce a
+# page that can never be exported again — and `export` fails the WHOLE run on the first
+# refusal, which is the owner's backup path.
+#
+# The two halves live in `gw_core::markdown` on purpose, for the reason `MARK_ORDER` does. The
+# mutations below break one half at a time, which is exactly the drift having them in one
+# crate is supposed to make impossible.
+
+# The scheme is what makes a destination a reference. Without it, every relative image in
+# every markdown file ever imported — `![Diagramm](diagramm.png)` — silently becomes a
+# reference to a file nobody attached, and the page then says so on screen.
+mutation crates/gw-core/src/markdown.rs killed \
+  's/    let name = dest.strip_prefix(ATTACHMENT_SCHEME)?.trim();/    let name = dest.trim_start_matches(ATTACHMENT_SCHEME).trim();/' \
+  'placements: a destination is a reference only if it SAYS so, never because it looks like a filename'
+# A name a page cannot really give a file must not read back as one, or the exporter writes a
+# destination the importer answers differently — `.` and `..` are the shapes
+# `canonical_filename` refuses on the store's side.
+mutation crates/gw-core/src/markdown.rs killed \
+  's/    if name.is_empty() || name == "." || name == ".." {/    if false {/' \
+  'placements: a reference to `.` or `..` is not a reference to a file'
+mutation crates/gw-core/src/markdown.rs killed \
+  "s#        .any(|c| c == '/' || c == '\\\\\\\\' || c == '\"' || c.is_control())#        .any(|_| false)#" \
+  'placements: a name holding a slash, a backslash or a quote is refused, as the store refuses it'
+# THE structural rule, and the one whose breakage is silent in both directions. A placement is
+# admitted by the editor's schema in `doc` and nowhere else: one read back into a list item is
+# a node ProseMirror cannot build, and `createNodeFromYElement` answers that by deleting the
+# element from the CRDT. One in a blockquote or a table cell exports to markdown that
+# re-imports as a paragraph of text, which refuses the page forever.
+mutation crates/gw-core/src/markdown.rs killed \
+  's/        self.stack.len() == 2 \&\& {/        true \&\& {/' \
+  'placements: a placement is read back at the top level of the document and nowhere else'
+# The other half of the same question. Asking it BEFORE the description is diverted is what
+# lets a reference in a sentence keep the emphasis in its description: CommonMark renders an
+# image description as plain text, so a placement that has to be degraded afterwards can only
+# give plain text back.
+mutation crates/gw-core/src/markdown.rs killed \
+  's/            top.kind == BlockKind::Paragraph \&\& top.content.is_empty()/            top.kind == BlockKind::Paragraph/' \
+  'placements: a reference that is not the first thing in its paragraph never starts one'
+# A degraded reference has lost its destination, and a loss nobody is told about is the one
+# outcome `gw_core::markdown`'s own header says cannot be detected later.
+mutation crates/gw-core/src/markdown.rs killed \
+  's/                self.note(Unsupported::Image);/                {};/' \
+  'placements: a reference that could not be placed is reported as the image it fell back to'
+# Degrading must produce the SAME tree an ordinary image produces, leaf for leaf — including
+# where the leaf boundaries are, because the exporter compares trees and not text.
+mutation crates/gw-core/src/markdown.rs killed \
+  's/                        \&\& prev.marks == child.marks =>/                        \&\& true =>/' \
+  'placements: a degraded description merges into a neighbour only where the marks agree'
+# `alt` is written even when empty, for the reason `checked` is. The editor's schema fills a
+# missing one in with `''`, so an importer that left it out would make every placement the
+# editor touched differ from the imported one — and `render_file` refuses rather than choosing.
+mutation crates/gw-core/src/markdown.rs killed \
+  's/                        .insert("alt".into(), serde_json::Value::from(placing.alt));/                        .insert("alt".into(), serde_json::Value::from(placing.alt.clone())); if placing.alt.is_empty() { placement.attrs.remove("alt"); }/' \
+  'placements: an empty description is stated rather than left out'
+
+# The exporter, which is the other half of the same agreement.
+#
+# `attachment_destination` is what wraps a name markdown cannot write bare — a space, an
+# unbalanced parenthesis — and refuses one no page could give a file. Writing the name raw
+# instead looks right for `befund.png` and silently breaks every other name.
+mutation crates/gw-api/src/export.rs killed \
+  's/        let Some(destination) = markdown::attachment_destination(filename) else {/        let destination = filename.to_string(); if false {/' \
+  'placements: a filename is written through the destination writer, never raw'
+# The description goes through the same escaping a paragraph takes, so a bracket in it comes
+# back as itself instead of closing the image early — and a newline in one is refused rather
+# than silently becoming a space.
+mutation crates/gw-api/src/export.rs killed \
+  's/        let alt = self.escape(alt);/        let alt = alt.to_string();/' \
+  'placements: a description is escaped, so markup in it stays text'
+
 # --- crash recovery ------------------------------------------------------------------
 #
 # A trap does not survive SIGKILL, and a killed run leaves the mutated file in place.
@@ -1493,6 +1570,9 @@ probe_for() {
     # The attachment endpoints, including the download authorisation and everything a
     # download tells the browser. One integration binary covers all four routes.
     crates/gw-api/src/routes/attachments.rs) echo "-p gw-api --test attachments" ;;
+    # The markdown renderer and the export round trip. Both integration binaries, plus the
+    # crate's own unit tests, and nothing else in gw-api touches this file.
+    crates/gw-api/src/export.rs) echo "-p gw-api --lib --test export --test export_markdown" ;;
     *) echo "" ;;
   esac
 }

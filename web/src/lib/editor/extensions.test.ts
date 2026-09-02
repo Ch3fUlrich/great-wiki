@@ -43,8 +43,9 @@ import {
  * XML element tag `gw-collab` writes (`doc.rs::tag_of` derives the tag from serde), and
  * therefore exactly the node name TipTap will look up in this schema.
  *
- * Fifteen, not the nine the M3 plan's sample lists: the plan predates the table kinds, and
- * `taskList`/`taskItem` arrived with piece 3's checkbox.
+ * Sixteen, not the nine the M3 plan's sample lists: the plan predates the table kinds,
+ * `taskList`/`taskItem` arrived with piece 3's checkbox, and `attachment` with piece 4's
+ * placed files.
  */
 const SERVER_KINDS = [
   'doc',
@@ -61,6 +62,7 @@ const SERVER_KINDS = [
   'tableRow',
   'tableHeader',
   'tableCell',
+  'attachment',
   'text'
 ];
 
@@ -109,6 +111,8 @@ const ONE_PER_KIND = {
     },
     { type: 'blockquote', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'zitat' }] }] },
     { type: 'codeBlock', attrs: { language: 'rust' }, content: [{ type: 'text', text: 'fn main() {}' }] },
+    // A file placed in the prose, at the top level — the only place the schema admits one.
+    { type: 'attachment', attrs: { filename: 'befund.png', alt: 'Röntgenbild, seitlich' } },
     {
       type: 'table',
       content: [
@@ -413,6 +417,170 @@ describe('the editor schema', () => {
     const item = (fragment.get(0) as Y.XmlElement).get(0) as Y.XmlElement;
     expect(item.getAttributes()).toEqual({ checked: true, id });
     expect(fragment.toString()).toContain('Milch und Brot kaufen');
+  });
+
+  // --- placed files (D-15) --------------------------------------------------------------
+  //
+  // The kind with the least on screen to notice its loss by. A checklist that loses `checked`
+  // still renders as a list; a placement that loses `filename` is a picture of nothing, with
+  // nothing left anywhere to say which picture it had been — the name is half of the address
+  // a download is authorised through (D-16) and the block carries no second copy of it.
+
+  /**
+   * A Y.Doc holding a placement, built the way `gw-collab::doc.rs::write_children` builds
+   * one: an element tagged with the serde name of its `BlockKind`, its `attrs` set as XML
+   * attributes, and no children at all.
+   */
+  function serverWrittenPlacement(attrs: Record<string, unknown>): Y.Doc {
+    const ydoc = new Y.Doc();
+    const placement = new Y.XmlElement('attachment');
+    for (const [key, value] of Object.entries(attrs)) {
+      placement.setAttribute(key, value as string);
+    }
+    const after = new Y.XmlElement('paragraph');
+    const leaf = new Y.XmlText();
+    leaf.insert(0, 'Und der Text danach.');
+    after.insert(0, [leaf]);
+    ydoc.getXmlFragment(CONTENT_FIELD).insert(0, [placement, after]);
+    return ydoc;
+  }
+
+  it('does not delete a placed file from the CRDT when the editor opens the page', () => {
+    // THE data-loss test for this kind, and the same one that had to be written for
+    // `taskList`: before it was in this schema, opening a page holding one ran
+    // `schema.node('attachment', …)`, threw, and deleted the element — broadcast to every
+    // other editor and snapshotted into a revision by the next sweep. Nothing threw and
+    // nothing was logged; the page simply came back one picture shorter.
+    const ydoc = serverWrittenPlacement({ filename: 'befund.png', alt: 'Röntgenbild' });
+    const fragment = ydoc.getXmlFragment(CONTENT_FIELD);
+
+    const doc = yXmlFragmentToProseMirrorRootNode(fragment, editorSchema);
+
+    // The Y.Doc still holds what the server put in it.
+    expect(fragment.length).toBe(2);
+    expect((fragment.get(0) as Y.XmlElement).nodeName).toBe('attachment');
+    // And the editor really built the node, rather than skipping it into nothing.
+    expect(doc.childCount).toBe(2);
+    expect(doc.firstChild?.type.name).toBe('attachment');
+    expect(doc.firstChild?.attrs).toEqual({ filename: 'befund.png', alt: 'Röntgenbild' });
+    expect(doc.textBetween(0, doc.content.size, ' ')).toContain('Und der Text danach.');
+  });
+
+  it('keeps a placement\'s filename and description through an edit somewhere else', () => {
+    // `updateYFragment` is what `@tiptap/extension-collaboration`'s sync plugin runs on every
+    // transaction, so this is the real write-back. An attribute the schema did not declare
+    // would be gone from the Y.Doc after this — the mechanism that nearly took a task's uuid
+    // and table column alignment with it — and here it would take the only statement of which
+    // file the page shows.
+    const attrs = { filename: 'befund.png', alt: 'Röntgenbild, seitlich' };
+    const ydoc = serverWrittenPlacement(attrs);
+    const fragment = ydoc.getXmlFragment(CONTENT_FIELD);
+
+    const { doc, meta } = initProseMirrorDoc(fragment, editorSchema);
+    expect(doc.firstChild?.attrs).toEqual(attrs);
+
+    const json = doc.toJSON();
+    json.content[1].content[0].text = 'Und der Text danach, geändert.';
+    const edited = PmNode.fromJSON(editorSchema, json);
+    ydoc.transact(() => updateYFragment(ydoc, fragment, edited, meta));
+
+    expect((fragment.get(0) as Y.XmlElement).getAttributes()).toEqual(attrs);
+    expect(fragment.toString()).toContain('geändert');
+  });
+
+  it('writes a placement back under exactly the two attributes the importer states', () => {
+    // The other half of the wire contract, and the half stock `Link` got wrong: whatever
+    // ProseMirror's `computeAttrs` produces travels verbatim into `gw_core::Block::attrs`, and
+    // `gw_api::export` compares a placement's attributes WHOLE — there is deliberately no
+    // reduction forgiving them, unlike a link's or a task's. So a third attribute declared in
+    // `extensions.ts` would be minted onto every placement and refuse the page on export,
+    // permanently, on the owner's backup path.
+    const ydoc = prosemirrorJSONToYDoc(
+      editorSchema,
+      {
+        type: 'doc',
+        content: [{ type: 'attachment', attrs: { filename: 'a.png', alt: 'x' } }]
+      },
+      CONTENT_FIELD
+    );
+    const placement = ydoc.getXmlFragment(CONTENT_FIELD).get(0);
+    if (!(placement instanceof Y.XmlElement)) throw new Error('expected an attachment element');
+    expect(placement.nodeName).toBe('attachment');
+    expect(placement.getAttributes()).toEqual({ filename: 'a.png', alt: 'x' });
+  });
+
+  it('keeps an empty description empty rather than letting it fall back to null', () => {
+    // `''` is the attribute's default and exactly what `gw_core::markdown` writes for
+    // `![](anhang:a.png)`. A `null` default here would put `alt: null` on every placement the
+    // editor touched, against the `alt: ""` the same file re-imports as — two values for one
+    // document, and `render_file` refuses the page rather than choosing between them.
+    const ydoc = prosemirrorJSONToYDoc(
+      editorSchema,
+      { type: 'doc', content: [{ type: 'attachment', attrs: { filename: 'a.png' } }] },
+      CONTENT_FIELD
+    );
+    const fragment = ydoc.getXmlFragment(CONTENT_FIELD);
+    expect((fragment.get(0) as Y.XmlElement).getAttributes()).toEqual({
+      filename: 'a.png',
+      alt: ''
+    });
+    const back = yXmlFragmentToProseMirrorRootNode(fragment, editorSchema);
+    expect(back.firstChild?.attrs.alt).toBe('');
+  });
+
+  it('admits a placement in the document and nowhere the importer would not read one', () => {
+    // The schema half of a rule whose other half is in `gw_core::markdown`. A placement in a
+    // list item is a node ProseMirror cannot build, and `createNodeFromYElement` answers that
+    // by deleting the element from the CRDT; one in a table cell or a blockquote exports to
+    // markdown that re-imports as text, which refuses the page forever. `check()` is what
+    // validates a content expression, and it throws rather than returning false.
+    const top = PmNode.fromJSON(editorSchema, {
+      type: 'doc',
+      content: [{ type: 'attachment', attrs: { filename: 'a.png', alt: '' } }]
+    });
+    expect(() => top.check()).not.toThrow();
+
+    for (const nested of [
+      {
+        type: 'bulletList',
+        content: [
+          {
+            type: 'listItem',
+            content: [{ type: 'attachment', attrs: { filename: 'a.png', alt: '' } }]
+          }
+        ]
+      },
+      {
+        type: 'blockquote',
+        content: [{ type: 'attachment', attrs: { filename: 'a.png', alt: '' } }]
+      },
+      {
+        type: 'table',
+        content: [
+          {
+            type: 'tableRow',
+            content: [
+              {
+                type: 'tableCell',
+                content: [{ type: 'attachment', attrs: { filename: 'a.png', alt: '' } }]
+              }
+            ]
+          }
+        ]
+      }
+    ]) {
+      expect(
+        () => PmNode.fromJSON(editorSchema, { type: 'doc', content: [nested] }).check(),
+        `a placement inside a ${nested.type} must not be a valid document`
+      ).toThrow();
+    }
+  });
+
+  it('carries no mark, because the CRDT has nowhere to put one on an element', () => {
+    // `gw-collab` writes a leaf's marks as Yjs TEXT formatting attributes
+    // (`doc.rs::mark_key_of`) and has no representation for a mark on an element. A schema
+    // that let one be applied would sync it, publish it, and lose it in silence.
+    expect(editorSchema.nodes.attachment.spec.marks).toBe('');
   });
 
   it('mints no id of its own for a task that has none yet', () => {

@@ -16,12 +16,19 @@
 //! writes it around a *span*, so the two do not line up on their own: the nesting order is
 //! [`gw_core::MARK_ORDER`] — defined once, in the crate that also stamps it on import, so
 //! that neither side can be edited into disagreeing with the other — and a mark covering
-//! several leaves is opened once around the whole run rather than per leaf. What a stored
-//! document still cannot hold is an image (the importer keeps only the alt text), a link
-//! resolved to another *document* rather than a URL (`Mark::attrs`' `doc` — nothing in this
-//! system writes one yet; see `gw_store::links` for why an `href` naming a page in this wiki
-//! counts as an internal link instead), and a horizontal rule — those are dropped on the way
-//! *in* (see
+//! several leaves is opened once around the whole run rather than per leaf.
+//!
+//! A **file placed in the prose** (D-15) survives too, as
+//! `![Beschreibung](anhang:datei.png)` on a line of its own. It is a reference and says
+//! nothing about the file beyond its name — see [`Renderer::attachment`], and
+//! [`gw_core::markdown`] for the syntax itself, which lives there so that the two directions
+//! cannot drift apart.
+//!
+//! What a stored document still cannot hold is a picture from **somewhere else** (an
+//! ordinary `![…](https://…)`, whose alt text is all the importer keeps), a link resolved to
+//! another *document* rather than a URL (`Mark::attrs`' `doc` — nothing in this system writes
+//! one yet; see `gw_store::links` for why an `href` naming a page in this wiki counts as an
+//! internal link instead), and a horizontal rule — those are dropped on the way *in* (see
 //! [`gw_core::markdown::Unsupported`]), long before anything reaches here, so an export
 //! cannot contain them either. That is a true statement about the database, not a defect in
 //! this converter, and it is the one thing an operator must not discover by accident:
@@ -99,10 +106,14 @@ great-wiki stores documents as a block tree. Inline formatting — bold, italic,
 strikethrough, inline code and links — now exports and re-imports exactly, the same as
 headings, paragraphs, lists and their nesting, blockquotes, code blocks with their
 language, tables with their column alignment, and every character of the text itself.
-What the tree still cannot hold is an image, an internal link resolved to another page
-rather than a URL, and a horizontal rule — those are dropped when markdown is imported
-(the importer says so, page by page) and so they cannot come back out. `export`
-verifies every other construct per document and refuses to write one it cannot.
+A file placed in the prose comes back as `![Beschreibung](anhang:datei.png)`, which
+names the file on its page and nothing else: the FILES THEMSELVES ARE NOT IN THIS
+DIRECTORY, so an export is a copy of the wiki's words and not of its attachments.
+What the tree still cannot hold is a picture from somewhere else, an internal link
+resolved to another page rather than a URL, and a horizontal rule — those are dropped
+when markdown is imported (the importer says so, page by page) and so they cannot come
+back out. `export` verifies every other construct per document and refuses to write one
+it cannot.
 
 Therefore: this directory is a faithful copy of what the DATABASE holds. It is NOT a
 faithful copy of hand-written markdown that was imported into it. Do not overwrite
@@ -245,8 +256,9 @@ fn describe(principal: &Principal) -> String {
 /// Refuse to write into a directory that holds markdown this tool did not put there.
 ///
 /// The single most expensive mistake available here is exporting over the hand-written
-/// corpus the wiki was seeded from: those files may hold images, raw HTML or internal links
-/// the database never kept, and an export would replace them with a copy that has none. A
+/// corpus the wiki was seeded from: those files may hold pictures from elsewhere, raw HTML
+/// or internal links the database never kept, and an export would replace them with a copy
+/// that has none. A
 /// directory carrying [`FIDELITY_FILE`] is a previous export and is fair game; anything else
 /// is somebody's writing.
 fn refuse_foreign_directory(dir: &Path) -> Result<()> {
@@ -257,9 +269,9 @@ fn refuse_foreign_directory(dir: &Path) -> Result<()> {
     anyhow::ensure!(
         existing.is_empty(),
         "{} already contains {} markdown file(s) and no `{}`, so it is not a previous \
-         export — refusing to overwrite it. An export holds no image and no raw HTML, \
-         because the database holds neither; writing it over hand-written source markdown \
-         destroys them. Export to an empty directory instead.",
+         export — refusing to overwrite it. An export holds no picture from elsewhere and \
+         no raw HTML, because the database holds neither; writing it over hand-written \
+         source markdown destroys them. Export to an empty directory instead.",
         dir.display(),
         existing.len(),
         FIDELITY_FILE
@@ -671,6 +683,7 @@ impl Renderer {
             BlockKind::Blockquote => self.blockquote(block),
             BlockKind::CodeBlock => self.code(block),
             BlockKind::Table => self.table(block),
+            BlockKind::Attachment => self.attachment(block),
             BlockKind::ListItem | BlockKind::TaskItem => {
                 self.problem("a list item is outside any list");
                 self.blocks(&block.content, Nesting::Item)
@@ -990,6 +1003,56 @@ impl Renderer {
             out.push_str(marker.trim_end());
         }
         out
+    }
+
+    /// A file placed in the prose (D-15): `![Beschreibung](anhang:datei.png)`, on a line of
+    /// its own.
+    ///
+    /// The syntax is `gw_core::markdown`'s, not this module's, and that is deliberate:
+    /// [`gw_core::markdown::attachment_destination`] writes the destination and
+    /// `attachment_reference` reads it back, both in the crate that also imports it, for the
+    /// reason [`gw_core::MARK_ORDER`] lives there. Two copies of one syntax in two crates
+    /// stop agreeing the day either is edited, and what that costs here is total: a
+    /// placement written in a form the importer does not read back as one re-imports as a
+    /// paragraph of text, `render_file` refuses the page, and `export` fails the whole run.
+    ///
+    /// **It says nothing about what the file is.** No type, no size, no address — a
+    /// placement is a *reference*, and everything else about the file is a fact about the
+    /// `attachments` row, which is the authority (D-15). The reader resolves the name
+    /// against the page's own list; a name that resolves to nothing is a reference to a file
+    /// that is not attached, which is a real state and stays exactly as written. Nothing
+    /// here is in a position to know, and nothing here may start guessing: this renderer has
+    /// no store, exactly as it has none to resolve a link's `doc` target with.
+    ///
+    /// Two refusals rather than a guess, both of shapes nothing in this system produces —
+    /// only a hand-written body could — and both loud, because a refusal names its page and
+    /// a silent substitution does not.
+    fn attachment(&mut self, block: &Block) -> String {
+        let Some(filename) = block.attrs.get("filename").and_then(|v| v.as_str()) else {
+            self.problem(
+                "a placed file states no `filename`, and there is nothing else in a \
+                 placement that could say which file it is",
+            );
+            return String::new();
+        };
+        let Some(destination) = markdown::attachment_destination(filename) else {
+            self.problem(format!(
+                "a placed file is called `{filename}`, which markdown has no way to write as \
+                 a destination — no name a page can give a file looks like this, so the \
+                 block was not written by this wiki"
+            ));
+            return String::new();
+        };
+        // Through the same escaping a paragraph's text takes, so brackets and asterisks in a
+        // description come back as themselves instead of closing the image early — and so a
+        // newline in one is refused rather than silently becoming a space.
+        let alt = block
+            .attrs
+            .get("alt")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let alt = self.escape(alt);
+        format!("![{alt}]({destination})")
     }
 
     fn blockquote(&mut self, block: &Block) -> String {

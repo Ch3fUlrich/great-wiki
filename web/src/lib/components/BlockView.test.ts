@@ -2,11 +2,12 @@ import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
 import BlockView from './BlockView.svelte';
 import type { Block, MarkKind } from '$lib/blocks/render';
+import type { Attachment } from '$lib/attachments';
 
 /// The component's markup, without the hydration markers Svelte interleaves — they are an
 /// implementation detail and would make every assertion about structure unreadable.
-function html(block: Block): string {
-  return render(BlockView, { props: { block } }).body.replace(/<!--.*?-->/g, '');
+function html(block: Block, anhaenge: Attachment[] = []): string {
+  return render(BlockView, { props: { block, anhaenge } }).body.replace(/<!--.*?-->/g, '');
 }
 
 /// A single formatted leaf, standalone: `BlockView` accepts any block kind at its root,
@@ -346,5 +347,145 @@ describe('BlockView', () => {
 
   it('leaves an unmarked leaf exactly as before', () => {
     expect(html({ kind: 'text', text: 'nichts Besonderes' })).toBe('nichts Besonderes');
+  });
+});
+
+// --- files placed in the prose (D-15) ----------------------------------------------------
+
+describe('a placed file', () => {
+  const row = (filename: string, media_type: string, byte_size = 1024): Attachment => ({
+    filename,
+    media_type,
+    byte_size,
+    uploaded_at: '2026-09-01 10:00:00',
+    uploaded_by_name: 'Anna',
+    // The API's own address: it names the PAGE and does not name the bytes, which is the
+    // whole of D-16. This component prints it and never assembles one.
+    href: `/api/attachment/${filename}/rundgang`
+  });
+
+  const placement = (filename: string, alt = ''): Block => ({
+    kind: 'attachment',
+    attrs: { filename, alt }
+  });
+
+  it('shows a picture where it was placed, at the address the API sent', () => {
+    const out = html(placement('befund.png', 'Röntgenbild, seitlich'), [
+      row('befund.png', 'image/png')
+    ]);
+    expect(out).toContain('<img');
+    expect(out).toContain('src="/api/attachment/befund.png/rundgang"');
+    expect(out).toContain('alt="Röntgenbild, seitlich"');
+  });
+
+  it('never puts a content address on the page', () => {
+    // A placement carries a name, and the row carries an `href` that names the page. If a
+    // digest ever reached either, a reader could go looking for the same bytes under a page
+    // they may not read — which is the thing D-16 exists to make impossible rather than
+    // merely unlikely.
+    const out = html(placement('befund.png', 'x'), [row('befund.png', 'image/png')]);
+    expect(out).not.toMatch(/[0-9a-f]{40}/i);
+    expect(out).not.toMatch(/sha256/i);
+  });
+
+  it('falls back to the filename when nobody described the picture', () => {
+    // Never `alt=""`. A placement is content somebody put in the middle of their prose, so
+    // it is never decorative, and an empty alt makes it invisible to a screen reader
+    // entirely. The filename is a poor description and it is the same string the `Anhänge`
+    // list names the file by, so a reader who cannot see it can still find and fetch it.
+    const out = html(placement('befund.png'), [row('befund.png', 'image/png')]);
+    expect(out).toContain('alt="befund.png"');
+    expect(out).not.toContain('alt=""');
+  });
+
+  it('renders an SVG through <img> and through nothing that could execute it', () => {
+    // ADR 0014, and the one thing in this feature that has to be exactly right. An SVG is
+    // XML that can carry `<script>`, event handlers and external references, and it is
+    // stored exactly as uploaded because nothing sanitises it. `<img src>` is a context no
+    // browser executes it in; `<object>`, `<embed>` and `<iframe>` all run it, and putting
+    // its markup into this wiki's own DOM would run it IN THIS ORIGIN with the session
+    // cookie in reach.
+    //
+    // Asserted on an SVG specifically rather than trusted to the image branch written for
+    // PNGs, for the reason `content_disposition` names SVG in its own arm on the server:
+    // a defence that depends on somebody remembering that SVG is an image does not survive
+    // the next type being added.
+    const out = html(placement('diagramm.svg', 'Ein Diagramm'), [
+      row('diagramm.svg', 'image/svg+xml')
+    ]);
+    expect(out).toContain('<img');
+    expect(out).toContain('src="/api/attachment/diagramm.svg/rundgang"');
+    for (const forbidden of ['<object', '<embed', '<iframe', '<svg', '<script', 'srcdoc']) {
+      expect(out.toLowerCase(), forbidden).not.toContain(forbidden);
+    }
+  });
+
+  it('offers everything that is not a picture as a card that downloads', () => {
+    const out = html(placement('laborwerte.csv', 'Laborwerte 2026'), [
+      row('laborwerte.csv', 'text/plain; charset=utf-8', 2048)
+    ]);
+    // A LINK, so it works before hydration, opens in a new tab and saves with a right-click
+    // — and the server sends `Content-Disposition: attachment` for it, so following it saves
+    // the file rather than replacing the page.
+    expect(out).toContain('<a');
+    expect(out).toContain('href="/api/attachment/laborwerte.csv/rundgang"');
+    expect(out).not.toContain('<img');
+    // What somebody needs before deciding to fetch it, in words rather than as an icon.
+    expect(out).toContain('Laborwerte 2026');
+    expect(out).toContain('laborwerte.csv');
+    expect(out).toContain('text/plain');
+    expect(out).toContain('2,0 kB');
+  });
+
+  it('shows a PDF as a card rather than in the middle of the prose', () => {
+    // The owner's decision: pictures are shown, everything else is offered. A PDF is served
+    // inline by the download route and is still not a picture here.
+    const out = html(placement('befund.pdf', 'Der Befund'), [
+      row('befund.pdf', 'application/pdf')
+    ]);
+    expect(out).not.toContain('<img');
+    expect(out).toContain('PDF');
+    expect(out).toContain('href="/api/attachment/befund.pdf/rundgang"');
+  });
+
+  it('says a file is not attached rather than drawing a broken picture', () => {
+    // Two ordinary things produce this and neither is a fault: somebody detached the file,
+    // which deliberately leaves the prose alone (D-15), or the page was imported from
+    // markdown naming a file nobody has uploaded. A missing `<img>` would render as an icon
+    // and read as "the network failed", which is neither true nor actionable.
+    const out = html(placement('gibtsnicht.png', 'Fehlt'), [row('befund.png', 'image/png')]);
+    expect(out).not.toContain('<img');
+    expect(out).not.toContain('<a');
+    expect(out).toContain('gibtsnicht.png');
+    expect(out).toMatch(/entfernt|hochgeladen/);
+  });
+
+  it('says the same thing when it was given no list at all', () => {
+    // The honest reading of an empty list: this page carries no such file. It must never
+    // fall back to guessing an address from the name — that would be this interface
+    // assembling a download address, which is exactly what D-16 forbids it.
+    const out = html(placement('befund.png', 'Röntgenbild'));
+    expect(out).not.toContain('<img');
+    expect(out).not.toContain('/api/attachment');
+    expect(out).toContain('befund.png');
+  });
+
+  it('draws nothing for a placement that names no file', () => {
+    // A malformed block. Drawing the "not attached" sentence about a file called "" would
+    // be the interface reporting a fault in a page as a fault in its attachments.
+    const out = html({ kind: 'attachment', attrs: {} }, [row('befund.png', 'image/png')]);
+    expect(out.trim()).toBe('');
+  });
+
+  it('resolves a placement anywhere in the tree, not only at the root', () => {
+    // The list is threaded through every level of the recursion rather than only the top
+    // one. Nothing the importer or the editor can produce puts a placement below the root —
+    // both refuse it — but a component that silently rendered nothing wherever the list did
+    // not reach would hide exactly the case somebody hand-edited a body into.
+    const out = html(
+      { kind: 'doc', content: [{ kind: 'doc', content: [placement('befund.png', 'tief')] }] },
+      [row('befund.png', 'image/png')]
+    );
+    expect(out).toContain('src="/api/attachment/befund.png/rundgang"');
   });
 });

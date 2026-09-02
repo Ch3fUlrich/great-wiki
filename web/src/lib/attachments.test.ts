@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
   attachmentApiPath,
+  attachmentNamed,
   attachmentsApiPath,
   describeAttachments,
+  describeMissingPlacement,
   describeUpload,
+  isPicture,
   kindText,
   sizeText,
   type Attachment
@@ -161,5 +164,75 @@ describe('why a file was not attached', () => {
     const said = describeUpload(500, 'internal error');
     expect(said).toContain('500');
     expect(said).toContain('internal error');
+  });
+});
+
+describe('placing a file in the prose (D-15)', () => {
+  const row = (filename: string, media_type: string): Attachment => ({
+    filename,
+    media_type,
+    byte_size: 1024,
+    uploaded_at: '2026-09-01 10:00:00',
+    uploaded_by_name: 'Anna',
+    href: `/api/attachment/${filename}/rundgang`
+  });
+
+  const liste = [row('befund.png', 'image/png'), row('laborwerte.csv', 'text/plain; charset=utf-8')];
+
+  it('resolves a placement against the list, which is the authority on what is attached', () => {
+    // Not against a second request and not against an address built from the name. The row
+    // is what carries `href` (the API's own, naming the page and not the bytes) and
+    // `media_type` (what `sniff` read out of the bytes), and both of those are why the
+    // lookup exists at all rather than the renderer composing a URL.
+    expect(attachmentNamed(liste, 'befund.png')?.href).toBe('/api/attachment/befund.png/rundgang');
+    expect(attachmentNamed(liste, 'laborwerte.csv')?.media_type).toBe(
+      'text/plain; charset=utf-8'
+    );
+  });
+
+  it('answers null for a file this page does not carry, which is a real state', () => {
+    // Detaching a file leaves every block that named it exactly where it was — that is
+    // D-15's consequence — and a page imported from markdown can name a file nobody has
+    // uploaded. Both arrive here, and the renderer says so rather than drawing a broken
+    // picture.
+    expect(attachmentNamed(liste, 'gibtsnicht.png')).toBeNull();
+    expect(attachmentNamed([], 'befund.png')).toBeNull();
+  });
+
+  it('matches the name the store recorded, letter for letter', () => {
+    // `canonical_filename` trims and otherwise keeps a name verbatim, and the mount is
+    // case-sensitive: `Befund.png` and `befund.png` are two files, so folding case here
+    // would render one page's picture from another page's file.
+    expect(attachmentNamed(liste, 'Befund.PNG')).toBeNull();
+    expect(attachmentNamed(liste, ' befund.png')).toBeNull();
+  });
+
+  it('shows pictures and offers everything else, decided by the bytes', () => {
+    expect(isPicture('image/png')).toBe(true);
+    expect(isPicture('image/jpeg')).toBe(true);
+    expect(isPicture('image/avif')).toBe(true);
+    // The owner's decision: a PDF is not shown in the middle of the prose even though the
+    // download serves it inline. Text, CSV and archives are cards.
+    expect(isPicture('application/pdf')).toBe(false);
+    expect(isPicture('text/plain; charset=utf-8')).toBe(false);
+    expect(isPicture('application/zip')).toBe(false);
+    expect(isPicture('video/mp4')).toBe(false);
+  });
+
+  it('treats an SVG as a picture, which is safe only because the renderer uses <img>', () => {
+    // ADR 0014: an SVG may be shown through `<img>` or a CSS background — contexts no
+    // browser executes it in — and never through `<object>`, `<embed>`, `<iframe>` or by
+    // putting its markup into this wiki's DOM. `BlockView.test.ts` is where that is checked
+    // on the markup; this states the classification the renderer acts on.
+    expect(isPicture('image/svg+xml')).toBe(true);
+  });
+
+  it('names the file it could not find, and says which of the two things happened', () => {
+    const said = describeMissingPlacement('befund.png', 'Röntgenbild');
+    expect(said).toContain('befund.png');
+    expect(said).toContain('Röntgenbild');
+    expect(said).toMatch(/entfernt|hochgeladen/);
+    // An empty description leaves no dangling dash behind it.
+    expect(describeMissingPlacement('a.png', '')).not.toContain('—');
   });
 });

@@ -116,6 +116,7 @@ function html(
     seitenleiste = 'seiten',
     loeschen = false,
     dateien = anhaenge,
+    koerper = body,
     anhaengeDarfSchreiben = false,
     anhaengeFehler = null,
     hochgeladen = null,
@@ -133,6 +134,7 @@ function html(
     seitenleiste?: SidebarMode;
     loeschen?: boolean;
     dateien?: Attachment[];
+    koerper?: Block;
     anhaengeDarfSchreiben?: boolean;
     anhaengeFehler?: string | null;
     hochgeladen?: Attachment | null;
@@ -148,7 +150,7 @@ function html(
         tabHrefs: [],
         hier: doc.path,
         doc,
-        body,
+        body: koerper,
         tree,
         backlinks,
         edit,
@@ -701,5 +703,71 @@ describe('what the page carries besides its words', () => {
     });
     expect(out).not.toContain('Keine Anhänge');
     expect(out).toContain('Fehler 500');
+  });
+});
+
+describe('a file placed in the prose (D-15)', () => {
+  // The other half of the `Anhänge` section: a file also appears where it was put in the
+  // text. The two halves are ONE list — the section below is the authority on what is
+  // attached, and a block in the body is a reference to a row in it — so this asserts that
+  // the very list the section renders is also what the document renderer resolves against.
+  // A page that fetched a second list for the body would be two answers to one question, and
+  // the day they disagreed the picture and the list would contradict each other.
+
+  const placement: Block = {
+    kind: 'doc',
+    content: [
+      { kind: 'paragraph', content: [{ kind: 'text', text: 'Der Befund:' }] },
+      { kind: 'attachment', attrs: { filename: 'Befund 2024.pdf', alt: 'Der Befund' } }
+    ]
+  };
+
+  it('resolves the placement against the same list the Anhänge section shows', () => {
+    const out = html(container, { koerper: placement });
+    // A PDF is not a picture: a card, offered at the API's own address — the same `href` the
+    // section below prints, character for character.
+    expect(out).toContain('/api/attachment/Befund%202024.pdf/rundgang/import-export');
+    // And it is in the DOCUMENT, above the section rather than inside it.
+    expect(out.indexOf('Der Befund')).toBeLessThan(out.indexOf('id="gw-anhaenge"'));
+  });
+
+  it('renders it in the first response, before any script has run', () => {
+    // The requirement this whole file exists for. A picture that appeared only after
+    // hydration would be a page that reads as broken to somebody on a slow connection, and
+    // as empty to somebody with JavaScript off.
+    const out = html(container, {
+      koerper: {
+        kind: 'doc',
+        content: [{ kind: 'attachment', attrs: { filename: 'bild.png', alt: 'Ein Bild' } }]
+      },
+      dateien: [
+        {
+          filename: 'bild.png',
+          media_type: 'image/png',
+          byte_size: 2048,
+          uploaded_at: '2026-09-01 09:30:00',
+          uploaded_by_name: 'Sergej',
+          href: '/api/attachment/bild.png/rundgang/import-export'
+        }
+      ]
+    });
+    expect(out).toContain('<img');
+    expect(out).toContain('src="/api/attachment/bild.png/rundgang/import-export"');
+    expect(out).toContain('alt="Ein Bild"');
+  });
+
+  it('says so when the page no longer carries the file the prose names', () => {
+    // Detaching a file leaves the block exactly where it was, deliberately (D-15): the list
+    // is the authority, and an inline block is a reference. So this is a real state of a
+    // page rather than a fault, and the page says which file is missing instead of drawing a
+    // broken picture.
+    const out = html(container, {
+      koerper: {
+        kind: 'doc',
+        content: [{ kind: 'attachment', attrs: { filename: 'weg.png', alt: 'Weg' } }]
+      }
+    });
+    expect(out).toContain('weg.png');
+    expect(out).not.toContain('/api/attachment/weg.png');
   });
 });

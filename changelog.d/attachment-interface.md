@@ -40,11 +40,10 @@
 
 ### Known limitations
 
-- **Files are still not placed *inside* the text.** The decision puts a file inline in the
-  prose as well as in the `Anhänge` list; only the list and the upload are here. The inline
-  placement needs a new kind of block in the document model, which is a separate piece of work
-  with its own hazards, and it is not part of this change. Dragging a file into the editor does
-  nothing yet.
+- **Dragging a file into the editor does nothing yet.** Placing a file *in* the text — the
+  other half of the decision — landed in the change that follows this one
+  (`changelog.d/inline-attachments.md`), as a button per attached file; drag-and-drop is still
+  not there.
 
 - **There is no »Entfernen« in the interface yet.** The API can take a file off a page; nothing
   here asks it to.
