@@ -1023,3 +1023,64 @@ Steps 3 through 5 are what make that sentence false, and the seed corpus should 
 formula and a highlighted listing in the same change — every `.md` file under `content-example/`
 is walked by an export round-trip test, so a seeded example is also a round-trip proof. Step 6
 should seed a `dok:` reference for the same reason, *after* the production check in D-21g.
+## Owner's answers to this plan's open questions, 2026-09-02
+
+The plan shipped with six open questions. Four are now answered; the reasoning is recorded
+because each was a real choice with a rejected alternative.
+
+### D-23: Shiki, its JavaScript regex engine, and a curated grammar set
+
+Editor-grade accuracy, and the languages are a deliberate list — shell, YAML, JSON, SQL,
+Rust, TypeScript, Python, Markdown — rather than everything Shiki ships.
+
+Rejected: highlight.js (smaller and needs no curation, but rougher on exactly the shell and
+YAML that this corpus is mostly made of) and Shiki's full grammar set (best on anything ever
+pasted, and by far the largest download for a wiki whose pages are overwhelmingly prose).
+
+**The engine is not a preference.** Shiki defaults to Oniguruma compiled to WebAssembly, and
+this application's Content-Security-Policy has no `'wasm-unsafe-eval'`. The JavaScript regex
+engine must be configured explicitly, and a test must assert it — a silent fall back to the
+WASM default would work in development, pass every test that does not render in a browser,
+and fail only behind the CSP in production.
+
+**Adding a language is a deliberate act**, and the set should live in one named place with
+that sentence beside it, so the ninth grammar is added on purpose rather than by reflex.
+
+### D-24: A diagram is rendered twice, once for each theme
+
+Mermaid runs during server rendering and its output is a fixed image; the site has a
+light/dark control, and one image can only match one of them.
+
+So both are produced and the stylesheet shows whichever matches. Rejected: one neutral look
+(simplest, and it would read as deliberately plain rather than wrong — but "acceptable on
+both grounds" is a compromise nobody asked for on a page they are trying to read), and
+rendering in the browser (diagrams would follow the theme live, and Mermaid would then run on
+every reader's machine over page text, which is precisely the attack surface D-19 exists to
+close).
+
+The cost is stated rather than hidden: every diagram is rendered twice at publish time and
+carried twice in the markup. That is paid once per page render, by the server, for a wiki of
+tens of pages — and it buys a diagram that is never wrong against its own background.
+
+### D-25: An unknown language is shown plain, and named quietly
+
+A fence whose language the highlighter does not know renders exactly as it does now —
+correct, monospaced, uncoloured — with the unrecognised language shown discreetly on the
+block.
+
+Rejected: silence. An author who writes ```` ```kotlin ```` and sees no colour has no way to
+tell whether the wiki does not know Kotlin, whether they misspelled it, or whether
+highlighting is broken. Naming it answers all three at once, and costs a label only on
+fences that already have something to explain.
+
+A fence with **no** language is not an unknown language and gets no label — the author said
+nothing and the page should not argue with them.
+
+### Still open
+
+Two of the six remain, and both need measurement rather than a decision:
+
+- The exact cap numbers (D-22's "generous" is settled as a direction; the figures should come
+  from what the corpus actually contains, with headroom).
+- Whether the live database holds any link mark whose `href` begins `dok:`. The corpora are
+  clean, but production could not be inspected from the session that wrote this.
