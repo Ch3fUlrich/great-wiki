@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { isActionFailure, isRedirect } from '@sveltejs/kit';
 import { actions, load } from './+page.server';
+import { GERMAN_REFUSALS } from '$lib/refusals';
 import type { DocumentView } from '$lib/api';
 import type { BoardNotice, BoardResponse, BoardTask } from '$lib/board';
 import type { Project } from '$lib/projects';
@@ -750,5 +751,63 @@ describe('the code blocks on the page', () => {
     const data = await loaded(withFence('x'.repeat(FENCE_CHARACTER_LIMIT + 1), 'rust'));
     expect(data.doc.path).toBe('/rundgang/tabellen');
     expect([...data.fences.values()][0].kind).toBe('plain');
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+//  The two refusals this page can produce, and the language they are in.
+//
+//  This is the screen an invited relative is most likely to meet that nobody designed for
+//  them: they follow a link — from a chat, from somebody's bookmark, from a page that
+//  mentions one they were not granted — and land on a refusal. It was in English until the
+//  invite flow was walked end to end, while the sibling loader one directory down
+//  (`history/+page.server.ts`) had been in German all along, which is what makes it an
+//  oversight rather than a convention.
+//
+//  Pinned as a test and not only as a translated string, because the next `error()` added
+//  to this loader will be written in whatever language its author is thinking in.
+// ---------------------------------------------------------------------------------------
+describe('being refused a page', () => {
+  async function refusal(status: number) {
+    const { fetchFn } = spyFetch({ '/api/documents': { status } });
+    try {
+      await load(loadEvent(fetchFn));
+    } catch (thrown) {
+      return thrown as { status: number; body: { message: string } };
+    }
+    throw new Error(`a ${status} from the API did not refuse the page`);
+  }
+
+  it('says in German that this page is not for you', async () => {
+    const thrown = await refusal(403);
+    expect(thrown.status).toBe(403);
+    expect(thrown.body.message).toContain('nicht');
+    expect(thrown.body.message).not.toMatch(/\b(access|page|not|have)\b/);
+  });
+
+  it('says in German that there is no such page', async () => {
+    const thrown = await refusal(404);
+    expect(thrown.status).toBe(404);
+    expect(thrown.body.message).toContain('Seite');
+    expect(thrown.body.message).not.toMatch(/\b(Page|not|found)\b/);
+  });
+
+  it('addresses the reader as »Sie«, like every other screen an invitee meets', () => {
+    // The invitation page, the sign-in page and the administration console all use »Sie«.
+    // A wiki that switches to »du« on its refusals reads as two different products, and
+    // the refusal is exactly where somebody is already unsure whether they did something
+    // wrong.
+    expect(GERMAN_REFUSALS.forbidden).toMatch(/\bSie\b/);
+    expect(GERMAN_REFUSALS.forbidden).not.toMatch(/\b(du|dich|dir|darfst)\b/);
+    expect(GERMAN_REFUSALS.missing).not.toMatch(/\b(du|dich|dir|gibst)\b/);
+  });
+
+  it('tells a refused reader nothing about the page beyond the address they typed', async () => {
+    // A refusal that named the title would hand over the one thing the filter exists to
+    // withhold — and `/api/documents` answers 403 with no body at all, so there is nothing
+    // here to leak by accident. This pins that the message stays a constant.
+    const thrown = await refusal(403);
+    expect(thrown.body.message).not.toContain('Tabellen');
+    expect(thrown.body.message).not.toContain('/rundgang');
   });
 });

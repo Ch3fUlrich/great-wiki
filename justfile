@@ -134,6 +134,29 @@ behaviour-fixture:
     # only because Admin satisfies Write — the editing checks on this subtree still pass.
     cargo run -q -p gw-api -- grant --path /verweisbeispiel/verweist-zurueck \
       --subject group:editors --permission admin --actor behaviour-fixture
+    # A SECOND page this identity administers, for Group P — and deliberately a different
+    # one from the line above, for the reason that line's comment gives about itself: Group
+    # J really does PURGE /verweisbeispiel/verweist-zurueck, so by the time Group P runs it
+    # does not exist. Group P spent its first run failing on exactly that, with a timeout
+    # waiting for a page to appear in a picker, which names neither the purge nor the group
+    # that performed it.
+    #
+    # Creating an invitation that carries a path is gated by `path_admin` on that path
+    # (D-M2-2: a path grant is bounded by its path), and write does not satisfy it — so
+    # without an admin grant on a SURVIVING page, Group P could only ever watch the gate
+    # refuse, and its positive checks (the link shown once, the acceptance page, the
+    # withdrawal) would be unrunnable while still reporting "ok" for having correctly
+    # detected a refusal. That is the same failure this recipe's comments keep being written
+    # about.
+    #
+    # /rundgang/groesse-und-mass-deutsch-im-system is chosen because nothing in the harness
+    # writes to it, trashes it or purges it — it is READ once, by I2, for a link in the topic
+    # index. Admin satisfies Write, so replacing the inherited /rundgang write grant here
+    # (grants are never unioned — nearest ancestor with ANY row wins outright) takes nothing
+    # away from that check. If a future group needs to destroy this page, Group P needs a
+    # different one, and this comment is the thing that says so.
+    cargo run -q -p gw-api -- grant --path /rundgang/groesse-und-mass-deutsch-im-system \
+      --subject group:editors --permission admin --actor behaviour-fixture
     echo "behaviour fixture ready:"
     echo "  GW_DATABASE_URL=$GW_DATABASE_URL"
     echo "  GW_MEDIA_DIR=$GW_MEDIA_DIR"

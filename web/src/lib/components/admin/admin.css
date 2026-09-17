@@ -835,6 +835,47 @@
 		gap: var(--space-4);
 	}
 
+	/* --- The invitation link, shown exactly once ---------------------------- */
+
+	/* This block holds a credential that will never be displayed again, so it is styled to
+	   be the loudest thing on the tab rather than a notice among notices. `--warn` and not
+	   `--danger`: nothing has gone wrong, but nothing here can be recovered either.
+
+	   Mixed from the token rather than written as a colour, per the rule at the top of this
+	   file, so a theme that repaints `--warn` repaints this with it. */
+	.gw-adm-invite-link {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-2);
+		padding: var(--space-4);
+		border: 2px solid var(--warn);
+		border-radius: var(--radius);
+		background: color-mix(in srgb, var(--warn) 10%, transparent);
+	}
+
+	.gw-adm-warn {
+		color: var(--warn);
+	}
+
+	/* `anywhere`, not `break-all`: a token has no spaces, and without this the box grows
+	   wider than the viewport and takes the whole page sideways with it. */
+	.gw-adm-invite-url {
+		display: block;
+		padding: var(--space-2) var(--space-3);
+		border: 1px solid var(--border-strong);
+		border-radius: var(--radius-sm);
+		background: var(--bg-raised);
+		user-select: all;
+		overflow-wrap: anywhere;
+	}
+
+	.gw-adm-invite-actions {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--space-2) var(--space-3);
+	}
+
 	/* --- Visually hidden ---------------------------------------------------- */
 
 	/* Readable by a screen reader, invisible on screen. `display: none` would hide it

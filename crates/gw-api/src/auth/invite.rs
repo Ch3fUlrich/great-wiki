@@ -164,6 +164,36 @@ fn escape(value: &str) -> String {
     out
 }
 
+/// `2026-10-17 12:00:00` → `17.10.2026`.
+///
+/// The stored value is SQLite's `YYYY-MM-DD HH:MM:SS`, and it was being shown to the
+/// recipient exactly as stored — an ISO date in the middle of a German sentence, on the one
+/// page in this application written for somebody who has never used it before. The rest of
+/// the interface formats dates as `TT.MM.JJJJ` (`formatInstant` in `adminApi.ts`); this is
+/// the same rule, restated here because this page cannot reach the front end for anything.
+///
+/// Anything that does not parse is returned unchanged rather than blanked: a date nobody
+/// can read still tells the recipient more than an empty space, and an invitation must not
+/// fail to render over its own expiry label.
+///
+/// The time component is dropped deliberately — the window is what matters to the person
+/// reading, and the hour is noise in a sentence about a link that lasts a month.
+fn german_date(stored: &str) -> String {
+    let date = stored.split_whitespace().next().unwrap_or(stored);
+    let mut parts = date.split('-');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(year), Some(month), Some(day), None)
+            if year.len() == 4
+                && month.len() == 2
+                && day.len() == 2
+                && date.chars().all(|c| c.is_ascii_digit() || c == '-') =>
+        {
+            format!("{day}.{month}.{year}")
+        }
+        _ => stored.to_string(),
+    }
+}
+
 /// What a permission means to somebody who has never seen this wiki.
 fn permission_word(permission: Permission) -> &'static str {
     match permission {
@@ -256,7 +286,19 @@ fn shell(title: &str, body: &str) -> String {
 }
 
 /// The page a live invitation shows.
-pub fn render(offer: &InviteOffer, token: &str, csrf: &str, notice: Option<Notice>) -> String {
+///
+/// `typed_name` is what the recipient had already put in the Anzeigename box when the form
+/// came back refused. It is echoed so that a rejected password does not also cost somebody
+/// their name — a relative who picks something under twelve characters was previously
+/// handed an empty form and had to type both fields again, which reads as the page having
+/// thrown their input away. The PASSWORD is never echoed, on any path.
+pub fn render(
+    offer: &InviteOffer,
+    token: &str,
+    csrf: &str,
+    notice: Option<Notice>,
+    typed_name: &str,
+) -> String {
     let inviter = match &offer.invited_by_name {
         Some(name) => format!(
             "<strong>{}</strong> hat Sie zu great-wiki eingeladen.",
@@ -293,12 +335,9 @@ pub fn render(offer: &InviteOffer, token: &str, csrf: &str, notice: Option<Notic
     };
 
     // The window matters to the person reading: it is why the link in their inbox may stop
-    // working. The date alone — the stored value's time component is noise here.
-    let expires = offer
-        .expires_at
-        .split_whitespace()
-        .next()
-        .unwrap_or(&offer.expires_at);
+    // working. In German spelling, because the person reading this has never seen this
+    // application and an ISO date in a German sentence reads as a fault.
+    let expires = german_date(&offer.expires_at);
 
     let body = format!(
         r#"    <h1>Einladung zu great-wiki</h1>
@@ -313,7 +352,7 @@ pub fn render(offer: &InviteOffer, token: &str, csrf: &str, notice: Option<Notic
       <input type="hidden" name="csrf" value="{csrf}">
       <label for="display_name">Anzeigename</label>
       <input id="display_name" name="display_name" type="text" autocomplete="name"
-             maxlength="120" required>
+             maxlength="120" value="{typed_name}" required>
       <label for="password">Passwort</label>
       <input id="password" name="password" type="password" autocomplete="new-password"
              minlength="12" required>
@@ -325,6 +364,9 @@ pub fn render(offer: &InviteOffer, token: &str, csrf: &str, notice: Option<Notic
         username = escape(&offer.username),
         token = escape(token),
         csrf = escape(csrf),
+        // Escaped like everything else on this page: it is text the recipient typed, and it
+        // is going straight back into an attribute.
+        typed_name = escape(typed_name),
     );
 
     shell("Einladung", &body)
@@ -371,6 +413,7 @@ fn respond(
     token: &str,
     notice: Option<Notice>,
     status: StatusCode,
+    typed_name: &str,
 ) -> Response {
     let existing = jar
         .get(CSRF_COOKIE)
@@ -396,7 +439,7 @@ fn respond(
             // next person through.
             (header::CACHE_CONTROL, "no-store"),
         ],
-        render(offer, token, &csrf, notice),
+        render(offer, token, &csrf, notice, typed_name),
     )
         .into_response()
 }
@@ -408,7 +451,7 @@ pub async fn show(
     Path(token): Path<String>,
 ) -> Response {
     match offer(&state, &token).await {
-        Some(offer) => respond(jar, &offer, &token, None, StatusCode::OK),
+        Some(offer) => respond(jar, &offer, &token, None, StatusCode::OK, ""),
         None => refused(),
     }
 }
@@ -439,6 +482,12 @@ pub async fn accept(
         .get(CSRF_COOKIE)
         .map(|cookie| cookie.value().to_string())
         .unwrap_or_default();
+    // Trimmed once, and used both as the value to store and as the value to echo back on
+    // every refusal below. The password is deliberately NOT given the same treatment: it is
+    // never echoed, so a refusal cannot put it into the page, into a cache, or into a
+    // browser's autofill history for a page that was answered with an error.
+    let display_name = form.display_name.trim().to_string();
+
     if expected.trim().is_empty() || !constant_time_eq(&expected, &form.csrf) {
         tracing::warn!("invite acceptance refused: the form carried no valid CSRF token");
         return respond(
@@ -447,10 +496,10 @@ pub async fn accept(
             &token,
             Some(Notice::Stale),
             StatusCode::BAD_REQUEST,
+            &display_name,
         );
     }
 
-    let display_name = form.display_name.trim().to_string();
     if display_name.is_empty() {
         return respond(
             jar,
@@ -458,6 +507,7 @@ pub async fn accept(
             &token,
             Some(Notice::NameRequired),
             StatusCode::BAD_REQUEST,
+            &display_name,
         );
     }
 
@@ -489,6 +539,7 @@ pub async fn accept(
                 &token,
                 Some(Notice::from(error)),
                 StatusCode::BAD_REQUEST,
+                &display_name,
             )
         }
     };
@@ -533,6 +584,7 @@ pub async fn accept(
             &token,
             Some(Notice::UsernameTaken),
             StatusCode::CONFLICT,
+            &display_name,
         ),
         Err(error) => ApiError::Internal(error).into_response(),
     }
@@ -540,7 +592,9 @@ pub async fn accept(
 
 #[cfg(test)]
 mod tests {
-    use super::{constant_time_eq, escape, permission_word, render, render_refusal, Notice};
+    use super::{
+        constant_time_eq, escape, german_date, permission_word, render, render_refusal, Notice,
+    };
     use gw_auth::{PasswordError, Permission};
     use gw_store::InviteOffer;
 
@@ -558,12 +612,16 @@ mod tests {
 
     #[test]
     fn the_page_says_who_invited_them_and_what_they_will_get() {
-        let page = render(&offer(), "abc", "csrf-token", None);
+        let page = render(&offer(), "abc", "csrf-token", None, "");
         assert!(page.contains("Lektor"), "{page}");
         assert!(page.contains("Lesezugriff"), "{page}");
         assert!(page.contains("/raum"), "{page}");
         assert!(page.contains("gast"), "{page}");
-        assert!(page.contains("2026-09-10"), "{page}");
+        // In GERMAN spelling. The stored value is `2026-09-10 12:00:00`, and it used to be
+        // rendered exactly as stored — an ISO date in the middle of a German sentence, on
+        // the one page here written for somebody who has never seen this application.
+        assert!(page.contains("10.09.2026"), "{page}");
+        assert!(!page.contains("2026-09-10"), "{page}");
         assert!(
             page.contains(r#"action="/auth/invite/abc/accept""#),
             "{page}"
@@ -581,6 +639,7 @@ mod tests {
             "abc",
             "t",
             None,
+            "",
         );
         assert!(
             page.contains("Sie wurden zu great-wiki eingeladen"),
@@ -600,6 +659,7 @@ mod tests {
             "abc",
             "t",
             None,
+            "",
         );
         assert!(page.contains("Redaktion"), "{page}");
         assert!(!page.contains("Lesezugriff"), "{page}");
@@ -619,6 +679,7 @@ mod tests {
             r#"" onload="alert(1)"#,
             "t",
             None,
+            "",
         );
         // The assertion has to be about a TAG being formed, not about the payload text
         // appearing: `onerror=alert(1)` contains nothing HTML-special, so it survives
@@ -656,7 +717,7 @@ mod tests {
     fn the_page_loads_nothing_from_anywhere() {
         // A page somebody types a new password into must not be one a third party can
         // change, or one that tells a third party it was opened.
-        let page = render(&offer(), "abc", "t", None);
+        let page = render(&offer(), "abc", "t", None, "");
         assert!(!page.contains("http://"), "{page}");
         assert!(!page.contains("https://"), "{page}");
         assert!(!page.contains("<script"), "{page}");
@@ -689,6 +750,57 @@ mod tests {
         assert_eq!(permission_word(Permission::Comment), "Kommentarzugriff");
         assert_eq!(permission_word(Permission::Write), "Schreibzugriff");
         assert_eq!(permission_word(Permission::Admin), "Verwaltungszugriff");
+    }
+
+    #[test]
+    fn a_stored_timestamp_becomes_a_date_a_relative_would_recognise() {
+        assert_eq!(german_date("2026-10-17 12:00:00"), "17.10.2026");
+        assert_eq!(german_date("2026-01-05"), "05.01.2026");
+        // Anything unrecognised comes back untouched rather than blank: a date nobody can
+        // read still says more than an empty space, and an invitation must never fail to
+        // render over its own expiry label.
+        assert_eq!(german_date("irgendwann"), "irgendwann");
+        assert_eq!(german_date(""), "");
+        assert_eq!(german_date("26-10-17"), "26-10-17");
+        assert_eq!(german_date("2026-1-7"), "2026-1-7");
+    }
+
+    #[test]
+    fn a_refused_attempt_keeps_the_name_but_never_the_password() {
+        // A relative who picks a password under twelve characters used to be handed an
+        // empty form and had to type their name again, which reads as the page having
+        // thrown their input away. The password is the one thing that must NOT come back:
+        // echoing it would put it in the page, in any cache that took it, and in the
+        // browser's history for a response that was an error.
+        let page = render(&offer(), "abc", "t", Some(Notice::TooShort), "Oma Erika");
+        assert!(page.contains(r#"value="Oma Erika""#), "{page}");
+        assert!(page.contains("mindestens 12 Zeichen"), "{page}");
+        assert!(!page.contains("type=\"password\" value="), "{page}");
+    }
+
+    #[test]
+    fn a_name_with_markup_in_it_cannot_escape_the_attribute_it_is_echoed_into() {
+        // It is the recipient's own input coming straight back into an attribute — the one
+        // new place on this page where unescaped text would be a hole.
+        let page = render(
+            &offer(),
+            "abc",
+            "t",
+            Some(Notice::TooShort),
+            r#"" onfocus="alert(1)"#,
+        );
+        assert!(!page.contains(r#"onfocus="alert"#), "{page}");
+        assert!(page.contains("&quot; onfocus=&quot;alert(1)"), "{page}");
+    }
+
+    #[test]
+    fn the_page_a_fresh_visitor_gets_has_an_empty_name_box() {
+        let page = render(&offer(), "abc", "t", None, "");
+        assert!(
+            page.contains(r#"name="display_name" type="text" autocomplete="name""#),
+            "{page}"
+        );
+        assert!(page.contains(r#"value="""#), "{page}");
     }
 
     #[test]

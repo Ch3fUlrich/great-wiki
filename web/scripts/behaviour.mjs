@@ -3143,6 +3143,365 @@ await check('O3 an embed of a page this reader may not see shows only the author
   );
 });
 
+// ---------------------------------------------------------------------------------------
+// Group P — the invitation: how a second person gets in, and what they meet on the way
+// ---------------------------------------------------------------------------------------
+//
+// This group exists because the invite flow had 42 unit tests and had never been walked by
+// a second human — which is how it reached this milestone with its console half missing
+// entirely. The API could create, list and withdraw an invitation, and the acceptance page
+// at `/auth/invite/{token}` was complete and tested, but the administration console had
+// four tabs and none of them could make one. The only route the interface offered for
+// bringing somebody in was »Person anlegen«, which means the owner chooses that person's
+// password and sends it through a chat app — precisely what D-M2-3 exists to prevent.
+//
+// So the checks below are deliberately end-to-end and in order: create an invitation
+// through the console, read the link it shows exactly once, open it as the recipient,
+// watch it refuse a bad password in German, withdraw it, and confirm the link is then
+// indistinguishable from one that never existed. A unit test can hold any one of those;
+// only this can hold the seam between them, and the seam is where the whole flow was
+// missing.
+//
+// THE IDENTITY MATTERS HERE. `just behaviour` runs as `sergej:editors`, which is NOT an
+// instance administrator (see the recipe's own comments). That is the more interesting
+// case and it is why two of these checks are possible at all: this identity administers
+// exactly one page (`/verweisbeispiel/verweist-zurueck`, granted `admin` by the fixture),
+// so it may invite into that subtree and nowhere else, and it may not attach a team —
+// D-M2-2, because a team reaches wherever it has been granted, instance-wide.
+//
+// This group MUTATES the fixture: it creates an invitation and withdraws it. That is safe
+// because `behaviour-fixture` rebuilds the database from scratch on every run, and no
+// other group reads the invites table.
+
+/**
+ * The page this group invites into.
+ *
+ * Creating an invitation that carries a path is gated by `path_admin` on that path, and the
+ * fixture grants this identity `admin` on exactly two pages. This is the one Group J does
+ * NOT purge — that is the whole reason the fixture grants a second one, and the justfile
+ * says so beside the grant. Picking the other page here is a timeout in P4 waiting for a
+ * page to appear in a picker, naming neither the purge nor the group that performed it.
+ */
+const INVITE_PATH = '/rundgang/groesse-und-mass-deutsch-im-system';
+/** Carried between checks: the link exists exactly once and cannot be asked for again. */
+const invitation = { url: null, id: null };
+
+/** The console's Einladungen tab, hydrated and open. */
+async function openInvitesTab(page) {
+  await page.goto(BASE + '/admin', { waitUntil: 'networkidle' });
+  const tab = page.getByRole('tab', { name: 'Einladungen' });
+  await tab.waitFor({ state: 'visible', timeout: 10_000 });
+  await tab.click();
+  const heading = page.getByRole('heading', { name: 'Einladungen', level: 2 });
+  await heading.waitFor({ state: 'visible', timeout: 5_000 });
+  return heading;
+}
+
+/**
+ * The invitations panel, and only it.
+ *
+ * Every tab's content is in the DOM at once — Ark hides the inactive ones with the `hidden`
+ * attribute rather than unmounting them — so `.gw-adm-section` matches five elements and
+ * `.gw-adm-table` matches the Protokoll's as readily as this one. Playwright refuses the
+ * ambiguity rather than picking, which is right, and this is the scope that resolves it.
+ */
+function invitesPanel(page) {
+  return page
+    .locator('.gw-adm-section')
+    .filter({ has: page.getByRole('heading', { name: 'Einladungen', level: 2 }) });
+}
+
+await check('P1 the console offers a way to invite somebody at all', async (page) => {
+  // The regression this group was written for. If this check ever fails again, nobody can
+  // bring a second person into the wiki through the interface — which is not a broken
+  // button but a missing flow, and it went unnoticed for a whole milestone.
+  await openInvitesTab(page);
+  const trigger = page.getByRole('button', { name: 'Einladung erstellen' }).first();
+  await trigger.waitFor({ state: 'visible', timeout: 5_000 });
+  assert(await trigger.isEnabled(), 'the console shows »Einladung erstellen« but will not open it');
+
+  // And it says, before anybody uses it, what the point of an invitation is over simply
+  // creating an account and handing the password over.
+  const body = await page.content();
+  assert(
+    body.includes('legen ihr Passwort selbst fest'),
+    'the panel never says that the invited person chooses their own password'
+  );
+});
+
+await check('P2 a fresh wiki says nobody is invited, rather than showing an empty table', async (page) => {
+  await openInvitesTab(page);
+  const text = await invitesPanel(page).innerText();
+  assert(
+    text.includes('Es ist derzeit niemand eingeladen'),
+    `expected the empty state to say so in words: ${text}`
+  );
+  // "None outstanding" and "could not be loaded" must not look the same.
+  assert(
+    !text.includes('konnten nicht geladen werden'),
+    `the listing failed to load, so this check proved nothing about the empty state: ${text}`
+  );
+});
+
+await check('P3 a space administrator is not offered a team they may not hand out', async (page) => {
+  // D-M2-2. A path grant is bounded by its path; a team reaches wherever it has been
+  // granted, anywhere in the instance, so a team-carrying invitation is instance admins
+  // only. `GET /api/admin/teams` is gated the same way, so this identity cannot even read
+  // the list — and an interface that offered the field anyway would be inviting somebody
+  // to fill in a form that is going to be refused.
+  await openInvitesTab(page);
+  await page.getByRole('button', { name: 'Einladung erstellen' }).first().click();
+  const dialog = page.getByRole('dialog', { name: 'Jemanden einladen' });
+  await dialog.waitFor({ state: 'visible', timeout: 5_000 });
+  const text = await dialog.innerText();
+
+  assert(text.includes('Benutzername'), `the invite dialog did not open: ${text}`);
+  assert(!text.includes('Team (optional)'), `a space admin was offered the team field: ${text}`);
+
+  // And the refusal D-M2-20 would produce is stated while the button is still disabled,
+  // rather than being discovered by pressing it.
+  assert(
+    text.includes('muss eine Seite oder ein Team mitbringen'),
+    `nothing explains why the button is grey: ${text}`
+  );
+  const submit = dialog.getByRole('button', { name: 'Einladung erstellen' });
+  assert(
+    !(await submit.isEnabled()),
+    'an invitation carrying neither a page nor a team could be submitted'
+  );
+});
+
+await check('P4 creating one shows the link once, and says that it is a credential', async (page) => {
+  await openInvitesTab(page);
+  await page.getByRole('button', { name: 'Einladung erstellen' }).first().click();
+  const dialog = page.getByRole('dialog', { name: 'Jemanden einladen' });
+  await dialog.waitFor({ state: 'visible', timeout: 5_000 });
+
+  await dialog.getByRole('textbox', { name: 'Benutzername' }).fill('grosstante');
+
+  // The page picker, on Ark's Select. Only pages this identity may READ are offered; the
+  // API decides separately whether it may invite into the one chosen.
+  await dialog.getByRole('combobox', { name: 'Seite' }).click();
+  const option = page
+    .locator('[role=listbox]:not([hidden]) [role=option]')
+    .filter({ hasText: INVITE_PATH });
+  await option.first().waitFor({ state: 'visible', timeout: 5_000 });
+  await option.first().click();
+
+  await dialog.getByRole('button', { name: 'Einladung erstellen' }).click();
+
+  const block = page.locator('.gw-adm-invite-link');
+  await block.waitFor({ state: 'visible', timeout: 10_000 });
+  const shown = await block.innerText();
+
+  // Shown ONCE, and said so before anybody navigates away. The plaintext token is never
+  // stored — the table holds only its SHA-256 — so this really is the only copy that will
+  // ever exist, and losing it means the invitation has to be made again.
+  assert(shown.includes('nur dieses eine Mal'), `the link is not marked as shown once: ${shown}`);
+  // And that the link IS the password until it is spent. »Hier ist ein Link« does not
+  // convey that to somebody about to paste it somewhere convenient.
+  assert(
+    shown.includes('Wer den Link hat, kann das Konto anlegen'),
+    `the link is handed over without saying what it is: ${shown}`
+  );
+
+  const url = (await block.locator('.gw-adm-invite-url').innerText()).trim();
+  assert(
+    /^https?:\/\/[^/]+\/auth\/invite\/[A-Za-z0-9_-]{16,}$/.test(url),
+    `the link is not an absolute invitation URL: ${url}`
+  );
+  invitation.url = url;
+
+  // The listing behind it now names the invitation, what it carries and that it is open.
+  const table = await invitesPanel(page).locator('.gw-adm-table').innerText();
+  assert(table.includes('grosstante'), `the new invitation is not in the listing: ${table}`);
+  assert(table.includes(INVITE_PATH), `the listing does not say what it carries: ${table}`);
+  assert(table.includes('Offen'), `the listing does not say it is still open: ${table}`);
+  // A listing must never carry the token or its digest: `InviteSummary` has no field for
+  // one, and this is the screen where a future field would surface.
+  assert(
+    !table.includes('/auth/invite/'),
+    `a token reached the listing, which must never hold one: ${table}`
+  );
+});
+
+await check('P5 the recipient meets a German page naming who invited them and what they get', async (page) => {
+  assert(invitation.url !== null, 'P4 did not produce a link, so there is nothing to open');
+  const response = await page.goto(invitation.url, { waitUntil: 'domcontentloaded' });
+  assert(response?.status() === 200, `the invitation link did not open: ${response?.status()}`);
+  const text = await page.locator('body').innerText();
+
+  assert(text.includes('Einladung zu great-wiki'), `not the invitation page: ${text}`);
+  assert(text.includes('eingeladen'), `the page does not say they were invited: ${text}`);
+  assert(text.includes('Lesezugriff'), `the page does not say what they get: ${text}`);
+  assert(text.includes(INVITE_PATH), `the page does not say what it is on: ${text}`);
+  assert(text.includes('grosstante'), `the page does not name the account: ${text}`);
+
+  // The expiry in GERMAN spelling. It was rendered as the stored `YYYY-MM-DD` — an ISO
+  // date in the middle of a German sentence, on the one page here written for somebody who
+  // has never used this application before.
+  assert(
+    /läuft am \d{2}\.\d{2}\.\d{4} ab/.test(text),
+    `the expiry is not written as a German date: ${text}`
+  );
+  assert(!/\d{4}-\d{2}-\d{2}/.test(text), `an ISO date survived on the invitation page: ${text}`);
+
+  // No English anywhere on the one screen a relative meets first.
+  for (const word of ['Invitation', 'password', 'Sign in', 'account', 'Accept']) {
+    assert(!text.includes(word), `English leaked onto the invitation page (${word}): ${text}`);
+  }
+
+  // It loads nothing from anywhere — no script, no font, no stylesheet. A page somebody
+  // types a new password into must not be one a third party can change.
+  const external = await page.evaluate(() =>
+    [...document.querySelectorAll('script[src], link[href], img[src], iframe[src]')].length
+  );
+  assert(external === 0, `the invitation page pulled in ${external} external resources`);
+});
+
+await check('P6 a refused password is explained in German and does not cost the typed name', async (page) => {
+  assert(invitation.url !== null, 'P4 did not produce a link, so there is nothing to open');
+  await page.goto(invitation.url, { waitUntil: 'domcontentloaded' });
+
+  await page.locator('#display_name').fill('Großtante Hedwig');
+  await page.locator('#password').fill('zukurz');
+  // `noValidate` so the server's German message is what appears, rather than the browser's
+  // own constraint bubble in whatever language the browser is in — which is the same
+  // reason the admin console's forms carry `novalidate`.
+  await page.evaluate(() => {
+    document.querySelector('form').noValidate = true;
+  });
+  await page.locator('button[type=submit]').click();
+  await page.waitForLoadState('domcontentloaded');
+
+  const text = await page.locator('body').innerText();
+  assert(
+    text.includes('mindestens 12 Zeichen'),
+    `the short password was not explained in German: ${text}`
+  );
+
+  // The NAME comes back. A relative who picks something too short used to be handed an
+  // empty form and had to type both fields again, which reads as the page having thrown
+  // their input away.
+  const name = await page.locator('#display_name').inputValue();
+  assert(name === 'Großtante Hedwig', `the typed name was discarded on refusal: "${name}"`);
+  // The PASSWORD does not. Echoing it would put it into the page, into any cache that took
+  // it, and into the browser's history for a response that was an error.
+  const password = await page.locator('#password').inputValue();
+  assert(password === '', `the password was echoed back into the page: "${password}"`);
+});
+
+await check('P7 a link that offers nothing says so without saying which of four reasons', async (page) => {
+  // Unknown, expired, revoked and already-spent must produce ONE page. Anything else turns
+  // the endpoint into a way to ask which tokens exist.
+  const response = await page.goto(BASE + '/auth/invite/diesentokengibtesnicht', {
+    waitUntil: 'domcontentloaded'
+  });
+  assert(response?.status() === 404, `expected 404 for an unknown token, got ${response?.status()}`);
+  const text = await page.locator('body').innerText();
+
+  assert(text.includes('Einladung ungültig'), `not the refusal page: ${text}`);
+  // It names every possibility precisely so that it names none of them.
+  for (const word of ['benutzt', 'zurückgezogen', 'abgelaufen', 'unvollständig']) {
+    assert(text.includes(word), `the refusal narrows it down — no mention of "${word}": ${text}`);
+  }
+  assert(!text.includes('<form'), 'the refusal page offered a form');
+});
+
+await check('P8 withdrawing it makes the link indistinguishable from one that never existed', async (page) => {
+  assert(invitation.url !== null, 'P4 did not produce a link, so there is nothing to withdraw');
+
+  await openInvitesTab(page);
+  const withdraw = page.getByRole('button', { name: /Einladung für grosstante zurückziehen/ });
+  await withdraw.waitFor({ state: 'visible', timeout: 5_000 });
+  await withdraw.click();
+
+  // `alertdialog`, not `dialog`: ConfirmDialog sets that role on purpose, because its body
+  // is a statement a screen-reader user needs read out on open rather than a form to fill
+  // in — and Playwright's role matching keeps the two apart.
+  const confirm = page.getByRole('alertdialog', { name: 'Einladung zurückziehen?' });
+  await confirm.waitFor({ state: 'visible', timeout: 5_000 });
+  const warning = await confirm.innerText();
+  // Said before it happens, because it cannot be undone.
+  assert(
+    warning.includes('sofort wertlos'),
+    `the confirmation does not say the link dies immediately: ${warning}`
+  );
+  await confirm.getByRole('button', { name: 'Zurückziehen' }).click();
+
+  await page
+    .locator('.gw-adm-notice', { hasText: 'zurückgezogen' })
+    .waitFor({ state: 'visible', timeout: 10_000 });
+
+  // The link is now dead — and dead in exactly the way an unknown token is dead. Two
+  // refusals that differ by a single byte are a way to ask which tokens once existed.
+  const revoked = await page.goto(invitation.url, { waitUntil: 'domcontentloaded' });
+  assert(revoked?.status() === 404, `a withdrawn link still answered ${revoked?.status()}`);
+  const revokedBody = await page.content();
+
+  const unknown = await page.goto(BASE + '/auth/invite/diesentokengibtesnicht', {
+    waitUntil: 'domcontentloaded'
+  });
+  assert(unknown?.status() === 404, `the control token answered ${unknown?.status()}`);
+  const unknownBody = await page.content();
+
+  assert(
+    revokedBody === unknownBody,
+    'a withdrawn invitation and an unknown one render differently, which tells them apart'
+  );
+});
+
+await check('P9 being refused a page is said in German, not in English', async (page) => {
+  // The screen an invited relative is most likely to meet that nobody designed for them:
+  // they follow a link — from a chat, from somebody's bookmark — to a page they were not
+  // granted. It said "You do not have access to this page." until this flow was walked.
+  //
+  // `/rundgang/nur-intern` is restricted to a group this fixture's identity is not in.
+  const response = await page.goto(BASE + '/rundgang/nur-intern', {
+    waitUntil: 'domcontentloaded'
+  });
+  assert(response?.status() === 403, `expected 403, got ${response?.status()}`);
+
+  const text = await page.locator('main').innerText();
+  assert(
+    text.includes('nicht für Sie freigegeben'),
+    `the refusal is not the German one: ${text}`
+  );
+  assert(text.includes('Zurück zur Startseite'), `the way back is not in German: ${text}`);
+  for (const phrase of ['You do not have access', 'Back to the start page', 'Something went wrong']) {
+    assert(!text.includes(phrase), `English survived on the refusal page (${phrase}): ${text}`);
+  }
+
+  // And it discloses nothing about the page beyond the address that was typed: not its
+  // title as the tree knows it, and none of its words.
+  const body = await page.content();
+  assert(
+    !body.includes('Sichtbarkeitsangabe'),
+    'a restricted page’s words reached a reader who may not read it'
+  );
+});
+
+await check('P10 the Protokoll names an invitation in German, not as a dotted verb', async (page) => {
+  // Half the audit log read as machine output — »Zugriff gewährt« on one line and
+  // `invite.create` on the next — because eleven of the twenty actions the backend records
+  // had no German word. The three halves of an invitation were three of them.
+  await page.goto(BASE + '/admin', { waitUntil: 'networkidle' });
+  const tab = page.getByRole('tab', { name: 'Protokoll' });
+  await tab.waitFor({ state: 'visible', timeout: 10_000 });
+  await tab.click();
+
+  const table = page.locator('.gw-adm-table').filter({ hasText: 'Zeitpunkt' });
+  await table.waitFor({ state: 'visible', timeout: 5_000 });
+  const text = await table.innerText();
+
+  assert(text.includes('Einladung erstellt'), `the log does not name the creation: ${text}`);
+  assert(text.includes('Einladung zurückgezogen'), `the log does not name the withdrawal: ${text}`);
+  // Anti-vacuity: the raw verbs are what the API sends, so their ABSENCE is the assertion.
+  assert(!text.includes('invite.create'), `a dotted English verb reached the German log: ${text}`);
+  assert(!text.includes('invite.revoke'), `a dotted English verb reached the German log: ${text}`);
+});
+
+
 await browser.close();
 
 // ---------------------------------------------------------------------------------------

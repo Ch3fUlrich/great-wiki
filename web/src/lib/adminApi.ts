@@ -134,7 +134,22 @@ export type Outcome<T> = { ok: true; value: T } | { ok: false; message: string }
  * It is separated from 5xx deliberately: "not reachable" and "answered with 500" send
  * somebody to different places.
  */
-export function describeStatus(status: number, clause: string): string {
+export function describeStatus(
+  status: number,
+  clause: string,
+  /**
+   * A sentence to use instead of the generic one for a particular status.
+   *
+   * Exists for exactly one reason: the generic sentences name an HTTP status and no
+   * remedy, which is right when the console cannot know what the status meant, and wrong
+   * when it can. `POST /api/admin/invites` has one 409 and one only — the username is
+   * taken — and "Der Server meldet einen Konflikt (409)" tells the person nothing they
+   * can act on. An override is a caller saying "I know what this status means here".
+   */
+  overrides?: Partial<Record<number, string>>
+): string {
+  const override = overrides?.[status];
+  if (override) return `${clause}: ${override}`;
   if (status === 0) return `${clause}: Die Verwaltungs-API ist nicht erreichbar.`;
   if (status === 401) return `${clause}: Nicht angemeldet (401). Bitte erneut anmelden.`;
   if (status === 403) return `${clause}: Dafür fehlen die Rechte (403).`;
@@ -162,7 +177,8 @@ async function request<T>(
   method: string,
   path: string,
   clause: string,
-  body?: unknown
+  body?: unknown,
+  overrides?: Partial<Record<number, string>>
 ): Promise<Outcome<T>> {
   let res: Response;
   try {
@@ -172,10 +188,10 @@ async function request<T>(
       body: body === undefined ? undefined : JSON.stringify(body)
     });
   } catch {
-    return { ok: false, message: describeStatus(0, clause) };
+    return { ok: false, message: describeStatus(0, clause, overrides) };
   }
 
-  if (!res.ok) return { ok: false, message: describeStatus(res.status, clause) };
+  if (!res.ok) return { ok: false, message: describeStatus(res.status, clause, overrides) };
 
   // 204 and an empty body are both legitimate for a DELETE.
   const text = await res.text();
@@ -243,6 +259,126 @@ export function listAudit(limit: number): Promise<Outcome<AuditPage>> {
 }
 
 // --- Writes ---------------------------------------------------------------
+
+/**
+ * One outstanding or finished invitation, as `GET /api/admin/invites` lists it.
+ *
+ * Mirrors `gw_store::InviteSummary`, and — like it — has **no token field and no digest
+ * field**, deliberately. The plaintext is never stored; the digest in a listing would be
+ * as good as the token to anybody who could also write to the database. The link exists
+ * exactly once, in the answer to the POST that created it, and nowhere else ever again.
+ */
+export interface Invite {
+  id: string;
+  username: string;
+  email: string | null;
+  invited_by: string | null;
+  /** Resolved now, and `null` when the inviter's account is gone — an invite outlives them. */
+  invited_by_name: string | null;
+  path: string | null;
+  permission: Permission | null;
+  /** A team slug, which is what the rest of this API speaks. */
+  team: string | null;
+  created_at: string;
+  expires_at: string;
+  state: InviteState;
+  accepted_principal_id: string | null;
+}
+
+export type InviteState = 'pending' | 'accepted' | 'revoked' | 'expired';
+
+/**
+ * How the link reached the person. Mirrors `gw_api::routes::admin::Delivery`, a tagged
+ * enum with one variant — the seam where `emailed` will appear once anything in this
+ * stack can send mail.
+ */
+export interface Delivery {
+  how: 'shown-once';
+  /**
+   * **Origin-relative.** The API refuses to build an absolute URL, because the only origin
+   * it could derive one from is the `Host` header and any client can set that — a link
+   * built from it could be made to point at somebody else's server and collect the token.
+   * The console is already on the right origin, so it prepends its own.
+   */
+  url: string;
+}
+
+/** What the POST answers: the invitation, and the one and only copy of its link. */
+export interface CreatedInvite extends Invite {
+  delivery: Delivery;
+}
+
+/**
+ * What an invitation is asked to carry.
+ *
+ * `path` + `permission` travel together or not at all, and a `team` puts the whole request
+ * behind instance administration rather than path administration — both rules are the
+ * API's (D-M2-2) and the panel mirrors them in what it offers, so that the interface never
+ * asks for something that is going to be refused.
+ */
+export interface NewInvite {
+  username: string;
+  email?: string;
+  path?: string;
+  permission?: Permission;
+  team?: string;
+}
+
+export function listInvites(): Promise<Outcome<Invite[]>> {
+  return request('GET', '/api/admin/invites', 'Die Einladungen konnten nicht geladen werden');
+}
+
+/**
+ * Create an invitation and hand back its link.
+ *
+ * The 409 is overridden because this endpoint has exactly one, it is not a race and it is
+ * not a server problem: somebody already holds that username. "Der Server meldet einen
+ * Konflikt (409)" would send a person to the logs for something they fix by typing a
+ * different word.
+ */
+export function createInvite(input: NewInvite): Promise<Outcome<CreatedInvite>> {
+  return request(
+    'POST',
+    '/api/admin/invites',
+    `Die Einladung für »${input.username}« konnte nicht erstellt werden`,
+    {
+      username: input.username,
+      email: input.email?.trim() ? input.email.trim() : undefined,
+      path: input.path || undefined,
+      permission: input.path ? input.permission : undefined,
+      team: input.team || undefined
+    },
+    {
+      409:
+        'Diesen Benutzernamen gibt es hier schon. Wählen Sie einen anderen, oder vergeben Sie ' +
+        'den Zugriff unter »Zugriff« an das vorhandene Konto.'
+    }
+  );
+}
+
+/**
+ * Withdraw an invitation that has not been redeemed.
+ *
+ * A 404 covers four things at once — no such invite, already spent, already withdrawn, or
+ * not this caller's to see — and the API answers it that way on purpose, so the console
+ * must not translate it into "gone" and leave somebody believing a live link is closed.
+ * An already-accepted invitation needs the ACCOUNT deactivating, which is a different tab,
+ * and the sentence says so.
+ */
+export function revokeInvite(id: string, username: string): Promise<Outcome<unknown>> {
+  return request(
+    'DELETE',
+    `/api/admin/invites/${encodeURIComponent(id)}`,
+    `Die Einladung für »${username}« konnte nicht zurückgezogen werden`,
+    undefined,
+    {
+      404:
+        'Sie ist nicht mehr offen — sie wurde bereits benutzt, bereits zurückgezogen, oder sie ' +
+        'ist abgelaufen. Ein bereits benutzter Link wird nicht zurückgezogen, sondern das ' +
+        'entstandene Konto unter »Personen« deaktiviert.'
+    }
+  );
+}
 
 export interface NewPrincipal {
   username: string;
@@ -348,6 +484,62 @@ export const PERMISSION_LABEL: Record<Permission, string> = {
   comment: 'Kommentieren',
   write: 'Schreiben',
   admin: 'Verwalten'
+};
+
+/**
+ * German for every action the audit log records.
+ *
+ * The API writes dotted English verbs — `acl.grant`, `invite.create` — and the Protokoll is
+ * read by the person who runs the wiki, in German, beside entries that were already
+ * translated. Eleven of the twenty the backend emits had no entry here and were rendered
+ * verbatim, so half the log read as machine output: »Zugriff gewährt« on one line and
+ * `attachment.attach` on the next.
+ *
+ * The panel still falls back to the raw name for anything unrecognised, deliberately — an
+ * action type nobody has translated yet must stay visible in the one screen that exists to
+ * make actions visible, rather than becoming "Unbekannt". That fallback is for a verb added
+ * tomorrow, not a substitute for translating the ones that exist.
+ *
+ * `Record<string, string>` and not a closed union: the key set lives in Rust, and a type
+ * that claimed to enumerate it here would be a claim this file cannot check.
+ */
+export const AUDIT_ACTION_LABEL: Record<string, string> = {
+  'acl.grant': 'Zugriff gewährt',
+  'acl.revoke': 'Zugriff entzogen',
+  'attachment.attach': 'Datei angehängt',
+  'attachment.detach': 'Datei entfernt',
+  // Not a person's action: the sweep that frees blobs no attachment points at any more.
+  'blobs.reclaim': 'Speicher freigegeben',
+  'document.purge': 'Seite endgültig gelöscht',
+  'document.restore': 'Seite wiederhergestellt',
+  'document.trash': 'Seite in den Papierkorb gelegt',
+  'document.visibility': 'Sichtbarkeit geändert',
+  // Three different facts about one link, and the log is where somebody checks which.
+  'invite.accept': 'Einladung angenommen',
+  'invite.create': 'Einladung erstellt',
+  'invite.revoke': 'Einladung zurückgezogen',
+  'principal.activate': 'Konto aktiviert',
+  'principal.create': 'Konto angelegt',
+  'principal.deactivate': 'Konto deaktiviert',
+  // The per-account instance-admin promotion of ADR 0006 — the fallback for an instance
+  // whose Authelia administrators are gone. »Verwaltung« is the word the access panel uses
+  // for the same reach, so the two screens agree.
+  'principal.demote': 'Verwaltungsrecht entzogen',
+  'principal.promote': 'Verwaltungsrecht erteilt',
+  'team.create': 'Team angelegt',
+  'team.member.add': 'Mitglied hinzugefügt',
+  'team.member.remove': 'Mitglied entfernt',
+  // Not emitted by anything today; kept because the sign-in path is the obvious next thing
+  // to audit and the words should not have to be invented under pressure.
+  'session.start': 'Anmeldung',
+  'session.end': 'Abmeldung'
+};
+
+export const INVITE_STATE_LABEL: Record<InviteState, string> = {
+  pending: 'Offen',
+  accepted: 'Angenommen',
+  revoked: 'Zurückgezogen',
+  expired: 'Abgelaufen'
 };
 
 export const SUBJECT_KIND_LABEL: Record<SubjectKind, string> = {

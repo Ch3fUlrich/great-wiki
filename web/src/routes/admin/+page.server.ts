@@ -5,6 +5,7 @@ import {
   type AdminPrincipal,
   type AuditPage,
   type GroupRole,
+  type Invite,
   type Loaded,
   type Team
 } from '$lib/adminApi';
@@ -53,7 +54,7 @@ export const load: PageServerLoad = async ({ fetch, request, url }) => {
   const requested = Number(url.searchParams.get('anzahl') ?? DEFAULT_LIMIT);
   const limit = ALLOWED_LIMITS.includes(requested) ? requested : DEFAULT_LIMIT;
 
-  const [tree, people, teams, roles, audit, acl] = await Promise.all([
+  const [tree, people, teams, roles, audit, invites, acl] = await Promise.all([
     loadOne<TreeNode[]>(fetch, cookie, '/api/tree', 'Der Seitenbaum konnte nicht geladen werden'),
     loadOne<AdminPrincipal[]>(
       fetch,
@@ -78,6 +79,15 @@ export const load: PageServerLoad = async ({ fetch, request, url }) => {
       `/api/admin/audit?limit=${limit}`,
       'Das Protokoll konnte nicht geladen werden'
     ),
+    // Filtered in the retriever, not here: an instance admin sees every invitation, a
+    // space admin sees the ones into subtrees they administer, and nobody sees a token —
+    // `InviteSummary` has no field that could carry one.
+    loadOne<Invite[]>(
+      fetch,
+      cookie,
+      '/api/admin/invites',
+      'Die Einladungen konnten nicht geladen werden'
+    ),
     selectedPath
       ? loadOne<AclView>(
           fetch,
@@ -101,6 +111,7 @@ export const load: PageServerLoad = async ({ fetch, request, url }) => {
     } satisfies Loaded<Team[]>,
     roles,
     audit,
+    invites,
     acl
   };
 };

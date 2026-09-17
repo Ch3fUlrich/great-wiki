@@ -1,9 +1,13 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import {
+  createInvite,
   describeStatus,
   formatInstant,
   parseSubjectKey,
+  AUDIT_ACTION_LABEL,
+  INVITE_STATE_LABEL,
   removeGrant,
+  revokeInvite,
   setPrincipalActive,
   subjectKey,
   subjectLabel,
@@ -141,5 +145,147 @@ describe('mutations', () => {
       expect(result.message).toContain('»Gast Konto« konnte nicht deaktiviert werden');
       expect(result.message).toContain('403');
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+//  Invitations.
+//
+//  The invite API existed before the console did: `POST /api/admin/invites`,
+//  `GET /api/admin/invites` and `DELETE /api/admin/invites/{id}` shipped with 42 Rust
+//  tests and no caller at all, which is how the flow went a milestone without anybody
+//  walking it. These are the client half.
+// ---------------------------------------------------------------------------------------
+
+describe('invitations', () => {
+  it('hands back the one and only copy of the link', async () => {
+    stubFetch(
+      new Response(
+        JSON.stringify({
+          id: 'i1',
+          username: 'oma',
+          email: null,
+          invited_by: 'p1',
+          invited_by_name: 'Sergej Maul',
+          path: '/familie',
+          permission: 'write',
+          team: null,
+          created_at: '2026-09-17 10:00:00',
+          expires_at: '2026-10-17 10:00:00',
+          state: 'pending',
+          accepted_principal_id: null,
+          delivery: { how: 'shown-once', url: '/auth/invite/tok' }
+        }),
+        { status: 201, headers: { 'content-type': 'application/json' } }
+      )
+    );
+    const result = await createInvite({ username: 'oma', path: '/familie', permission: 'write' });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.delivery.url).toBe('/auth/invite/tok');
+      expect(result.value.username).toBe('oma');
+    }
+  });
+
+  it('says in plain German that the username is taken rather than "Konflikt (409)"', async () => {
+    // The generic 409 sentence names an HTTP status and no remedy. This is the one
+    // conflict this endpoint can actually produce, and the remedy is one word long.
+    stubFetch(new Response('', { status: 409 }));
+    const result = await createInvite({ username: 'oma', path: '/familie', permission: 'read' });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.message).toContain('Benutzername');
+      expect(result.message).not.toContain('Konflikt');
+    }
+  });
+
+  it('reports a withdrawal that withdrew nothing as a failure', async () => {
+    // 404 is what the API answers for an invite that is already spent, already revoked,
+    // or not the caller's to see. An administrator must not be told the link is closed.
+    stubFetch(new Response('', { status: 404 }));
+    const result = await revokeInvite('i1', 'oma');
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.message).toContain('»oma«');
+  });
+
+  it('turns an unreachable API into a sentence, not an exception', async () => {
+    stubFetch(new TypeError('Failed to fetch'));
+    const result = await revokeInvite('i1', 'oma');
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.message).toContain('nicht erreichbar');
+  });
+
+  it('gives every invite state a German word', () => {
+    expect(INVITE_STATE_LABEL.pending).toBe('Offen');
+    expect(INVITE_STATE_LABEL.accepted).toBe('Angenommen');
+    expect(INVITE_STATE_LABEL.revoked).toBe('Zurückgezogen');
+    expect(INVITE_STATE_LABEL.expired).toBe('Abgelaufen');
+  });
+});
+
+describe('the audit log vocabulary', () => {
+  /**
+   * Every action name `gw-store` and `gw-api` actually write, as of this walkthrough.
+   *
+   * Listed here rather than derived, because there is no way for a TypeScript test to read
+   * the Rust source — so this is the seam, and it is a deliberate one: a new audited action
+   * has to be added in two places, and this test is what says so out loud when only one of
+   * them was done. Regenerate with:
+   *
+   *   grep -rhoE '"(acl|document|team|principal|invite|attachment|blobs)\.[a-z._]+"' crates/ | sort -u
+   */
+  const EMITTED = [
+    'acl.grant',
+    'acl.revoke',
+    'attachment.attach',
+    'attachment.detach',
+    'blobs.reclaim',
+    'document.purge',
+    'document.restore',
+    'document.trash',
+    'document.visibility',
+    'invite.accept',
+    'invite.create',
+    'invite.revoke',
+    'principal.activate',
+    'principal.create',
+    'principal.deactivate',
+    'principal.demote',
+    'principal.promote',
+    'team.create',
+    'team.member.add',
+    'team.member.remove'
+  ];
+
+  it('has a German word for every action the backend records', () => {
+    // Eleven of these had none, so the German console showed `invite.create`,
+    // `attachment.attach` and `document.trash` verbatim beside »Zugriff gewährt« — found
+    // by reading the Protokoll after walking an invitation through it. The panel falls
+    // back to the raw name on purpose (a new action must not become invisible), and that
+    // fallback had quietly become the normal case for half the log.
+    const missing = EMITTED.filter((action) => !(action in AUDIT_ACTION_LABEL));
+    expect(missing).toEqual([]);
+  });
+
+  it('says what happened, not which endpoint was called', () => {
+    // A person reading the Protokoll is asking "what was done to my wiki", not "which
+    // handler ran". No label may be the dotted verb with a space in it.
+    for (const [action, label] of Object.entries(AUDIT_ACTION_LABEL)) {
+      expect(label).not.toContain('.');
+      expect(label.toLowerCase()).not.toBe(action.replace('.', ' '));
+      expect(label).toMatch(/[a-zäöüß]/);
+    }
+  });
+
+  it('names the three halves of an invitation apart from one another', () => {
+    // Created, accepted and withdrawn are three different facts about one link, and the
+    // log is where somebody checks which of them happened.
+    const words = [
+      AUDIT_ACTION_LABEL['invite.create'],
+      AUDIT_ACTION_LABEL['invite.accept'],
+      AUDIT_ACTION_LABEL['invite.revoke']
+    ];
+    expect(new Set(words).size).toBe(3);
+    for (const word of words) expect(word).toMatch(/Einladung/);
   });
 });

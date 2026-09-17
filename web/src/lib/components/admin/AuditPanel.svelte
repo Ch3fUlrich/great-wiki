@@ -14,6 +14,7 @@
   import Notice from './Notice.svelte';
   import type { Option } from './ComboField.svelte';
   import {
+    AUDIT_ACTION_LABEL,
     MAX_AUDIT_LIMIT,
     formatInstant,
     type AdminPrincipal,
@@ -30,25 +31,6 @@
 
   let { page, error, principals, limit, onLimitChange }: Props = $props();
 
-  /**
-   * German for the actions the API is known to record. Anything unrecognised is shown
-   * verbatim rather than as "Unbekannt" — a raw `acl.something` is still information,
-   * and hiding it would make a new action type invisible in the one place that exists to
-   * make actions visible.
-   */
-  const ACTION_LABEL: Record<string, string> = {
-    'acl.grant': 'Zugriff gewährt',
-    'acl.revoke': 'Zugriff entzogen',
-    'document.visibility': 'Sichtbarkeit geändert',
-    'team.create': 'Team angelegt',
-    'team.member.add': 'Mitglied hinzugefügt',
-    'team.member.remove': 'Mitglied entfernt',
-    'principal.create': 'Konto angelegt',
-    'principal.activate': 'Konto aktiviert',
-    'principal.deactivate': 'Konto deaktiviert',
-    'session.start': 'Anmeldung',
-    'session.end': 'Abmeldung'
-  };
 
   /**
    * The log stores a principal id and nothing else, so names are resolved here.
@@ -118,7 +100,7 @@
               <th scope="row" class="gw-adm-mono">{formatInstant(entry.at)}</th>
               <td>{who(entry.principal_id)}</td>
               <td>
-                {ACTION_LABEL[entry.action] ?? entry.action}
+                {AUDIT_ACTION_LABEL[entry.action] ?? entry.action}
                 <!-- `target` is what the action names — a team slug, a username, a
                      subject. It sits with the verb rather than in the path column,
                      because it is usually not a path. -->

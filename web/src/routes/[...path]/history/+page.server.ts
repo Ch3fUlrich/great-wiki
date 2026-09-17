@@ -7,6 +7,7 @@ import {
   type RevisionSource,
   type RevisionSummary
 } from '$lib/history';
+import { GERMAN_REFUSALS } from '$lib/refusals';
 import type { PageServerLoad } from './$types';
 
 /**
@@ -55,8 +56,11 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
     `/api/documents/${params.path}`,
     cookie
   );
-  if (status === 403) error(403, 'Diese Seite darfst du nicht lesen, ihren Verlauf also auch nicht.');
-  if (!doc) error(404, 'Diese Seite gibt es nicht.');
+  // »Sie«, like every other screen an invited reader meets. This loader was German before
+  // the page loader beside it was, but in the other register, and a wiki that switches
+  // person on its refusals reads as two different products.
+  if (status === 403) error(403, GERMAN_REFUSALS.forbiddenHistory);
+  if (!doc) error(404, GERMAN_REFUSALS.missing);
 
   const { status: listStatus, data: list } = await apiGet<{ revisions: RevisionSummary[] }>(
     fetch,

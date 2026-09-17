@@ -19,20 +19,26 @@
   import AccessPanel from '$lib/components/admin/AccessPanel.svelte';
   import AuditPanel from '$lib/components/admin/AuditPanel.svelte';
   import DocumentTree from '$lib/components/admin/DocumentTree.svelte';
+  import InvitesPanel from '$lib/components/admin/InvitesPanel.svelte';
   import Notice from '$lib/components/admin/Notice.svelte';
   import PeoplePanel from '$lib/components/admin/PeoplePanel.svelte';
   import TeamsPanel from '$lib/components/admin/TeamsPanel.svelte';
   import {
     addGrant,
     addTeamMember,
+    createInvite,
     createPrincipal,
     createTeam,
     removeGrant,
     removeTeamMember,
+    revokeInvite,
     setPrincipalActive,
     setVisibility,
     subjectLabel,
     VISIBILITY_LABEL,
+    type CreatedInvite,
+    type Invite,
+    type NewInvite,
     type NewPrincipal,
     type Outcome,
     type Permission,
@@ -184,6 +190,65 @@
       `${who?.display_name ?? principalId} gehört nicht mehr zu »${slug}«.`
     );
   }
+
+  // --- Einladungen --------------------------------------------------------
+  //
+  // The created invitation is held HERE and not in the panel, because creating one calls
+  // `invalidateAll` and the link it carries exists exactly once — the plaintext token is
+  // never stored, so if this state were lost with a re-rendered child, the invitation
+  // would be dead and would have to be made again. Page state outlives the reload.
+  let createdInvite = $state<CreatedInvite | null>(null);
+
+  /**
+   * Whether this administrator may attach a team.
+   *
+   * `GET /api/admin/teams` is gated by `instance_admin`, so a null team list IS the
+   * answer: a space admin cannot read teams and, by D-M2-2, cannot hand one out either —
+   * a team reaches wherever it has been granted, instance-wide, which is reach they do
+   * not have and cannot see. Deriving it from the data already loaded beats asking the
+   * server a second question that could disagree with the first.
+   */
+  const canInviteTeam = $derived(data.teams.data !== null);
+
+  /**
+   * Create one, and keep the link.
+   *
+   * Deliberately NOT routed through `run`: that helper reports a boolean, and the whole
+   * value of this call is in its body. The reload still happens, and the outcome sentence
+   * is still written the same way.
+   */
+  async function invite(input: NewInvite): Promise<CreatedInvite | null> {
+    if (busy) return null;
+    busy = true;
+    notice = null;
+    try {
+      const outcome = await createInvite(input);
+      if (!outcome.ok) {
+        notice = { tone: 'fail', text: outcome.message };
+        return null;
+      }
+      createdInvite = outcome.value;
+      notice = {
+        tone: 'ok',
+        text: `Einladung für »${input.username}« erstellt. Der Link steht unten — er wird nur einmal gezeigt.`
+      };
+      await invalidateAll();
+      return outcome.value;
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function withdraw(invitation: Invite) {
+    const done = await run(
+      () => revokeInvite(invitation.id, invitation.username),
+      `Die Einladung für »${invitation.username}« ist zurückgezogen; der Link ist wertlos.`
+    );
+    // The link on screen belongs to the invitation that was just withdrawn — showing it
+    // any longer would be offering a credential that no longer works.
+    if (done && createdInvite?.id === invitation.id) createdInvite = null;
+    return done;
+  }
 </script>
 
 <svelte:head><title>Verwaltung — great-wiki</title></svelte:head>
@@ -208,6 +273,7 @@
       <Tabs.Trigger value="zugriff" class="gw-adm-tab">Zugriff</Tabs.Trigger>
       <Tabs.Trigger value="personen" class="gw-adm-tab">Personen</Tabs.Trigger>
       <Tabs.Trigger value="teams" class="gw-adm-tab">Teams</Tabs.Trigger>
+      <Tabs.Trigger value="einladungen" class="gw-adm-tab">Einladungen</Tabs.Trigger>
       <Tabs.Trigger value="protokoll" class="gw-adm-tab">Protokoll</Tabs.Trigger>
       <Tabs.Indicator class="gw-adm-tabindicator" />
     </Tabs.List>
@@ -265,6 +331,21 @@
         onCreateTeam={newTeam}
         onAddMember={addMember}
         onRemoveMember={removeMember}
+      />
+    </Tabs.Content>
+
+    <Tabs.Content value="einladungen" class="gw-adm-tabpanel">
+      <InvitesPanel
+        invites={data.invites.data}
+        tree={data.tree.data}
+        teams={data.teams.data}
+        error={data.invites.error}
+        created={createdInvite}
+        {canInviteTeam}
+        {busy}
+        onCreate={invite}
+        onRevoke={withdraw}
+        onDismissCreated={() => (createdInvite = null)}
       />
     </Tabs.Content>
 

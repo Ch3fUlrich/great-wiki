@@ -30,6 +30,7 @@ import {
   type DocumentTopicsResponse,
   type Topic
 } from '$lib/topics';
+import { GERMAN_REFUSALS } from '$lib/refusals';
 import type { Actions, PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
@@ -40,8 +41,8 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
     cookie
   );
 
-  if (status === 403) error(403, 'You do not have access to this page.');
-  if (!data) error(404, 'Page not found.');
+  if (status === 403) error(403, GERMAN_REFUSALS.forbidden);
+  if (!data) error(404, GERMAN_REFUSALS.missing);
 
   const body = parseBody(data);
 

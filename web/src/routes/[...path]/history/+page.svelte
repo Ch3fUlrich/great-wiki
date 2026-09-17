@@ -142,7 +142,7 @@
         {/if}
         wird als neue Fassung veröffentlicht. Der aktuelle Stand bleibt als eigene Fassung im
         Verlauf erhalten — es wird nichts gelöscht, und das Wiederherstellen lässt sich selbst
-        wieder rückgängig machen, indem du die andere Fassung wiederherstellst.
+        wieder rückgängig machen, indem Sie die andere Fassung wiederherstellen.
       </p>
       {#if restoreError}
         <p class="notice notice--error" role="alert">{restoreError}</p>
