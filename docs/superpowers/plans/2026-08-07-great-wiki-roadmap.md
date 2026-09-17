@@ -177,3 +177,25 @@ passage goes, the same rule a detached task follows — *and* a page carries a *
 own** for anything that is not about one sentence. Rejected: page-level only ("this sentence
 is wrong" then has to say which sentence in words) and passage-only (a question about the
 page as a whole has nowhere to sit). Two surfaces, one comment model underneath.
+
+### M6, three more decisions (2026-09-17)
+
+**Anyone who may read a page may comment on it.** Reading is enough to ask a question or flag
+an error — which is exactly what a family member with read access needs to say "this dosage
+looks wrong" without being an editor. Rejected: writers only, which leaves a reader who spots
+a mistake with no way to say so inside the wiki. Consequence: a comment is a disclosure
+surface like everything else — a thread reveals that a page exists and who reads it, so it is
+filtered through the same accessor as the page, per document.
+
+**Notification is in the wiki, plus a daily email digest.** A notifications view and a header
+badge; nothing leaves the site except one summary a day. Rejected: in-wiki only (you hear
+nothing until you open it) and one mail per event (a busy thread becomes a busy inbox).
+**Prerequisite to verify before building it:** an outbound mail path from the API host on
+cloud.vm — nothing in this stack sends mail today, and the digest is the first thing that
+would. Find out what the homelab already has (Authelia notifies somehow) before choosing a
+library.
+
+**A thread is resolved, kept, and collapsed.** Anyone in it may mark it resolved; it folds
+out of the way and stays in the page's history. Rejected: hiding it into an archive (one more
+place to look) and author deletion (the only thing in this wiki that would vanish without
+trace — every other surface here appends, detaches or trashes).
