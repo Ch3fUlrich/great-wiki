@@ -106,8 +106,11 @@ Three things about this that are load-bearing:
 
 ## Deploying a new version
 
-1. Build and push **all three** images at the same short SHA:
-   `harbor.ohje.ooguy.com/great-wiki/{gw-api,gw-web,gw-caddy}:<sha>`
+1. `./scripts/build-images.sh` — builds and pushes **all three** images at HEAD's short SHA and
+   then proves each is in Harbor with `docker manifest inspect`. Use it rather than a loop of
+   your own: a `docker push … | tail` reports tail's exit code, and a deploy once failed on a
+   pull because three pushes had been silently refused with `unauthorized` (the login on the
+   box had expired) while the loop printed success.
 2. Bump all three `image:` lines in `Server/server/cloud/great-wiki/docker-compose.yml`
    and push that repo — Semaphore pulls **origin/improve** from GitHub.
 3. Launch Semaphore template 36 with `image_repos` listing all three.
