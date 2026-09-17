@@ -168,3 +168,12 @@ is shared with any assistant built later, so nothing is wasted by deferring the 
 Searching *inside* attachments is explicitly not in this — it needs sandboxed extraction in a
 background job, which the roadmap already flags as an attack surface, and it can be added to
 a working search rather than delaying one.
+
+### M6 comments attach to both a passage and the page (2026-09-17)
+
+Asked ahead of building it. A comment may anchor to a **selected passage** — the anchor
+follows the text as the page is edited, and is marked orphaned rather than deleted when the
+passage goes, the same rule a detached task follows — *and* a page carries a **thread of its
+own** for anything that is not about one sentence. Rejected: page-level only ("this sentence
+is wrong" then has to say which sentence in words) and passage-only (a question about the
+page as a whole has nowhere to sit). Two surfaces, one comment model underneath.

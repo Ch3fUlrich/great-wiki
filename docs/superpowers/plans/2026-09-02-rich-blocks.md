@@ -1111,3 +1111,35 @@ Two of the six remain, and both need measurement rather than a decision:
   from what the corpus actually contains, with headroom).
 - Whether the live database holds any link mark whose `href` begins `dok:`. The corpora are
   clean, but production could not be inspected from the session that wrote this.
+
+## Transclusion, decided (2026-09-17)
+
+The plan's transclusion section was written "if it is ever built". The owner has now asked for
+it, after identity links, and settled the two questions that size it.
+
+### D-27: A whole page, or one section of it
+
+A reference may embed a page, or only the part beneath one of its headings. Rejected: whole
+page only — a medical reference reuses a dosage table or a checklist, not the page it lives
+on, and "split it into its own page first" makes the wiki's structure answer to a rendering
+limitation.
+
+**Consequence, and it is the hard part:** a section needs an anchor that survives edits. A
+heading's text can change; its position certainly does. The reference must therefore name
+the heading by something stabler than either — the same problem a task block solved with an
+id minted on publish, and the same answer is available: a heading carries a stable `id`
+attribute the moment it is first transcluded, minted server-side, and the four mirrors of
+`BlockKind` are unaffected because `Heading` already exists. What changes is an *attribute*,
+which the editor must declare or it will strip it (the `taskItem.id` lesson, verbatim).
+
+### D-28: Framed, with the source named
+
+Embedded content is visibly a quotation from elsewhere: a subtle frame, and the source page's
+title as a link to it. Rejected: seamless — it reads best, and a reader then cannot tell
+which words are this page's own, and an edit made "here" lands silently on a different page
+under a different ACL. Honesty about provenance is worth a border.
+
+The permission rule from the section above stands unchanged: the embedded page is filtered
+through the same accessor as any read, per document; an unreadable target renders as the
+author's reference text and discloses neither title nor existence; depth is one; a cycle is
+stopped at render and named.
