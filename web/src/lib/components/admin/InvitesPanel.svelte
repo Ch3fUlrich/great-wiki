@@ -24,6 +24,20 @@
   for something that is going to be refused: a path grant is bounded by its path and needs
   only path administration, but a team reaches wherever it has been granted, instance-wide,
   so the team field appears only for an instance administrator.
+
+  THE E-MAIL FIELD IS REQUIRED, AND IT IS NOT A NOTE (ADR 0021)
+
+  It is the merge key. When somebody later signs in through Authelia whose address that
+  provider asserts as *verified* matches this one, they are the same principal — same
+  grants, same history, one credential each way and no second password to lose. An
+  invitation with no address can never become that person, and nothing fixes it afterwards
+  but withdrawing the link and making another; so this asks for one, refuses to submit
+  without it, and says on screen what it is for rather than leaving »warum ist das grau?«
+  to be worked out.
+
+  The owner sets it, never the invitee: the acceptance page asks for a display name and a
+  password and nothing else. An invitee who could nominate their own merge key could
+  nominate somebody else's.
 -->
 <script lang="ts">
   import Dialog from '$lib/components/Dialog.svelte';
@@ -34,7 +48,10 @@
   import SelectField from './SelectField.svelte';
   import {
     formatInstant,
+    INVITE_EMAIL_ERROR,
+    INVITE_EMAIL_HELP,
     INVITE_STATE_LABEL,
+    isMatchableEmail,
     PERMISSION_LABEL,
     type CreatedInvite,
     type Invite,
@@ -117,20 +134,24 @@
   let touched = $state(false);
 
   const usernameBad = $derived(touched && username.trim().length === 0);
+
+  const emailBad = $derived(touched && !isMatchableEmail(email));
   /**
    * D-M2-20: an invitation carrying neither a page nor a team creates an account that can
    * sign in and see nothing. The API refuses it; the button is disabled rather than
    * letting somebody submit into that refusal.
    */
   const carriesNothing = $derived(path === NO_PATH && team === NO_TEAM);
-  const complete = $derived(username.trim().length > 0 && !carriesNothing);
+  const complete = $derived(
+    username.trim().length > 0 && isMatchableEmail(email) && !carriesNothing
+  );
 
   async function submit(event: SubmitEvent) {
     event.preventDefault();
     if (!complete) return;
     const made = await onCreate({
       username: username.trim(),
-      email: email.trim() || undefined,
+      email: email.trim(),
       path: path === NO_PATH ? undefined : path,
       permission: path === NO_PATH ? undefined : permission,
       team: team === NO_TEAM ? undefined : team
@@ -228,13 +249,19 @@
               <Field.ErrorText class="gw-adm-error">Ein Benutzername wird gebraucht.</Field.ErrorText>
             </Field.Root>
 
-            <Field.Root class="gw-adm-field">
-              <Field.Label class="gw-adm-field-label">E‑Mail (optional)</Field.Label>
-              <Field.Input class="gw-adm-input" type="email" bind:value={email} autocomplete="off" />
-              <Field.HelperText class="gw-adm-help">
-                Nur zur Wiedererkennung. great-wiki verschickt keine Post — den Link geben
-                Sie selbst weiter.
-              </Field.HelperText>
+            <Field.Root class="gw-adm-field" invalid={emailBad} required>
+              <Field.Label class="gw-adm-field-label">
+                E‑Mail <Field.RequiredIndicator>*</Field.RequiredIndicator>
+              </Field.Label>
+              <Field.Input
+                class="gw-adm-input"
+                type="email"
+                bind:value={email}
+                autocomplete="off"
+                oninput={() => (touched = true)}
+              />
+              <Field.HelperText class="gw-adm-help">{INVITE_EMAIL_HELP}</Field.HelperText>
+              <Field.ErrorText class="gw-adm-error">{INVITE_EMAIL_ERROR}</Field.ErrorText>
             </Field.Root>
 
             <div class="gw-adm-field">

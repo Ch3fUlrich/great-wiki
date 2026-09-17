@@ -15,6 +15,14 @@ pub struct Principal {
     pub id: String,
     pub kind: PrincipalKind,
     pub username: String,
+    /// The Authelia `preferred_username` this account answers to, or `None` when it has
+    /// never signed in through Authelia.
+    ///
+    /// A SECOND handle rather than a replacement for `username`: a merged account was
+    /// invited as `oma` and is `erika.mueller` in the homelab directory, and both strings
+    /// are true at once. `username` stays what every screen shows and what every grant
+    /// was written against; this is only ever a lookup key for the sign-in.
+    pub oidc_username: Option<String>,
     pub display_name: String,
     pub email: Option<String>,
     /// From the OIDC `groups` claim. Empty for local accounts.
@@ -32,6 +40,7 @@ impl Principal {
             id: String::new(),
             kind: PrincipalKind::Local,
             username: String::new(),
+            oidc_username: None,
             display_name: "Anonymous".into(),
             email: None,
             groups: Vec::new(),
@@ -50,6 +59,7 @@ impl Principal {
             id: format!("test-{username}"),
             kind: PrincipalKind::Local,
             username: username.into(),
+            oidc_username: None,
             display_name: username.into(),
             email: None,
             groups: groups.iter().map(|s| s.to_string()).collect(),

@@ -34,6 +34,8 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 
+use gw_store::OidcSignIn;
+
 use super::session::{
     cleared_cookie, flow_cookie, found, hash_token, new_session_token, session_cookie,
 };
@@ -135,6 +137,10 @@ pub struct IdClaims {
     pub preferred_username: Option<String>,
     pub name: Option<String>,
     pub email: Option<String>,
+    /// Whether the provider vouches for that address. `None` means the claim was absent,
+    /// which is NOT the same as `Some(false)` to read but is treated identically: both
+    /// mean nobody has asserted it, and only an assertion may merge an identity.
+    pub email_verified: Option<bool>,
     /// `None` means the token carried no `groups` claim at all, which is a different thing
     /// from carrying an empty one — the first sends us to the userinfo endpoint, the
     /// second means this person is genuinely in no groups.
@@ -147,6 +153,7 @@ struct UserInfo {
     preferred_username: Option<String>,
     name: Option<String>,
     email: Option<String>,
+    email_verified: Option<bool>,
     groups: Option<Vec<String>>,
 }
 
@@ -156,7 +163,55 @@ pub struct VerifiedIdentity {
     pub username: String,
     pub display_name: String,
     pub email: Option<String>,
+    /// Carried NEXT TO the address rather than folded into it, so that the address is
+    /// still stored and still shown on a sign-in that may not merge. The two travel
+    /// together from whichever source supplied them — see [`merge_key`].
+    pub email_verified: bool,
     pub groups: Vec<String>,
+}
+
+/// Why a sign-in carries no merge key. Logged, never returned: which check declined to
+/// merge is an operator's business and an oracle for anybody else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoMergeKey {
+    /// The provider asserted no address at all.
+    NoAddress,
+    /// It asserted one and did not vouch for it. The claim was `false`, or absent.
+    NotVerified,
+    /// It vouched for something this code will not key on — no `@`, two of them, or a
+    /// character outside printable ASCII. See `gw_store::canonical_email`.
+    Unmatchable,
+}
+
+impl std::fmt::Display for NoMergeKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoAddress => "the provider asserted no email address",
+            Self::NotVerified => "the email address is not asserted as verified",
+            Self::Unmatchable => "the verified email address is not one this wiki can match on",
+        })
+    }
+}
+
+/// The merge key for a sign-in, or why there is none.
+///
+/// **The whole of ADR 0021's first rule is this function.** An identity merges on the
+/// address the provider asserts as `email_verified: true`, and on nothing else: not on an
+/// address somebody typed into a form here, not on an unverified claim, not on
+/// `preferred_username`, and not on `sub`. Without the verified flag, an Authelia account
+/// whose holder can set their own address is a way to claim anybody's grants by writing
+/// their address into a profile field.
+///
+/// Free of I/O and of the store, so every one of its answers is a unit test below.
+pub fn merge_key(email: Option<&str>, email_verified: bool) -> Result<String, NoMergeKey> {
+    let email = email
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .ok_or(NoMergeKey::NoAddress)?;
+    if !email_verified {
+        return Err(NoMergeKey::NotVerified);
+    }
+    gw_store::canonical_email(email).ok_or(NoMergeKey::Unmatchable)
 }
 
 /// The three secrets one login attempt is built on.
@@ -377,6 +432,10 @@ impl OidcClient {
         let mut username = claims.preferred_username;
         let mut display_name = claims.name;
         let mut email = claims.email;
+        // Bound to the address it describes, and only meaningful with it: taking
+        // `email_verified` from the id token while the ADDRESS came from userinfo would
+        // let one source vouch for another source's value.
+        let mut email_verified = claims.email_verified.unwrap_or(false);
         let mut groups = claims.groups;
 
         if username.is_none() || groups.is_none() {
@@ -398,7 +457,10 @@ impl OidcClient {
             }
             username = username.or(info.preferred_username);
             display_name = display_name.or(info.name);
-            email = email.or(info.email);
+            if email.is_none() {
+                email = info.email;
+                email_verified = info.email_verified.unwrap_or(false);
+            }
             groups = groups.or(info.groups);
         }
 
@@ -414,6 +476,7 @@ impl OidcClient {
             display_name: display_name.unwrap_or_else(|| username.clone()),
             username,
             email,
+            email_verified,
             groups: groups.unwrap_or_default(),
         })
     }
@@ -604,18 +667,68 @@ async fn complete_sign_in(
         .resolve_identity(claims, tokens.access_token.as_deref())
         .await?;
 
-    // Groups are REPLACED here, never merged — `upsert_oidc_principal` does that, and it
+    // ADR 0021. The key is derived here, from the verified claims and nothing else, and
+    // an absent one is the OLD behaviour in full: a principal of this account's own, with
+    // no access, exactly as before this decision existed.
+    //
+    // The reason is LOGGED on every sign-in that does not merge. A relative who was
+    // invited, signs in through Authelia and lands in an account with nothing in it is
+    // going to say "it does not work", and without this line the owner has no way to tell
+    // "Authelia does not vouch for that address" from "the address does not match".
+    let key = merge_key(identity.email.as_deref(), identity.email_verified);
+    if let Err(reason) = &key {
+        tracing::info!(
+            username = %identity.username,
+            %reason,
+            "sign-in will not be merged with an existing account"
+        );
+    }
+
+    // Groups are REPLACED here, never merged — `upsert_oidc_identity` does that, and it
     // is why losing a group in Authelia takes effect at the next sign-in.
-    let principal = state
+    let outcome = state
         .store
-        .upsert_oidc_principal(
+        .upsert_oidc_identity(
             &identity.username,
             &identity.display_name,
             identity.email.as_deref(),
+            key.as_deref().ok(),
             &identity.groups,
         )
         .await
         .map_err(OidcError::Internal)?;
+
+    let principal = match outcome {
+        OidcSignIn::Recognised(principal) | OidcSignIn::Created(principal) => principal,
+        OidcSignIn::Merged {
+            principal,
+            username,
+        } => {
+            tracing::info!(
+                oidc_username = %identity.username,
+                username = %username,
+                "sign-in merged into the account that was invited"
+            );
+            *principal
+        }
+        // Both refusals are 403 and neither says which one it was. `UsernameHeldByAnother`
+        // in particular used to be a silent TAKEOVER of the account that holds the name,
+        // so refusing it is the fix; a caller learning which of these applied would learn
+        // whether a given username exists here.
+        OidcSignIn::UsernameHeldByAnother => {
+            return Err(rejected(format!(
+                "`{}` is already somebody else's username here and no verified address \
+                 matched",
+                identity.username
+            )))
+        }
+        OidcSignIn::AmbiguousEmail => {
+            return Err(rejected(
+                "more than one account carries that address; an administrator has to \
+                 resolve it before it can be signed in to",
+            ))
+        }
+    };
 
     let token = new_session_token();
     state
@@ -645,7 +758,9 @@ fn flow_value(jar: &CookieJar, name: &str) -> Result<String, OidcError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{algorithm_for, code_challenge_s256, random_secret, OidcConfig};
+    use super::{
+        algorithm_for, code_challenge_s256, merge_key, random_secret, NoMergeKey, OidcConfig,
+    };
     use jsonwebtoken::jwk::{
         AlgorithmParameters, CommonParameters, Jwk, KeyAlgorithm, OctetKeyParameters, OctetKeyType,
         RSAKeyParameters, RSAKeyType,
@@ -748,5 +863,67 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("great-wiki"));
+    }
+    // ---------------------------------------------------------------------------------
+    // ADR 0021: what may become a merge key, and what may not.
+    // ---------------------------------------------------------------------------------
+
+    #[test]
+    fn only_an_address_the_provider_vouches_for_becomes_a_key() {
+        assert_eq!(
+            merge_key(Some("Oma@Example.de "), true),
+            Ok("oma@example.de".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unverified_address_is_never_a_key() {
+        // The one that matters. Without `email_verified`, anybody who can edit their own
+        // profile in Authelia types somebody else's address into it and signs in as them.
+        assert_eq!(
+            merge_key(Some("oma@example.de"), false),
+            Err(NoMergeKey::NotVerified)
+        );
+    }
+
+    #[test]
+    fn a_missing_address_is_never_a_key() {
+        assert_eq!(merge_key(None, true), Err(NoMergeKey::NoAddress));
+        assert_eq!(merge_key(Some(""), true), Err(NoMergeKey::NoAddress));
+        assert_eq!(merge_key(Some("   "), true), Err(NoMergeKey::NoAddress));
+        // Verified-but-absent is still absent: an empty string vouched for is nothing
+        // vouched for, and must not become a key that every address-less account shares.
+        assert_eq!(merge_key(None, false), Err(NoMergeKey::NoAddress));
+    }
+
+    #[test]
+    fn a_verified_address_this_wiki_cannot_match_is_refused_rather_than_guessed_at() {
+        for bad in ["oma", "oma@", "@example.de", "a@b@c.de", "oma@exämple.de"] {
+            assert_eq!(
+                merge_key(Some(bad), true),
+                Err(NoMergeKey::Unmatchable),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_refusal_says_why_in_words_an_operator_can_act_on() {
+        // These strings are the only thing a sign-in that quietly did not merge leaves
+        // behind, so an empty or identical one would be the whole diagnosis missing.
+        let reasons: Vec<String> = [
+            NoMergeKey::NoAddress,
+            NoMergeKey::NotVerified,
+            NoMergeKey::Unmatchable,
+        ]
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
+        assert_eq!(
+            reasons.iter().collect::<HashSet<_>>().len(),
+            3,
+            "two reasons read the same: {reasons:?}"
+        );
+        assert!(reasons.iter().all(|r| r.len() > 20), "{reasons:?}");
     }
 }

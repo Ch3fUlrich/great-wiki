@@ -5,7 +5,9 @@ import {
   formatInstant,
   parseSubjectKey,
   AUDIT_ACTION_LABEL,
+  INVITE_EMAIL_HELP,
   INVITE_STATE_LABEL,
+  isMatchableEmail,
   removeGrant,
   revokeInvite,
   setPrincipalActive,
@@ -19,6 +21,7 @@ const principals: AdminPrincipal[] = [
   {
     id: 'p1',
     kind: 'local',
+    oidc_username: null,
     username: 'gast',
     display_name: 'Gast Konto',
     email: null,
@@ -179,7 +182,12 @@ describe('invitations', () => {
         { status: 201, headers: { 'content-type': 'application/json' } }
       )
     );
-    const result = await createInvite({ username: 'oma', path: '/familie', permission: 'write' });
+    const result = await createInvite({
+      username: 'oma',
+      email: 'oma@example.de',
+      path: '/familie',
+      permission: 'write'
+    });
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.value.delivery.url).toBe('/auth/invite/tok');
@@ -187,16 +195,62 @@ describe('invitations', () => {
     }
   });
 
-  it('says in plain German that the username is taken rather than "Konflikt (409)"', async () => {
-    // The generic 409 sentence names an HTTP status and no remedy. This is the one
-    // conflict this endpoint can actually produce, and the remedy is one word long.
+  it('says in plain German what a 409 means rather than "Konflikt (409)"', async () => {
+    // The generic 409 sentence names an HTTP status and no remedy. This endpoint has two
+    // conflicts — the username, and (since ADR 0021) the e-mail address — and they share
+    // one remedy: give the account that already exists access, rather than inviting the
+    // same person a second time.
     stubFetch(new Response('', { status: 409 }));
-    const result = await createInvite({ username: 'oma', path: '/familie', permission: 'read' });
+    const result = await createInvite({
+      username: 'oma',
+      email: 'oma@example.de',
+      path: '/familie',
+      permission: 'read'
+    });
     expect(result.ok).toBe(false);
     if (!result.ok) {
-      expect(result.message).toContain('Benutzername');
+      expect(result.message).toContain('Benutzernamen');
+      expect(result.message).toContain('E-Mail-Adresse');
+      expect(result.message).toContain('Zugriff');
       expect(result.message).not.toContain('Konflikt');
     }
+  });
+
+  it('explains a refused address rather than saying "Die Eingabe wurde abgelehnt (400)"', async () => {
+    // The address is the merge key, not a note, so "abgelehnt" with no reason leaves
+    // somebody guessing at a field the whole decision rests on.
+    stubFetch(new Response('', { status: 400 }));
+    const result = await createInvite({
+      username: 'oma',
+      email: 'oma',
+      path: '/familie',
+      permission: 'read'
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.message).toContain('name@beispiel.de');
+      expect(result.message).not.toContain('(400)');
+    }
+  });
+
+  it('sends the address the owner typed, trimmed, and never omits it', async () => {
+    // It is required: an invitation with no address can only ever become a SECOND account
+    // for one person, and nothing repairs that afterwards.
+    let sent: Record<string, unknown> = {};
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init: RequestInit) => {
+        sent = JSON.parse(init.body as string);
+        return new Response('{}', { status: 201, headers: { 'content-type': 'application/json' } });
+      })
+    );
+    await createInvite({
+      username: 'oma',
+      email: '  Oma@Example.de  ',
+      path: '/familie',
+      permission: 'read'
+    });
+    expect(sent.email).toBe('Oma@Example.de');
   });
 
   it('reports a withdrawal that withdrew nothing as a failure', async () => {
@@ -232,7 +286,7 @@ describe('the audit log vocabulary', () => {
    * has to be added in two places, and this test is what says so out loud when only one of
    * them was done. Regenerate with:
    *
-   *   grep -rhoE '"(acl|document|team|principal|invite|attachment|blobs)\.[a-z._]+"' crates/ | sort -u
+   *   grep -rhoE '"(acl|document|team|principal|invite|attachment|blobs|identity)\.[a-z._]+"' crates/ | sort -u
    */
   const EMITTED = [
     'acl.grant',
@@ -244,6 +298,7 @@ describe('the audit log vocabulary', () => {
     'document.restore',
     'document.trash',
     'document.visibility',
+    'identity.merge',
     'invite.accept',
     'invite.create',
     'invite.revoke',
@@ -287,5 +342,34 @@ describe('the audit log vocabulary', () => {
     ];
     expect(new Set(words).size).toBe(3);
     for (const word of words) expect(word).toMatch(/Einladung/);
+  });
+});
+
+describe('the address an invitation is matched on (ADR 0021)', () => {
+  it('accepts an ordinary address whatever its case or surrounding space', () => {
+    for (const good of ['oma@example.de', 'Oma@Example.DE', '  oma@example.de  ']) {
+      expect(isMatchableEmail(good)).toBe(true);
+    }
+  });
+
+  it('refuses everything the merge cannot key on, rather than guessing', () => {
+    // The same list `gw_store::canonical_email` refuses. Two of these matter especially:
+    // an internationalised domain is a DIFFERENT registration from the one it resembles,
+    // and a Cyrillic `о` renders identically to a Latin one — folding either would hand
+    // one person's grants to whoever can register the other.
+    for (const bad of ['', '   ', 'oma', 'oma@', '@example.de', 'a@b@c.de', 'oma @example.de',
+                       'oma@exämple.de', 'оma@example.de']) {
+      expect(isMatchableEmail(bad), bad).toBe(false);
+    }
+  });
+
+  it('tells the owner what the field is for, not merely that it is required', () => {
+    // A required field with no reason on screen is a field people fill in with anything,
+    // and what is at stake is whether one person ends up with two accounts.
+    expect(INVITE_EMAIL_HELP).toContain('Authelia');
+    expect(INVITE_EMAIL_HELP).toContain('dasselbe Konto');
+    expect(INVITE_EMAIL_HELP).toContain('nachträglich nicht mehr zusammenlegen');
+    // And it still says the wiki sends no mail, which was the old field's only job.
+    expect(INVITE_EMAIL_HELP).toContain('keine Post');
   });
 });

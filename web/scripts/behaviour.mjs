@@ -3278,6 +3278,10 @@ await check('P4 creating one shows the link once, and says that it is a credenti
   await dialog.waitFor({ state: 'visible', timeout: 5_000 });
 
   await dialog.getByRole('textbox', { name: 'Benutzername' }).fill('grosstante');
+  // Required since ADR 0021, and it is the merge key rather than a note: it is what a
+  // later Authelia sign-in with a verified address is recognised by. Group Q below is
+  // about the field itself; here it is filled in so that the rest of P still walks.
+  await dialog.getByRole('textbox', { name: 'E‑Mail' }).fill('grosstante@example.de');
 
   // The page picker, on Ark's Select. Only pages this identity may READ are offered; the
   // API decides separately whether it may invite into the one chosen.
@@ -3315,6 +3319,13 @@ await check('P4 creating one shows the link once, and says that it is a credenti
   // The listing behind it now names the invitation, what it carries and that it is open.
   const table = await invitesPanel(page).locator('.gw-adm-table').innerText();
   assert(table.includes('grosstante'), `the new invitation is not in the listing: ${table}`);
+  // The address is in the listing too, so that an owner can see WHICH address this link
+  // will be matched on before they hand it over — afterwards the only remedy is to
+  // withdraw it and make another.
+  assert(
+    table.includes('grosstante@example.de'),
+    `the listing does not say which address the invitation is matched on: ${table}`
+  );
   assert(table.includes(INVITE_PATH), `the listing does not say what it carries: ${table}`);
   assert(table.includes('Offen'), `the listing does not say it is still open: ${table}`);
   // A listing must never carry the token or its digest: `InviteSummary` has no field for
@@ -3499,6 +3510,179 @@ await check('P10 the Protokoll names an invitation in German, not as a dotted ve
   // Anti-vacuity: the raw verbs are what the API sends, so their ABSENCE is the assertion.
   assert(!text.includes('invite.create'), `a dotted English verb reached the German log: ${text}`);
   assert(!text.includes('invite.revoke'), `a dotted English verb reached the German log: ${text}`);
+});
+
+
+// ---------------------------------------------------------------------------------------
+// Group Q — one person, one identity: the address an invitation is matched on
+// ---------------------------------------------------------------------------------------
+//
+// ADR 0021. An invitation names an e-mail address, and when somebody later signs in
+// through Authelia whose address that provider asserts as VERIFIED matches it, they are
+// the same principal — same grants, same history, one credential each way. Before this,
+// an invitation made a local account and the same person arriving through Authelia was
+// mirrored as a second principal with no access at all, and nothing joined the two.
+//
+// That makes the address a security control rather than a note, and it moves the failure
+// mode into the console: an invitation created WITHOUT a matchable address quietly
+// guarantees the duplicate, and nothing repairs it afterwards — the account is made when
+// the link is used. Unit tests hold the rule (`gw_store::canonical_email`, the API's 400
+// and 409, the panel's own disabled-button logic). Only this holds the seam: that the form
+// asks for it, refuses to submit without it, says why on screen, and that the refusal an
+// owner meets when the address is already taken arrives in German with the name in it.
+//
+// It runs after Group P, which has already withdrawn its own invitation, so the addresses
+// used here are fresh. It leaves one invitation outstanding; the fixture is rebuilt from
+// scratch on every run.
+
+/** Open the »Jemanden einladen« dialog with the page field already set. */
+async function openInviteDialog(page, { withPath = true } = {}) {
+  await openInvitesTab(page);
+  await page.getByRole('button', { name: 'Einladung erstellen' }).first().click();
+  const dialog = page.getByRole('dialog', { name: 'Jemanden einladen' });
+  await dialog.waitFor({ state: 'visible', timeout: 5_000 });
+  if (withPath) {
+    await dialog.getByRole('combobox', { name: 'Seite' }).click();
+    const option = page
+      .locator('[role=listbox]:not([hidden]) [role=option]')
+      .filter({ hasText: INVITE_PATH });
+    await option.first().waitFor({ state: 'visible', timeout: 5_000 });
+    await option.first().click();
+  }
+  return dialog;
+}
+
+await check('Q1 the form asks for an address and says what it is for, not merely that it is needed', async (page) => {
+  // "Required" with no reason on screen is a field people fill in with anything — and what
+  // is at stake is whether one relative ends up with two accounts and two passwords.
+  const dialog = await openInviteDialog(page, { withPath: false });
+  const text = await dialog.innerText();
+
+  assert(text.includes('E‑Mail'), `the address field is gone: ${text}`);
+  assert(!text.includes('(optional)'), `the address is still offered as optional: ${text}`);
+  assert(
+    text.includes('Authelia'),
+    `nothing says the address is what recognises the same person later: ${text}`
+  );
+  assert(
+    text.includes('dasselbe Konto'),
+    `nothing says the two sign-ins become one account: ${text}`
+  );
+  assert(
+    text.includes('nachträglich nicht mehr zusammenlegen'),
+    `nothing says it cannot be repaired afterwards: ${text}`
+  );
+  // The old wording said the address was "nur zur Wiedererkennung" and that the wiki sends
+  // no post. The second half is still true and still said; the first is now wrong.
+  assert(text.includes('keine Post'), `the panel no longer says it sends no mail: ${text}`);
+  assert(!text.includes('Nur zur Wiedererkennung'), `the old optional wording survived: ${text}`);
+});
+
+await check('Q2 an invitation with no address, or an unmatchable one, cannot be submitted', async (page) => {
+  // The button is disabled rather than submitting into a refusal — the same treatment
+  // D-M2-20's "carries nothing" already gets, and for the same reason: an invitation that
+  // is going to be refused should not be offered.
+  const dialog = await openInviteDialog(page);
+  const submit = dialog.getByRole('button', { name: 'Einladung erstellen' });
+  await dialog.getByRole('textbox', { name: 'Benutzername' }).fill('grossonkel');
+
+  assert(
+    !(await submit.isEnabled()),
+    'an invitation with a page but no address could be submitted'
+  );
+
+  // Not a permissive "looks like an email" check.
+  const field = dialog.getByRole('textbox', { name: 'E‑Mail' });
+  for (const bad of ['grossonkel', 'grossonkel@', 'a@b@c.de']) {
+    await field.fill(bad);
+    assert(
+      !(await submit.isEnabled()),
+      `»${bad}« was accepted as an address the merge could key on`
+    );
+  }
+
+  // An internationalised domain, which is the case worth spelling out because THE BROWSER
+  // gets to it first. `<input type="email">` in Chrome converts the domain to punycode
+  // before anything here reads the value, so what the console actually submits for
+  // `onkel@exämple.de` is `onkel@xn--exmple-cua.de` — a different, ASCII address, which is
+  // accepted, and correctly so: it is precisely NOT the address it resembles. The rule
+  // that matters is the same one either way and it is asserted here in that form, so this
+  // check cannot pass by the value silently becoming the Latin lookalike. A client that is
+  // not a browser e-mail field reaches the API's own refusal instead, which is pinned in
+  // `gw_store::canonical_email`'s tests and in `tests/invites.rs`.
+  await field.fill('onkel@exämple.de');
+  const held = await field.inputValue();
+  assert(
+    held !== 'grossonkel@example.de' && held !== 'onkel@example.de',
+    `an internationalised address became the Latin one it imitates: ${held}`
+  );
+  if (/^[\x21-\x7e]+$/.test(held)) {
+    assert(
+      held.includes('xn--'),
+      `the address lost its domain on the way through the field: ${held}`
+    );
+  } else {
+    assert(
+      !(await submit.isEnabled()),
+      `»${held}« was accepted as an address the merge could key on`
+    );
+  }
+
+  // And the reason is on screen while the button is grey, rather than being discovered by
+  // pressing it. Asserted against a value that is unambiguously bad — the punycode case
+  // above ends up VALID, so the error text is correctly gone by then.
+  await field.fill('grossonkel');
+  assert(
+    (await dialog.innerText()).includes('name@beispiel.de'),
+    'nothing on screen says what a usable address looks like'
+  );
+
+  await dialog.getByRole('textbox', { name: 'E‑Mail' }).fill('grossonkel@example.de');
+  assert(await submit.isEnabled(), 'a perfectly ordinary address was still refused');
+  await submit.click();
+  await page.locator('.gw-adm-invite-link').waitFor({ state: 'visible', timeout: 10_000 });
+});
+
+await check('Q3 a second invitation for the same address is refused, in German, naming who holds it', async (page) => {
+  // The other direction of the decision, and the reason it is a refusal rather than a
+  // merge: the link IS a credential, handed to one person over a chat app, so an
+  // invitation that landed on an address somebody already uses would be a way to set a
+  // password on an account that already holds grants. A mistyped address aims that at the
+  // owner. The existing identity wins, and the owner is sent to »Zugriff« instead.
+  //
+  // Different username, different capitals and a trailing space: the key is the address,
+  // normalised, and none of those three may be what decides it.
+  const dialog = await openInviteDialog(page);
+  await dialog.getByRole('textbox', { name: 'Benutzername' }).fill('jemand-anderes');
+  await dialog.getByRole('textbox', { name: 'E‑Mail' }).fill('  GROSSONKEL@Example.DE  ');
+  await dialog.getByRole('button', { name: 'Einladung erstellen' }).click();
+
+  // Scoped by its words, not by the panel: the console renders a mutation's outcome ABOVE
+  // the tab strip, in the page rather than in the panel that caused it. »Personen« and
+  // »Teams« are gated on instance administration, so for THIS identity they each carry a
+  // standing failure notice of their own — an unscoped locator matches three of them and
+  // Playwright refuses the ambiguity, which is right.
+  const notice = page.locator('.gw-adm-notice--fail', {
+    hasText: 'Die Einladung für »jemand-anderes« konnte nicht erstellt werden'
+  });
+  await notice.waitFor({ state: 'visible', timeout: 10_000 });
+  const text = await notice.innerText();
+
+  assert(
+    text.includes('E-Mail-Adresse gibt es hier schon'),
+    `the refusal does not say the address is already in use: ${text}`
+  );
+  assert(text.includes('Zugriff'), `the refusal does not say what to do instead: ${text}`);
+  // Not the generic "Der Server meldet einen Konflikt (409)", which sends somebody to the
+  // logs for something they fix in the form.
+  assert(!text.includes('Konflikt'), `the generic 409 wording reached the screen: ${text}`);
+
+  // And nothing was created: one invitation for that address, not two.
+  const table = await invitesPanel(page).locator('.gw-adm-table').innerText();
+  assert(
+    !table.includes('jemand-anderes'),
+    `a second invitation for one address was written anyway: ${table}`
+  );
 });
 
 

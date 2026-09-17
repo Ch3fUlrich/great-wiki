@@ -102,7 +102,14 @@ pub struct InviteOffer {
 /// An invite to be written. Borrowed, because every field comes straight off a request.
 pub struct NewInvite<'a> {
     pub username: &'a str,
-    pub email: Option<&'a str>,
+    /// **Required** (ADR 0021), because it is the merge key and not a note.
+    ///
+    /// The address is what a later Authelia sign-in is matched against, so an invitation
+    /// with none creates exactly the second account the decision exists to prevent — and
+    /// there is nothing to do about it afterwards but withdraw the invitation and make
+    /// another. It must also be one [`crate::canonical_email`] can key on, or it could
+    /// never match anything; that is refused here rather than accepted and quietly inert.
+    pub email: &'a str,
     pub path: Option<&'a str>,
     pub permission: Option<Permission>,
     /// The team's slug. Resolved to an id here, so a slug naming no team is a typo the
@@ -123,6 +130,17 @@ pub enum CreateInviteOutcome {
     /// Neither a path grant nor a team (D-M2-20). Refused rather than stored: see the
     /// 0007 migration for why.
     NothingGranted,
+    /// The address is missing, or is not one the merge key can be derived from — no `@`,
+    /// two of them, or anything outside printable ASCII. See [`crate::canonical_email`]
+    /// for why an internationalised address is refused rather than folded.
+    EmailNotUsable,
+    /// Somebody already answers to that address: an account, or another outstanding
+    /// invitation. Carries their username, because "this address is taken" with no name
+    /// attached leaves an administrator guessing at their own instance.
+    ///
+    /// The EXISTING identity wins, always. Letting the invitation attach a password to it
+    /// would make a link somebody was sent a way into an account that already has grants.
+    EmailTaken(String),
 }
 
 /// What accepting an invite actually did.
@@ -137,6 +155,11 @@ pub enum AcceptOutcome {
     /// Not a token state, so it is allowed to read differently — only the holder of a
     /// valid token can ever see it.
     UsernameTaken,
+    /// Somebody took the ADDRESS in the same window. Same reasoning as `UsernameTaken`,
+    /// and the invite is deliberately left live: the address now belongs to an account,
+    /// which is something the owner has to look at rather than something to resolve by
+    /// silently burning a link the recipient is holding.
+    EmailTaken,
 }
 
 /// What revoking an invite actually did.
@@ -273,6 +296,13 @@ impl Store {
             return Ok(CreateInviteOutcome::NothingGranted);
         }
 
+        // ADR 0021. Derived before anything is written, because an invitation whose
+        // address cannot be keyed is an invitation that can never become the person it
+        // was meant for.
+        let Some(canonical) = crate::canonical_email(invite.email) else {
+            return Ok(CreateInviteOutcome::EmailNotUsable);
+        };
+
         let mut tx = self.pool.begin().await?;
 
         let taken: Option<(String,)> =
@@ -283,6 +313,26 @@ impl Store {
         if taken.is_some() {
             tx.rollback().await?;
             return Ok(CreateInviteOutcome::UsernameTaken);
+        }
+
+        // One address, one identity — checked against accounts AND against outstanding
+        // invitations, because two live links for one address produce two accounts of
+        // which only one could ever merge. A withdrawn, spent or expired link does not
+        // count: it can no longer create anything, and holding an address hostage over a
+        // typo would make the mistake permanent.
+        let held: Option<(String,)> = sqlx::query_as(
+            "SELECT username FROM principals WHERE email_canonical = ?1 \
+             UNION ALL \
+             SELECT username FROM invites WHERE email_canonical = ?1 \
+               AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > datetime('now') \
+             LIMIT 1",
+        )
+        .bind(&canonical)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((username,)) = held {
+            tx.rollback().await?;
+            return Ok(CreateInviteOutcome::EmailTaken(username));
         }
 
         // Looked up rather than left to the foreign key: a slug naming no team is a typo in
@@ -308,14 +358,16 @@ impl Store {
         let permission = invite.permission.map(permission_column);
         sqlx::query(
             "INSERT INTO invites \
-             (id, token_hash, invited_by, username, email, path, permission, team_id, expires_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now', ?9))",
+             (id, token_hash, invited_by, username, email, email_canonical, path, permission, \
+              team_id, expires_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now', ?10))",
         )
         .bind(&id)
         .bind(token_hash)
         .bind(actor)
         .bind(invite.username)
-        .bind(invite.email)
+        .bind(invite.email.trim())
+        .bind(&canonical)
         .bind(invite.path)
         .bind(permission)
         .bind(&team_id)
@@ -331,6 +383,9 @@ impl Store {
             invite.path,
             &json!({
                 "username": invite.username,
+                // The merge key, because months later "why did these two become one
+                // account" is answered by this row and the `identity.merge` row together.
+                "email": canonical,
                 "path": invite.path,
                 "permission": permission,
                 "team": invite.team,
@@ -494,6 +549,26 @@ impl Store {
         if taken.is_some() {
             tx.rollback().await?;
             return Ok(AcceptOutcome::UsernameTaken);
+        }
+
+        // And the same question about the ADDRESS (ADR 0021). Creation already asked it,
+        // but a month can pass between the link being handed over and it being clicked,
+        // and in that month »Person anlegen« can write the same address. Creating the
+        // account anyway would leave two principals sharing a merge key, which the merge
+        // then refuses for BOTH of them — one mistake made permanent for two people.
+        //
+        // The rollback undoes the consuming UPDATE above as well, so the link stays live.
+        let address = email.as_deref().and_then(crate::canonical_email);
+        if let Some(address) = &address {
+            let held: Option<(String,)> =
+                sqlx::query_as("SELECT id FROM principals WHERE email_canonical = ?1")
+                    .bind(address)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if held.is_some() {
+                tx.rollback().await?;
+                return Ok(AcceptOutcome::EmailTaken);
+            }
         }
 
         let principal_id = insert_local_principal(
@@ -737,7 +812,11 @@ mod tests {
     fn to_raum(username: &str) -> NewInvite<'_> {
         NewInvite {
             username,
-            email: None,
+            // Required, and derived from the username so that every test gets an address
+            // nobody else in its store holds. An invitation with no matchable address can
+            // never become the same person as their Authelia account, which is the whole
+            // of ADR 0021 — so there is no such invitation.
+            email: Box::leak(format!("{username}@example.de").into_boxed_str()),
             path: Some("/raum"),
             permission: Some(Permission::Read),
             team: None,
@@ -796,7 +875,7 @@ mod tests {
                 "digest",
                 &NewInvite {
                     username: "niemand",
-                    email: None,
+                    email: "niemand@example.de",
                     path: None,
                     permission: None,
                     team: None,
@@ -824,7 +903,7 @@ mod tests {
                 "digest",
                 &NewInvite {
                     username: "gast",
-                    email: None,
+                    email: "gast@example.de",
                     path: None,
                     permission: None,
                     team: Some("tippfehler"),
@@ -1089,5 +1168,193 @@ mod tests {
         let rendered = serde_json::to_string(&summary).unwrap();
         assert!(!rendered.contains("geheim"), "{rendered}");
         assert!(rendered.contains("gast"), "{rendered}");
+    }
+    // -------------------------------------------------------------------------------
+    // One person, one identity (ADR 0021). The address an invitation names is what a
+    // later Authelia sign-in is matched against, so the address has to be unambiguous
+    // BEFORE the link is handed over — afterwards there is nothing to do about it but
+    // withdraw the invitation.
+    // -------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn an_invitation_must_name_an_address_that_can_actually_be_matched() {
+        let store = store().await;
+        for bad in ["", "   ", "oma", "oma@", "oma@exämple.de", "a@b@c.de"] {
+            let outcome = store
+                .create_invite_audited(
+                    "chef",
+                    "digest",
+                    &NewInvite {
+                        email: bad,
+                        ..to_raum("oma")
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, CreateInviteOutcome::EmailNotUsable),
+                "{bad:?} was accepted: {outcome:?}"
+            );
+        }
+        assert!(store.invite_offer("digest").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_invitation_naming_somebody_who_is_already_here_is_refused() {
+        // WHO WINS ON A COLLISION, and this is it: the account that already exists.
+        //
+        // The alternative — letting the invitation attach a password to the existing
+        // principal — turns an invitation into an account-takeover primitive: whoever
+        // holds the link sets a credential on an identity that already has grants, and a
+        // mistyped address aims that at somebody else. The owner already has a way to
+        // give an existing person access, and it is »Zugriff«.
+        let store = store().await;
+        let sergej = store
+            .create_local_principal("sergej", "Sergej", Some("Sergej@Example.de"), "hash")
+            .await
+            .unwrap();
+
+        let outcome = store
+            .create_invite_audited(
+                "chef",
+                "digest",
+                &NewInvite {
+                    username: "sergej-zweit",
+                    email: " sergej@example.de ",
+                    ..to_raum("unbenutzt")
+                },
+            )
+            .await
+            .unwrap();
+        let CreateInviteOutcome::EmailTaken(held_by) = outcome else {
+            panic!("the owner was invitable by their own address: {outcome:?}");
+        };
+        assert_eq!(held_by, "sergej");
+        assert!(store.invite_offer("digest").await.unwrap().is_none());
+        assert_eq!(store.list_principals().await.unwrap().len(), 1);
+        assert_eq!(
+            store
+                .principal_by_id(&sergej.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .as_deref(),
+            Some("hash"),
+            "the existing credential was touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_outstanding_invitations_cannot_name_one_address() {
+        // Two links for one address create two accounts, and then exactly one of them can
+        // ever be merged — the other is the duplicate this decision exists to remove.
+        let store = store().await;
+        created(&store, "eins", to_raum("oma")).await;
+
+        let outcome = store
+            .create_invite_audited(
+                "chef",
+                "zwei",
+                &NewInvite {
+                    username: "oma-zwei",
+                    email: "OMA@EXAMPLE.DE",
+                    ..to_raum("unbenutzt")
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&outcome, CreateInviteOutcome::EmailTaken(who) if who == "oma"),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_withdrawn_invitation_frees_its_address_again() {
+        // Otherwise a typo in an address is permanent: the link is dead, nobody holds the
+        // account, and the address can never be invited again.
+        let store = store().await;
+        let first = created(&store, "eins", to_raum("oma")).await;
+        assert_eq!(
+            store
+                .revoke_invite_audited("chef", &first.id)
+                .await
+                .unwrap(),
+            RevokeInviteOutcome::Revoked
+        );
+
+        let outcome = store
+            .create_invite_audited(
+                "chef",
+                "zwei",
+                &NewInvite {
+                    username: "oma-neu",
+                    email: "oma@example.de",
+                    ..to_raum("unbenutzt")
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, CreateInviteOutcome::Created(_)),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_account_that_appears_while_the_link_is_out_refuses_the_acceptance() {
+        // The race the creation-time check cannot close. Refused inside the transaction,
+        // and the link stays LIVE — the address now belongs to somebody, and that is the
+        // owner's problem to look at, not a reason to burn the invitation silently.
+        let store = store().await;
+        created(&store, "digest", to_raum("oma")).await;
+        store
+            .create_local_principal("dazwischen", "Dazwischen", Some("oma@example.de"), "hash")
+            .await
+            .unwrap();
+
+        let outcome = store
+            .accept_invite_audited("digest", "Oma Erika", "hash", "sitzung", 3600)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, AcceptOutcome::EmailTaken), "{outcome:?}");
+        assert!(
+            store.invite_offer("digest").await.unwrap().is_some(),
+            "the link was consumed by a refusal"
+        );
+        assert_eq!(store.list_principals().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_accepted_invitation_leaves_an_account_a_verified_address_can_reach() {
+        // The end-to-end shape of the decision, at the store: invitation names an address,
+        // the invitee sets a password, the Authelia sign-in lands on the SAME principal.
+        let store = store().await;
+        created(&store, "digest", to_raum("oma")).await;
+        let AcceptOutcome::Accepted(oma) = store
+            .accept_invite_audited("digest", "Oma Erika", "hash", "sitzung", 3600)
+            .await
+            .unwrap()
+        else {
+            panic!("the invitation was not accepted");
+        };
+
+        let signed_in = store
+            .upsert_oidc_identity(
+                "erika.mueller",
+                "Erika Müller",
+                Some("Oma@Example.de"),
+                crate::canonical_email("Oma@Example.de").as_deref(),
+                &["users".to_string()],
+            )
+            .await
+            .unwrap();
+        let crate::OidcSignIn::Merged { principal, .. } = signed_in else {
+            panic!("the invited account was not recognised: {signed_in:?}");
+        };
+        assert_eq!(principal.id, oma.id);
+        assert_eq!(principal.username, "oma");
+        assert_eq!(principal.oidc_username.as_deref(), Some("erika.mueller"));
     }
 }

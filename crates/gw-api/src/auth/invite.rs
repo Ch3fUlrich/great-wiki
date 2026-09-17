@@ -112,6 +112,11 @@ pub enum Notice {
     Breached,
     /// Somebody took the username while the invitation was outstanding.
     UsernameTaken,
+    /// Somebody took the ADDRESS while the invitation was outstanding (ADR 0021). Said
+    /// separately from `UsernameTaken` because what the recipient has to do about it is
+    /// different: nothing they can type will fix it, and the person who invited them has
+    /// to look at an account that already exists.
+    EmailTaken,
 }
 
 impl Notice {
@@ -129,6 +134,11 @@ impl Notice {
             Notice::UsernameTaken => {
                 "Dieser Benutzername ist inzwischen vergeben. Bitte wenden Sie sich an die Person, \
                  die Sie eingeladen hat."
+            }
+            Notice::EmailTaken => {
+                "Zu dieser E-Mail-Adresse gibt es hier bereits ein Konto. Diese Einladung kann \
+                 kein zweites anlegen. Bitte wenden Sie sich an die Person, die Sie eingeladen \
+                 hat — sie kann dem bestehenden Konto den Zugriff geben."
             }
         }
     }
@@ -586,6 +596,16 @@ pub async fn accept(
             StatusCode::CONFLICT,
             &display_name,
         ),
+        // The link is deliberately still live — see `accept_invite_audited`. The page says
+        // so in as many words rather than offering a form that cannot succeed.
+        Ok(AcceptOutcome::EmailTaken) => respond(
+            jar,
+            &offer,
+            &token,
+            Some(Notice::EmailTaken),
+            StatusCode::CONFLICT,
+            &display_name,
+        ),
         Err(error) => ApiError::Internal(error).into_response(),
     }
 }
@@ -739,6 +759,7 @@ mod tests {
             Notice::TooShort,
             Notice::Breached,
             Notice::UsernameTaken,
+            Notice::EmailTaken,
         ] {
             assert!(!notice.message().contains("Token"));
         }

@@ -166,4 +166,15 @@ describe('InvitesPanel', () => {
       expect(text).not.toMatch(new RegExp(`\\b${word}\\b`));
     }
   });
+
+  // ---------------------------------------------------------------------------------
+  // One person, one identity (ADR 0021). The address is the merge key, not a note.
+  // ---------------------------------------------------------------------------------
+
+  it('shows the address beside the person an invitation is for', () => {
+    // So that an owner reading the listing can see WHICH address a link will be matched
+    // on, before they hand it over — afterwards the only remedy is to withdraw it.
+    const withEmail: Invite = { ...pending, email: 'oma@example.de' };
+    expect(html(props({ invites: [withEmail] }))).toContain('oma@example.de');
+  });
 });

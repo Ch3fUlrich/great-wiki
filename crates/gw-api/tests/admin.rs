@@ -326,6 +326,8 @@ fn path_scoped_mutations() -> Vec<(Method, String, Option<Value>)> {
             "/api/admin/invites".into(),
             Some(json!({
                 "username": "eingeladen",
+                // Required since ADR 0021: the address is the merge key, not a note.
+                "email": "eingeladen@example.de",
                 "path": "/raum",
                 "permission": "read",
             })),

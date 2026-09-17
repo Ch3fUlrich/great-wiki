@@ -16,7 +16,7 @@
   import { Switch } from '@ark-ui/svelte/switch';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import Notice from './Notice.svelte';
-  import { describeStatus, SOURCE_LABEL, type AdminPrincipal, type NewPrincipal } from '$lib/adminApi';
+  import { describeStatus, sourceLabel, type AdminPrincipal, type NewPrincipal } from '$lib/adminApi';
 
   interface Props {
     principals: AdminPrincipal[] | null;
@@ -324,7 +324,7 @@
                 <span class="gw-adm-muted gw-adm-mono">{person.username}</span>
               </th>
               <td>
-                <span class="gw-adm-badge">{SOURCE_LABEL[person.kind]}</span>
+                <span class="gw-adm-badge">{sourceLabel(person)}</span>
               </td>
               <td>{person.groups.length ? person.groups.join(', ') : '—'}</td>
               <td>{person.teams.length ? person.teams.join(', ') : '—'}</td>

@@ -31,7 +31,9 @@ pub use invites::{
 };
 pub use links::{Backlink, Graph, GraphEdge, GraphNode, Reference, MAX_REFERENCES_PER_PAGE};
 pub use login_attempts::{LoginScope, LOGIN_FAILURE_LIMIT, LOGIN_LOCKOUT_SECONDS};
-pub use principals::TeamSummary;
+pub use principals::{
+    canonical_email, MergeCandidate, MergeCandidateAccount, OidcSignIn, TeamSummary,
+};
 pub use reclaim::{Reclaim, ReclaimReport};
 pub use revisions::{Author, Revision, IMPORT_AUTHOR_ID, IMPORT_AUTHOR_NAME};
 pub use sessions::SESSION_TTL_SECONDS;
@@ -88,10 +90,17 @@ impl Store {
             .connect_with(opts)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self {
+
+        let store = Self {
             pool,
             public_origin: None,
-        })
+        };
+        // The one part of 0014 that is not SQL. The merge key has exactly one definition
+        // — `canonical_email` — and writing a second one in a migration would be two
+        // rules that can disagree about whether two addresses are one person. Idempotent
+        // and bounded by the number of accounts, so it is cheap to run at every start.
+        store.backfill_email_keys().await?;
+        Ok(store)
     }
 
     /// Configure the origin this deployment is publicly reachable at, so that an absolute

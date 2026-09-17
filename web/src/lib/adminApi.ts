@@ -38,9 +38,19 @@ export interface Grant {
 
 export interface AdminPrincipal {
   id: string;
-  /** `oidc` is a homelab account; `local` is a great-wiki guest account. */
+  /**
+   * Where the account came FROM: `oidc` is a homelab account this wiki mirrored, `local`
+   * is a great-wiki account with a password. It is an origin, not a list of the ways in —
+   * a merged account keeps the kind it started as and gains `oidc_username`.
+   */
   kind: 'oidc' | 'local';
   username: string;
+  /**
+   * The Authelia handle this account also answers to, or `null` if it never has (ADR
+   * 0021). A `local` account with one is a MERGED account: one person, one principal, one
+   * set of grants, reachable with a password or through Authelia.
+   */
+  oidc_username: string | null;
   display_name: string;
   email: string | null;
   groups: string[];
@@ -318,11 +328,56 @@ export interface CreatedInvite extends Invite {
  */
 export interface NewInvite {
   username: string;
-  email?: string;
+  /**
+   * **Required** (ADR 0021), and the owner's to set — not the invitee's.
+   *
+   * This is the merge key: when somebody later signs in through Authelia whose address
+   * that provider asserts as *verified* matches this one, they are the same principal,
+   * with the same grants and the same history. An invitation with no address, or with one
+   * the wiki cannot match on, can only ever produce a second account for one person, and
+   * nothing fixes that afterwards but withdrawing the link. So the API refuses it, and
+   * the panel asks for it as a required field with the reason on screen.
+   */
+  email: string;
   path?: string;
   permission?: Permission;
   team?: string;
 }
+
+/**
+ * Whether an address can be the merge key — the same rule `gw_store::canonical_email`
+ * applies, so the form can refuse before the round trip instead of only after it.
+ *
+ * Deliberately NOT a permissive "looks like an email" pattern. One local part, one `@`,
+ * one domain, printable ASCII. An internationalised address is refused rather than
+ * folded, because `exämple.de` and `example.de` are different registrations and a
+ * Cyrillic `о` renders identically to a Latin one; either, silently folded, would hand one
+ * person's grants to whoever can register the other. The API refuses it too — this is the
+ * same answer arriving sooner, not a second rule, and the Rust side is the one that
+ * actually decides.
+ */
+export function isMatchableEmail(value: string): boolean {
+  const trimmed = value.trim();
+  return /^[\x21-\x7e]+$/.test(trimmed) && /^[^@]+@[^@]+$/.test(trimmed);
+}
+
+/**
+ * What the invitation form says the address is for.
+ *
+ * A constant rather than markup in the panel, so that the sentence can be pinned by a
+ * test: "required" with no reason on screen is a field people fill in with anything, and
+ * what is at stake here is whether one person ends up with two accounts.
+ */
+export const INVITE_EMAIL_HELP =
+  'Daran wird dieselbe Person später wiedererkannt: Meldet sie sich über Authelia an und ' +
+  'bestätigt Authelia diese Adresse, ist es dasselbe Konto — dieselben Rechte, dieselbe ' +
+  'Geschichte, kein zweites Passwort. Ohne Adresse entstünde ein zweites Konto für ' +
+  'dieselbe Person, und das lässt sich nachträglich nicht mehr zusammenlegen. great-wiki ' +
+  'verschickt trotzdem keine Post — den Link geben Sie selbst weiter.';
+
+/** Said under the field when what was typed cannot be a merge key. */
+export const INVITE_EMAIL_ERROR =
+  'Gebraucht wird eine gewöhnliche Adresse der Form name@beispiel.de.';
 
 export function listInvites(): Promise<Outcome<Invite[]>> {
   return request('GET', '/api/admin/invites', 'Die Einladungen konnten nicht geladen werden');
@@ -331,10 +386,12 @@ export function listInvites(): Promise<Outcome<Invite[]>> {
 /**
  * Create an invitation and hand back its link.
  *
- * The 409 is overridden because this endpoint has exactly one, it is not a race and it is
- * not a server problem: somebody already holds that username. "Der Server meldet einen
- * Konflikt (409)" would send a person to the logs for something they fix by typing a
- * different word.
+ * Two statuses are overridden, because neither is a server problem and both are fixed by
+ * typing something else. A 409 is "somebody already holds that username, or already uses
+ * that address" — since ADR 0021 the endpoint has both, and they share a sentence because
+ * the remedy is the same one and the API's own message names which it was. A 400 is an
+ * address the merge cannot key on. The generic wording — "Der Server meldet einen Konflikt
+ * (409)" — would send a person to the logs for something they fix in the form.
  */
 export function createInvite(input: NewInvite): Promise<Outcome<CreatedInvite>> {
   return request(
@@ -343,15 +400,20 @@ export function createInvite(input: NewInvite): Promise<Outcome<CreatedInvite>> 
     `Die Einladung für »${input.username}« konnte nicht erstellt werden`,
     {
       username: input.username,
-      email: input.email?.trim() ? input.email.trim() : undefined,
+      email: input.email.trim(),
       path: input.path || undefined,
       permission: input.path ? input.permission : undefined,
       team: input.team || undefined
     },
     {
+      400:
+        'Die E-Mail-Adresse fehlt oder lässt sich nicht zuordnen. Gebraucht wird eine ' +
+        'gewöhnliche Adresse der Form name@beispiel.de — sie ist es, an der ein späterer ' +
+        'Anmeldung über Authelia dieselbe Person wiedererkannt wird.',
       409:
-        'Diesen Benutzernamen gibt es hier schon. Wählen Sie einen anderen, oder vergeben Sie ' +
-        'den Zugriff unter »Zugriff« an das vorhandene Konto.'
+        'Diesen Benutzernamen oder diese E-Mail-Adresse gibt es hier schon. Eine Person ist ' +
+        'ein Konto: vergeben Sie den Zugriff unter »Zugriff« an das vorhandene Konto, statt ' +
+        'ein zweites einzuladen.'
     }
   );
 }
@@ -517,6 +579,7 @@ export const AUDIT_ACTION_LABEL: Record<string, string> = {
   // Three different facts about one link, and the log is where somebody checks which.
   'invite.accept': 'Einladung angenommen',
   'invite.create': 'Einladung erstellt',
+  'identity.merge': 'Konten zusammengeführt',
   'invite.revoke': 'Einladung zurückgezogen',
   'principal.activate': 'Konto aktiviert',
   'principal.create': 'Konto angelegt',
@@ -561,6 +624,21 @@ export const SOURCE_LABEL: Record<AdminPrincipal['kind'], string> = {
   oidc: 'Authelia',
   local: 'Lokal'
 };
+
+/**
+ * How an account can be signed in to, which is not the same question as where it came
+ * from (ADR 0021).
+ *
+ * A merged account is `local` — it was invited, and it has a password — and it also
+ * answers to Authelia. Showing only `SOURCE_LABEL` would say »Lokal« next to somebody who
+ * signs in through the homelab every day, and would hide the one fact an owner needs when
+ * they deactivate it: doing so closes BOTH doors, because it is one row.
+ */
+export function sourceLabel(person: AdminPrincipal): string {
+  return person.kind === 'local' && person.oidc_username
+    ? `Lokal + Authelia (${person.oidc_username})`
+    : SOURCE_LABEL[person.kind];
+}
 
 /**
  * A stable string for one subject, used as a list key and for equality.

@@ -67,6 +67,10 @@ struct IdpScript {
     sub: String,
     preferred_username: Option<String>,
     email: Option<String>,
+    /// `None` puts no `email_verified` claim in the token at all, which is a DIFFERENT
+    /// thing to write than `Some(false)` and must be treated the same: neither is an
+    /// assertion, and only an assertion may merge one person's account into another's.
+    email_verified: Option<bool>,
     /// `None` puts no `groups` claim in the id token at all, which is a different thing
     /// from an empty list and sends the code to the userinfo endpoint.
     groups: Option<Vec<String>>,
@@ -86,6 +90,7 @@ impl Default for IdpScript {
             sub: "abc-123".into(),
             preferred_username: Some("sergej".into()),
             email: Some("sergej@example.invalid".into()),
+            email_verified: Some(true),
             groups: Some(vec!["admins".into()]),
             userinfo_groups: None,
             userinfo_sub: None,
@@ -201,6 +206,9 @@ async fn idp_token(
     }
     if let Some(email) = &script.email {
         claims["email"] = json!(email);
+    }
+    if let Some(verified) = script.email_verified {
+        claims["email_verified"] = json!(verified);
     }
     if let Some(groups) = &script.groups {
         claims["groups"] = json!(groups);
@@ -1103,4 +1111,311 @@ fn set_cookie_names(response: &Response) -> Vec<String> {
         .filter_map(|v| v.split('=').next())
         .map(str::to_string)
         .collect()
+}
+
+// =====================================================================================
+// One person, one identity (ADR 0021).
+//
+// An invitation names an email; the invitee accepts it and sets a password; when somebody
+// later signs in through Authelia whose email the provider asserts as VERIFIED matches,
+// they are the same principal — same id, same grants, same history.
+//
+// These run the whole flow against the stand-in provider, because the property is about
+// what a token says and what the store then does with it, and a test that called the
+// store directly would prove nothing about the claim ever being read.
+// =====================================================================================
+
+/// The account an invitation would have left behind: local, with a password and an
+/// address, holding a grant on the restricted page.
+async fn invited(store: &Store, username: &str, email: &str) -> String {
+    let principal = store
+        .create_local_principal(username, "Oma Erika", Some(email), "argon2-hash")
+        .await
+        .unwrap();
+    store
+        .add_grant(
+            "/geheim",
+            gw_auth::Subject::Principal(principal.id.clone()),
+            gw_auth::Permission::Read,
+        )
+        .await
+        .unwrap();
+    principal.id
+}
+
+#[tokio::test]
+async fn a_verified_address_signs_in_as_the_account_that_was_invited() {
+    let idp = Idp::start().await;
+    let store = seed().await;
+    let invited_id = invited(&store, "oma", "Oma@Example.de").await;
+    let app = app(&store, Some(&idp));
+
+    // A different Authelia handle, a different case, a trailing space — and the same
+    // person, because the address is what is matched and it is normalised first.
+    idp.script(|s| {
+        s.preferred_username = Some("erika.mueller".into());
+        s.email = Some("oma@example.de ".into());
+        s.email_verified = Some(true);
+        s.groups = Some(vec!["users".into()]);
+    });
+
+    let mut jar = Jar::default();
+    assert_eq!(
+        sign_in(&app, &idp, &mut jar).await.status(),
+        StatusCode::FOUND
+    );
+
+    let me = json_body(send(&app, "GET", "/api/me", &mut jar).await).await;
+    assert_eq!(me["authenticated"], json!(true), "{me}");
+    assert_eq!(
+        me["username"],
+        json!("oma"),
+        "a second account was made: {me}"
+    );
+    assert_eq!(me["groups"], json!(["users"]));
+
+    assert_eq!(store.list_principals().await.unwrap().len(), 1);
+    assert_eq!(
+        store
+            .principal_by_username("oma")
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .id,
+        invited_id
+    );
+
+    // The grant the invitation left is hers on this credential too — same principal id,
+    // so there was never anything to copy.
+    assert_eq!(
+        send(&app, "GET", "/api/documents/geheim", &mut jar)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn an_unverified_address_does_not_merge_and_reaches_nothing() {
+    // THE DISCLOSURE TEST. Authelia lets an account hold an address it has not vouched
+    // for. Without `email_verified`, anybody who can edit their own profile there types
+    // somebody else's address into it and signs in as them.
+    let idp = Idp::start().await;
+    let store = seed().await;
+    invited(&store, "oma", "oma@example.de").await;
+    let app = app(&store, Some(&idp));
+
+    idp.script(|s| {
+        s.preferred_username = Some("angreifer".into());
+        s.email = Some("oma@example.de".into());
+        s.email_verified = Some(false);
+        s.groups = Some(vec![]);
+    });
+
+    let mut jar = Jar::default();
+    assert_eq!(
+        sign_in(&app, &idp, &mut jar).await.status(),
+        StatusCode::FOUND
+    );
+
+    let me = json_body(send(&app, "GET", "/api/me", &mut jar).await).await;
+    assert_eq!(
+        me["username"],
+        json!("angreifer"),
+        "an unverified claim merged: {me}"
+    );
+    assert_eq!(store.list_principals().await.unwrap().len(), 2);
+    assert_eq!(
+        send(&app, "GET", "/api/documents/geheim", &mut jar)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN,
+        "the attacker reached the invited account's page"
+    );
+}
+
+#[tokio::test]
+async fn an_absent_verification_claim_is_treated_exactly_like_a_false_one() {
+    // The provider that simply does not send `email_verified` must not be read as
+    // vouching for the address. "Nobody said no" is not an assertion.
+    let idp = Idp::start().await;
+    let store = seed().await;
+    invited(&store, "oma", "oma@example.de").await;
+    let app = app(&store, Some(&idp));
+
+    idp.script(|s| {
+        s.preferred_username = Some("angreifer".into());
+        s.email = Some("oma@example.de".into());
+        s.email_verified = None;
+        s.groups = Some(vec![]);
+    });
+
+    let mut jar = Jar::default();
+    sign_in(&app, &idp, &mut jar).await;
+
+    let me = json_body(send(&app, "GET", "/api/me", &mut jar).await).await;
+    assert_eq!(me["username"], json!("angreifer"), "{me}");
+    assert_eq!(store.list_principals().await.unwrap().len(), 2);
+    assert_eq!(
+        send(&app, "GET", "/api/documents/geheim", &mut jar)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn a_verified_address_reaches_only_the_account_that_carries_it() {
+    // The other half of the disclosure: verification is real, and it still only ever
+    // matches the address it actually is.
+    let idp = Idp::start().await;
+    let store = seed().await;
+    invited(&store, "oma", "oma@example.de").await;
+    let app = app(&store, Some(&idp));
+
+    idp.script(|s| {
+        s.preferred_username = Some("nachbar".into());
+        s.email = Some("nachbar@example.de".into());
+        s.email_verified = Some(true);
+        s.groups = Some(vec![]);
+    });
+
+    let mut jar = Jar::default();
+    sign_in(&app, &idp, &mut jar).await;
+
+    let me = json_body(send(&app, "GET", "/api/me", &mut jar).await).await;
+    assert_eq!(me["username"], json!("nachbar"), "{me}");
+    assert_eq!(
+        send(&app, "GET", "/api/documents/geheim", &mut jar)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn merging_confers_nothing_that_the_group_mapping_does_not_already_confer() {
+    // What the union IS: the account's own grants, plus whatever `group_roles` says the
+    // verified groups reach. There is no third source, and in particular Authelia's
+    // groups do not arrive with any reach of their own.
+    let idp = Idp::start().await;
+    let store = seed().await;
+    invited(&store, "oma", "oma@example.de").await;
+    let app = app(&store, Some(&idp));
+
+    // `lieferanten` is in no `group_roles` row, so it confers the public baseline. The
+    // merged account must end up with exactly its own grant and that baseline.
+    idp.script(|s| {
+        s.preferred_username = Some("erika.mueller".into());
+        s.email = Some("oma@example.de".into());
+        s.email_verified = Some(true);
+        s.groups = Some(vec!["lieferanten".into()]);
+    });
+
+    let mut jar = Jar::default();
+    sign_in(&app, &idp, &mut jar).await;
+
+    let me = json_body(send(&app, "GET", "/api/me", &mut jar).await).await;
+    assert_eq!(me["username"], json!("oma"), "{me}");
+    assert_eq!(
+        me["baseline"],
+        json!("public"),
+        "an unmapped group widened the baseline: {me}"
+    );
+    // Her own grant, and nothing beyond it.
+    assert_eq!(
+        send(&app, "GET", "/api/documents/geheim", &mut jar)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&app, "GET", "/api/admin/principals", &mut jar)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN,
+        "the merge handed out instance administration"
+    );
+}
+
+#[tokio::test]
+async fn an_authelia_handle_that_is_already_somebody_else_s_username_is_refused() {
+    // Before this, `upsert_oidc_principal` was an UPSERT ON CONFLICT (username): an
+    // Authelia account calling itself `oma` silently TOOK OVER the local `oma` — its
+    // grants, its revisions, its history — with no address involved anywhere. Refused now.
+    let idp = Idp::start().await;
+    let store = seed().await;
+    let invited_id = invited(&store, "oma", "oma@example.de").await;
+    let app = app(&store, Some(&idp));
+
+    idp.script(|s| {
+        s.preferred_username = Some("oma".into());
+        s.email = Some("wer.auch.immer@example.de".into());
+        s.email_verified = Some(true);
+        s.groups = Some(vec!["admins".into()]);
+    });
+
+    let mut jar = Jar::default();
+    assert_eq!(
+        sign_in(&app, &idp, &mut jar).await.status(),
+        StatusCode::FORBIDDEN,
+        "the local account was taken over by a name collision"
+    );
+
+    let (oma, hash) = store.principal_by_username("oma").await.unwrap().unwrap();
+    assert_eq!(oma.id, invited_id);
+    assert_eq!(oma.display_name, "Oma Erika");
+    assert_eq!(hash.as_deref(), Some("argon2-hash"));
+    assert!(
+        oma.groups.is_empty(),
+        "Authelia's groups were grafted on: {oma:?}"
+    );
+    assert_eq!(store.list_principals().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn signing_out_one_way_leaves_the_other_way_signed_in() {
+    // Decided and pinned: signing out ends the session that was presented, not every
+    // session the principal holds. A merged person signed in on two devices with two
+    // credentials is still one principal, and "sign out" has never meant "everywhere" —
+    // that is deactivation, which now covers both halves precisely BECAUSE it is one row.
+    let idp = Idp::start().await;
+    let store = seed().await;
+    let invited_id = invited(&store, "oma", "oma@example.de").await;
+    // The password half, already signed in in another browser.
+    store
+        .create_session(&invited_id, &hash_token("das-lokale-token"), 3600)
+        .await
+        .unwrap();
+    let app = app(&store, Some(&idp));
+
+    idp.script(|s| {
+        s.preferred_username = Some("erika.mueller".into());
+        s.email = Some("oma@example.de".into());
+        s.email_verified = Some(true);
+        s.groups = Some(vec!["users".into()]);
+    });
+    let mut jar = Jar::default();
+    sign_in(&app, &idp, &mut jar).await;
+    assert_eq!(store.session_count_for(&invited_id).await.unwrap(), 2);
+
+    send(&app, "POST", "/auth/logout", &mut jar).await;
+    assert_eq!(
+        store.session_count_for(&invited_id).await.unwrap(),
+        1,
+        "signing out of one browser ended the other"
+    );
+    assert!(store
+        .principal_for_session(&hash_token("das-lokale-token"))
+        .await
+        .unwrap()
+        .is_some());
+
+    // Deactivation, by contrast, ends both — one principal, one act.
+    store
+        .set_principal_active(&invited_id, false)
+        .await
+        .unwrap();
+    assert_eq!(store.session_count_for(&invited_id).await.unwrap(), 0);
 }

@@ -23,6 +23,7 @@ const principals: AdminPrincipal[] = [
   {
     id: 'p1',
     kind: 'oidc',
+    oidc_username: null,
     username: 'sergej',
     display_name: 'Sergej Maul',
     email: null,
@@ -33,6 +34,7 @@ const principals: AdminPrincipal[] = [
   {
     id: 'p2',
     kind: 'local',
+    oidc_username: null,
     username: 'gast',
     display_name: 'Gast Konto',
     email: null,

@@ -15,6 +15,7 @@
     {
       id: 'p1',
       kind: 'oidc',
+      oidc_username: null,
       username: 'sergej',
       display_name: 'Sergej Maul',
       email: null,

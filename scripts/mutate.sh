@@ -200,6 +200,66 @@ mutation crates/gw-api/src/routes/admin.rs killed \
   's/^        instance_admin,$/        instance_admin: body.admin,/' \
   'admin interlock: "still an administrator" is asked of baseline_for, not assumed from the request'
 
+# --- identity: one person, one account, and what may join two of them ----------------
+#
+# ADR 0021. A merge takes one principal's id and lets a SECOND credential reach it, so
+# every grant, revision and attachment that principal holds comes with it. The key is
+# therefore an authorisation decision dressed as a string comparison, and the three ways
+# to get it wrong are all silent:
+#
+#   1. MERGING ON AN UNVERIFIED ADDRESS. Authelia lets an account hold an address nobody
+#      vouched for. Without `email_verified`, anybody who can edit their own profile there
+#      types somebody else's address into it and signs in as them. This is the one that
+#      matters most, and the first two mutations below are it from both ends.
+#   2. NORMALISING TOO MUCH. Folding an internationalised address, or folding an address
+#      that is genuinely somebody else's, makes two people one.
+#   3. MERGING ON A NAME. The `ON CONFLICT (username) DO UPDATE` this replaced did exactly
+#      that, and it was live: a homelab `oma` became the invited `oma` outright.
+#
+# `crates/gw-api/src/auth/oidc.rs` holds the gate; `crates/gw-store/src/principals.rs`
+# holds the key and the match.
+mutation crates/gw-api/src/auth/oidc.rs killed \
+  's/    if !email_verified {/    if false {/' \
+  'identity: an address the provider does not vouch for is never a merge key'
+mutation crates/gw-api/src/auth/oidc.rs killed \
+  's/    let mut email_verified = claims.email_verified.unwrap_or(false);/    let mut email_verified = claims.email_verified.unwrap_or(true);/' \
+  'identity: a token with NO email_verified claim is treated as unverified, not as verified'
+mutation crates/gw-api/src/auth/oidc.rs killed \
+  's/            key.as_deref().ok(),/            gw_store::canonical_email(identity.email.as_deref().unwrap_or("")).as_deref(),/' \
+  'identity: the callback passes the VERIFIED key to the store, not the bare address claim'
+mutation crates/gw-store/src/principals.rs killed \
+  's/    if !trimmed.bytes().all(|b| (0x21..=0x7e).contains(&b)) || trimmed.is_empty() {/    if trimmed.is_empty() {/' \
+  'identity: an internationalised address is refused as a key rather than folded into one'
+mutation crates/gw-store/src/principals.rs killed \
+  's/        local.to_ascii_lowercase(),/        local.to_string(),/' \
+  'identity: case is normalised, so Oma@ and oma@ are one person'
+mutation crates/gw-store/src/principals.rs killed \
+  's/    let trimmed = raw.trim_matches(|c: char| c.is_ascii_whitespace());/    let trimmed = raw;/' \
+  'identity: a pasted address with a trailing space is the same address'
+mutation crates/gw-store/src/principals.rs killed \
+  "s/                 WHERE email_canonical = ?1 AND oidc_username IS NULL AND active = 1\",/                 WHERE oidc_username IS NULL AND active = 1\",/" \
+  'identity: the merge matches the address it was given, not simply the first account going'
+mutation crates/gw-store/src/principals.rs killed \
+  's/            match rows.len() {/            match rows.len().min(1) {/' \
+  'identity: two accounts on one address refuse to merge rather than one being picked'
+mutation crates/gw-store/src/principals.rs killed \
+  's/        if taken.is_some() {/        if false {/' \
+  'identity: an Authelia handle already held as a username is refused, not taken over'
+# And the other direction. An invitation naming an address somebody already uses would let
+# the link — which is itself a credential, handed over a chat app — set a password on an
+# account that already holds grants; a mistyped address aims that at the owner. The
+# EXISTING identity wins, at creation and again inside the acceptance transaction, and the
+# second is not redundant: a month can pass between handing the link over and it being used.
+mutation crates/gw-store/src/invites.rs killed \
+  's/        if let Some((username,)) = held {/        if let Some((username,)) = None::<(String,)> {/' \
+  'identity: an invitation cannot name an address that already belongs to somebody'
+mutation crates/gw-store/src/invites.rs killed \
+  's/            if held.is_some() {/            if false {/' \
+  'identity: an account appearing while the link was out refuses the acceptance'
+mutation crates/gw-store/src/invites.rs killed \
+  's/        let Some(canonical) = crate::canonical_email(invite.email) else {/        let Some(canonical) = Some(invite.email.to_string()) else {/' \
+  'identity: an invitation address that cannot be a merge key is refused, not stored inert'
+
 # --- invites: a link that creates an account -----------------------------------------
 #
 # An invite is a CREDENTIAL, and an unusual one: it is handed to somebody who has no

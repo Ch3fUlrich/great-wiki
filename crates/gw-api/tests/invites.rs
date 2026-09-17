@@ -267,9 +267,24 @@ fn invite_from(created: &Value) -> Invite {
 /// Create an invite and assert it was created. Used wherever the creation itself is a
 /// precondition rather than the thing under test.
 async fn invite(fx: &Fixture, who: &str, body: Value) -> Invite {
-    let (status, created) = post(fx, Some(who), "/api/admin/invites", body).await;
+    let (status, created) = post(fx, Some(who), "/api/admin/invites", with_email(body)).await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
     invite_from(&created)
+}
+
+/// An address for a request that does not name one.
+///
+/// Since ADR 0021 the address is REQUIRED — it is the merge key a later Authelia sign-in
+/// is matched against — and it has to be unique per person, so it is derived from the
+/// username. Added here rather than to forty literals so that every test that is about
+/// something else stays about that thing; the rules the address itself has to follow are
+/// pinned by the tests under "one person, one identity" below, which pass it explicitly.
+fn with_email(mut body: Value) -> Value {
+    let username = body["username"].as_str().map(str::to_string);
+    if let (Some(username), None) = (username, body.get("email")) {
+        body["email"] = json!(format!("{username}@example.de"));
+    }
+    body
 }
 
 /// The commonest one: a read grant on `/raum`, made by the space admin.
@@ -483,7 +498,8 @@ async fn an_invite_into_a_space_the_inviter_does_not_administer_is_refused() {
         &fx,
         Some("lektor"),
         "/api/admin/invites",
-        json!({"username": "gast-raum", "path": "/raum", "permission": "read"}),
+        json!({"username": "gast-raum", "email": "gast-raum@example.de",
+               "path": "/raum", "permission": "read"}),
     )
     .await;
     assert_eq!(allowed, StatusCode::CREATED, "{created}");
@@ -535,7 +551,8 @@ async fn a_space_admin_cannot_put_the_invited_account_in_a_team() {
         &fx,
         Some("chef"),
         "/api/admin/invites",
-        json!({"username": "gast", "path": "/raum", "permission": "read", "team": "redaktion"}),
+        json!({"username": "gast", "email": "gast@example.de",
+               "path": "/raum", "permission": "read", "team": "redaktion"}),
     )
     .await;
     assert_eq!(allowed, StatusCode::CREATED, "{created}");
@@ -1394,5 +1411,195 @@ async fn an_accept_that_fails_leaves_no_account_no_grant_and_no_record() {
     assert!(
         !actions.contains(&"invite.accept"),
         "an acceptance that did not happen was recorded: {log}"
+    );
+}
+
+// =====================================================================================
+// One person, one identity (ADR 0021).
+//
+// The invitation's address is the merge key: it is what a later Authelia sign-in with a
+// VERIFIED address is matched against. Three properties, and each of these tests breaks
+// one of them.
+// =====================================================================================
+
+#[tokio::test]
+async fn an_invitation_must_name_an_address_the_merge_can_actually_use() {
+    // An invitation with no matchable address guarantees a second account for one person,
+    // and nothing can fix it afterwards but withdrawing the link and making another. So
+    // it is refused at the door rather than accepted and quietly inert.
+    let fx = fixture().await;
+
+    for bad in [
+        None,
+        Some(""),
+        Some("  "),
+        Some("oma"),
+        Some("a@b@c.de"),
+        Some("oma@exämple.de"),
+    ] {
+        let mut body = json!({"username": "oma", "path": "/raum", "permission": "read"});
+        if let Some(bad) = bad {
+            body["email"] = json!(bad);
+        }
+        let (status, answer) = post(&fx, Some("lektor"), "/api/admin/invites", body).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{bad:?} was accepted: {answer}"
+        );
+        assert!(
+            answer["error"].as_str().unwrap().contains("email address"),
+            "the refusal does not say what is wrong: {answer}"
+        );
+    }
+
+    let (_, listed) = get(&fx, Some("chef"), "/api/admin/invites").await;
+    assert!(listed.as_array().unwrap().is_empty(), "{listed}");
+}
+
+#[tokio::test]
+async fn the_owner_cannot_be_merged_into_by_an_invitation_naming_their_address() {
+    // THE DISCLOSURE TEST for the other direction. If an invitation could land on an
+    // address somebody already uses, the link — which is itself a credential, handed to
+    // one person over a chat app — would set a password on an account that already holds
+    // grants. A mistyped address would aim that at the owner.
+    //
+    // The existing account wins, always, and the refusal says whose it is so that an
+    // administrator is not left guessing at their own instance.
+    let fx = fixture().await;
+    fx.store
+        .create_local_principal("besitzer", "Besitzer", Some("besitzer@example.de"), "hash")
+        .await
+        .unwrap();
+
+    let (status, answer) = post(
+        &fx,
+        Some("lektor"),
+        "/api/admin/invites",
+        // Deliberately a different username and a different CASE: the key is the address,
+        // normalised, and neither of those may be what decides it.
+        json!({"username": "ganz-wer-anders", "email": " Besitzer@Example.DE ",
+               "path": "/raum", "permission": "read"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert!(
+        answer["error"].as_str().unwrap().contains("besitzer"),
+        "{answer}"
+    );
+
+    let (_, listed) = get(&fx, Some("chef"), "/api/admin/invites").await;
+    assert!(listed.as_array().unwrap().is_empty(), "{listed}");
+
+    // And the credential it would have overwritten is untouched.
+    assert_eq!(
+        fx.store
+            .principal_by_username("besitzer")
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .as_deref(),
+        Some("hash")
+    );
+}
+
+#[tokio::test]
+async fn the_invitee_cannot_choose_the_address_they_are_matched_on() {
+    // The address is set by the OWNER. The acceptance form asks for a display name and a
+    // password and nothing else — an invitee who could nominate their own merge key could
+    // nominate somebody else's, and the account they created would then be the account a
+    // later Authelia sign-in landed on.
+    let fx = fixture().await;
+    fx.store
+        .create_local_principal("besitzer", "Besitzer", Some("besitzer@example.de"), "hash")
+        .await
+        .unwrap();
+    let created = invite_to_raum(&fx, "gast").await;
+    let app = browser(&fx).await;
+
+    let mut jar = Jar::default();
+    open_invite(&app, &mut jar, &created.token).await;
+    let csrf = jar.get(CSRF_COOKIE).unwrap_or_default().to_string();
+    let form = format!(
+        "{}&email={}",
+        accept_form("Gast", "ein-langes-passwort", &csrf),
+        encode("besitzer@example.de")
+    );
+    visit(
+        &app,
+        &mut jar,
+        "POST",
+        &format!("/auth/invite/{}/accept", created.token),
+        Some(form),
+    )
+    .await;
+
+    let gast = fx
+        .store
+        .principal_by_username("gast")
+        .await
+        .unwrap()
+        .expect("the account was not created")
+        .0;
+    assert_eq!(
+        gast.email.as_deref(),
+        Some("gast@example.de"),
+        "the invitee wrote their own merge key"
+    );
+
+    // And the owner's account is still the only one that address reaches.
+    let signed_in = fx
+        .store
+        .upsert_oidc_identity(
+            "wer.auch.immer",
+            "Wer Auch Immer",
+            Some("besitzer@example.de"),
+            gw_store::canonical_email("besitzer@example.de").as_deref(),
+            &["users".to_string()],
+        )
+        .await
+        .unwrap();
+    let gw_store::OidcSignIn::Merged { principal, .. } = signed_in else {
+        panic!("{signed_in:?}");
+    };
+    assert_eq!(principal.username, "besitzer");
+}
+
+#[tokio::test]
+async fn the_candidate_listing_is_for_instance_admins_and_changes_nothing() {
+    let fx = fixture().await;
+    fx.store
+        .create_local_principal("oma", "Oma", Some("oma@example.de"), "hash")
+        .await
+        .unwrap();
+    fx.store
+        .upsert_oidc_principal("erika", "Erika", Some("Oma@Example.de"), &[])
+        .await
+        .unwrap();
+
+    let before = fx.store.list_principals().await.unwrap().len();
+    assert_eq!(
+        get(&fx, Some("lektor"), "/api/admin/identity/candidates")
+            .await
+            .0,
+        StatusCode::FORBIDDEN,
+        "a space admin read the whole instance's addresses"
+    );
+    assert_eq!(
+        get(&fx, None, "/api/admin/identity/candidates").await.0,
+        StatusCode::FORBIDDEN
+    );
+
+    let (status, listed) = get(&fx, Some("chef"), "/api/admin/identity/candidates").await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let groups = listed.as_array().unwrap();
+    assert_eq!(groups.len(), 1, "{listed}");
+    assert_eq!(groups[0]["email"], json!("oma@example.de"));
+    assert_eq!(groups[0]["accounts"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        fx.store.list_principals().await.unwrap().len(),
+        before,
+        "reading the list merged something"
     );
 }

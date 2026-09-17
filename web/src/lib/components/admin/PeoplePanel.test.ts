@@ -14,6 +14,7 @@ const principals: AdminPrincipal[] = [
   {
     id: 'p1',
     kind: 'oidc',
+    oidc_username: null,
     username: 'sergej',
     display_name: 'Sergej Maul',
     email: null,
@@ -24,6 +25,7 @@ const principals: AdminPrincipal[] = [
   {
     id: 'p2',
     kind: 'local',
+    oidc_username: null,
     username: 'gast',
     display_name: 'Gast Konto',
     email: null,
@@ -103,5 +105,21 @@ describe('PeoplePanel', () => {
     // An empty cell reads as "not loaded"; a dash reads as "none", which is what it is.
     const out = html(props({ principals: [principals[1]] }));
     expect(out).toContain('—');
+  });
+
+  it('shows a merged account as reachable both ways, and names the Authelia handle', () => {
+    // ADR 0021: a merged account is `local` — it was invited and has a password — and it
+    // also answers to Authelia. »Lokal« alone would say the wrong thing about somebody who
+    // signs in through the homelab daily, and would hide the fact that deactivating this
+    // row closes BOTH doors, because it is one row.
+    const merged: AdminPrincipal = {
+      ...principals[1],
+      kind: 'local',
+      username: 'oma',
+      oidc_username: 'erika.mueller',
+      active: true
+    };
+    const out = html(props({ principals: [merged] }));
+    expect(out).toContain('Lokal + Authelia (erika.mueller)');
   });
 });

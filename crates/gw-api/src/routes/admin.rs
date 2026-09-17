@@ -42,8 +42,8 @@ use gw_core::Visibility;
 use gw_store::admin::{ActiveOutcome, InstanceAdminOutcome, VisibilityOutcome};
 use gw_store::principals::AdminCandidate;
 use gw_store::{
-    AuditPage, Baseline, CreateInviteOutcome, InviteSummary, MembershipOutcome, NewInvite,
-    RevokeInviteOutcome, TeamSummary, INVITE_TTL_SECONDS,
+    AuditPage, Baseline, CreateInviteOutcome, InviteSummary, MembershipOutcome, MergeCandidate,
+    NewInvite, RevokeInviteOutcome, TeamSummary, INVITE_TTL_SECONDS,
 };
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -60,6 +60,7 @@ pub fn routes() -> Router<AppState> {
             post(set_instance_admin),
         )
         .route("/api/admin/admins/candidates", get(admin_candidates))
+        .route("/api/admin/identity/candidates", get(merge_candidates))
         .route("/api/admin/teams", get(list_teams).post(create_team))
         .route("/api/admin/teams/{slug}/members", post(add_member))
         .route(
@@ -415,6 +416,37 @@ pub async fn set_instance_admin(
         changed,
         instance_admin,
     }))
+}
+
+/// Addresses that more than one account here carries — and nothing else (ADR 0021).
+///
+/// **This is the answer to "what would a retroactive merge do", and it is READ-ONLY.**
+/// Merging accounts that already exist is not something this decision does on its own: two
+/// accounts sharing an address may be one person with two credentials, or may be a shared
+/// family address that two people really do use, and the second case merged is one person
+/// silently holding the other's grants. There is no endpoint that performs it, on purpose.
+/// The owner reads this list and resolves each pair by hand under »Personen«.
+///
+/// From a terminal on the API host:
+///
+/// ```text
+/// curl -s --cookie "__Host-gw_session=$TOKEN" \
+///      https://wiki.example.com/api/admin/identity/candidates | jq .
+/// ```
+///
+/// Instance-wide, by the same argument as listing principals: it names accounts and the
+/// addresses they carry, which is the whole of what »Personen« already shows.
+pub async fn merge_candidates(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<Vec<MergeCandidate>>, ApiError> {
+    instance_admin(&state, &jar).await?;
+    state
+        .store
+        .merge_candidates()
+        .await
+        .map(Json)
+        .map_err(ApiError::Internal)
 }
 
 /// Who could be promoted, most recently active first.
@@ -929,8 +961,17 @@ pub struct InviteRequest {
     /// the acceptance page asks for a display name and a password, and letting the link be
     /// redeemed as any name at all would let it become a name an ACL already trusts.
     username: String,
+    /// **Required** (ADR 0021), and set by the OWNER rather than by the invitee.
+    ///
+    /// The link is still the credential; this is the merge key. When somebody later signs
+    /// in through Authelia whose *verified* address matches, they are this same principal
+    /// — so an invitation with no matchable address is the one thing that guarantees a
+    /// second account for one person, and there is no way to fix it after the fact.
+    ///
+    /// `#[serde(default)]` so an older client's body lands on this endpoint's own refusal,
+    /// in words, rather than on axum's 422.
     #[serde(default)]
-    email: Option<String>,
+    email: String,
     #[serde(default)]
     path: Option<String>,
     /// Required when `path` is given and refused when it is not. Not defaulted to `read`:
@@ -991,6 +1032,13 @@ const NOTHING_GRANTED: &str = "an invite must carry a path grant, a team, or bot
                                carries neither creates an account that can sign in and see \
                                nothing";
 
+/// Refused for naming no address, or one that cannot be a merge key (ADR 0021).
+const EMAIL_REQUIRED: &str = "an invite must name an email address this wiki can match on: \
+                              one local part, one @, one domain, printable ASCII. It is what \
+                              a later Authelia sign-in is recognised by, and an invitation \
+                              without one can only ever become a second account for the same \
+                              person";
+
 pub async fn create_invite(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1030,6 +1078,10 @@ pub async fn create_invite(
     if username.is_empty() {
         return Err(ApiError::Invalid("username is required".into()));
     }
+    let email = body.email.trim();
+    if email.is_empty() {
+        return Err(ApiError::Invalid(EMAIL_REQUIRED.into()));
+    }
     match (path, body.permission) {
         (Some(path), Some(_)) => validate_grant_path(path)?,
         (Some(_), None) => {
@@ -1057,11 +1109,7 @@ pub async fn create_invite(
             &hash_token(&token),
             &NewInvite {
                 username,
-                email: body
-                    .email
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|e| !e.is_empty()),
+                email,
                 path,
                 permission: body.permission,
                 team,
@@ -1092,6 +1140,16 @@ pub async fn create_invite(
         // is entitled to its own opinion about D-M2-20 and this must not become a 500 if
         // the two ever disagree.
         CreateInviteOutcome::NothingGranted => Err(ApiError::Invalid(NOTHING_GRANTED.into())),
+        CreateInviteOutcome::EmailNotUsable => Err(ApiError::Invalid(EMAIL_REQUIRED.into())),
+        // 409 and not 404: the address names something that DOES exist, and the answer is
+        // to give that account access rather than to invite it a second time. It names the
+        // account, which is a disclosure — bounded by the gate above, which has already
+        // established that the caller administers the space they are inviting into, and
+        // the alternative is an administrator staring at "taken" in their own instance.
+        CreateInviteOutcome::EmailTaken(username) => Err(ApiError::Conflict(format!(
+            "»{username}« already uses that email address here. One person is one account: \
+             give that account access under Zugriff rather than inviting them again."
+        ))),
     }
 }
 
