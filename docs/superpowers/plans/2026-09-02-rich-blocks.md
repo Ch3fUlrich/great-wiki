@@ -1048,19 +1048,46 @@ that sentence beside it, so the ninth grammar is added on purpose rather than by
 
 ### D-24: A diagram is rendered twice, once for each theme
 
-Mermaid runs during server rendering and its output is a fixed image; the site has a
-light/dark control, and one image can only match one of them.
+**Corrected 2026-09-17.** As first written, this decision said Mermaid "runs during server
+rendering". That premise was the orchestrator's, put to the owner in the question that
+produced this answer, and it is false: Mermaid needs a browser DOM to measure text (D-19 says
+so, a section above), so it runs in the reader's browser and nowhere else. The implementer
+followed D-19 and flagged the contradiction; the owner's actual choice — both themes, rather
+than one neutral look or one wrong one — stands, and is what shipped. The "rejected"
+alternative below is therefore the *only* place it can run, and the sentence about it is
+kept struck through so the error is visible rather than silently repaired.
 
-So both are produced and the stylesheet shows whichever matches. Rejected: one neutral look
+The site has a light/dark control, and one rendered image can only match one of them. So
+both are produced and the stylesheet shows whichever matches. Rejected: one neutral look
 (simplest, and it would read as deliberately plain rather than wrong — but "acceptable on
 both grounds" is a compromise nobody asked for on a page they are trying to read), and
-rendering in the browser (diagrams would follow the theme live, and Mermaid would then run on
-every reader's machine over page text, which is precisely the attack surface D-19 exists to
-close).
+~~rendering in the browser (Mermaid would then run on every reader's machine over page text)~~
+— it already does, and must; what D-19 governs is *how* it is contained while it does.
 
-The cost is stated rather than hidden: every diagram is rendered twice at publish time and
-carried twice in the markup. That is paid once per page render, by the server, for a wiki of
-tens of pages — and it buys a diagram that is never wrong against its own background.
+The cost is stated rather than hidden: every diagram is drawn twice in the reader's browser
+and carried twice in the markup. It buys a diagram that is never wrong against its own
+background.
+
+### D-26: Mermaid runs in a frame of its own (2026-09-17)
+
+Because it runs in the browser, Mermaid injects a `<style>` into the page while measuring,
+and the page's policy refuses it — four console errors per diagram, and text measured against
+the page's font rather than the drawn one. The drawing is unaffected, and the policy is doing
+exactly its job.
+
+The owner chose to **isolate Mermaid in a same-origin frame of its own**, served from one
+route with a policy scoped to that route. Mermaid then never touches the page at all: D-19's
+"barrier one" becomes a real boundary rather than a policy holding while the library works
+inside the page. The diagram comes back over `postMessage` as a string and goes into the
+`<img>` exactly as now.
+
+Rejected: leaving it documented (the noise masks real errors in exactly the place a developer
+looks first, and a measurement done against the wrong font is a defect even if padding hides
+it today), and pre-rendering at publish time with a headless browser on the API host (the
+cleanest result, and a large new dependency on the one host that must stay small).
+
+Cost: `frame-src` opens from `'none'` to `'self'` — one origin, this one — and there is a
+second document to keep in step with the first.
 
 ### D-25: An unknown language is shown plain, and named quietly
 
