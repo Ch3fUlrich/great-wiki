@@ -27,7 +27,31 @@ use serde::{Deserialize, Serialize};
 /// every kind in German for the revision diff, and falls back to the raw name rather than
 /// rendering nothing.
 ///
-/// Adding `TaskList` cost exactly this, and adding `Attachment` cost it again.
+/// **This list understates it, and the correction is part of adding a kind.** Two more move
+/// in practice, and both were missed by the count above until `Transclusion` was added:
+///
+/// 6. **`ATTRIBUTE_LABEL`**, in the same file as `BLOCK_LABEL` — the German names for the
+///    attributes a *design* diff reports. A kind with attributes and no entries there shows
+///    a reader `heading` and `label` where the rest of the page shows German words, and the
+///    attachment commit edited it in the same hunk as `BLOCK_LABEL` without the list saying
+///    it had to.
+/// 7. **The editor surface's own `:global(.gw-ed-…)` CSS**, which has to mirror whatever
+///    `BlockView.svelte` does for the kind, or one page looks like two different things in
+///    the two places it is seen. Latent rather than overdue: both atom kinds give their
+///    editor node a class (`gw-ed-datei`, `gw-ed-einbettung`) and neither styles it yet, so
+///    they are consistently plain. The day one of them is styled, the other is the mirror
+///    that was forgotten.
+///
+/// And **a mark's attributes have their own version of rule 1, with the opposite sign.**
+/// y-tiptap null-filters a NODE's attributes — `createTypeFromElementNode` skips a null value
+/// and `updateYFragment` removes one — and does **not** filter a mark's: `marksToAttributes`
+/// writes `mark.attrs` back whole. So `TaskItem`'s `id: { default: null }` is free, and the
+/// same shape on a mark mints `null` into every stored mark of that kind — which an
+/// allow-list in `gw_api::export` keeps without inspecting, refusing the page from the
+/// owner's backup. Both edits, or neither; see `Anchor` in `extensions.ts`.
+///
+/// Adding `TaskList` cost exactly this, adding `Attachment` cost it again, and adding
+/// `Transclusion` cost all seven plus a store-side resolver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
@@ -118,6 +142,63 @@ pub enum BlockKind {
     /// exporter writes somewhere the importer will not read one back is a page that can
     /// never be exported again.
     Attachment,
+    /// A live view of another page, or of one section of it (D-27).
+    ///
+    /// A **reference**, exactly as [`BlockKind::Attachment`] is, and the difference between
+    /// the two is only what is referenced. Nothing of the target is stored here: the block
+    /// says *which* page and *which* section, and what is drawn is fetched when the page is
+    /// **read**, through the same permission-checked accessor a page read itself ends in.
+    /// That is not an optimisation — it is the whole disclosure property. A copy would go on
+    /// showing a reader words they lost access to, and would go stale the moment the source
+    /// was edited, which is the one thing an embed exists not to do.
+    ///
+    /// It carries four attributes and no fifth may be added without the editor's schema
+    /// being widened in the same change (`web/src/lib/editor/extensions.ts`):
+    ///
+    /// * `doc` — the target's document id, when the target is known by identity (D-5). The
+    ///   one that survives the target being renamed or moved.
+    /// * `path` — the target's address, for a target whose id this database has never heard
+    ///   of. Exactly one of the two, never both once `gw_store`'s `settle_embeds` has seen
+    ///   the body: the pair exists only between `gw_core::markdown` and the store, for
+    ///   [`Mark::FALLBACK_ATTR`]'s reason and with [`Mark::FALLBACK_ATTR`]'s life
+    ///   expectancy.
+    /// * `heading` — the stable id of the heading the embedded section begins at, or absent
+    ///   for the whole page. It is a heading's `id` attribute (minted on publish), never its
+    ///   slug and never its text: a heading's words change and its position certainly does,
+    ///   and an anchor that moved with either would silently quote a different section.
+    /// * `label` — the author's own words for what they embedded, written even when empty
+    ///   for the reason [`BlockKind::Attachment`]'s `alt` is. It is what the reader is shown
+    ///   when the target cannot be shown, and it is the **only** thing in the block that a
+    ///   reader who may not read the target ever sees.
+    ///
+    /// **It has no children, and reconciliation depends on that.** A checklist inside an
+    /// embedded section belongs to the page it is written on (D-30): one task, one record,
+    /// one board. `gw_store::tasks::reconcile_tasks` walks `content`, so an embed that
+    /// carried a copy of the target's tree would mint a second set of task records on the
+    /// embedding page and shed the originals' cards on the next publish of the source.
+    ///
+    /// **It contributes nothing to [`Block::plain_text`]** — same as a placement, same
+    /// reasons, plus a sharper one: `plain_text` is computed in this crate, which has no
+    /// store and cannot ask a permission question, so feeding another page's words in would
+    /// put content the reader may not see into this page's anchor ids and its search index.
+    ///
+    /// **Top-level only**, exactly as a placement is and for the identical reason: markdown
+    /// writes it as an image standing alone in its own paragraph, and the importer only
+    /// reads one back at the root of the document. A block the exporter writes somewhere the
+    /// importer will not read one back is a page that can never be exported again.
+    ///
+    /// # `embed` on the wire, `Transclusion` in Rust — and the rename is the decision
+    ///
+    /// The wire name is what every mirror keys off: TipTap looks a node up by it, the
+    /// reader's union is written in it, the CRDT stores it as the element tag. So it is
+    /// pinned by this enum's guard test like every other one, and it is deliberately **not**
+    /// `transclusion`. "Transclusion" is the name of the *idea* and the word the decision
+    /// records use; `embed` is the word the editor's control, the reader's frame and every
+    /// German label are about, it is four characters in every Y.Doc that holds one, and it
+    /// is what a person reading a stored body will guess. The Rust variant keeps the precise
+    /// word because a type name is read by people who want the precise word.
+    #[serde(rename = "embed")]
+    Transclusion,
     Text,
 }
 
@@ -285,7 +366,21 @@ pub struct Block {
 pub struct Heading {
     pub level: u8,
     pub text: String,
+    /// The anchor a reader's address bar shows: [`crate::slugify`] of the text.
+    ///
+    /// Human-readable, ASCII, and **derived** — so it changes when the heading's words do,
+    /// which is exactly right for a fragment somebody copied out of the address bar an hour
+    /// ago and wrong for anything that has to survive an edit. See [`Heading::anchor`].
     pub id: String,
+    /// The heading's **stable** id: the uuid `gw_store` mints onto every heading on publish,
+    /// or `None` for a heading that has not been published since that existed.
+    ///
+    /// This is what a transclusion names a section by (D-27), and the two ids are two
+    /// different answers to two different questions on purpose. `id` follows the words; this
+    /// one does not, so re-wording a heading moves its fragment and leaves every embed of it
+    /// pointing at the same section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
 }
 
 impl Block {
@@ -421,6 +516,11 @@ impl Block {
                 level,
                 id: slugify(&text),
                 text,
+                anchor: self
+                    .attrs
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
             });
             return; // headings do not nest
         }
@@ -428,6 +528,84 @@ impl Block {
             child.collect_headings(out);
         }
     }
+
+    /// The part of this document that sits beneath the heading whose stable id is `anchor`:
+    /// that heading and every block after it, up to the next heading of the same level or
+    /// higher. `None` when no heading here carries that id.
+    ///
+    /// `None` is what D-29 is about, and it is the reason this returns an `Option` rather
+    /// than an empty document: an embed whose anchor has been deleted or merged away keeps
+    /// its frame and says the section is gone, with a link to the source. It must never fall
+    /// back to the whole page — that quietly swaps a dosage table for an entire page the
+    /// author never meant to quote — and it must never render as nothing, because nothing
+    /// here vanishes silently (the rule a detached task follows, D-8).
+    ///
+    /// **Top level only.** A heading nested inside a blockquote or a list item is not a
+    /// section of the document — [`Block::headings`] recurses because an outline wants every
+    /// heading, and a *section* is a run of siblings, which only exists at the level the run
+    /// is a run of. The store mints ids onto nested headings all the same; they simply
+    /// cannot be anchored to, and an embed naming one is an orphan like any other.
+    ///
+    /// How one [`BlockKind::Transclusion`] is named in the map a reader is handed, or `None`
+    /// for a block that names no target at all.
+    ///
+    /// `<ziel>` or `<ziel>#<abschnitt>`, where `<ziel>` is the target's document id or, for a
+    /// target this database has not identified yet, its path. Not the markdown destination
+    /// and not the block's position: the destination would put a scheme into a JSON key for
+    /// no reason, and a position changes when somebody adds a paragraph above it, so a page
+    /// holding two embeds of one section would resolve each of them twice.
+    ///
+    /// **`web/src/lib/blocks/render.ts::embedKey` is a deliberate mirror of this** and must
+    /// stay byte-identical, exactly as `plainText` is: the server fills the map and the
+    /// reader looks the entry up, so a disagreement renders every embed on the page as its
+    /// label — the same thing an unreadable target renders as, which is precisely the state
+    /// nobody would think to investigate.
+    pub fn embed_key(&self) -> Option<String> {
+        if self.kind != BlockKind::Transclusion {
+            return None;
+        }
+        let attr = |key: &str| self.attrs.get(key).and_then(|v| v.as_str());
+        let target = attr("doc").or_else(|| attr("path"))?;
+        Some(match attr("heading") {
+            Some(heading) => format!("{target}#{heading}"),
+            None => target.to_string(),
+        })
+    }
+
+    /// A pure function of the tree, here rather than in `gw_store` for [`crate::MARK_ORDER`]'s
+    /// reason: the editor's section picker and the reader's expansion have to agree about
+    /// where a section ends, and two copies of that rule would stop agreeing.
+    pub fn section(&self, anchor: &str) -> Option<Block> {
+        let start = self.content.iter().position(|b| {
+            b.kind == BlockKind::Heading
+                && b.attrs.get("id").and_then(|v| v.as_str()) == Some(anchor)
+        })?;
+        let level = heading_level(&self.content[start]);
+        let mut section = Block {
+            kind: BlockKind::Doc,
+            attrs: serde_json::Map::new(),
+            content: vec![self.content[start].clone()],
+            text: None,
+            marks: Vec::new(),
+        };
+        for block in &self.content[start + 1..] {
+            if block.kind == BlockKind::Heading && heading_level(block) <= level {
+                break;
+            }
+            section.content.push(block.clone());
+        }
+        Some(section)
+    }
+}
+
+/// A heading's level, clamped the way every reader of one clamps it.
+fn heading_level(block: &Block) -> u8 {
+    block
+        .attrs
+        .get("level")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1)
+        .clamp(1, 6) as u8
 }
 
 /// Collapse the prose gathered so far into one segment, exactly as [`Block::plain_text`]
@@ -615,6 +793,7 @@ mod tests {
             BlockKind::TableHeader,
             BlockKind::TableCell,
             BlockKind::Attachment,
+            BlockKind::Transclusion,
             BlockKind::Text,
         ];
         for kind in EVERY_KIND {
@@ -634,6 +813,7 @@ mod tests {
                 | BlockKind::TableHeader
                 | BlockKind::TableCell
                 | BlockKind::Attachment
+                | BlockKind::Transclusion
                 | BlockKind::Text => {}
             }
         }
@@ -670,6 +850,7 @@ mod tests {
                 "tableHeader",
                 "tableCell",
                 "attachment",
+                "embed",
                 "text",
             ],
             "A `BlockKind` was added, removed or renamed. It has four mirrors outside Rust's \
@@ -744,6 +925,90 @@ mod tests {
             doc.headings().is_empty(),
             "a column title is not a section of the document"
         );
+    }
+
+    // --- a section, which is what a transclusion may name half of a page by ---------------
+
+    /// Two sections under one `##`, with a `###` inside the first so the walk has something
+    /// to *not* stop at, and a trailing `##` so it has something to stop at.
+    fn sectioned() -> Block {
+        serde_json::from_str(
+            r#"{"kind":"doc","content":[
+                 {"kind":"paragraph","content":[{"kind":"text","text":"Vorspann"}]},
+                 {"kind":"heading","attrs":{"level":2,"id":"0199c0de-0000-7000-8000-00000000000a"},
+                  "content":[{"kind":"text","text":"Dosierung"}]},
+                 {"kind":"paragraph","content":[{"kind":"text","text":"5 mg"}]},
+                 {"kind":"heading","attrs":{"level":3,"id":"0199c0de-0000-7000-8000-00000000000b"},
+                  "content":[{"kind":"text","text":"Kinder"}]},
+                 {"kind":"paragraph","content":[{"kind":"text","text":"2 mg"}]},
+                 {"kind":"heading","attrs":{"level":2,"id":"0199c0de-0000-7000-8000-00000000000c"},
+                  "content":[{"kind":"text","text":"Nebenwirkungen"}]},
+                 {"kind":"paragraph","content":[{"kind":"text","text":"Selten"}]}]}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_section_runs_to_the_next_heading_of_its_own_level_or_higher() {
+        let section = sectioned()
+            .section("0199c0de-0000-7000-8000-00000000000a")
+            .expect("the anchor is in the document");
+        // The heading itself, its paragraph, the `###` under it and that one's paragraph —
+        // and NOT the `##` that follows, nor the prose before it.
+        assert_eq!(section.plain_text(), "Dosierung 5 mg Kinder 2 mg");
+        assert_eq!(section.kind, BlockKind::Doc);
+    }
+
+    #[test]
+    fn a_deeper_section_stops_at_the_next_heading_of_any_higher_level() {
+        let section = sectioned()
+            .section("0199c0de-0000-7000-8000-00000000000b")
+            .expect("the anchor is in the document");
+        assert_eq!(section.plain_text(), "Kinder 2 mg");
+    }
+
+    #[test]
+    fn a_section_whose_anchor_is_gone_is_none_and_never_the_whole_page() {
+        // D-29: the embedding page keeps its frame and says the section no longer exists.
+        // Falling back to the whole page would quietly swap a dosage table for a page the
+        // author never meant to quote, so the absence has to be expressible.
+        assert!(sectioned()
+            .section("0199c0de-0000-7000-8000-ffffffffffff")
+            .is_none());
+    }
+
+    #[test]
+    fn a_heading_carries_both_its_slug_and_its_stable_anchor() {
+        let headings = sectioned().headings();
+        assert_eq!(headings[0].id, "dosierung");
+        assert_eq!(
+            headings[0].anchor.as_deref(),
+            Some("0199c0de-0000-7000-8000-00000000000a")
+        );
+        // A heading that has never been published since ids existed has no stable anchor,
+        // and says so rather than pretending its slug is one.
+        assert_eq!(sample().headings()[0].anchor, None);
+    }
+
+    #[test]
+    fn an_embed_has_no_children_and_contributes_no_text() {
+        // D-30's reconciliation half, asserted where the shape is decided rather than only
+        // where it is relied on: an embed is a REFERENCE, so the embedding page's body holds
+        // none of the target's blocks and `reconcile_tasks` — which walks `content` — has
+        // nothing of somebody else's checklist to mint records for.
+        let doc: Block = serde_json::from_str(
+            r#"{"kind":"doc","content":[
+                 {"kind":"paragraph","content":[{"kind":"text","text":"Siehe:"}]},
+                 {"kind":"embed","attrs":{"doc":"0199c0de-0000-7000-8000-000000000001",
+                                          "heading":"0199c0de-0000-7000-8000-00000000000a",
+                                          "label":"Dosierung"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(doc.content[1].kind, BlockKind::Transclusion);
+        assert!(doc.content[1].content.is_empty());
+        // The label is an attribute, like a placement's `alt`, so it is not in the search
+        // index, not in an anchor id and not in the chunker.
+        assert_eq!(doc.plain_text(), "Siehe:");
     }
 
     #[test]

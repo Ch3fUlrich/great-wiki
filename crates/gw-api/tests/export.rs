@@ -83,6 +83,8 @@ async fn snapshot(store: &Store, principal: &Principal) -> BTreeMap<String, serd
             .iter()
             .map(|t| t.display_path.clone())
             .collect();
+        let mut body = serde_json::from_str::<serde_json::Value>(&doc.body).unwrap();
+        forget_task_ids(&mut body);
         out.insert(
             path,
             serde_json::json!({
@@ -93,12 +95,42 @@ async fn snapshot(store: &Store, principal: &Principal) -> BTreeMap<String, serd
                 "sort_key": doc.sort_key,
                 "slug": doc.slug,
                 "parent_path": doc.parent_path,
-                "body": serde_json::from_str::<serde_json::Value>(&doc.body).unwrap(),
+                "body": body,
                 "topics": topics,
             }),
         );
     }
     out
+}
+
+/// Blank the uuid on every `taskItem`, which is the ONE thing in a body that cannot survive
+/// a re-seed and must not.
+///
+/// A task's id is database identity rather than document content: it ties the line to its
+/// record on the board, `gw_core::markdown` mints none (it is a pure function, and an id
+/// invented per render would refuse the page from every export), and the STORE mints one
+/// during reconciliation on publish. `SeedMeta` has no way to carry it, so the second
+/// database mints its own — exactly as `gw_api::export::TASK_ITEM_ATTRS` says by keeping
+/// `checked` and discarding everything beside it.
+///
+/// **A heading's stable id is deliberately NOT blanked**, and the contrast is the point: that
+/// one IS written into the file (`## Titel {#…}`, ADR 0020), because an anchor that a seed
+/// minted afresh would orphan every section embed in a restored corpus — with no fallback
+/// available, since the anchor is by design not derivable from anything else. So this
+/// comparison proves the first is forgotten and the second survives, in one run.
+fn forget_task_ids(body: &mut serde_json::Value) {
+    if body.get("kind").and_then(|k| k.as_str()) == Some("taskItem") {
+        if let Some(attrs) = body.get_mut("attrs").and_then(|a| a.as_object_mut()) {
+            if attrs.contains_key("id") {
+                attrs.insert("id".into(), serde_json::Value::String("<gemintet>".into()));
+            }
+        }
+    }
+    if let Some(children) = body.get_mut("content").and_then(|c| c.as_array_mut()) {
+        for child in children {
+            forget_task_ids(child);
+        }
+    }
 }
 
 /// An account that really exists in `store` and may write `path` — what publishing needs.
@@ -174,6 +206,50 @@ async fn the_example_corpus_survives_export_then_seed() {
             "`{path}` came back different after export → seed"
         );
     }
+
+    // Anti-vacuity for `forget_task_ids`, and the claim ADR 0020 rests on: a heading's stable
+    // anchor is the same string in both databases, because the FILE carries it. Without that,
+    // every section embed in a restored corpus would be an orphan — a frame reading "this
+    // section no longer exists" about a section nobody removed.
+    let anchors = |snap: &BTreeMap<String, serde_json::Value>| -> Vec<String> {
+        let body: gw_core::Block =
+            serde_json::from_value(snap["/verweisbeispiel"]["body"].clone()).unwrap();
+        body.headings()
+            .into_iter()
+            .filter_map(|h| h.anchor)
+            .collect()
+    };
+    let survived = anchors(&before);
+    assert!(
+        !survived.is_empty(),
+        "the corpus has no anchored heading, so nothing about anchors was proved"
+    );
+    assert_eq!(
+        survived,
+        anchors(&after),
+        "a heading's stable anchor did not survive export → seed"
+    );
+
+    // And an embed naming its target by ADDRESS came back naming it by address, which is what
+    // makes a restored copy of a corpus keep its frames rather than merely its words.
+    let embedded: gw_core::Block =
+        serde_json::from_value(after["/verweisbeispiel/einbettung"]["body"].clone()).unwrap();
+    let targets: Vec<Option<String>> = embedded
+        .content
+        .iter()
+        .filter(|b| b.kind == gw_core::BlockKind::Transclusion)
+        .map(|b| b.embed_key())
+        .collect();
+    assert_eq!(
+        targets,
+        vec![
+            Some("/verweisbeispiel#0199c0de-0000-7000-8000-00000000000a".into()),
+            Some("/verweisbeispiel#0199c0de-0000-7000-8000-00000000000b".into()),
+            Some("/verweisbeispiel#0199c0de-0000-7000-8000-0000000000ff".into()),
+            Some("/rundgang/nur-intern".into()),
+        ],
+        "an embed did not come back naming what it named"
+    );
 }
 
 #[tokio::test]
@@ -1454,4 +1530,213 @@ fn a_placement_naming_a_file_nothing_is_attached_to_still_exports_exactly_as_wri
     let file = export::render_file(&befund_meta(), &body, &no_paths())
         .expect("a reference to a file that is not attached is not a broken document");
     assert!(file.contains("![Fehlt](anhang:gibtsnicht.png)"), "{file}");
+}
+
+// --- an embedded page, and a heading's stable anchor (D-27, ADR 0020) ---------------------
+
+/// The frontmatter every one of the checks below exports against. The metadata is not what
+/// they are about; the body is.
+fn embed_meta() -> export::FileMeta {
+    export::FileMeta {
+        title: "Übersicht".into(),
+        doc_type: "page".into(),
+        visibility: "restricted".into(),
+        language: "de".into(),
+        sort_key: 0,
+        slug: "uebersicht".into(),
+        tags: Vec::new(),
+    }
+}
+
+/// A `doc` block holding exactly the JSON handed in.
+fn body_of(json: &str) -> Block {
+    serde_json::from_str(&format!(r#"{{"kind":"doc","content":[{json}]}}"#)).unwrap()
+}
+
+/// Through `render_file`, never through `render` alone.
+///
+/// The refusal for an embed happens in the **comparison**, not in the renderer: a unit test
+/// of `render` passes while the export refuses the page, and a refused page is a page missing
+/// from the owner's backup under a `FIDELITY` file calling the directory a faithful copy of
+/// the database.
+fn exported(body: &Block, paths: &export::ReferencePaths) -> String {
+    export::render_file(&embed_meta(), body, paths)
+        .unwrap_or_else(|e| panic!("this page must export, and it did not: {e}"))
+}
+
+const EMBED_TARGET: &str = "0199c0de-0000-7000-8000-000000000001";
+const EMBED_SECTION: &str = "0199c0de-0000-7000-8000-00000000000a";
+
+#[test]
+fn an_embed_survives_the_round_trip_its_own_markdown_is_compared_against() {
+    let body = body_of(&format!(
+        r#"{{"kind":"embed","attrs":{{"doc":"{EMBED_TARGET}","label":"Laborwerte"}}}}"#
+    ));
+    let file = exported(&body, &no_paths());
+    assert!(
+        file.contains(&format!("![Laborwerte](einbettung:{EMBED_TARGET})")),
+        "{file}"
+    );
+}
+
+#[test]
+fn an_embed_of_one_section_keeps_the_anchor_that_says_which_section() {
+    // The attribute whose loss is silent: without it the frame quietly grows to the whole
+    // page, which is exactly the fallback D-29 refused.
+    let body = body_of(&format!(
+        r#"{{"kind":"embed","attrs":{{"doc":"{EMBED_TARGET}","heading":"{EMBED_SECTION}",
+             "label":"Dosierung"}}}}"#
+    ));
+    let file = exported(&body, &no_paths());
+    assert!(
+        file.contains(&format!(
+            "![Dosierung](einbettung:{EMBED_TARGET}#{EMBED_SECTION})"
+        )),
+        "{file}"
+    );
+}
+
+#[test]
+fn an_embed_carries_its_targets_path_and_the_fallback_stays_out_of_the_comparison() {
+    // `render_file` succeeding is the assertion: the stored `{doc, label}` and the
+    // `{doc, path, label}` its own markdown re-imports as have to compare equal, or every
+    // page holding an embed is refused from every export from then on — the `LINK_ATTRS`
+    // incident a fourth time.
+    let body = body_of(&format!(
+        r#"{{"kind":"embed","attrs":{{"doc":"{EMBED_TARGET}","label":"Laborwerte"}}}}"#
+    ));
+    let mut paths = export::ReferencePaths::new();
+    paths.insert(
+        EMBED_TARGET.to_string(),
+        gw_store::Reference {
+            path: "/darm/labor".into(),
+            title: "Laborwerte".into(),
+        },
+    );
+    let file = exported(&body, &paths);
+    assert!(
+        file.contains(&format!(
+            "![Laborwerte](einbettung:{EMBED_TARGET} \"/darm/labor\")"
+        )),
+        "the target's path is not beside the id, so a restored backup frames nothing:\n{file}"
+    );
+}
+
+#[test]
+fn an_embed_the_exporting_account_may_not_read_is_written_bare() {
+    // `references_for` has no entry for a target this account may not read, so there is no
+    // path to write — and the file must not become a way to learn a restricted page's
+    // address. Anti-vacuity: the test above proves a readable target DOES carry one.
+    let body = body_of(&format!(
+        r#"{{"kind":"embed","attrs":{{"doc":"{EMBED_TARGET}","label":"Laborwerte"}}}}"#
+    ));
+    let file = exported(&body, &no_paths());
+    assert!(
+        !file.contains('"'),
+        "a path reached the file anyway:\n{file}"
+    );
+}
+
+#[test]
+fn an_embed_naming_its_target_by_address_round_trips_as_an_address() {
+    // What a restored backup holds until the next publish exchanges it for this database's
+    // id. `path` is off `EMBED_ATTRS`, so the guard here is `render_file` succeeding on a
+    // tree whose destination the reduction cannot see — which is `transclusion_destination`'s
+    // job, and it is why the writer asks the reader rather than formatting the string.
+    let body = body_of(r#"{"kind":"embed","attrs":{"path":"/darm/labor","label":"Laborwerte"}}"#);
+    let file = exported(&body, &no_paths());
+    assert!(
+        file.contains("![Laborwerte](einbettung:/darm/labor)"),
+        "{file}"
+    );
+    let (_, markdown) = gw_core::split_frontmatter(&file);
+    let back = gw_core::markdown::markdown_to_blocks(markdown);
+    assert_eq!(
+        back.content[0].attrs.get("path").and_then(|v| v.as_str()),
+        Some("/darm/labor")
+    );
+}
+
+#[test]
+fn an_embed_with_a_minted_null_attribute_still_exports() {
+    // The editor DECLARES all four attributes — it has to, or y-tiptap deletes them from the
+    // Y.Doc — and y-tiptap null-filters a node's attributes on the way out, so a null should
+    // never arrive. `kept()` is the belt: an allow-list keeps a key without inspecting its
+    // value, and one that reached the body another way would otherwise refuse the page.
+    let body = body_of(&format!(
+        r#"{{"kind":"embed","attrs":{{"doc":"{EMBED_TARGET}","path":null,"heading":null,
+             "label":"Laborwerte"}}}}"#
+    ));
+    exported(&body, &no_paths());
+}
+
+#[test]
+fn an_embed_naming_no_target_is_refused_loudly_rather_than_written_as_nothing() {
+    for attrs in [
+        r#"{"label":"Laborwerte"}"#,
+        &format!(r#"{{"doc":"{EMBED_TARGET}","path":"/darm/labor","label":"x"}}"#),
+        r#"{"doc":"x) [siehe](https://angreifer.example/","label":"x"}"#,
+        &format!(r#"{{"doc":"{EMBED_TARGET}","heading":"kopf","label":"x"}}"#),
+    ] {
+        let body = body_of(&format!(r#"{{"kind":"embed","attrs":{attrs}}}"#));
+        let refused = export::render_file(&embed_meta(), &body, &no_paths());
+        assert!(
+            refused.is_err(),
+            "`{attrs}` was written into the owner's backup instead of being refused"
+        );
+    }
+}
+
+#[test]
+fn a_heading_keeps_the_stable_id_a_section_embed_anchors_to() {
+    let body = body_of(&format!(
+        r#"{{"kind":"heading","attrs":{{"level":2,"id":"{EMBED_SECTION}"}},
+             "content":[{{"kind":"text","text":"Dosierung"}}]}}"#
+    ));
+    let file = exported(&body, &no_paths());
+    assert!(
+        file.contains(&format!("## Dosierung {{#{EMBED_SECTION}}}")),
+        "{file}"
+    );
+}
+
+#[test]
+fn an_empty_heading_with_an_id_is_still_an_empty_heading_when_it_comes_back() {
+    let body = body_of(&format!(
+        r#"{{"kind":"heading","attrs":{{"level":3,"id":"{EMBED_SECTION}"}}}}"#
+    ));
+    let file = exported(&body, &no_paths());
+    assert!(
+        file.contains(&format!("### {{#{EMBED_SECTION}}}")),
+        "{file}"
+    );
+}
+
+#[test]
+fn a_heading_whose_own_words_end_in_an_anchor_keeps_them_when_it_has_an_id() {
+    // The real id is always written last, so the last suffix in the line is always the one
+    // to take off. That is what makes the pair total rather than usually right.
+    let body = body_of(&format!(
+        r#"{{"kind":"heading","attrs":{{"level":2,"id":"{EMBED_SECTION}"}},
+             "content":[{{"kind":"text","text":"Dosis {{#{EMBED_TARGET}}}"}}]}}"#
+    ));
+    exported(&body, &no_paths());
+}
+
+#[test]
+fn a_heading_with_no_id_whose_words_end_in_an_anchor_is_refused_rather_than_corrupted() {
+    // The one shape the syntax cannot carry, refused loudly instead of handing back a
+    // different document. Publishing the page once mints the id and settles it for good.
+    let body = body_of(&format!(
+        r#"{{"kind":"heading","attrs":{{"level":2}},
+             "content":[{{"kind":"text","text":"Dosis {{#{EMBED_TARGET}}}"}}]}}"#
+    ));
+    assert!(export::render_file(&embed_meta(), &body, &no_paths()).is_err());
+    // …and an ordinary heading with braces in it is untouched, so the refusal is about the
+    // shape and not about braces.
+    let ordinary = body_of(
+        r#"{"kind":"heading","attrs":{"level":2},
+             "content":[{"kind":"text","text":"Dosis {#2}"}]}"#,
+    );
+    exported(&ordinary, &no_paths());
 }

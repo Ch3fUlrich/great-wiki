@@ -155,6 +155,10 @@ export const BLOCK_LABEL: Record<string, string> = {
   // name and a description and says nothing about what the file is — whether it shows as a
   // picture is decided when it is read, from the media type the bytes were sniffed as.
   attachment: 'Datei',
+  // A live view of another page (D-27). »Einbettung« rather than »Zitat«: a quotation is a
+  // copy of somebody's words and this is not one — the frame shows whatever the source says
+  // NOW, and shows nothing at all to a reader who may not read it.
+  embed: 'Einbettung',
   text: 'Text'
 };
 
@@ -176,6 +180,16 @@ export const ATTRIBUTE_LABEL: Record<string, string> = {
   // can tell two apart.
   filename: 'Datei',
   alt: 'Bildbeschreibung',
+  // The four an embed carries. A changed `doc` or `heading` is the whole of "this frame
+  // quotes something else now", and it is the only place a revision can say so: an embed has
+  // no text, so `diff_structure` fingerprints every one of them alike and only the design
+  // diff can tell two apart. `id` is a heading's stable anchor, which changes only when a
+  // heading is first published — worth naming so a reader of the diff is not left wondering.
+  doc: 'Zielseite',
+  path: 'Zieladresse',
+  heading: 'Abschnitt',
+  label: 'Beschriftung',
+  id: 'Ankerkennung',
   marks: 'Formatierung'
 };
 

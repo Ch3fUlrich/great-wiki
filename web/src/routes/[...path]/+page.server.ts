@@ -1,5 +1,6 @@
 import { error, fail, redirect } from '@sveltejs/kit';
 import { apiGet, apiSend, apiUpload, parseBody, type Backlink, type DocumentView } from '$lib/api';
+import type { Block } from '$lib/blocks/render';
 import {
   attachmentApiPath,
   attachmentsApiPath,
@@ -61,7 +62,27 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
    * is a lever on the whole deployment rather than on one tab. A formula that could not be
    * set renders as its own source with a line saying which limit stopped it.
    */
-  const formeln = typesetDocument(body);
+  /**
+   * The blocks to typeset and highlight: this page's own, plus everything inside an embed's
+   * frame.
+   *
+   * An embedded section is drawn by the same `BlockView`, so a ` ```math ` fence or a listing
+   * inside one has to be in the same two maps — they are keyed by the fence's own text
+   * (`$lib/blocks/maths` and `$lib/blocks/code` say so), so one walk over a synthetic
+   * document holding both answers for both. Without it a quoted formula would render as its
+   * own source with no explanation, which is the state that means "the server refused this"
+   * asserted about something nothing refused.
+   *
+   * The caps then apply to the page as a whole, which is the right place for them: they exist
+   * because per-fence limits cannot see how many fences a reader's one request is paying for,
+   * and an embed is exactly a way to have more of them than the page appears to hold.
+   */
+  const zuSetzen: Block = {
+    kind: 'doc',
+    content: [body, ...Object.values(data.embeds ?? {}).flatMap((e) => (e.body ? [e.body] : []))]
+  };
+
+  const formeln = typesetDocument(zuSetzen);
 
   /**
    * The page's fenced code blocks, tokenised by Shiki — **here, and not in the component
@@ -80,7 +101,7 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
    * page rather than the block, and never fails it: over a limit, a fence renders as
    * ordinary code with a line saying which one.
    */
-  const codeBloecke = highlightDocument(body);
+  const codeBloecke = highlightDocument(zuSetzen);
 
   // Own endpoint, own prefix (`/api/links/backlinks/{*path}`, not a suffix under
   // `/api/documents`) — see `gw-api/src/routes/links.rs` for why. Already filtered to what
@@ -223,6 +244,16 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
      * or widen.
      */
     verweise: data.references ?? {},
+    /**
+     * What every embed on this page may show **whoever is reading it** (D-27).
+     *
+     * Taken off the document response for `verweise`' reason: it is the answer the very read
+     * that produced this page reached, against this caller, so a frame and the page it sits
+     * in cannot come from two different permission verdicts. `?? {}` only for a response from
+     * an older API that carries no such key — never as a second filter, which
+     * `gw_store::Store::embeds_for` has already applied and which no client may re-apply.
+     */
+    einbettungen: data.embeds ?? {},
     formeln,
     fences: codeBloecke,
     // The tree is NOT fetched here any more: the shell renders it on every view, so

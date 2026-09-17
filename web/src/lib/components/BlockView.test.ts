@@ -8,7 +8,7 @@ import type { Fences } from '$lib/blocks/code';
 import { typesetDocument } from '$lib/server/maths';
 import { highlightDocument } from '$lib/server/highlight';
 import type { Attachment } from '$lib/attachments';
-import type { Reference } from '$lib/blocks/render';
+import type { EmbeddedPage, Reference } from '$lib/blocks/render';
 
 /// The component's markup, without the hydration markers Svelte interleaves — they are an
 /// implementation detail and would make every assertion about structure unreadable.
@@ -17,10 +17,11 @@ function html(
   anhaenge: Attachment[] = [],
   formeln: Formulas | null = null,
   fences: Fences | null = null,
-  verweise: Record<string, Reference> = {}
+  verweise: Record<string, Reference> = {},
+  einbettungen: Record<string, EmbeddedPage> = {}
 ): string {
   return render(BlockView, {
-    props: { block, anhaenge, formeln, fences, verweise }
+    props: { block, anhaenge, formeln, fences, verweise, einbettungen }
   }).body.replace(/<!--.*?-->/g, '');
 }
 
@@ -812,5 +813,163 @@ describe('a diagram', () => {
     const out = html(diagram('graph TD;\n  A["<script>alert(1)</script>"]-->B;'));
     expect(out).not.toContain('<script');
     expect(out).toContain('&lt;script');
+  });
+});
+
+// --- a live view of another page (D-27 … D-30) --------------------------------------------
+
+describe('an embedded page', () => {
+  const ZIEL = '0199c0de-0000-7000-8000-000000000001';
+  const ABSCHNITT = '0199c0de-0000-7000-8000-00000000000a';
+
+  /** An embed block naming `ZIEL`, optionally anchored at `ABSCHNITT`. */
+  function embed(label: string, heading?: string): Block {
+    return {
+      kind: 'embed',
+      attrs: { doc: ZIEL, label, ...(heading ? { heading } : {}) }
+    };
+  }
+
+  /** What the server answers for a readable target whose section says `text`. */
+  function aufgeloest(text: string, extra: Partial<EmbeddedPage> = {}): EmbeddedPage {
+    return {
+      path: '/darm/labor',
+      title: 'Laborwerte',
+      body: { kind: 'doc', content: [{ kind: 'paragraph', content: [{ kind: 'text', text }] }] },
+      ...extra
+    };
+  }
+
+  it('draws a frame naming its source, with the source page as a link (D-28)', () => {
+    // Never seamless: a reader has to be able to tell which words are this page's own, and
+    // an edit made "here" would land on a different page under a different ACL.
+    const out = html(embed('Laborwerte'), [], null, null, {}, { [ZIEL]: aufgeloest('5 mg.') });
+    expect(out).toContain('5 mg.');
+    expect(out).toContain('Eingebettet aus');
+    expect(out).toContain('href="/darm/labor"');
+    expect(out).toContain('Laborwerte');
+    expect(out).toContain('class="einbettung');
+  });
+
+  it('shows the author\'s own label and nothing else for a target it was told nothing about', () => {
+    // A page this reader may not read, one in the Papierkorb, one that was purged, one that
+    // never existed and one past the per-page cap are ONE state here, because telling them
+    // apart is itself the disclosure. The label stays: it is the author's, and it is in a
+    // body this reader is already reading.
+    const out = html(embed('Laborbefund'), [], null, null, {}, {});
+    expect(out).toContain('Laborbefund');
+    expect(out).not.toContain('href="/darm/labor"');
+    expect(out).not.toContain('Eingebettet aus');
+  });
+
+  it('keeps the frame and says the section is gone when its anchor has been removed (D-29)', () => {
+    // Never a fall back to the whole page, which quietly swaps a dosage table for a page the
+    // author never meant to quote; never nothing at all, because nothing here vanishes
+    // silently. The source is still named and still linked, so the reader can go and look.
+    const ziel: EmbeddedPage = { path: '/darm/labor', title: 'Laborwerte' };
+    const out = html(embed('Dosierung', ABSCHNITT), [], null, null, {}, {
+      [`${ZIEL}#${ABSCHNITT}`]: ziel
+    });
+    expect(out).toContain('gibt es auf dieser Seite nicht mehr');
+    expect(out).toContain('href="/darm/labor"');
+    expect(out).toContain('einbettung-verwaist');
+  });
+
+  it('names a cycle instead of drawing one', () => {
+    const out = html(embed('Rundherum'), [], null, null, {}, {
+      [ZIEL]: { path: '/darm/labor', title: 'Laborwerte', cycle: ['Laborwerte', 'Übersicht'] }
+    });
+    expect(out).toContain('würde sich selbst enthalten');
+    expect(out).toContain('Laborwerte → Übersicht → diese Seite');
+    expect(out).toContain('einbettung-kreis');
+  });
+
+  it('renders an embed inside an embed as its label, so depth is one', () => {
+    // Closed by construction rather than by remembering to carry a visited set: the blocks
+    // inside a frame are rendered with an EMPTY map, so a nested embed takes the same branch
+    // an unreadable one takes.
+    //
+    // The inner embed names a target that IS in the map, and that is the whole point of the
+    // fixture: with a key nothing resolves, this test passes whether the map is handed down
+    // or not — it was written that way first, and a hand-run mutation (pass `einbettungen`
+    // into the frame instead of `{}`) survived it. Naming ZIEL means the map being passed
+    // down would expand the inner frame too, and the counts below would change.
+    const innen: Block = { kind: 'embed', attrs: { doc: ZIEL, label: 'Tiefer' } };
+    const out = html(embed('Aussen'), [], null, null, {}, {
+      [ZIEL]: { path: '/darm/labor', title: 'Laborwerte', body: { kind: 'doc', content: [innen] } }
+    });
+    // The inner one is drawn as its author's label, exactly as an unreadable target is.
+    expect(out).toContain('Tiefer');
+    expect(out).toContain('einbettung-fremd');
+    // …and exactly one frame is named, which is what says the inner one did not expand.
+    expect(out.match(/Eingebettet aus/g)?.length).toBe(1);
+  });
+
+  it('shows a quoted checklist read-only, with its live state, and says where ticking happens (D-30)', () => {
+    const liste: Block = {
+      kind: 'doc',
+      content: [
+        {
+          kind: 'taskList',
+          content: [
+            {
+              kind: 'taskItem',
+              attrs: { checked: true },
+              content: [{ kind: 'paragraph', content: [{ kind: 'text', text: 'Probe abgenommen' }] }]
+            }
+          ]
+        }
+      ]
+    };
+    const out = html(embed('Checkliste'), [], null, null, {}, {
+      [ZIEL]: { path: '/darm/labor', title: 'Laborwerte', body: liste }
+    });
+    // Live state, from the source page's own body.
+    expect(out).toContain('checked');
+    expect(out).toContain('disabled');
+    expect(out).toContain('Probe abgenommen');
+    // One task, one record, one board (D-2): the click goes to the page the line lives on.
+    expect(out).toContain('Abgehakt wird auf');
+  });
+
+  it('never resolves a quoted page\'s file against the page that quotes it', () => {
+    // Reusing the host's `Anhänge` list would make every picture inside a frame read the
+    // German "not attached" sentence — a false statement about somebody else's page — and
+    // guessing an address would bypass D-16 outright.
+    const mitBild: Block = {
+      kind: 'doc',
+      content: [{ kind: 'attachment', attrs: { filename: 'befund.png', alt: 'Röntgen' } }]
+    };
+    const out = html(embed('Bild'), [], null, null, {}, {
+      [ZIEL]: { path: '/darm/labor', title: 'Laborwerte', body: mitBild }
+    });
+    expect(out).toContain('befund.png');
+    expect(out).toContain('steht auf');
+    expect(out).not.toContain('<img');
+    expect(out).not.toContain('Diese Datei ist');
+  });
+
+  it('never puts the stored target into an attribute a browser would follow', () => {
+    // `attrs.doc` is an arbitrary string that reached `documents.body` over the collaboration
+    // socket with nothing validating it. What becomes an address is the PATH the server
+    // resolved, and it goes through `safeHref` like every other one.
+    const boese: Block = {
+      kind: 'embed',
+      attrs: { doc: 'javascript:alert(1)', label: 'harmlos' }
+    };
+    const out = html(boese, [], null, null, {}, {
+      'javascript:alert(1)': { path: 'javascript:alert(1)', title: 'Böse', body: { kind: 'doc' } }
+    });
+    expect(out).not.toContain('href="javascript:');
+    expect(out).not.toContain('src="javascript:');
+    // It falls through to the same state an unreadable target renders in, which is the
+    // fallthrough every other unresolvable address already takes.
+    expect(out).toContain('einbettung-fremd');
+    expect(out).toContain('harmlos');
+    // `data-einbettung` carries it, and that is deliberate: it is neither an address nor a
+    // name, the value is in the page's own data either way (`+page.server.ts` returns the
+    // body), and it is what a browser check finds the frame by — exactly `data-doc`'s
+    // argument on a reference.
+    expect(out).toContain('data-einbettung="javascript:alert(1)"');
   });
 });

@@ -3,7 +3,7 @@ import { render } from 'svelte/server';
 import Page from './+page.svelte';
 import { ANONYMOUS, type Backlink, type DocumentView, type Me, type TreeNode } from '$lib/api';
 import type { BoardNotice, BoardResponse, BoardTask } from '$lib/board';
-import type { Block } from '$lib/blocks/render';
+import type { Block, EmbeddedPage } from '$lib/blocks/render';
 import { typesetDocument } from '$lib/server/maths';
 import { highlightDocument } from '$lib/server/highlight';
 import type { SidebarMode, Topic, TopicSummary } from '$lib/topics';
@@ -128,7 +128,8 @@ function html(
     anhaengeFehler = null,
     hochgeladen = null,
     form = null,
-    verweise = {}
+    verweise = {},
+    einbettungen = {}
   }: {
     me?: Me;
     edit?: boolean;
@@ -148,6 +149,7 @@ function html(
     hochgeladen?: Attachment | null;
     form?: { wo: 'thema' | 'loeschen' | 'anhang'; fehler: string; getippt: string } | null;
     verweise?: Record<string, Reference>;
+    einbettungen?: Record<string, EmbeddedPage>;
   } = {}
 ): string {
   return render(Page, {
@@ -171,6 +173,10 @@ function html(
         // unless a test passes one: an id with no entry renders as the author's own text,
         // which is the same thing a reference to an unreadable page does.
         verweise,
+        // What every embed on this page may show this reader (D-27). Empty here unless a
+        // test passes one: a block with no entry renders as the author's own label, which is
+        // the same thing an embed of an unreadable page does.
+        einbettungen,
         tree,
         backlinks,
         edit,

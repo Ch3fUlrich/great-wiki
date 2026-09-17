@@ -112,7 +112,85 @@ pub fn one_per_kind() -> Vec<(&'static str, Block)> {
 
     cases.push(("attachment", placed_files()));
 
+    cases.push(("embed", embedded_pages()));
+
+    cases.push(("heading (with a stable id)", anchored_headings()));
+
     cases
+}
+
+/// Three live views of other pages (D-27), shaped around what makes an embed fragile.
+///
+/// An embed is an atom: no children, and its whole meaning is in attributes that nothing on
+/// the page spells out. Every one of the four is here, and each of the three cases exercises
+/// a different pair, because the attribute that is missing is the one whose loss is silent:
+///
+/// * a whole page by **identity**, which is the ordinary case;
+/// * one **section** of a page, whose `heading` is the only thing saying which half of the
+///   target is quoted — lose it and the frame quietly grows to the whole page, which is
+///   exactly the fallback D-29 refused;
+/// * a target named by **address**, which is what a restored backup holds until the next
+///   publish exchanges it for this database's id.
+///
+/// `label` is written on all three including when it is empty, for the reason a placement's
+/// `alt` is: it is the author's own words and the only thing a reader who may not read the
+/// target is ever shown, so an empty one and no key at all must not become the same document.
+pub fn embedded_pages() -> Block {
+    fn embed(doc: Option<&str>, path: Option<&str>, heading: Option<&str>, label: &str) -> Block {
+        let mut b = block(BlockKind::Transclusion);
+        if let Some(doc) = doc {
+            b = with_attr(b, "doc", Value::from(doc));
+        }
+        if let Some(path) = path {
+            b = with_attr(b, "path", Value::from(path));
+        }
+        if let Some(heading) = heading {
+            b = with_attr(b, "heading", Value::from(heading));
+        }
+        with_attr(b, "label", Value::from(label))
+    }
+    doc(vec![
+        paragraph("Zum Nachschlagen:"),
+        embed(
+            Some("0199c0de-0000-7000-8000-000000000001"),
+            None,
+            None,
+            "Laborwerte",
+        ),
+        embed(
+            Some("0199c0de-0000-7000-8000-000000000002"),
+            None,
+            Some("0199c0de-0000-7000-8000-00000000000a"),
+            "Dosierung",
+        ),
+        embed(None, Some("/darm/labor"), None, ""),
+    ])
+}
+
+/// Headings carrying the stable id a section embed anchors to.
+///
+/// A separate case from `one_per_kind`'s plain headings on purpose: `id` is an attribute the
+/// editor's schema has to DECLARE, and an undeclared one is deleted from the Y.Doc and
+/// broadcast to everybody else editing — so every embed of a section of this page would
+/// become an orphan, on a page nobody had knowingly changed, with nothing on screen to show
+/// it. One heading deliberately carries none, which is the honest state of a page that has
+/// not been published since ids existed.
+pub fn anchored_headings() -> Block {
+    fn heading(level: u64, id: Option<&str>, text_: &str) -> Block {
+        let mut h = with_attr(block(BlockKind::Heading), "level", Value::from(level));
+        if let Some(id) = id {
+            h = with_attr(h, "id", Value::from(id));
+        }
+        h.content.push(text(text_));
+        h
+    }
+    doc(vec![
+        heading(2, Some("0199c0de-0000-7000-8000-00000000000a"), "Dosierung"),
+        paragraph("5 mg."),
+        heading(3, Some("0199c0de-0000-7000-8000-00000000000b"), "Kinder"),
+        paragraph("2 mg."),
+        heading(2, None, "Noch nie veröffentlicht"),
+    ])
 }
 
 /// Two files placed in the prose (D-15), shaped around what makes a placement fragile.

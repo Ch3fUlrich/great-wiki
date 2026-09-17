@@ -652,6 +652,68 @@ mod tests {
     }
 
     #[test]
+    fn an_embed_keeps_every_attribute_that_says_what_it_embeds() {
+        // Asserted directly as well as through `assert_round_trips`, so this test still
+        // means something if the fixture ever loses an attribute: an embed is an ATOM, so
+        // there is no text and no child to notice the loss by, and what it embeds is the
+        // whole of what it is. A `heading` dropped on the way through the Y.Doc turns a
+        // quoted dosage table into somebody's entire page, silently, for everyone.
+        let embeds = fixtures::embedded_pages();
+        assert_round_trips(&embeds);
+        let back = CollabDoc::from_block(&embeds).to_block();
+        let attrs: Vec<Vec<(&str, &str)>> = back
+            .content
+            .iter()
+            .filter(|b| b.kind == gw_core::BlockKind::Transclusion)
+            .map(|b| {
+                b.attrs
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str().unwrap_or("")))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            attrs,
+            vec![
+                vec![
+                    ("doc", "0199c0de-0000-7000-8000-000000000001"),
+                    ("label", "Laborwerte")
+                ],
+                vec![
+                    ("doc", "0199c0de-0000-7000-8000-000000000002"),
+                    ("heading", "0199c0de-0000-7000-8000-00000000000a"),
+                    ("label", "Dosierung")
+                ],
+                // The empty label survives as an empty label rather than as no key at all.
+                vec![("label", ""), ("path", "/darm/labor")],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_heading_keeps_the_stable_id_a_section_embed_anchors_to() {
+        let headings = fixtures::anchored_headings();
+        assert_round_trips(&headings);
+        let back = CollabDoc::from_block(&headings).to_block();
+        let ids: Vec<Option<&str>> = back
+            .content
+            .iter()
+            .filter(|b| b.kind == gw_core::BlockKind::Heading)
+            .map(|b| b.attrs.get("id").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                Some("0199c0de-0000-7000-8000-00000000000a"),
+                Some("0199c0de-0000-7000-8000-00000000000b"),
+                None
+            ],
+            "a heading's stable id did not survive the Y.Doc — every section embed of this \
+             page would be an orphan, on a page nobody knowingly changed"
+        );
+    }
+
+    #[test]
     fn a_table_keeps_its_per_column_alignment() {
         let table = fixtures::aligned_table();
         assert_round_trips(&table);

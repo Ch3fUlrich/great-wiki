@@ -1,7 +1,7 @@
 <script lang="ts">
-  import type { Block, Mark, Reference } from '$lib/blocks/render';
+  import type { Block, EmbeddedPage, Mark, Reference } from '$lib/blocks/render';
   import { slugify } from '$lib/slug';
-  import { codeText, placedFile, plainText, safeHref } from '$lib/blocks/render';
+  import { codeText, embeddedPage, placedFile, plainText, safeHref } from '$lib/blocks/render';
   import { alignOf } from '$lib/blocks/table';
   import {
     attachmentNamed,
@@ -94,6 +94,42 @@
      * disclose more than a reader would see.
      */
     verweise?: Record<string, Reference>;
+    /**
+     * What every `embed` block on this page may show **this reader** —
+     * `gw_store::Store::embeds_for`'s answer, keyed by `embedKey`.
+     *
+     * Passed down for `verweise`' reason and one that is sharper: an embed puts a DIFFERENT
+     * page's words on this one, so the permission question is about a page this component has
+     * never read. A component that fetched the target itself would be a second answer to that
+     * question, computed where the answer cannot be trusted.
+     *
+     * **A block with no entry here renders as the author's own label and nothing else** — no
+     * frame contents, no title, no address. It is a page this reader may not read, one in the
+     * Papierkorb, one that was purged, one that never existed, or one past the per-page cap,
+     * and those are deliberately indistinguishable: telling them apart is the disclosure.
+     *
+     * `{}` by default, and honest for every caller with no page load behind it — the editor
+     * renders this component while TipTap mounts. Every embed then shows its label, which is
+     * the same thing an embed of an unreadable page shows, so nothing there can disclose more
+     * than a reader would see.
+     */
+    einbettungen?: Record<string, EmbeddedPage>;
+    /**
+     * Whether this subtree is being drawn INSIDE an embed's frame.
+     *
+     * **Depth is one, and this is how.** The blocks handed back for an embed may themselves
+     * hold embeds; inside a frame they render as their labels rather than expanding, which
+     * closes the recursion by construction rather than by remembering to carry a visited set,
+     * and bounds what one page read can cost. It also decides the two things D-30 is about: a
+     * quoted checklist says where ticking happens, and a quoted file says where it is shown,
+     * because neither belongs to the page being read.
+     */
+    eingebettet?: boolean;
+    /**
+     * Where the source page of the frame this subtree is inside lives, for the links those
+     * two states need. `null` outside a frame.
+     */
+    quelle?: { path: string; title: string } | null;
   }
 
   let {
@@ -101,8 +137,17 @@
     anhaenge = [],
     formeln = null,
     fences = null,
-    verweise = {}
+    verweise = {},
+    einbettungen = {},
+    eingebettet = false,
+    quelle = null
   }: Props = $props();
+
+  /** Whether anything under `b` is a checklist line — what D-30's note is offered for. */
+  function hatAufgaben(b: Block): boolean {
+    if (b.kind === 'taskItem') return true;
+    return (b.content ?? []).some(hatAufgaben);
+  }
 </script>
 
 <!-- Only known kinds render. An unknown block is skipped rather than emitted raw, which is
@@ -120,26 +165,26 @@
      markup — which is the containment ADR 0014 already requires for an uploaded SVG. -->
 
 {#if block.kind === 'doc'}
-  {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}
+  {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}
 {:else if block.kind === 'paragraph'}
-  <p>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}</p>
+  <p>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}</p>
 {:else if block.kind === 'heading'}
   {@const level = Math.min(6, Math.max(1, Number(block.attrs?.level ?? 1)))}
   {@const id = slugify(plainText(block))}
   <svelte:element this={`h${level}`} {id}>
-    {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}
+    {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}
   </svelte:element>
 {:else if block.kind === 'bulletList'}
-  <ul>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}</ul>
+  <ul>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}</ul>
 {:else if block.kind === 'orderedList'}
-  <ol>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}</ol>
+  <ol>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}</ol>
 {:else if block.kind === 'listItem'}
-  <li>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}</li>
+  <li>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}</li>
 {:else if block.kind === 'taskList'}
   <!-- A checklist. `data-type` is the attribute TipTap's own `TaskList` puts on its `<ul>`,
        so the editor and the reader can be styled by one rule instead of two that drift. -->
   <ul class="task-list" data-type="taskList">
-    {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}
+    {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}
   </ul>
 {:else if block.kind === 'taskItem'}
   {@const checked = block.attrs?.checked === true}
@@ -161,10 +206,10 @@
        every line beneath it as well. -->
   <li class="task-item" data-type="taskItem" data-checked={checked}>
     <input type="checkbox" {checked} disabled aria-label={plainText(block.content?.[0] ?? block)} />
-    <div>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}</div>
+    <div>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}</div>
   </li>
 {:else if block.kind === 'blockquote'}
-  <blockquote>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}</blockquote>
+  <blockquote>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}</blockquote>
 {:else if block.kind === 'codeBlock'}
   <!-- `codeText`, never `plainText`: the whitespace IS the content of a fence, and
        `plainText` collapses it — see its own doc comment for why widening THAT is not the
@@ -195,14 +240,14 @@
        no import cycle between the two components. -->
   <TableView {block} child={nested} />
 {:else if block.kind === 'tableRow'}
-  <tr>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}</tr>
+  <tr>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}</tr>
 {:else if block.kind === 'tableHeader'}
   <th scope="col" style:text-align={alignOf(block)}
-    >{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}</th
+    >{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}</th
   >
 {:else if block.kind === 'tableCell'}
   <td style:text-align={alignOf(block)}
-    >{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}</td
+    >{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}</td
   >
 {:else if block.kind === 'attachment'}
   <!-- A file placed in the prose (D-15). Three outcomes, and which one applies is decided by
@@ -217,8 +262,21 @@
        nothing about how it renders. -->
   {@const placed = placedFile(block)}
   {#if placed}
-    {@const anhang = attachmentNamed(anhaenge, placed.filename)}
-    {#if anhang === null}
+    {@const anhang = eingebettet ? null : attachmentNamed(anhaenge, placed.filename)}
+    {#if eingebettet}
+      <!-- A file placed in an EMBEDDED page is that page's file, not this one's. Resolving it
+           against the host page's `Anhänge` list would make every picture inside a frame read
+           the German "not attached" sentence — a false statement about somebody else's page —
+           and guessing an address would be worse: a download is authorised against the page
+           it was reached through (D-16), and there is deliberately no address built from a
+           digest. So the frame names the file and says where it is shown. -->
+      <p class="datei-fehlt">
+        »{placed.filename}« steht auf {#if quelle}<a
+            href={safeHref(quelle.path) ?? ''}
+            rel="noopener noreferrer">{quelle.title}</a
+          >{:else}der Quellseite{/if}.
+      </p>
+    {:else if anhang === null}
       <!-- Stated, not drawn as a broken picture. See `describeMissingPlacement`: an `<img>`
            whose source 404s renders as an icon and reads as "the network failed", and the
            truth is different and actionable — the file was detached (which deliberately does
@@ -268,11 +326,106 @@
       </a>
     {/if}
   {/if}
+{:else if block.kind === 'embed'}
+  <!-- A live view of another page, or of one section of it (D-27). Four outcomes, and which
+       one applies is decided by the map the server filled and by nothing in the block: an
+       embed is a REFERENCE, and what may be said about its target is a permission decision
+       about a page this component has never read.
+
+       D-28: FRAMED, WITH THE SOURCE NAMED. Never seamless. Seamless reads better and leaves a
+       reader unable to tell which words are this page's own — and an edit made "here" would
+       land silently on a different page under a different ACL. Honesty about provenance is
+       worth a border.
+
+       The address is `ziel.path`, from the server's own resolution, through `safeHref` like
+       every other one — the same sink, not a second judgement of what is safe. Nothing here
+       interpolates `attrs.doc`, which is an arbitrary string that reached `documents.body`
+       over the collaboration socket with nothing validating it. -->
+  {@const ref = embeddedPage(block)}
+  {#if ref}
+    {@const ziel = einbettungen[ref.key]}
+    {@const zielHref = ziel ? safeHref(ziel.path) : null}
+    {#if !ziel || zielHref === null}
+      <!-- The page is not this reader's to see, is in the Papierkorb, was purged, never
+           existed, or is past the per-page cap. One state, one sentence, because telling
+           them apart is itself the disclosure — and the author's own label stays, because it
+           is the author's and is in a body this reader is already reading. -->
+      <div class="einbettung einbettung-fremd" data-einbettung={ref.key}>
+        <p class="einbettung-kopf">Eingebettete Seite</p>
+        <p class="einbettung-wort">
+          {ref.label === '' ? 'Diese Seite ist hier nicht verfügbar.' : ref.label}
+        </p>
+      </div>
+    {:else if (ziel.cycle ?? []).length > 0}
+      <!-- A cycle, stopped at render and NAMED. It is allowed to exist — refusing a publish
+           because somebody else's page points back here would mean reading pages the author
+           may not read — so it is caught where both ends are known. Every title in the chain
+           is a page this reader may read; one passing through a page they may not is simply
+           not found, exactly as it is not listed anywhere else. -->
+      <div class="einbettung einbettung-kreis" data-einbettung={ref.key}>
+        <p class="einbettung-kopf">
+          Eingebettet aus <a href={zielHref} rel="noopener noreferrer">{ziel.title}</a>
+        </p>
+        <p class="einbettung-wort">
+          Diese Einbettung würde sich selbst enthalten und wird deshalb nicht angezeigt:
+          {(ziel.cycle ?? []).join(' → ')} → diese Seite.
+        </p>
+      </div>
+    {:else if !ziel.body}
+      <!-- D-29: an orphaned embed STAYS and says so. Never a fall back to the whole page,
+           which never shows an empty frame and quietly swaps a dosage table for a page the
+           author never meant to quote; never nothing at all, because nothing here vanishes
+           silently (the rule a detached task follows, D-8). -->
+      <div class="einbettung einbettung-verwaist" data-einbettung={ref.key}>
+        <p class="einbettung-kopf">
+          Eingebettet aus <a href={zielHref} rel="noopener noreferrer">{ziel.title}</a>
+        </p>
+        <p class="einbettung-wort">
+          Den Abschnitt gibt es auf dieser Seite nicht mehr. Er wurde gelöscht oder mit einem
+          anderen zusammengeführt.
+        </p>
+      </div>
+    {:else}
+      <!-- The frame. `eingebettet` is what makes depth one: an embed inside these blocks
+           renders as its own label rather than expanding, which closes the recursion by
+           construction. `verweise` is the EMBEDDED body's own references, resolved against
+           this same reader — reusing the host page's map would leave every `dok:` inside the
+           frame as unlinked words, which is the state that means "you may not read that". -->
+      <figure class="einbettung" data-einbettung={ref.key}>
+        <figcaption class="einbettung-kopf">
+          Eingebettet aus <a href={zielHref} rel="noopener noreferrer">{ziel.title}</a>{ref.section
+            ? ' (ein Abschnitt)'
+            : ''}
+        </figcaption>
+        <div class="einbettung-inhalt">
+          {#each ziel.body.content ?? [] as child, i (i)}<Self
+              block={child}
+              {anhaenge}
+              formeln={null}
+              fences={null}
+              verweise={ziel.references ?? {}}
+              einbettungen={{}}
+              eingebettet={true}
+              quelle={{ path: ziel.path, title: ziel.title }}
+            />{/each}
+        </div>
+        {#if hatAufgaben(ziel.body)}
+          <!-- D-30: the boxes above show their LIVE state and cannot be ticked here. One
+               task, one record, one board (D-2): the record owns the state, and it belongs to
+               the page the line is written on. So the click goes there, and the page says so
+               rather than leaving a reader pressing a box that does nothing. -->
+          <p class="einbettung-fuss">
+            Abgehakt wird auf <a href={zielHref} rel="noopener noreferrer">{ziel.title}</a>.
+          </p>
+        {/if}
+      </figure>
+    {/if}
+  {/if}
 {:else if block.kind === 'text'}
   {@render marked(block.text ?? '', block.marks ?? [])}
 {/if}
 
-{#snippet nested(child: Block)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/snippet}
+{#snippet nested(child: Block)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/snippet}
 
 <!-- A leaf's `marks`, applied outermost first — the order `gw_core::MARK_ORDER` already
      sorted them into (see `render.ts`'s `Block.marks` doc). Recursing one mark at a time
@@ -410,6 +563,55 @@
     padding: var(--space-2) var(--space-3);
     border-inline-start: 3px solid var(--border-strong);
     background: var(--bg-sunken);
+    color: var(--ink-muted);
+    font-size: var(--text-sm);
+  }
+
+  /* The frame (D-28). A subtle border and a named source, never seamless: a reader has to be
+     able to tell which words are this page's own, and an edit made "here" would land on a
+     different page under a different ACL. Tokens throughout, so a theme can repaint it. */
+  .einbettung {
+    margin-block: var(--space-4);
+    padding: var(--space-3) var(--space-4);
+    border: 1px solid var(--border);
+    border-inline-start: 3px solid var(--accent);
+    border-radius: var(--radius-sm);
+    background: var(--bg-raised);
+  }
+
+  .einbettung-kopf {
+    margin: 0 0 var(--space-2);
+    color: var(--ink-muted);
+    font-size: var(--text-sm);
+  }
+
+  .einbettung-inhalt > :global(*:first-child) {
+    margin-block-start: 0;
+  }
+
+  .einbettung-inhalt > :global(*:last-child) {
+    margin-block-end: 0;
+  }
+
+  .einbettung-fuss {
+    margin: var(--space-3) 0 0;
+    color: var(--ink-muted);
+    font-size: var(--text-sm);
+  }
+
+  /* Not an error colour and not an alert, for `.datei-fehlt`'s reason: a frame whose section
+     was renamed away, whose target is not this reader's to see, or which closes a ring is an
+     ordinary, recoverable state of a page. Painting it red would make every such page look
+     broken. */
+  .einbettung-fremd,
+  .einbettung-verwaist,
+  .einbettung-kreis {
+    border-inline-start-color: var(--border-strong);
+    background: var(--bg-sunken);
+  }
+
+  .einbettung-wort {
+    margin: 0;
     color: var(--ink-muted);
     font-size: var(--text-sm);
   }

@@ -14,6 +14,7 @@ pub mod revisions;
 pub mod sessions;
 pub mod tasks;
 pub mod topics;
+pub mod transclusion;
 pub mod trash;
 
 pub use acl::{Baseline, DocumentAccess};
@@ -39,6 +40,7 @@ pub use topics::{
     canonical_topic, Topic, TopicDocument, TopicListing, TopicOutcome, TopicSummary,
     MAX_TOPIC_DEPTH, MAX_TOPIC_NAME_CHARS,
 };
+pub use transclusion::{Embed, MAX_EMBEDS_PER_PAGE};
 pub use trash::{
     Purge, PurgeOutcome, PurgeReport, PurgedPage, TrashEntry, TrashOutcome, TrashSummary,
 };

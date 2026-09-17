@@ -104,7 +104,16 @@
 
         <g class="edges">
           {#each lines as drawn (edgeKey(drawn!.edge))}
+            <!-- The two ends named on the element. Not decoration and not a disclosure: both
+                 ids are already in this page's data and both ends' PATHS are spelled out in
+                 the accessible list below — `graph_for` emits an edge only when the caller
+                 may read both — so this adds nothing a reader does not already have. What it
+                 adds is the ability to say WHICH line is which: a graph with more than one
+                 edge is otherwise a set of indistinguishable `<line>` elements, and a check
+                 of "does the arrow point the right way" then has nothing to point at. -->
             <line
+              data-von={drawn!.edge.from}
+              data-nach={drawn!.edge.to}
               x1={drawn!.line!.x1}
               y1={drawn!.line!.y1}
               x2={drawn!.line!.x2}

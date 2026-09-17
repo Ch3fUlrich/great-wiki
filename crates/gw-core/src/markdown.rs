@@ -27,6 +27,22 @@
 //! CommonMark's link-title slot ([`document_fallback`]) — what a database that has never
 //! heard of that id falls back to, and nothing else. [ADR 0019](../../../docs/decisions/0019-how-a-document-reference-is-written-in-markdown.md)
 //! has the reasoning and the cost.
+//!
+//! # Embedding another page, or one section of it (D-27)
+//!
+//! The first shape a third time: `![Beschriftung](einbettung:<ziel>#<abschnitt> "/pfad")` is a
+//! live view of another page. [`transclusion_destination`] writes it and
+//! [`transclusion_reference`] reads it, and it goes through the *image* path — not the link
+//! path — because an embed is a top-level atom whose text is what to show when the thing
+//! itself cannot be shown, which is what an image is and what a link is not. The
+//! "alone in its own top-level paragraph" rule is therefore the same rule, unchanged.
+//!
+//! The `#<abschnitt>` names a heading by the **stable id** the store mints onto it on publish,
+//! and that id is written into the file as well — `## Titel {#<uuid>}`, see
+//! [`heading_anchor`]. It is read here rather than by turning on pulldown-cmark's heading
+//! attributes, so that only a uuid-shaped suffix counts and no heading anybody has already
+//! written changes meaning. [ADR 0020](../../../docs/decisions/0020-how-an-embedded-page-and-a-heading-s-anchor-are-written-in-markdown.md)
+//! has the reasoning and the cost.
 
 use crate::block::{Block, BlockKind, Mark, MarkKind};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -262,6 +278,216 @@ pub fn document_fallback_path(title: &str) -> Option<&str> {
     Some(title)
 }
 
+/// What an image destination has to say to be a **live view of another page** (D-27).
+///
+/// [`ATTACHMENT_SCHEME`]'s argument a third time, and the third time it needs no arguing:
+/// a scheme rather than a shape, German because this wiki is, both halves in this crate
+/// because two copies of one rule in two crates stop agreeing the day one of them is edited.
+///
+/// It is written as an **image** rather than as a link, and that is a decision rather than an
+/// accident of reuse. A transclusion is a top-level atom with no inline content, which is
+/// exactly what a placement is and exactly what a link is not: CommonMark renders `![…]`'s
+/// content as a plain string, so the author's label cannot carry marks that would have to
+/// round-trip, and the existing "alone in its own top-level paragraph" rule
+/// ([`Builder::placement_is_possible`], [`Builder::settle_placements`]) is the same rule
+/// unchanged. And the alt slot is *already* markdown's place for "what to show when the
+/// thing itself cannot be shown", which is precisely what a label is for
+/// ([`crate::BlockKind::Transclusion`]'s `label`).
+pub const TRANSCLUSION_SCHEME: &str = "einbettung:";
+
+/// What an [`crate::BlockKind::Transclusion`] destination names.
+///
+/// Exactly one of `doc` and `path` is `Some`, which is the same invariant
+/// [`crate::Mark`] states about a link and for the same reason: a block carrying both can
+/// disagree with itself the day the target moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Transclusion<'a> {
+    /// The target's document id, when the destination names one by identity (D-5).
+    pub doc: Option<&'a str>,
+    /// The target's address, when the destination names one by where it is.
+    ///
+    /// This is the restored-backup form and not a second way of writing a reference: a seed
+    /// into a fresh database mints every document id anew, so no `einbettung:<uuid>` in a
+    /// restored corpus can match anything, and an embed that could only be written by
+    /// identity would come back as a frame around nothing. `gw_store`'s `settle_embeds`
+    /// exchanges an unknown id for the path a file carried, and the next publish exchanges
+    /// the path back for *this* database's id — the same two-step ADR 0019 built for `dok:`.
+    pub path: Option<&'a str>,
+    /// The stable id of the heading the embedded section starts at; `None` for a whole page.
+    pub heading: Option<&'a str>,
+}
+
+/// The markdown destination naming `doc` or `path`, optionally anchored at `heading`, or
+/// `None` for anything this syntax could not carry back unchanged.
+///
+/// The *writing* half of one agreement whose *reading* half is [`transclusion_reference`],
+/// and it asks that half rather than restating its rules — [`document_destination`]'s
+/// reason, and its safety property: `gw_api::export`'s renderer interpolates a destination
+/// with no escaping at all, and every one of these values reached `documents.body` over the
+/// collaboration socket without passing any validation.
+pub fn transclusion_destination(
+    doc: Option<&str>,
+    path: Option<&str>,
+    heading: Option<&str>,
+) -> Option<String> {
+    let target = match (doc, path) {
+        (Some(doc), None) => doc,
+        (None, Some(path)) => path,
+        // Neither is a block that names nothing; both is a block that can disagree with
+        // itself. The exporter turns either into a refusal that names the page.
+        _ => return None,
+    };
+    let written = match heading {
+        Some(heading) => format!("{TRANSCLUSION_SCHEME}{target}#{heading}"),
+        None => format!("{TRANSCLUSION_SCHEME}{target}"),
+    };
+    let read = transclusion_reference(&written)?;
+    (read.doc == doc && read.path == path && read.heading == heading).then_some(written)
+}
+
+/// What an image destination embeds, or `None` for a destination that embeds nothing.
+///
+/// The reading half of [`transclusion_destination`]. The target is a document id
+/// ([`is_document_id`]) or a rooted wiki path ([`document_fallback_path`]'s shape, which is
+/// what `Store::create_document` builds), and nothing else; the optional anchor after `#` is
+/// a document id too, because that is what a heading's stable id is minted as.
+///
+/// **Anything else is an ordinary image**, and that degradation is load-bearing rather than
+/// lenient for [`document_reference`]'s reason, run once more: `einbettung:etwas` is a string
+/// anybody with write access could type into an image destination, it round-trips today as a
+/// picture from somewhere this wiki does not store, and a reader that accepted it would make
+/// that page re-import as a different tree — a page nobody edited becoming permanently
+/// unexportable.
+///
+/// Deliberately **not** an existence check and **not** a permission check: this crate has no
+/// store, exactly as it has none to resolve a link's `doc` with.
+pub fn transclusion_reference(dest: &str) -> Option<Transclusion<'_>> {
+    let target = dest.strip_prefix(TRANSCLUSION_SCHEME)?;
+    // The anchor is split off first because a path may not contain `#` and an id may not
+    // either, so the LAST `#` cannot belong to the target — and splitting on the first would
+    // read `#` inside a malformed target as an anchor boundary.
+    let (target, heading) = match target.rsplit_once('#') {
+        Some((target, heading)) => (target, Some(heading)),
+        None => (target, None),
+    };
+    if let Some(heading) = heading {
+        if !is_document_id(heading) {
+            return None;
+        }
+    }
+    if is_document_id(target) {
+        return Some(Transclusion {
+            doc: Some(target),
+            path: None,
+            heading,
+        });
+    }
+    document_fallback_path(target).map(|path| Transclusion {
+        doc: None,
+        path: Some(path),
+        heading,
+    })
+}
+
+/// The suffix that states a heading's **stable** id: `## Titel {#<uuid>}`.
+///
+/// # Why a heading needs one at all, and why it is in the file
+///
+/// A transclusion may name one section of a page (D-27), and a section needs an anchor that
+/// survives an edit. A heading's words change and its position certainly does, so neither is
+/// an anchor; the answer is the one a task block already uses — a uuid minted server-side on
+/// publish, carried in the block's `attrs`.
+///
+/// It could have stopped there. `gw_api::export`'s comparison would simply reduce the id
+/// away, exactly as it reduces a task's, and the file would not mention it. That was rejected
+/// for ADR 0019's reason: a seed into a fresh database mints ids anew, so an export restored
+/// into an empty store would keep every word, keep every page, and orphan **every section
+/// embed in the corpus** — with no fallback available, because the anchor's whole point is
+/// that it is not derivable from anything else in the file. Writing it costs one visible
+/// suffix per heading and buys a restore that is complete rather than merely readable.
+///
+/// # Why it is parsed here rather than by pulldown-cmark
+///
+/// `Options::ENABLE_HEADING_ATTRIBUTES` exists and would read `{#id}` for us. Turning it on
+/// is a **global re-parse of every heading in the corpus**: a heading whose text happens to
+/// end in `{#…}` would come back as different text with an id, differ from what is stored,
+/// and be refused from every export from then on — a page nobody edited becoming
+/// unexportable, which this project treats as disqualifying. Reading the suffix here instead
+/// means the rule can be as narrow as it needs to be: only a **uuid-shaped** id counts, which
+/// is a thing no heading in this corpus contains and no author writes by accident.
+///
+/// `None` for an id this syntax could not carry back unchanged, which the exporter turns into
+/// a refusal that names the page.
+pub fn heading_anchor(id: &str) -> Option<String> {
+    let written = format!(" {{#{id}}}");
+    (heading_anchor_id(&format!("x{written}")) == Some(("x", id))).then_some(written)
+}
+
+/// A heading's text split from the stable id its last characters state, or `None` when they
+/// state none.
+///
+/// The reading half of [`heading_anchor`], asked by it rather than restated. Returns the text
+/// with the suffix **and the space before it** removed, so `## Titel {#…}` gives back exactly
+/// the `Titel` that was stored.
+///
+/// The **last** such suffix wins, and that is what makes the pair total rather than merely
+/// usually right: a heading whose own words end in `{#0199…}` exports as
+/// `## Titel {#0199…} {#<real id>}` and reads back as the text it was, because the real id is
+/// always written last. The one shape this cannot carry is a heading that has **no** id and
+/// whose text ends in an anchor-shaped suffix; `gw_api::export` refuses that page loudly
+/// rather than writing a file that would re-import as something else, and a single publish
+/// (which mints the id) fixes it for good.
+pub fn heading_anchor_id(text: &str) -> Option<(&str, &str)> {
+    let head = text.strip_suffix('}')?;
+    let (head, id) = head.rsplit_once("{#")?;
+    if !is_document_id(id) {
+        return None;
+    }
+    // The space is the separator the writer put there; without it, `Titel{#…}` would come
+    // back as `Titel` and the file would not re-import as itself. An EMPTY head is the one
+    // exception and it is a real document: a heading with no words and an id writes as
+    // `## {#…}`, whose whole text is the suffix, with the separator absorbed by the `# `.
+    let head = if head.is_empty() {
+        head
+    } else {
+        head.strip_suffix(' ')?
+    };
+    Some((head, id))
+}
+
+/// What an image destination really names, or `None` for an ordinary picture.
+///
+/// The one place the two schemes are asked about together, so that "which schemes make an
+/// image a block" is a single list rather than a condition repeated at each end of the
+/// converter.
+fn placed_by(dest: &str, title: &str) -> Option<Placed> {
+    if let Some(filename) = attachment_reference(dest) {
+        return Some(Placed::File {
+            filename: filename.to_string(),
+        });
+    }
+    transclusion_reference(dest).map(|t| Placed::Page {
+        // The title slot carries the target's path as it stood when the file was written — a
+        // FALLBACK for a database that does not know this id, never a second address, and
+        // read only for an embed that names its target BY id. `gw_store`'s `settle_embeds`
+        // ends the pair; see [`document_fallback`], whose reasoning this is.
+        path: match (t.doc, t.path) {
+            (Some(_), _) => document_fallback_path(title).map(str::to_string),
+            (None, path) => path.map(str::to_string),
+        },
+        doc: t.doc.map(str::to_string),
+        heading: t.heading.map(str::to_string),
+    })
+}
+
+/// Whether this block is one an image destination produced — a placement or an embed.
+///
+/// Both are top-level atoms written as an image alone in its own paragraph, so both take the
+/// same degradation when that paragraph turns out to hold something else as well.
+fn is_placed(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::Attachment | BlockKind::Transclusion)
+}
+
 /// A markdown construct the M1 block schema cannot represent, and what became of it.
 ///
 /// Kept as an enum rather than a string so a caller can match on one, and so the
@@ -432,10 +658,29 @@ struct Table {
 
 /// An attachment reference between its `Start(Image)` and `End(Image)`.
 struct Placing {
-    filename: String,
+    /// What this image really is: a file on this page, or a live view of another page.
+    ///
+    /// One field rather than two `Option`s on the builder, because the two are mutually
+    /// exclusive by construction — an image destination states one scheme — and two options
+    /// would make "both open at once" a state somebody has to reason about.
+    what: Placed,
     /// The alt text as it arrives. Plain: a description is what a screen reader is handed
-    /// and what a card is labelled with, and neither has anywhere to put emphasis.
+    /// and what a card is labelled with, and neither has anywhere to put emphasis. For an
+    /// embed it is the author's own label, and the same argument applies twice over: it is
+    /// the only thing a reader who may not read the target is ever shown.
     alt: String,
+}
+
+/// The two things an image destination can name that are not a picture.
+enum Placed {
+    /// A file on this page ([`ATTACHMENT_SCHEME`]).
+    File { filename: String },
+    /// Another page, or one section of it ([`TRANSCLUSION_SCHEME`]).
+    Page {
+        doc: Option<String>,
+        path: Option<String>,
+        heading: Option<String>,
+    },
 }
 
 struct Builder {
@@ -551,12 +796,7 @@ impl Builder {
     /// its own output and compares, so a paragraph that came back split into three leaves
     /// instead of one would refuse the page.
     fn settle_placements(&mut self, mut block: Block) -> Block {
-        if block.kind != BlockKind::Paragraph
-            || !block
-                .content
-                .iter()
-                .any(|c| c.kind == BlockKind::Attachment)
-        {
+        if block.kind != BlockKind::Paragraph || !block.content.iter().any(is_placed) {
             return block;
         }
         if block.content.len() == 1 {
@@ -565,13 +805,20 @@ impl Builder {
 
         let mut merged: Vec<Block> = Vec::with_capacity(block.content.len());
         for child in block.content.drain(..) {
-            let child = if child.kind == BlockKind::Attachment {
+            let child = if is_placed(&child) {
                 self.note(Unsupported::Image);
                 let mut leaf = self::block(BlockKind::Text);
+                // The author's own words either way — a picture's description or an embed's
+                // label — which is exactly what an ordinary image degrades to, leaf for leaf.
+                let key = if child.kind == BlockKind::Transclusion {
+                    "label"
+                } else {
+                    "alt"
+                };
                 leaf.text = Some(
                     child
                         .attrs
-                        .get("alt")
+                        .get(key)
                         .and_then(|v| v.as_str())
                         .unwrap_or_default()
                         .to_string(),
@@ -804,6 +1051,46 @@ impl Builder {
         }
     }
 
+    /// Move a `{#<uuid>}` suffix off the open heading's last leaf and into its `id`.
+    ///
+    /// The **last unmarked text leaf**, and only that one: the writer appends the suffix
+    /// after everything the heading says, so a space separates it from whatever came before
+    /// and CommonMark gives it back as a leaf of its own whenever the heading ends in a mark.
+    /// A leaf that carries marks is therefore never the suffix, and a heading whose own words
+    /// end in braces inside a `**…**` keeps them.
+    ///
+    /// The leaf is dropped entirely when nothing is left of it, which is what makes a heading
+    /// with no words and an id (`## {#…}`) come back as the empty heading it was rather than
+    /// as one holding an empty text node.
+    fn take_heading_anchor(&mut self) {
+        let heading = self.top();
+        if heading.kind != BlockKind::Heading {
+            return;
+        }
+        let Some(last) = heading.content.last_mut() else {
+            return;
+        };
+        if last.kind != BlockKind::Text || !last.marks.is_empty() {
+            return;
+        }
+        let Some((head, id)) = last
+            .text
+            .as_deref()
+            .and_then(heading_anchor_id)
+            .map(|(head, id)| (head.to_string(), id.to_string()))
+        else {
+            return;
+        };
+        if head.is_empty() {
+            heading.content.pop();
+        } else {
+            last.text = Some(head);
+        }
+        heading
+            .attrs
+            .insert("id".into(), serde_json::Value::from(id));
+    }
+
     fn start(&mut self, tag: Tag<'_>) {
         match tag {
             Tag::Paragraph => self.open(block(BlockKind::Paragraph)),
@@ -884,10 +1171,17 @@ impl Builder {
             // An image is a file placed in the prose (D-15) when its destination names one
             // and it can stand where a placement may stand; anything else is a picture from
             // somewhere this wiki does not store, and keeps the behaviour it always had.
-            Tag::Image { dest_url, .. } => match attachment_reference(&dest_url) {
-                Some(filename) if self.placement_is_possible() => {
+            //
+            // A `einbettung:` destination is the same shape a third time and a live view of
+            // another page (D-27): an atom at the top level of the document, written as an
+            // image because an image is markdown's only way to say "this stands alone and
+            // its text is what to show when the thing itself cannot be shown".
+            Tag::Image {
+                dest_url, title, ..
+            } => match placed_by(&dest_url, &title) {
+                Some(what) if self.placement_is_possible() => {
                     self.placing = Some(Placing {
-                        filename: filename.to_string(),
+                        what,
                         alt: String::new(),
                     })
                 }
@@ -925,8 +1219,17 @@ impl Builder {
 
     fn end(&mut self, tag: TagEnd) {
         match tag {
+            // A heading may end with the stable id a transclusion anchors to — see
+            // `heading_anchor`. It is taken off here, before the frame closes, so nothing
+            // downstream ever sees it as part of the heading's words: it is not in
+            // `plain_text`, not in the search index, not in the slug the reader's fragment
+            // is built from, and not in the seeder's exact comparison of a body heading
+            // against the page title.
+            TagEnd::Heading(_) => {
+                self.take_heading_anchor();
+                self.close();
+            }
             TagEnd::Paragraph
-            | TagEnd::Heading(_)
             | TagEnd::BlockQuote(_)
             | TagEnd::Item
             | TagEnd::TableHead
@@ -959,18 +1262,51 @@ impl Builder {
             // opened no frame and pushed no mark, so it closes neither.
             TagEnd::Image => {
                 if let Some(placing) = self.placing.take() {
-                    let mut placement = block(BlockKind::Attachment);
-                    placement
-                        .attrs
-                        .insert("filename".into(), serde_json::Value::from(placing.filename));
+                    let mut placement = match placing.what {
+                        Placed::File { filename } => {
+                            let mut b = block(BlockKind::Attachment);
+                            b.attrs
+                                .insert("filename".into(), serde_json::Value::from(filename));
+                            b
+                        }
+                        // An embed's own two-or-three attributes. `doc` and `path` are never
+                        // both written — `transclusion_reference` guarantees exactly one —
+                        // and `heading` is absent for a whole page rather than null, because
+                        // an absent key and a null one must be the same document and the
+                        // editor's schema drops a null node attribute on the way to the CRDT.
+                        Placed::Page { doc, path, heading } => {
+                            let mut b = block(BlockKind::Transclusion);
+                            if let Some(doc) = doc {
+                                b.attrs.insert("doc".into(), serde_json::Value::from(doc));
+                            }
+                            if let Some(path) = path {
+                                b.attrs.insert("path".into(), serde_json::Value::from(path));
+                            }
+                            if let Some(heading) = heading {
+                                b.attrs
+                                    .insert("heading".into(), serde_json::Value::from(heading));
+                            }
+                            b
+                        }
+                    };
                     // Written even when it is empty, for the reason `checked` is: an empty
                     // description and no description are the same thing to a reader and two
                     // different documents to `render_file`'s comparison — and the editor's
                     // schema fills a missing one in with `''`, so leaving it out here would
                     // make every placement the editor touched differ from the imported one.
+                    // `alt` for a placement, `label` for an embed: two names because they
+                    // are two different things a reader is shown — a description of a picture
+                    // and the author's own words for what they quoted — and one key for both
+                    // would make the editor's two schemas share an attribute they each mean
+                    // something else by.
+                    let key = if placement.kind == BlockKind::Transclusion {
+                        "label"
+                    } else {
+                        "alt"
+                    };
                     placement
                         .attrs
-                        .insert("alt".into(), serde_json::Value::from(placing.alt));
+                        .insert(key.into(), serde_json::Value::from(placing.alt));
                     self.top().content.push(placement);
                 }
             }
@@ -1060,8 +1396,8 @@ mod tests {
     use crate::block::{Block, BlockKind, MarkKind};
     use crate::markdown::{
         attachment_destination, attachment_reference, convert, document_destination,
-        document_fallback, document_fallback_path, document_reference, markdown_to_blocks,
-        Unsupported,
+        document_fallback, document_fallback_path, document_reference, heading_anchor,
+        heading_anchor_id, markdown_to_blocks, transclusion_destination, Unsupported,
     };
 
     fn keys(md: &str) -> Vec<&'static str> {
@@ -2009,6 +2345,220 @@ mod tests {
         assert!(leaves[0].marks.is_empty());
         assert_eq!(leaves[1].text.as_deref(), Some("fett"));
         assert!(!leaves[1].marks.is_empty(), "the bold run lost its mark");
+    }
+
+    // --- a live view of another page (D-27) ------------------------------------------------
+
+    const EMBED_ID: &str = "0199c0de-0000-7000-8000-000000000001";
+    const EMBED_ANCHOR: &str = "0199c0de-0000-7000-8000-00000000000a";
+
+    #[test]
+    fn an_image_naming_another_page_becomes_an_embed_of_it() {
+        let doc = markdown_to_blocks(&format!("![Laborwerte](einbettung:{EMBED_ID})\n"));
+        assert_eq!(doc.content.len(), 1);
+        let embed = &doc.content[0];
+        assert_eq!(embed.kind, BlockKind::Transclusion);
+        assert_eq!(embed.attrs.get("doc").unwrap(), EMBED_ID);
+        assert_eq!(embed.attrs.get("label").unwrap(), "Laborwerte");
+        // No anchor means the whole page, and the key is ABSENT rather than null: the
+        // editor's schema drops a null node attribute on the way to the CRDT, so a null here
+        // would differ from what comes back and refuse the page from every export.
+        assert!(!embed.attrs.contains_key("heading"));
+        assert!(!embed.attrs.contains_key("path"));
+        // The wire name IS the CRDT element tag and the TipTap node name.
+        assert!(serde_json::to_string(&doc)
+            .unwrap()
+            .contains(r#""kind":"embed""#));
+    }
+
+    #[test]
+    fn an_embed_may_name_one_section_of_the_page() {
+        let doc = markdown_to_blocks(&format!(
+            "![Dosierung](einbettung:{EMBED_ID}#{EMBED_ANCHOR})\n"
+        ));
+        let embed = &doc.content[0];
+        assert_eq!(embed.attrs.get("doc").unwrap(), EMBED_ID);
+        assert_eq!(embed.attrs.get("heading").unwrap(), EMBED_ANCHOR);
+    }
+
+    #[test]
+    fn an_embed_may_name_its_target_by_address_for_a_database_that_never_heard_of_the_id() {
+        // What a restored backup produces, and the reason the path form exists at all: a
+        // seed into a fresh database mints every id anew.
+        let doc = markdown_to_blocks(&format!(
+            "![Dosierung](einbettung:/darm/labor#{EMBED_ANCHOR})\n"
+        ));
+        let embed = &doc.content[0];
+        assert_eq!(embed.kind, BlockKind::Transclusion);
+        assert_eq!(embed.attrs.get("path").unwrap(), "/darm/labor");
+        assert_eq!(embed.attrs.get("heading").unwrap(), EMBED_ANCHOR);
+        assert!(!embed.attrs.contains_key("doc"), "both addresses at once");
+    }
+
+    #[test]
+    fn a_destination_that_is_not_shaped_like_a_target_stays_an_ordinary_image() {
+        // The degradation is load-bearing, exactly as `dok:etwas` is: anybody with write
+        // access could have typed one of these into an image destination at any point in the
+        // past, and a reader that accepted them would make that page re-import as a different
+        // tree — a page nobody edited becoming permanently unexportable.
+        for dest in [
+            "einbettung:etwas",
+            "einbettung:",
+            "einbettung:darm/labor",            // not rooted
+            "einbettung:/darm/labor#abschnitt", // the anchor is not an id
+            "einbettung:/darm/labor#",
+        ] {
+            let doc = markdown_to_blocks(&format!("![a]({dest})\n"));
+            assert!(
+                doc.content
+                    .iter()
+                    .all(|b| b.kind != BlockKind::Transclusion),
+                "{dest:?} became an embed"
+            );
+            assert_eq!(doc.plain_text(), "a", "{dest:?} lost its description too");
+        }
+    }
+
+    #[test]
+    fn an_embed_below_the_top_level_degrades_to_its_label() {
+        // Its own group in the editor's schema admits it in `doc` and nowhere else, so an
+        // embed read back inside a list item or a table cell is a tree TipTap deletes on
+        // open. The importer never writes one there, and the label survives as text.
+        for md in [
+            &format!("- ![a](einbettung:{EMBED_ID})\n"),
+            &format!("> ![a](einbettung:{EMBED_ID})\n"),
+            &format!("| Kopf |\n|---|\n| ![a](einbettung:{EMBED_ID}) |\n"),
+            &format!("siehe ![a](einbettung:{EMBED_ID}) hier\n"),
+        ] {
+            let doc = markdown_to_blocks(md);
+            let mut kinds = Vec::new();
+            fn walk(b: &Block, out: &mut Vec<BlockKind>) {
+                out.push(b.kind);
+                for c in &b.content {
+                    walk(c, out);
+                }
+            }
+            walk(&doc, &mut kinds);
+            assert!(
+                !kinds.contains(&BlockKind::Transclusion),
+                "{md:?} embedded somewhere the editor cannot hold one"
+            );
+            assert!(
+                doc.plain_text().contains('a'),
+                "{md:?} lost the label as well: {:?}",
+                doc.plain_text()
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_halves_of_the_embed_syntax_are_one_rule() {
+        // The writer asks the reader rather than restating its rules, so this pins the pair
+        // rather than either side: `Renderer::wrap` and `Renderer::embed` escape nothing, and
+        // every one of these values reached `documents.body` over the collaboration socket.
+        assert_eq!(
+            transclusion_destination(Some(EMBED_ID), None, None).as_deref(),
+            Some(&*format!("einbettung:{EMBED_ID}"))
+        );
+        assert_eq!(
+            transclusion_destination(Some(EMBED_ID), None, Some(EMBED_ANCHOR)).as_deref(),
+            Some(&*format!("einbettung:{EMBED_ID}#{EMBED_ANCHOR}"))
+        );
+        assert_eq!(
+            transclusion_destination(None, Some("/darm/labor"), None).as_deref(),
+            Some("einbettung:/darm/labor")
+        );
+        // Neither names nothing; both can disagree with itself the day the target moves.
+        assert_eq!(transclusion_destination(None, None, None), None);
+        assert_eq!(
+            transclusion_destination(Some(EMBED_ID), Some("/darm/labor"), None),
+            None
+        );
+        // And nothing that would not read back unchanged is ever written.
+        assert_eq!(transclusion_destination(Some("x) [a](b"), None, None), None);
+        assert_eq!(
+            transclusion_destination(Some(EMBED_ID), None, Some("kopf")),
+            None
+        );
+        assert_eq!(
+            transclusion_destination(None, Some("/pfad mit leerzeichen"), None),
+            None
+        );
+
+        // And the case the `?` above does NOT cover, which is the one the final comparison
+        // exists for: a destination that reads back perfectly and reads back as something
+        // ELSE. Both attributes are arbitrary strings that reached `documents.body` over the
+        // collaboration socket, so a `doc` holding a path is a thing a page can hold — and
+        // writing it would export a block that re-imports as an ADDRESS-named embed, a
+        // different document, which `render_file` then refuses for ever.
+        assert_eq!(
+            transclusion_destination(Some("/darm/labor"), None, None),
+            None
+        );
+        assert_eq!(transclusion_destination(None, Some(EMBED_ID), None), None);
+    }
+
+    // --- a heading's stable id, which is what a section embed anchors to --------------------
+
+    #[test]
+    fn a_heading_carries_a_stable_id_written_after_its_words() {
+        let doc = markdown_to_blocks(&format!("## Dosierung {{#{EMBED_ANCHOR}}}\n"));
+        let heading = &doc.content[0];
+        assert_eq!(heading.kind, BlockKind::Heading);
+        assert_eq!(heading.attrs.get("id").unwrap(), EMBED_ANCHOR);
+        // The id is NOT part of the heading's words: not in the search index, not in the
+        // slug the reader's fragment is built from, not in the seeder's title comparison.
+        assert_eq!(heading.plain_text(), "Dosierung");
+        assert_eq!(doc.headings()[0].id, "dosierung");
+        assert_eq!(doc.headings()[0].anchor.as_deref(), Some(EMBED_ANCHOR));
+    }
+
+    #[test]
+    fn a_heading_with_no_words_and_an_id_comes_back_as_the_empty_heading_it_was() {
+        let doc = markdown_to_blocks(&format!("## {{#{EMBED_ANCHOR}}}\n"));
+        let heading = &doc.content[0];
+        assert!(
+            heading.content.is_empty(),
+            "an empty text leaf was left behind"
+        );
+        assert_eq!(heading.attrs.get("id").unwrap(), EMBED_ANCHOR);
+    }
+
+    #[test]
+    fn only_an_id_shaped_suffix_is_an_anchor_and_the_last_one_wins() {
+        // Narrow on purpose. `Options::ENABLE_HEADING_ATTRIBUTES` would read ANY `{…}`, which
+        // is a global re-parse of every heading in the corpus and would refuse from every
+        // export a page nobody had edited.
+        let doc = markdown_to_blocks("## Dosis {#2}\n");
+        assert!(!doc.content[0].attrs.contains_key("id"));
+        assert_eq!(doc.content[0].plain_text(), "Dosis {#2}");
+
+        // …and a heading whose own words end in one keeps them, because the real id is always
+        // written last. This is what makes the pair total rather than usually right.
+        let doc = markdown_to_blocks(&format!("## Dosis {{#{EMBED_ID}}} {{#{EMBED_ANCHOR}}}\n"));
+        assert_eq!(doc.content[0].attrs.get("id").unwrap(), EMBED_ANCHOR);
+        assert_eq!(
+            doc.content[0].plain_text(),
+            format!("Dosis {{#{EMBED_ID}}}")
+        );
+    }
+
+    #[test]
+    fn a_heading_anchor_needs_the_space_its_writer_puts_there() {
+        assert_eq!(
+            heading_anchor(EMBED_ANCHOR).as_deref(),
+            Some(&*format!(" {{#{EMBED_ANCHOR}}}"))
+        );
+        assert_eq!(heading_anchor("kopf"), None);
+        assert_eq!(
+            heading_anchor_id(&format!("Dosierung {{#{EMBED_ANCHOR}}}")),
+            Some(("Dosierung", EMBED_ANCHOR))
+        );
+        // Without the separator the file would not re-import as itself.
+        assert_eq!(
+            heading_anchor_id(&format!("Dosierung{{#{EMBED_ANCHOR}}}")),
+            None
+        );
     }
 
     #[test]

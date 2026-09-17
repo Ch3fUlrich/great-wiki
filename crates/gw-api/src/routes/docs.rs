@@ -5,7 +5,7 @@ use axum::Json;
 use axum_extra::extract::CookieJar;
 use gw_auth::Action;
 use gw_core::Block;
-use gw_store::{Reference, StoredDocument};
+use gw_store::{Embed, Reference, StoredDocument};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -56,6 +56,21 @@ pub struct DocumentView {
     /// reference's own text with no address and no title. ADR 0019.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub references: BTreeMap<String, Reference>,
+    /// What every embed in this body may show **this caller**, keyed by the block's own
+    /// target-and-section key (`gw_core::Block::embed_key`).
+    ///
+    /// An embed stores which page and which section and nothing else (D-27), so the words
+    /// inside the frame are resolved here, at read time, against the person reading — which
+    /// is what keeps a frame from going on showing somebody a page they lost access to.
+    ///
+    /// **Not computed here.** [`gw_store::Store::embeds_for`] is the whole rule, for
+    /// `references`' reason. An embed absent from this map names a page this caller may not
+    /// read, one in the Papierkorb, one that was purged, one that never existed, or one past
+    /// the per-page cap — deliberately indistinguishable, and rendered as the author's own
+    /// label. An entry whose `body` is absent is D-29's orphan: the anchored heading is gone,
+    /// and the frame says so and links the source. ADR 0020.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub embeds: BTreeMap<String, Embed>,
 }
 
 /// One document, if the caller may read it.
@@ -103,12 +118,22 @@ pub async fn get_document(
     // parse is not this handler's to repair: it answers with no references, so the page
     // still renders and its references fall through to plain text, which is the same state
     // an unreadable target is in.
-    let references = match serde_json::from_str::<Block>(&access.document.body) {
-        Ok(body) => state
-            .store
-            .references_for(&principal, &body)
-            .await
-            .map_err(ApiError::Internal)?,
+    let (references, embeds) = match serde_json::from_str::<Block>(&access.document.body) {
+        Ok(body) => (
+            state
+                .store
+                .references_for(&principal, &body)
+                .await
+                .map_err(ApiError::Internal)?,
+            // The host document's own id, because an embed of the page it is written on —
+            // and any ring of embeds leading back to it — is a cycle, which is stopped at
+            // render and named rather than drawn.
+            state
+                .store
+                .embeds_for(&principal, &access.document.id, &body)
+                .await
+                .map_err(ApiError::Internal)?,
+        ),
         Err(error) => {
             tracing::warn!(
                 target: "gw_api::docs",
@@ -116,7 +141,7 @@ pub async fn get_document(
                 %error,
                 "a stored body would not parse; its references are not resolved"
             );
-            BTreeMap::new()
+            (BTreeMap::new(), BTreeMap::new())
         }
     };
 
@@ -124,5 +149,6 @@ pub async fn get_document(
         document: access.document,
         may_write: access.may_write,
         references,
+        embeds,
     }))
 }

@@ -20,6 +20,11 @@ export type BlockKind =
   // attributes `placedFile` below reads. A reference to a row in the page's `Anhänge` list,
   // never a possession — see `gw_core::BlockKind::Attachment`.
   | 'attachment'
+  // A live view of another page, or of one section of it (D-27). An atom, like `attachment`:
+  // no content, and its whole meaning is the four attributes `embeddedPage` below reads. The
+  // wire name is `embed` while the Rust variant is `BlockKind::Transclusion` — see that
+  // enum's doc comment for why the two differ on purpose.
+  | 'embed'
   | 'text';
 
 // Mirrors `gw_core::MarkKind` — the wire name IS the Yjs attribute key `gw-collab` reads and
@@ -114,7 +119,99 @@ export interface Block {
 export interface Heading {
   level: number;
   text: string;
+  /** The anchor in the address bar: `slugify` of the text, so it follows the words. */
   id: string;
+  /**
+   * The heading's **stable** id — the uuid the store mints on publish — or `undefined` for a
+   * heading on a page that has not been published since those existed.
+   *
+   * What a section embed anchors to (D-27). The two ids answer two different questions: `id`
+   * follows the words, and this one does not, so re-wording a heading moves its fragment and
+   * leaves every embed of it quoting the same section. Mirrors `gw_core::Heading::anchor`.
+   */
+  anchor?: string;
+}
+
+/**
+ * One embed, resolved for the reader this page is being rendered for. Mirrors
+ * `gw_store::Embed`.
+ *
+ * Every field is a disclosure about the target page, so none of them exists for a reader who
+ * may not read it: the map simply has no entry for that embed, exactly as `Reference` works.
+ */
+export interface EmbeddedPage {
+  /** Where the source page is **now**. */
+  path: string;
+  /** What the source page is called **now** (D-28: the frame names its source). */
+  title: string;
+  /**
+   * The blocks to draw inside the frame — the whole page, or the anchored section.
+   *
+   * Absent is D-29's orphan: the heading the embed anchors to has been deleted or merged
+   * away, so the frame stays and says the section no longer exists. It is also what a cycle
+   * produces, and the two are told apart by `cycle` rather than by guessing.
+   */
+  body?: Block;
+  /** Where the EMBEDDED body's own references point, for this same reader. */
+  references?: Record<string, Reference>;
+  /**
+   * The titles leading from the source back to the page being read, host last — empty or
+   * absent when there is no cycle. Named rather than merely refused, because "this shows
+   * nothing" and "these pages quote each other in a ring" are different problems.
+   */
+  cycle?: string[];
+}
+
+/**
+ * What an `embed` block says, or `null` for a block that names no target.
+ *
+ * `label` is the author's own words and the only thing a reader who may not read the target
+ * is ever shown, which is why it is read straight off the block rather than out of the
+ * resolved map: the map is a statement about somebody else's page and this is not.
+ */
+export interface EmbedRef {
+  key: string;
+  label: string;
+  /** Whether the block names one section rather than the whole page. */
+  section: boolean;
+}
+
+/**
+ * A byte-for-byte mirror of `gw_core::Block::embed_key`.
+ *
+ * The server fills the map and this looks the entry up, so a disagreement renders every embed
+ * on the page as its label — which is the same thing an unreadable target renders as, and
+ * therefore precisely the state nobody would think to investigate. `<ziel>` or
+ * `<ziel>#<abschnitt>`, where `<ziel>` is the target's id or, for a target this database has
+ * not identified yet, its path.
+ */
+export function embedKey(block: Block): string | null {
+  const attr = (key: string) => {
+    const value = block.attrs?.[key];
+    return typeof value === 'string' && value !== '' ? value : null;
+  };
+  const target = attr('doc') ?? attr('path');
+  if (target === null) return null;
+  const heading = attr('heading');
+  return heading === null ? target : `${target}#${heading}`;
+}
+
+/**
+ * What an `embed` block names, or `null` for a block that names nothing.
+ *
+ * `null` rather than a guess, exactly as `placedFile` returns one: a block that cannot say
+ * which page it embeds is malformed, and a frame drawn around nothing would be this interface
+ * inventing a state the data model does not have.
+ */
+export function embeddedPage(block: Block): EmbedRef | null {
+  const key = embedKey(block);
+  if (key === null) return null;
+  const label = block.attrs?.label;
+  return {
+    key,
+    label: typeof label === 'string' ? label : '',
+    section: typeof block.attrs?.heading === 'string'
+  };
 }
 
 /** What an `attachment` block says: which file on this page, and what it shows. */
@@ -203,7 +300,13 @@ export function outline(block: Block): Heading[] {
       const raw = Number(b.attrs?.level ?? 1);
       const level = Math.min(6, Math.max(1, Number.isFinite(raw) ? raw : 1));
       const text = plainText(b);
-      out.push({ level, text, id: slugify(text) });
+      const anchor = b.attrs?.id;
+      out.push({
+        level,
+        text,
+        id: slugify(text),
+        ...(typeof anchor === 'string' && anchor !== '' ? { anchor } : {})
+      });
       return; // headings do not nest
     }
     b.content?.forEach(walk);

@@ -43,9 +43,10 @@ import {
  * XML element tag `gw-collab` writes (`doc.rs::tag_of` derives the tag from serde), and
  * therefore exactly the node name TipTap will look up in this schema.
  *
- * Sixteen, not the nine the M3 plan's sample lists: the plan predates the table kinds,
- * `taskList`/`taskItem` arrived with piece 3's checkbox, and `attachment` with piece 4's
- * placed files.
+ * Seventeen, not the nine the M3 plan's sample lists: the plan predates the table kinds,
+ * `taskList`/`taskItem` arrived with piece 3's checkbox, `attachment` with piece 4's placed
+ * files, and `embed` with transclusion. The wire name is `embed` while the Rust variant is
+ * `BlockKind::Transclusion`; this list is the WIRE.
  */
 const SERVER_KINDS = [
   'doc',
@@ -63,6 +64,7 @@ const SERVER_KINDS = [
   'tableHeader',
   'tableCell',
   'attachment',
+  'embed',
   'text'
 ];
 
@@ -113,6 +115,18 @@ const ONE_PER_KIND = {
     { type: 'codeBlock', attrs: { language: 'rust' }, content: [{ type: 'text', text: 'fn main() {}' }] },
     // A file placed in the prose, at the top level — the only place the schema admits one.
     { type: 'attachment', attrs: { filename: 'befund.png', alt: 'Röntgenbild, seitlich' } },
+    // A live view of one section of another page, also at the top level and also the only
+    // place the schema admits one. Every attribute is set, because the one that is missing is
+    // the one whose loss is silent.
+    {
+      type: 'embed',
+      attrs: {
+        doc: '0199c0de-0000-7000-8000-000000000001',
+        path: null,
+        heading: '0199c0de-0000-7000-8000-00000000000a',
+        label: 'Dosierung'
+      }
+    },
     {
       type: 'table',
       content: [
@@ -403,6 +417,115 @@ describe('the editor schema', () => {
     if (!(item instanceof Y.XmlElement)) throw new Error('expected a taskItem element');
     expect(item.nodeName).toBe('taskItem');
     expect(item.getAttributes()).toEqual({ checked: true });
+  });
+
+  // --- a live view of another page (D-27 … D-30) ----------------------------------------
+
+  const EMBED_DOC = '0199c0de-0000-7000-8000-000000000001';
+  const EMBED_SECTION = '0199c0de-0000-7000-8000-00000000000a';
+
+  /**
+   * A Y.Doc as `gw-collab::doc.rs::write_children` writes one holding a section embed and an
+   * anchored heading — the two things transclusion adds to the CRDT.
+   */
+  function serverWrittenEmbed(): Y.Doc {
+    const ydoc = new Y.Doc();
+
+    const heading = new Y.XmlElement('heading');
+    heading.setAttribute('level', 2 as unknown as string);
+    heading.setAttribute('id', EMBED_SECTION);
+    const words = new Y.XmlText();
+    words.insert(0, 'Dosierung');
+    heading.insert(0, [words]);
+
+    const embed = new Y.XmlElement('embed');
+    embed.setAttribute('doc', EMBED_DOC);
+    embed.setAttribute('heading', EMBED_SECTION);
+    embed.setAttribute('label', 'Dosierung');
+
+    ydoc.getXmlFragment(CONTENT_FIELD).insert(0, [heading, embed]);
+    return ydoc;
+  }
+
+  it('does not delete an embed from the CRDT when the editor opens the page', () => {
+    // THE data-loss test for this kind, in the shape the checklist one is written in: a tag
+    // this schema does not name makes `createNodeFromYElement` throw, and its `catch` runs
+    // `el._item.delete(transaction)` — broadcast to every other editor and snapshotted into
+    // a revision by the next sweep. The frame would simply be gone from everybody's page.
+    const ydoc = serverWrittenEmbed();
+    const fragment = ydoc.getXmlFragment(CONTENT_FIELD);
+
+    const doc = yXmlFragmentToProseMirrorRootNode(fragment, editorSchema);
+
+    expect(fragment.length).toBe(2);
+    expect((fragment.get(1) as Y.XmlElement).nodeName).toBe('embed');
+    expect(doc.childCount).toBe(2);
+    expect(doc.child(1).type.name).toBe('embed');
+    // And every attribute arrived. `heading` is the one whose loss is silent AND wrong in the
+    // most expensive way: without it the frame quietly grows from a quoted dosage table to
+    // somebody's entire page.
+    expect(doc.child(1).attrs).toMatchObject({
+      doc: EMBED_DOC,
+      heading: EMBED_SECTION,
+      label: 'Dosierung'
+    });
+  });
+
+  it("keeps a heading's stable anchor, which every section embed of this page depends on", () => {
+    // The attribute whose loss reaches OTHER PEOPLE'S pages. With `id` undeclared, opening
+    // this page deletes it from the Y.Doc; the next publish mints a fresh one; and every
+    // embed of that section, anywhere in the wiki, becomes a frame reading "this section no
+    // longer exists" about a section nobody removed. Remove `id` from `Section` in
+    // `extensions.ts` and this goes red.
+    const ydoc = serverWrittenEmbed();
+    const doc = yXmlFragmentToProseMirrorRootNode(ydoc.getXmlFragment(CONTENT_FIELD), editorSchema);
+    expect(doc.child(0).type.name).toBe('heading');
+    expect(doc.child(0).attrs.id).toBe(EMBED_SECTION);
+    expect(doc.child(0).attrs.level).toBe(2);
+  });
+
+  it('writes an embed back to the CRDT with its four attributes and nothing beside them', () => {
+    // The other half of the wire contract. An embed's attributes travel to
+    // `gw_core::Block::attrs` verbatim, so a fifth one declared here would be minted into
+    // every stored embed and `gw_api::export`'s `EMBED_ATTRS` would not know about it — the
+    // page refused from the backup, permanently. And the three that default to `null` must
+    // not reach the wire as nulls: `createTypeFromElementNode` skips a null NODE attribute,
+    // which is what makes a whole-page embed write no `heading` key at all.
+    const doc = {
+      type: 'doc',
+      content: [{ type: 'embed', attrs: { doc: EMBED_DOC, label: 'Laborwerte' } }]
+    };
+
+    const ydoc = prosemirrorJSONToYDoc(editorSchema, doc, CONTENT_FIELD);
+    const embed = ydoc.getXmlFragment(CONTENT_FIELD).get(0);
+    if (!(embed instanceof Y.XmlElement)) throw new Error('expected an embed element');
+    expect(embed.nodeName).toBe('embed');
+    expect(embed.getAttributes()).toEqual({ doc: EMBED_DOC, label: 'Laborwerte' });
+  });
+
+  it('holds an embed only where the importer will read one back', () => {
+    // Its own group, admitted by `Doc` alone — the same rule as a placement and for the same
+    // three failures. A list item cannot hold an atom in first position, and
+    // `createNodeFromYElement` answers a node ProseMirror cannot build by DELETING the
+    // element from the CRDT.
+    expect(editorSchema.nodes.embed.spec.group).toBe('embed');
+    expect(editorSchema.nodes.doc.spec.content).toBe('(block|attachment|embed)+');
+    expect(() =>
+      PmNode.fromJSON(editorSchema, {
+        type: 'doc',
+        content: [
+          {
+            type: 'bulletList',
+            content: [
+              {
+                type: 'listItem',
+                content: [{ type: 'embed', attrs: { doc: EMBED_DOC, label: 'x' } }]
+              }
+            ]
+          }
+        ]
+      }).check()
+    ).toThrow();
   });
 
   it('keeps an unticked box unticked rather than letting it fall back to a default', () => {

@@ -113,6 +113,18 @@ struct Targets {
 /// `from` is the linking document's OWN path — the base an `href` with no leading slash is
 /// resolved against, per [`wiki_path`].
 fn collect(body: &Block, into: &mut Targets, from: &str, public_origin: Option<&Url>) {
+    // An embed is at least as strong a connection as a link — it puts another page's words
+    // on this one — and it is invisible to the walk below, which reads MARKS: what an embed
+    // names is a block ATTRIBUTE. So it is read here, by identity or by address, and inherits
+    // `graph_for`'s both-ends filter for free.
+    if body.kind == gw_core::BlockKind::Transclusion {
+        let attr = |key: &str| body.attrs.get(key).and_then(|v| v.as_str());
+        if let Some(doc) = attr("doc") {
+            into.docs.insert(doc.to_string());
+        } else if let Some(path) = attr("path").and_then(|p| wiki_path(p, from, public_origin)) {
+            into.paths.insert(path);
+        }
+    }
     for mark in &body.marks {
         // A link carries EITHER `doc` or `href`, never both — `gw_core::Mark` says so — and
         // `else` rather than a second `if` keeps that true here even if one ever did.
@@ -482,6 +494,15 @@ pub(crate) async fn replace_links(
 /// the graph and wants an `href` as well, this one is resolving references for a reader and
 /// an `href` is already an address the reader can follow.
 fn collect_docs(body: &Block, into: &mut BTreeSet<String>) {
+    // An embed's target too, so that `references_for` answers for it as well. `gw_api::export`
+    // is what needs that: it writes the target's CURRENT path beside the id as the fallback a
+    // restored backup falls back to, and it takes every path it writes from this one
+    // permission-checked resolver and from nowhere else.
+    if body.kind == gw_core::BlockKind::Transclusion {
+        if let Some(doc) = body.attrs.get("doc").and_then(|v| v.as_str()) {
+            into.insert(doc.to_string());
+        }
+    }
     for mark in &body.marks {
         if let Some(doc) = mark.target_doc() {
             into.insert(doc.to_string());

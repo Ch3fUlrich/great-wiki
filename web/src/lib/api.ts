@@ -1,7 +1,7 @@
 import { env } from '$env/dynamic/private';
-import type { Block, Reference } from '$lib/blocks/render';
+import type { Block, EmbeddedPage, Reference } from '$lib/blocks/render';
 
-export type { Reference };
+export type { EmbeddedPage, Reference };
 
 export interface TreeNode {
   /**
@@ -175,6 +175,23 @@ export interface DocumentView extends StoredDocument {
    * second answer to a permission question. ADR 0019.
    */
   references?: Record<string, Reference>;
+  /**
+   * What every embed in this body may show **the caller this response was built for**, keyed
+   * by the block's own target-and-section key (`embedKey` in `$lib/blocks/render`). Mirrors
+   * `gw_api::routes::docs::DocumentView::embeds`.
+   *
+   * An embed stores which page and which section and nothing of either (D-27), so the words
+   * inside the frame are resolved when the page is read, against the person reading it —
+   * which is what keeps a frame from going on quoting a page somebody has lost access to.
+   *
+   * **A block with no entry here is not an error and must not be drawn as one.** It names a
+   * page this caller may not read, one in the Papierkorb, one that was purged, one that never
+   * existed, or one past the per-page cap — deliberately indistinguishable, because telling
+   * them apart is itself the disclosure — and it renders as the author's own label. An entry
+   * whose `body` is missing is the orphan D-29 decided on: the anchored heading is gone, so
+   * the frame stays and says so.
+   */
+  embeds?: Record<string, EmbeddedPage>;
 }
 
 

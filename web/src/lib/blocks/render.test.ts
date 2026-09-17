@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { codeText, outline, placedFile, plainText, safeHref, type Block } from './render';
+import {
+  codeText,
+  embedKey,
+  embeddedPage,
+  outline,
+  placedFile,
+  plainText,
+  safeHref,
+  type Block
+} from './render';
 
 const doc: Block = {
   kind: 'doc',
@@ -201,5 +210,95 @@ describe('codeText', () => {
 
   it('reads an empty fence as empty rather than as missing', () => {
     expect(codeText({ kind: 'codeBlock' })).toBe('');
+  });
+});
+
+// --- a live view of another page (D-27) ----------------------------------------------------
+
+describe('embedKey', () => {
+  // A byte-for-byte mirror of `gw_core::Block::embed_key`. The server fills the map and this
+  // looks the entry up, so a disagreement renders every embed on the page as its label —
+  // which is the same thing an unreadable target renders as, and therefore exactly the state
+  // nobody would think to investigate. These cases are the ones that suite pins.
+  const ID = '0199c0de-0000-7000-8000-000000000001';
+  const ANKER = '0199c0de-0000-7000-8000-00000000000a';
+
+  it('is the target on its own for a whole page', () => {
+    expect(embedKey({ kind: 'embed', attrs: { doc: ID, label: 'x' } })).toBe(ID);
+  });
+
+  it('carries the anchor after a hash for a section', () => {
+    expect(embedKey({ kind: 'embed', attrs: { doc: ID, heading: ANKER, label: 'x' } })).toBe(
+      `${ID}#${ANKER}`
+    );
+  });
+
+  it('uses the address for a target this database has not identified yet', () => {
+    expect(embedKey({ kind: 'embed', attrs: { path: '/darm/labor', label: 'x' } })).toBe(
+      '/darm/labor'
+    );
+  });
+
+  it('is null for a block that names no target at all', () => {
+    // `null` rather than a guess, exactly as `placedFile` returns one: a frame drawn around
+    // nothing would be this interface inventing a state the data model does not have.
+    expect(embedKey({ kind: 'embed', attrs: { label: 'x' } })).toBeNull();
+    expect(embedKey({ kind: 'embed', attrs: { doc: '', label: 'x' } })).toBeNull();
+    expect(embedKey({ kind: 'paragraph' })).toBeNull();
+  });
+});
+
+describe('embeddedPage', () => {
+  it('reads the author\'s own label, which is all an unreadable target ever shows', () => {
+    const ref = embeddedPage({
+      kind: 'embed',
+      attrs: { doc: '0199c0de-0000-7000-8000-000000000001', label: 'Laborbefund' }
+    });
+    expect(ref).toEqual({ key: '0199c0de-0000-7000-8000-000000000001', label: 'Laborbefund', section: false });
+  });
+
+  it('says when one section rather than a whole page was quoted', () => {
+    const ref = embeddedPage({
+      kind: 'embed',
+      attrs: {
+        doc: '0199c0de-0000-7000-8000-000000000001',
+        heading: '0199c0de-0000-7000-8000-00000000000a',
+        label: 'Dosierung'
+      }
+    });
+    expect(ref?.section).toBe(true);
+  });
+
+  it('reports an empty label as empty rather than as missing', () => {
+    // The importer writes `label` even when it is empty, so the two sides have to agree.
+    expect(embeddedPage({ kind: 'embed', attrs: { doc: 'x'.repeat(1), label: '' } })?.label).toBe('');
+  });
+});
+
+describe('outline', () => {
+  it("carries a heading's stable anchor beside the slug it already had", () => {
+    // Two ids answering two different questions: `id` follows the words (the address bar's
+    // fragment), `anchor` does not (what a section embed quotes). Mirrors
+    // `gw_core::Block::headings`.
+    const [heading] = outline({
+      kind: 'doc',
+      content: [
+        {
+          kind: 'heading',
+          attrs: { level: 2, id: '0199c0de-0000-7000-8000-00000000000a' },
+          content: [{ kind: 'text', text: 'Größe und Maß' }]
+        }
+      ]
+    });
+    expect(heading.id).toBe('groesse-und-mass');
+    expect(heading.anchor).toBe('0199c0de-0000-7000-8000-00000000000a');
+  });
+
+  it('leaves the anchor out for a heading that has never been published', () => {
+    const [heading] = outline({
+      kind: 'doc',
+      content: [{ kind: 'heading', attrs: { level: 2 }, content: [{ kind: 'text', text: 'Neu' }] }]
+    });
+    expect(heading.anchor).toBeUndefined();
   });
 });

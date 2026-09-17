@@ -109,6 +109,15 @@ language, tables with their column alignment, and every character of the text it
 A file placed in the prose comes back as `![Beschreibung](anhang:datei.png)`, which
 names the file on its page and nothing else: the FILES THEMSELVES ARE NOT IN THIS
 DIRECTORY, so an export is a copy of the wiki's words and not of its attachments.
+An EMBEDDED page — a live view of another page, or of one section of it — comes
+back as `![Beschriftung](einbettung:<id>#<abschnitt> \"/pfad\")`. NOTHING OF THE
+EMBEDDED PAGE IS IN THIS FILE: an embed is a reference, the target's own file in
+this directory is where its words are, and what a reader sees is fetched when the
+page is read and filtered against THAT reader. The `#<abschnitt>` names a heading
+by the stable id written after that heading's words as `{#<uuid>}`, which is what
+lets an embed keep quoting the same section after the heading has been re-worded.
+Those ids are in these files on purpose: without them a restored copy would keep
+every page and orphan every section embed in it.
 A link to another page of this wiki comes back as `[Titel](dok:<id> \"/pfad\")`. The
 id names that page by its DATABASE IDENTITY rather than by where it currently sits,
 which is what keeps such a link working when the page is renamed or moved; the path
@@ -489,6 +498,30 @@ const CODE_BLOCK_ATTRS: [&str; 1] = ["language"];
 /// `gw_core::markdown`, which is a pure function and must stay one.
 const TASK_ITEM_ATTRS: [&str; 1] = ["checked"];
 
+/// The attributes of an `embed` that markdown states about the DOCUMENT rather than about
+/// this database's bookkeeping.
+///
+/// Three, and the fourth is the point of the list. `doc`, `heading` and `label` are what the
+/// block says: which page, which section, and the author's own words for it. `path` is
+/// deliberately **absent**, and it is `gw_core::Mark::FALLBACK_ATTR` in block form — the
+/// target's address as it stood when the file was written, so that an export re-seeded into a
+/// fresh database (where every id is minted anew) finds the page by address instead of
+/// framing nothing.
+///
+/// The exporter writes that address into the link-title slot of a reference it is writing by
+/// id, so the stored `{doc, label}` and the `{doc, path, label}` its own markdown re-imports
+/// as are the same document. Without this reduction every page holding an embed would be
+/// refused from every export from then on — the `LINK_ATTRS` incident a fourth time, and the
+/// reason the allow-list exists at all rather than being discovered again.
+///
+/// What it costs is stated because the obvious reading is too generous: this is an
+/// allow-list, so a key nobody has thought of is invisible here too, and the destination of a
+/// path-addressed embed is not compared at all. The guard for that one is
+/// `gw_core::markdown::transclusion_destination`, which refuses to write anything its own
+/// reader would not give back unchanged — the same guard a placement's filename has, for the
+/// same reason: `Renderer::embed` escapes nothing.
+const EMBED_ATTRS: [&str; 3] = ["doc", "heading", "label"];
+
 /// A `Block` reduced to what markdown could ever state about it, for [`render_file`]'s
 /// round-trip comparison.
 ///
@@ -591,6 +624,11 @@ fn reduce(block: &mut Block) {
         block
             .attrs
             .retain(|key, value| kept(&CODE_BLOCK_ATTRS, key, value));
+    }
+    if block.kind == BlockKind::Transclusion {
+        block
+            .attrs
+            .retain(|key, value| kept(&EMBED_ATTRS, key, value));
     }
     for mark in &mut block.marks {
         if mark.kind == MarkKind::Link {
@@ -792,6 +830,7 @@ impl Renderer {
             BlockKind::CodeBlock => self.code(block),
             BlockKind::Table => self.table(block),
             BlockKind::Attachment => self.attachment(block),
+            BlockKind::Transclusion => self.embed(block),
             BlockKind::ListItem | BlockKind::TaskItem => {
                 self.problem("a list item is outside any list");
                 self.blocks(&block.content, Nesting::Item)
@@ -1033,15 +1072,51 @@ impl Renderer {
             .unwrap_or(1)
             .clamp(1, 6) as usize;
         let text = self.inline(block);
+        // The stable id a section embed anchors to (D-27), written after everything the
+        // heading says so that the LAST such suffix in the line is always the real one —
+        // which is what lets a heading whose own words end in braces keep them. See
+        // `gw_core::markdown::heading_anchor`, which is asked rather than restated.
+        let stored = block.attrs.get("id").and_then(|v| v.as_str());
+        let anchor = match stored {
+            Some(id) => match markdown::heading_anchor(id) {
+                Some(anchor) => anchor,
+                None => {
+                    self.problem(format!(
+                        "a heading carries the stable id `{id}`, which is not shaped like one \
+                         — a section anchor is minted as a document id and nothing else, so \
+                         this block was not written by this wiki"
+                    ));
+                    return String::new();
+                }
+            },
+            // No id at all is the honest state of a page not published since anchors
+            // existed — unless its own words end in something that WOULD read back as one,
+            // in which case writing them plainly would hand back a different document. That
+            // is a refusal rather than a corruption, and one publish (which mints the id)
+            // ends it for good.
+            None => {
+                if markdown::heading_anchor_id(&text).is_some() {
+                    self.problem(
+                        "a heading's own words end in something markdown would read back as a \
+                         section anchor, and this heading has no stable id of its own to \
+                         write after them — publishing the page once mints one and settles it",
+                    );
+                    return String::new();
+                }
+                String::new()
+            }
+        };
         if text.is_empty() {
-            return "#".repeat(level);
+            // `## {#…}` — the `# ` supplies the separator the anchor's own leading space
+            // would otherwise duplicate, and an empty heading with an id is a real document.
+            return format!("{}{}", "#".repeat(level), anchor);
         }
         // A heading ending in `#` would have it read as a closing sequence and dropped.
         let text = match text.strip_suffix('#') {
             Some(head) => format!("{head}\\#"),
             None => text,
         };
-        format!("{} {}", "#".repeat(level), text)
+        format!("{} {}{}", "#".repeat(level), text, anchor)
     }
 
     fn bullet_list(&mut self, block: &Block, bullet: char) -> String {
@@ -1197,6 +1272,42 @@ impl Renderer {
             .unwrap_or_default();
         let alt = self.escape(alt);
         format!("![{alt}]({destination})")
+    }
+
+    /// A live view of another page (D-27), written as an image with the `einbettung:` scheme.
+    ///
+    /// Shaped exactly like [`Self::attachment`], and the two refusals are the same two: a
+    /// block that names no target, and a target this syntax cannot carry back unchanged. Both
+    /// are refusals rather than guesses for the reason `gw_core::markdown`'s writers give —
+    /// every one of these values reached `documents.body` over the collaboration socket
+    /// without passing any validation, and the `format!` below escapes nothing at all.
+    ///
+    /// The target's current path rides in the link-title slot whenever the block names its
+    /// target by id, as a **fallback** for a database that has never heard of that id, which
+    /// is what re-seeding an export into a fresh store produces. It comes from
+    /// `Store::references_for` and from nowhere else, so an embed of a page the exporting
+    /// account may not read carries no path and is written bare — the file cannot become a
+    /// way to learn a restricted page's address. ADR 0020, and ADR 0019's argument verbatim.
+    fn embed(&mut self, block: &Block) -> String {
+        let attr = |key: &str| block.attrs.get(key).and_then(|v| v.as_str());
+        let (doc, path, heading) = (attr("doc"), attr("path"), attr("heading"));
+        let Some(destination) = markdown::transclusion_destination(doc, path, heading) else {
+            self.problem(
+                "an embedded page states no target this format can write — an embed names                  EITHER a document id or a path of this wiki, never both and never neither,                  and its section anchor is a document id or absent",
+            );
+            return String::new();
+        };
+        // The author's own words, through the same escaping a paragraph's text takes, so
+        // brackets and asterisks come back as themselves instead of closing the image early.
+        let label = self.escape(attr("label").unwrap_or_default());
+        match doc
+            .and_then(|id| self.paths.get(id))
+            .map(|reference| reference.path.as_str())
+            .and_then(markdown::document_fallback)
+        {
+            Some(fallback) => format!("![{label}]({destination} {fallback})"),
+            None => format!("![{label}]({destination})"),
+        }
     }
 
     fn blockquote(&mut self, block: &Block) -> String {

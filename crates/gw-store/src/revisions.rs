@@ -217,6 +217,11 @@ pub(crate) async fn append_revision(
     // Inside the transaction, on the connection, for `replace_links`' reason: it changes the
     // body that is about to be stored, so a failure below takes it back with everything else.
     let settled = crate::links::settle_references(&mut *conn, &mut body).await?;
+    // The same pair, one layer up: an embed freshly imported from markdown carries the
+    // target's path beside its id for a database that has never heard of that id. It runs
+    // here for `settle_references`' reasons, and BEFORE the edges are read out because which
+    // of the two an embed becomes decides which edge `replace_links` records for it.
+    let embedded = crate::transclusion::settle_embeds(&mut *conn, &mut body).await?;
     crate::links::replace_links(&mut *conn, document_id, &path, &body, public_origin).await?;
 
     // The board is derived from the body too, and joins the same transaction for the same
@@ -236,7 +241,18 @@ pub(crate) async fn append_revision(
     // is therefore measured after this rather than before it: the timeline's delta must
     // describe the revision that was actually written.
     let minted = crate::tasks::reconcile_tasks(&mut *conn, document_id, &mut body).await?;
-    let body_json = if minted || settled {
+
+    // Every heading gets the stable id a section embed anchors to (D-27), on the same
+    // principle a checklist line gets one: the identity is the store's to mint, `gw_core`'s
+    // converter is a pure function and mints none, and what is STORED has to be what was
+    // minted into — writing the string this function was handed would file a revision whose
+    // headings carry no ids, so the next publish would mint again and every embed of a
+    // section of this page would be an orphan, once per save, in silence.
+    //
+    // An id already there is never re-minted; see `mint_heading_ids`.
+    let anchored = crate::transclusion::mint_heading_ids(&mut body);
+
+    let body_json = if minted || settled || embedded || anchored {
         Cow::Owned(serde_json::to_string(&body)?)
     } else {
         Cow::Borrowed(body_json)
@@ -370,6 +386,10 @@ impl Store {
             .document_path_unchecked(document_id)
             .await?
             .unwrap_or_default();
+        // The block half of the same exchange, run in the same place and for the same
+        // reason: an embed naming its target by address — which is what a restored backup
+        // holds — becomes one naming it by identity, for a page the author may read.
+        self.resolve_embeds(author, &mut body).await?;
         self.resolve_references(author, &from_path, &mut body)
             .await?;
 

@@ -26,6 +26,7 @@
   import { kindText, type Attachment } from '$lib/attachments';
   import { normalizeLinkAddress } from './linkAddress';
   import LinkDialog from './LinkDialog.svelte';
+import EmbedDialog from './EmbedDialog.svelte';
   import type { PageChoice } from './pagePicker';
   import type { TreeNode } from '$lib/api';
 
@@ -74,6 +75,41 @@
 
   /** Whether the link dialog is open. */
   let linkDialog = $state(false);
+
+  /** Whether the embed dialog is open. */
+  let embedDialog = $state(false);
+
+  /**
+   * Put a live view of another page where the caret is (D-27).
+   *
+   * A command rather than a toggle, exactly as `place` below is, and for the same reason:
+   * "this block IS a heading" is a state a toggle can describe and "quote that page here" is
+   * not. So it sits outside the ToggleGroup and outside `CONTROLS`.
+   *
+   * What is stored is the target's **identity** and, for a section, the heading's **stable
+   * id** — never a path and never a slug. The dialog already has both: the picker's `id`
+   * comes from the tree, and the anchor comes from the target's own body. Nothing here
+   * resolves anything, for `linkToPage`'s reason: a client that turned an address into an id
+   * would be a second answer to a permission question.
+   *
+   * The label defaults to the page's CURRENT title — the same snapshot `linkToPage` takes of
+   * a link's text, and the same argument: the label is document content and has to round-trip
+   * through markdown, while the title in the frame is resolved afresh on every read. A
+   * section embed's label names the section, because that is what was quoted.
+   */
+  function embed(e: Editor, wahl: { seite: PageChoice; abschnitt: { text: string; anchor: string } | null }) {
+    e.chain()
+      .focus()
+      .insertContent({
+        type: 'embed',
+        attrs: {
+          doc: wahl.seite.id,
+          heading: wahl.abschnitt?.anchor ?? null,
+          label: wahl.abschnitt?.text ?? wahl.seite.title
+        }
+      })
+      .run();
+  }
 
   /**
    * Store the chosen page's IDENTITY, not its address (D-5).
@@ -375,6 +411,12 @@
 <!-- Rendered beside the toolbar rather than inside it: a `<dialog>` inside a `role="toolbar"`
      would put a whole form into a roving-tabindex set of toggles. It is in the DOM at all
      times and shown with `showModal()`, which is what supplies the focus trap and Escape. -->
+<EmbedDialog
+  bind:offen={embedDialog}
+  {seiten}
+  onEinbetten={(wahl) => editor && embed(editor, wahl)}
+/>
+
 <LinkDialog
   bind:offen={linkDialog}
   {seiten}
@@ -398,6 +440,27 @@
      address and nothing here can name a file that is not attached: a placement is a
      reference to a row in that list (D-15), and choosing from it is what keeps the two in
      step. -->
+<!-- Quoting another page, beside the file buttons and outside the toolbar: a command, not a
+     toggle, so a screen reader arrowing through a set of states never lands on an action.
+
+     Always offered, unlike the file row, because every wiki has other pages and none of them
+     has to be prepared first — and because the dialog is where the page is chosen, so there
+     is nothing to list here that could be empty. -->
+<div class="gw-ed-dateien">
+  <p id="gw-ed-einbetten-label">Andere Seite</p>
+  <div class="gw-ed-dateiliste" role="group" aria-labelledby="gw-ed-einbetten-label">
+    <button
+      type="button"
+      class="gw-ed-datei-btn"
+      disabled={!enabled}
+      title="Eine andere Seite oder einen ihrer Abschnitte hier einbetten"
+      onclick={() => (embedDialog = true)}
+    >
+      Seite einbetten
+    </button>
+  </div>
+</div>
+
 {#if anhaenge.length > 0}
   <div class="gw-ed-dateien">
     <p id="gw-ed-dateien-label">Datei einfügen</p>

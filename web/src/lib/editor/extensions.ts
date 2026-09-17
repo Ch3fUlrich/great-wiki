@@ -68,6 +68,7 @@ import { getSchema, Node } from '@tiptap/core';
 import type { Extensions } from '@tiptap/core';
 import StarterKit from '@tiptap/starter-kit';
 import { Document } from '@tiptap/extension-document';
+import { Heading } from '@tiptap/extension-heading';
 import { Table, TableCell, TableHeader, TableRow } from '@tiptap/extension-table';
 import { TaskItem, TaskList } from '@tiptap/extension-list';
 import { Bold } from '@tiptap/extension-bold';
@@ -314,6 +315,147 @@ const Attachment = Node.create({
 });
 
 /**
+ * TipTap's `Heading`, taught the ONE attribute the stock extension does not know about.
+ *
+ * A heading carries a **stable id** in `attrs` beside `level` — a uuid the store mints on
+ * publish — and it is what a transclusion names a section by (D-27). Nothing on the page
+ * shows it, which is exactly what makes losing it invisible: the module docs above say what
+ * happens to an attribute this schema does not declare, and it is not "ignored".
+ * `computeAttrs` never copies it into the ProseMirror node and `updateYFragment`'s closing
+ * pass deletes it from the Y.Doc on the first edit that touches the heading. The next publish
+ * would then find a heading with no id and mint a fresh one, and **every embed of that
+ * section, on every other page, would become an orphan** — a frame reading "this section no
+ * longer exists" about a section nobody removed, once per edit, in silence. This is
+ * `TaskItem`'s `id` again with a blast radius that reaches other people's pages.
+ *
+ * `this.parent?.()` rather than a fresh literal, so `level` keeps the stock declaration and
+ * `levels` keeps working; re-stating it here would be a second copy to drift.
+ *
+ * The three choices about `id` are `Task`'s below, for `Task`'s reasons:
+ *
+ * - **`default: null`.** `gw_core::markdown` mints none, so the default has to be the absent
+ *   value — and y-tiptap skips a null node attribute when it creates an element and removes
+ *   one on write-back, so a heading with no id yet writes no `id` key.
+ * - **`keepOnSplit: false`.** Pressing Enter in the middle of a heading makes a second
+ *   heading; carrying the id across would give two headings one identity, and the section a
+ *   reader is quoting would depend on which of them `section()` found first.
+ * - **`rendered: false`.** It is database identity rather than markup. It stays in the schema
+ *   (which is all the CRDT needs) and out of the editor's DOM, where it would otherwise
+ *   collide with the reader's own `id` attribute on a heading — which is the SLUG, a
+ *   different id answering a different question — and where pasted HTML could claim it.
+ *
+ * `StarterKit.configure({ heading: false })` below is what stops the stock one being
+ * registered alongside this. `@tiptap/extension-heading` is not named in `package.json`; it
+ * arrives as `@tiptap/starter-kit`'s own dependency, pinned by it to the same exact 3.30.0
+ * (checked in `package-lock.json`), exactly as `extension-document` does.
+ */
+const Section = Heading.extend({
+  addAttributes() {
+    return {
+      ...this.parent?.(),
+      id: { default: null, keepOnSplit: false, rendered: false }
+    };
+  }
+});
+
+/**
+ * A live view of another page, or of one section of it (D-27): `gw_core::BlockKind::Transclusion`.
+ *
+ * # Four attributes, and no fifth
+ *
+ * `doc`, `path`, `heading` and `label` — exactly what `gw_core::markdown` writes and exactly
+ * what `gw_api::export` compares through `EMBED_ATTRS`. Both hazards the module docs describe
+ * apply here at once, and the first one is the whole feature:
+ *
+ * - **Undeclared is deleted.** `doc` (or `path`) is the only thing saying which page is
+ *   quoted and `heading` the only thing saying which part of it. An attribute this schema
+ *   does not declare is removed from the Y.Doc on the first edit that touches the node and
+ *   BROADCAST to everybody else editing, so a frame would quietly become a frame around
+ *   nothing — or, worse for `heading`, around somebody's entire page instead of the dosage
+ *   table the author meant to quote.
+ * - **Over-declared is minted.** A fifth attribute would be filled in with its default by
+ *   `computeAttrs`, written onto the wire, copied into `Block::attrs`, and compared — and
+ *   `EMBED_ATTRS` would not know about it, so the page would be refused on export,
+ *   permanently, on the owner's backup path.
+ *
+ * `label` defaults to `''` rather than `null`, because the importer writes it even when it is
+ * empty and the two sides have to agree — `Attachment`'s `alt` above, verbatim. The other
+ * three default to `null`, which is the absent value: y-tiptap's `createTypeFromElementNode`
+ * skips a null NODE attribute and `updateYFragment` removes one, so a whole-page embed writes
+ * no `heading` key and an embed named by identity writes no `path` key. (That filtering is
+ * for nodes only. A MARK's attributes are written back whole, which is why the same shape on
+ * `Anchor` above needed a change in Rust as well.)
+ *
+ * `rendered: false` on none of them: unlike a task's id, all four are document content, and
+ * the editor shows which page is quoted so the author can see what they placed.
+ *
+ * # Its own group, so it can only stand where the importer will read one back
+ *
+ * `group: 'embed'` and NOT `'block'`, with `Doc` below widening only the document's content
+ * expression to admit it — `Attachment`'s argument above, unchanged and for the same three
+ * failures: the importer reads one back only at the top level, `listItem`'s content
+ * expression cannot hold an atom in first position (and `createNodeFromYElement` answers a
+ * node ProseMirror cannot build by DELETING the element from the CRDT), and a `tableCell` in
+ * markdown is one paragraph and nothing else.
+ *
+ * # `atom`, `draggable`, and no marks
+ *
+ * `atom: true` because it has no content to edit — and it must not: an embed is a REFERENCE,
+ * so the embedding page's body holds none of the target's blocks, which is what keeps
+ * `reconcile_tasks` from minting a second set of records for somebody else's checklist
+ * (D-30). `marks: ''` because `gw-collab` writes a leaf's marks as Yjs text formatting and
+ * has nowhere to put a mark on an element.
+ */
+const Embed = Node.create({
+  name: 'embed',
+  group: 'embed',
+  atom: true,
+  draggable: true,
+  marks: '',
+  addAttributes: () => ({
+    doc: {
+      default: null,
+      parseHTML: (element: HTMLElement) => element.getAttribute('data-doc')
+    },
+    path: {
+      default: null,
+      parseHTML: (element: HTMLElement) => element.getAttribute('data-path')
+    },
+    heading: {
+      default: null,
+      parseHTML: (element: HTMLElement) => element.getAttribute('data-heading')
+    },
+    label: {
+      default: '',
+      parseHTML: (element: HTMLElement) => element.getAttribute('data-label') ?? ''
+    }
+  }),
+  // `data-*` on a `<figure>` rather than anything resembling the reader's frame, and for
+  // `Attachment`'s reason: the editor has no permission-checked answer about the target — the
+  // one the reader gets is `Store::embeds_for`'s, against the reader, and this component
+  // never asked it — so a node view that drew the quoted words would be this interface
+  // answering a permission question it may not ask. The editor shows WHICH page is quoted, in
+  // words; the reader shows the page.
+  parseHTML: () => [{ tag: 'figure[data-embed]' }],
+  renderHTML: ({ HTMLAttributes }) => [
+    'figure',
+    {
+      'data-embed': '',
+      'data-doc': HTMLAttributes.doc,
+      'data-path': HTMLAttributes.path,
+      'data-heading': HTMLAttributes.heading,
+      'data-label': HTMLAttributes.label,
+      class: 'gw-ed-einbettung'
+    },
+    [
+      'figcaption',
+      {},
+      `⧉ ${HTMLAttributes.label || 'Eingebettete Seite'}${HTMLAttributes.heading ? ' (ein Abschnitt)' : ''}`
+    ]
+  ]
+});
+
+/**
  * TipTap's `Document`, widened by exactly one group so a placement has somewhere to go.
  *
  * `content: 'block+'` is the stock expression, and `attachment` is deliberately not in the
@@ -325,7 +467,7 @@ const Attachment = Node.create({
  * `@tiptap/starter-kit`'s own dependency, pinned by it to the same exact 3.30.0 (checked in
  * `package-lock.json`), exactly as the six marks imported above do.
  */
-const Doc = Document.extend({ content: '(block|attachment)+' });
+const Doc = Document.extend({ content: '(block|attachment|embed)+' });
 
 /**
  * The Yjs fragment the document lives in.
@@ -360,6 +502,7 @@ export const SERVER_BLOCK_KINDS = [
   'tableHeader',
   'tableCell',
   'attachment',
+  'embed',
   'text'
 ] as const satisfies readonly BlockKind[];
 
@@ -395,8 +538,11 @@ export function contentExtensions(): Extensions {
     // `Doc` above replaces it, widened to admit a placement. Everything else about the stock
     // Document is kept by extending it rather than writing a new one.
     Doc,
+    Section,
     StarterKit.configure({
       document: false,
+      // `Section` above replaces it, taught the stable id a section embed anchors to.
+      heading: false,
       bold: false,
       italic: false,
       strike: false,
@@ -448,6 +594,8 @@ export function contentExtensions(): Extensions {
     // A file placed in the prose. Its own group, admitted only by `Doc` above — see its doc
     // comment for why `block` would be three different kinds of data loss.
     Attachment,
+    // A live view of another page. Its own group too, admitted only by `Doc` above.
+    Embed,
     // The five marks the server can store, `Strong`/`Em` renamed per the module docs above;
     // `Strike`, `Code` and `Anchor` keep TipTap's own names because those already agree with
     // `MarkKind`'s serde names. `Anchor` is `Link` with its attribute declaration trimmed to

@@ -1118,8 +1118,16 @@ await check('F1 an arrowhead marker is present and the edge points from source t
   const markerPath = svg.locator('marker#gw-graph-pfeil path');
   assert((await markerPath.count()) === 1, 'expected exactly one <path> inside marker#gw-graph-pfeil');
 
-  const line = svg.locator('.edges line');
-  assert((await line.count()) === 1, `expected exactly one edge, found ${await line.count()}`);
+  // Scoped to the ONE edge this check is about rather than to "the graph has one edge".
+  // `content-example` gained an embedding page (D-27), and an embed is an edge too — it puts
+  // another page's words on this one, which is at least as strong a connection as a link. The
+  // anti-vacuity the old count carried is kept by asserting that this specific pair is drawn
+  // exactly once, which is the thing the direction check below needs anyway.
+  const line = svg.locator(`.edges line[data-von="${GRAPH_SOURCE}"][data-nach="${GRAPH_TARGET}"]`);
+  assert(
+    (await line.count()) === 1,
+    `expected exactly one edge from ${GRAPH_SOURCE} to ${GRAPH_TARGET}, found ${await line.count()}`
+  );
   assert(
     (await line.getAttribute('marker-end')) === 'url(#gw-graph-pfeil)',
     'the edge line does not reference the arrowhead marker'
@@ -3008,6 +3016,130 @@ await check('N3 a page chosen in the dialog survives the CRDT, the publish and a
   assert(
     /data-doc="[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"/.test(article),
     `the stored reference is not a document id: ${article}`
+  );
+});
+
+// ---------------------------------------------------------------------------------------
+// Group O — a live view of another page, filtered against whoever is reading (D-27 … D-30)
+//
+// A unit test can show that `Store::embeds_for` resolves a section and that `BlockView` draws
+// what it is handed. It cannot show that the two are wired to each other through the store,
+// the API, the page load and a plain fetch — and the failure that matters here is a
+// disclosure: a frame on a world-readable page quoting a page almost nobody may read. So
+// every assertion below is made against the HTML a reader really receives, with nothing
+// hydrated, which is also what a reader with JavaScript switched off gets.
+//
+// `/verweisbeispiel/einbettung` (content-example) holds four embeds on purpose: a section, a
+// quoted checklist, an anchor that does not exist, and a page this fixture's identity may not
+// read (`/rundgang/nur-intern`, granted to a group it is not in).
+// ---------------------------------------------------------------------------------------
+
+const EMBED_PAGE = '/verweisbeispiel/einbettung';
+const EMBED_SOURCE = '/verweisbeispiel';
+
+/** The article element of EMBED_PAGE, as a plain fetch returns it. */
+async function embedArticle(page) {
+  const html = await (await page.request.get(BASE + EMBED_PAGE)).text();
+  const article = html.match(/<article[^>]*class="prose[\s\S]*?<\/article>/)?.[0] ?? '';
+  assert(article !== '', 'the page came back without a document at all');
+  return article;
+}
+
+await check('O1 an embed shows one section of another page, framed and naming its source', async (page) => {
+  const article = await embedArticle(page);
+  // The quoted section's own words, which live only in the SOURCE page's body — nothing of
+  // them is stored on this page.
+  assert(
+    article.includes('Wird die Seite später umbenannt'),
+    `the quoted section's words are not on the page: ${article}`
+  );
+  // …and only that section: the source's first paragraph is NOT quoted, because the author
+  // named a heading rather than the page.
+  assert(
+    !article.includes('kein erfundenes Beispiel'),
+    `the frame quoted more of the source than the author asked for: ${article}`
+  );
+  // D-28: visibly a quotation, with the source page's CURRENT title as a link to it. The
+  // title is resolved at read time and is not in this page's body.
+  assert(article.includes('Eingebettet aus'), `the frame does not name its source: ${article}`);
+  assert(
+    article.includes(`href="${EMBED_SOURCE}"`),
+    `the source is not linked: ${article}`
+  );
+  assert(article.includes('Verweisbeispiel'), `the source's current title is missing: ${article}`);
+
+  // D-30: a quoted checklist keeps its live state, cannot be ticked here, and says where it
+  // can be. The second embed on this page is the checklist section.
+  assert(article.includes('Verweise nach Identität'), `the quoted checklist is missing: ${article}`);
+  assert(article.includes('Abgehakt wird auf'), `nothing says where ticking happens: ${article}`);
+  const boxes = article.match(/<input[^>]*type="checkbox"[^>]*>/g) ?? [];
+  assert(boxes.length >= 2, `expected the quoted boxes, found ${boxes.length}`);
+  assert(
+    boxes.every((box) => box.includes('disabled')),
+    `a box inside a frame is not read-only: ${boxes.join(' | ')}`
+  );
+  assert(
+    boxes.some((box) => box.includes('checked')),
+    `no box carries the source's live state: ${boxes.join(' | ')}`
+  );
+});
+
+await check('O2 an embed whose anchor is gone keeps its frame and says so', async (page) => {
+  // D-29. Not a fall back to the whole page — that quietly swaps a dosage table for a page
+  // the author never meant to quote — and not nothing at all, because nothing here vanishes
+  // silently.
+  const article = await embedArticle(page);
+  assert(
+    article.includes('gibt es auf dieser Seite nicht mehr'),
+    `an orphaned embed said nothing: ${article}`
+  );
+  assert(
+    article.includes('einbettung-verwaist'),
+    `the orphaned frame is not there at all: ${article}`
+  );
+});
+
+await check('O3 an embed of a page this reader may not see shows only the author\'s label', async (page) => {
+  // THE disclosure check. `/rundgang/nur-intern` is restricted to a group this identity is not
+  // in, and the page embedding it is world-readable. Its title, its address and its words must
+  // none of them be in the response — and it must answer IDENTICALLY to an embed of a page
+  // that does not exist, because telling those apart is itself the disclosure.
+  const article = await embedArticle(page);
+  assert(
+    article.includes('Nur für Eingeweihte'),
+    `the author's own label was blanked, which hides nothing the block does not contain: ${article}`
+  );
+  // What is withheld is everything that is the TARGET'S: its current name, its words, and any
+  // sign that it exists. What is NOT withheld is what the author themselves wrote into this
+  // page's body — including the address they named. That is the same line ADR 0019 draws for
+  // a link: an internal `href` nobody could resolve renders as the author's own address
+  // today, and blanking it would corrupt somebody's page in order to hide a string they typed
+  // into it. The rendered frame is what must disclose nothing, and it does not even become a
+  // link: `safeHref` is never given the stored target.
+  assert(
+    !article.includes('href="/rundgang/nur-intern"'),
+    `an unreadable target became a link the reader can follow: ${article}`
+  );
+  assert(
+    !article.includes('Nur intern'),
+    `a restricted page's title came back to a reader who may not read it: ${article}`
+  );
+  assert(
+    !article.includes('Sichtbarkeitsangabe'),
+    `a restricted page's WORDS came back inside somebody else's frame: ${article}`
+  );
+  // …and it answers IDENTICALLY to an embed of a page that does not exist: the same frame,
+  // the same sentence, the same class. Telling those two apart is itself the disclosure.
+  assert(
+    article.includes('einbettung-fremd'),
+    `the unreadable embed did not take the same shape an absent one takes: ${article}`
+  );
+
+  // Anti-vacuity: the very same response DOES resolve the readable embed above, so this is
+  // about the filter and not about a page whose frames all failed to render.
+  assert(
+    article.includes('Eingebettet aus'),
+    `nothing on the page resolved at all, so nothing above was proved: ${article}`
   );
 });
 

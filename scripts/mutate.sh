@@ -756,7 +756,7 @@ mutation crates/gw-store/src/tasks.rs killed \
 # write and least likely to notice, because the FIRST publish is perfect and every later
 # one re-mints; a test that publishes once passes forever.
 mutation crates/gw-store/src/revisions.rs killed \
-  's|    let body_json = if minted {|    let body_json = if false {|' \
+  's|    let body_json = if minted \|\| settled \|\| embedded \|\| anchored {|    let body_json = if false {|' \
   'reconciliation: the body that is stored is the body the ids were minted into'
 # Adoption by the words, which is what makes an ID-LESS republish idempotent — a markdown
 # import, and `seed --update`, which re-converts the same file on every run and would
@@ -953,7 +953,7 @@ mutation crates/gw-api/src/routes/tasks.rs killed \
   's|            may_write: task.may_write,|            may_write: true,|' \
   'may_write: a card on the wire carries the store verdict, not one the handler made up'
 mutation crates/gw-api/src/routes/docs.rs killed \
-  's|                may_write: access.may_write,|                may_write: true,|' \
+  's|^        may_write: access.may_write,|        may_write: true,|' \
   'may_write: a page read carries the verdict the accessor gave, not a constant'
 
 # --- the trash: the first thing in this system that can destroy something ---------------
@@ -1356,7 +1356,7 @@ mutation crates/gw-core/src/markdown.rs killed \
 # missing one in with `''`, so an importer that left it out would make every placement the
 # editor touched differ from the imported one — and `render_file` refuses rather than choosing.
 mutation crates/gw-core/src/markdown.rs killed \
-  's/                        .insert("alt".into(), serde_json::Value::from(placing.alt));/                        .insert("alt".into(), serde_json::Value::from(placing.alt.clone())); if placing.alt.is_empty() { placement.attrs.remove("alt"); }/' \
+  's/                        .insert(key.into(), serde_json::Value::from(placing.alt));/                        .insert(key.into(), serde_json::Value::from(placing.alt.clone())); if placing.alt.is_empty() { placement.attrs.remove(key); }/' \
   'placements: an empty description is stated rather than left out'
 
 # The exporter, which is the other half of the same agreement.
@@ -1507,6 +1507,148 @@ mutation crates/gw-store/src/links.rs killed \
 mutation crates/gw-store/src/links.rs killed \
   's/^pub const MAX_REFERENCES_PER_PAGE: usize = 256;/pub const MAX_REFERENCES_PER_PAGE: usize = usize::MAX;/' \
   'references: one page resolves a bounded number of references, whatever its body holds'
+
+# --- transclusion: a frame on one page, showing another page's words ---------------------
+#
+# An embed is the first thing in this system that puts one page's content inside another, so
+# the permission question is about a page the reader never asked for, on a host page that may
+# be world-readable while the quoted one is almost nobody's to see. Four things here can fail
+# silently and each has its own shape of failure.
+#
+# The DISCLOSURE, which is the one that matters most and is strictly worse than the reference
+# leak above: there, a restricted page's title and address escaped; here its WORDS would.
+# `crates/gw-api/tests/embeds.rs` puts an embed of a restricted page called »Blutbild Müller«,
+# whose body says »sehr vertraulich«, on a PUBLIC page, and asserts on the raw response text
+# rather than on a parsed field — a handler that leaked the title somewhere else in the body
+# would not satisfy it. Its anti-vacuity half is a second principal who MAY read the target
+# and gets all of it.
+#
+# The ORPHAN (D-29). The failure is not an error: it is a frame that quietly grows from a
+# quoted section to the WHOLE page, swapping a dosage table for a page the author never meant
+# to quote.
+#
+# The CYCLE. It is allowed to exist — refusing A's publish because B embeds A would mean
+# reading pages the author may not read, and `links` has no acyclicity constraint — so the
+# render-time guard is the only thing there is.
+#
+# And the SYNTAX, exactly as the placement and reference syntaxes above: `render_file`
+# re-imports its own output and compares, so an importer and an exporter that disagree by one
+# character produce a page that can never be exported again.
+
+# THE one, twice: an embed names its target by identity OR by address, both forms reach
+# `documents.body`, and a resolver that filtered one and not the other would be filtered only
+# until somebody restored the corpus from a backup. `Baseline::Admin` is the mutation rather
+# than an unchecked row lookup because it is the exact shape of the mistake — the accessor is
+# still THE accessor, asked on behalf of somebody else — and because `readable_embed` was
+# written as one function precisely so that this could be one line.
+mutation crates/gw-store/src/transclusion.rs killed \
+  's/(principal, id, Action::Read, baseline)/(principal, id, Action::Read, Baseline::Admin)/' \
+  'embeds: a frame named by identity resolves against the READER, not on an administrator behalf'
+mutation crates/gw-store/src/transclusion.rs killed \
+  's/(principal, path, Action::Read, baseline)/(principal, path, Action::Read, Baseline::Admin)/' \
+  'embeds: a frame named by ADDRESS takes exactly the same check as one named by identity'
+
+# The orphan, D-29. Falling back to the whole page is the natural implementation and it is the
+# one the owner rejected by name.
+mutation crates/gw-core/src/block.rs killed \
+  's/        let start = self.content.iter().position(|b| {/        if true { return Some(self.clone()); }\n        let start = self.content.iter().position(|b| {/' \
+  'embeds: an anchor that is gone keeps its frame and never falls back to the whole page'
+# And where a section ENDS. Without the level check it runs to the end of the document, so the
+# frame shows everything under the chosen heading and everything after it too.
+mutation crates/gw-core/src/block.rs killed \
+  's/            if block.kind == BlockKind::Heading \&\& heading_level(block) <= level {/            if false {/' \
+  'embeds: a section stops at the next heading of its own level or higher'
+
+# The cycle guard, both halves: a page quoting itself, and a ring leading back to it.
+mutation crates/gw-store/src/transclusion.rs killed \
+  's/        if doc.id == host {/        if false {/' \
+  'embeds: a page that quotes itself is named as a cycle rather than drawn'
+mutation crates/gw-store/src/transclusion.rs killed \
+  's/                if next.id == host {/                if false {/' \
+  'embeds: a ring of pages quoting each other is found and named'
+
+# The cap is an availability control, not a correctness one: every expansion is an
+# authorisation, a row and a JSON parse of somebody else s whole body through the single
+# SQLite connection the whole application shares, and nothing caps how many blocks a body
+# holds.
+mutation crates/gw-store/src/transclusion.rs killed \
+  's/^pub const MAX_EMBEDS_PER_PAGE: usize = 16;/pub const MAX_EMBEDS_PER_PAGE: usize = usize::MAX;/' \
+  'embeds: one page expands a bounded number of frames, whatever its body holds'
+
+# Identity beats the address a file carried, which is the whole of the settle order: a page
+# renamed after the export has a stale path and a perfectly good id.
+mutation crates/gw-store/src/transclusion.rs killed \
+  's/                if live {/                if false {/' \
+  'embeds: a live id wins against the path a file carried, never the other way round'
+
+# The syntax, one half at a time — the drift that having both halves in one crate is supposed
+# to make impossible.
+mutation crates/gw-core/src/markdown.rs killed \
+  's/    let target = dest.strip_prefix(TRANSCLUSION_SCHEME)?;/    let target = dest.trim_start_matches(TRANSCLUSION_SCHEME);/' \
+  'embeds: an image is an embed only if it SAYS so, never because it looks like one'
+mutation crates/gw-core/src/markdown.rs killed \
+  's/    (read.doc == doc \&\& read.path == path \&\& read.heading == heading).then_some(written)/    Some(written)/' \
+  'embeds: a destination the reader would not give back unchanged is never written'
+
+# A heading anchor, which is what a section embed is named by. Without the shape check every
+# heading whose words end in braces re-imports as different text — a page nobody edited
+# becoming permanently unexportable, which is the failure ENABLE_HEADING_ATTRIBUTES was
+# rejected over.
+mutation crates/gw-core/src/markdown.rs killed \
+  '/^pub fn heading_anchor_id/,/^}$/ s/    if !is_document_id(id) {/    if false {/' \
+  'anchors: only a uuid-shaped suffix is a section anchor, never a headings own words'
+# And minting. Re-minting on every publish would move every section embed in the wiki each
+# time somebody fixed a typo — the failure a slug already has and the whole reason a stable
+# anchor exists.
+mutation crates/gw-store/src/transclusion.rs killed \
+  's/    if body.kind == BlockKind::Heading \&\& !body.attrs.contains_key("id") {/    if body.kind == BlockKind::Heading {/' \
+  'anchors: a heading that already has an anchor keeps it, publish after publish'
+
+# THE HALF THAT IS NOT IN THIS FILE, named rather than left to be discovered — the same gap
+# the reference feature has and for the same reason: `run_tests` runs `cargo test` and nothing
+# else, so a mutation in `web/` cannot be scored here. TWO things in TypeScript carry this
+# feature and both fail silently:
+#
+#   1. `heading.id` and the four `embed` attributes must be DECLARED in
+#      `web/src/lib/editor/extensions.ts`, or y-tiptap deletes them from the Y.Doc and
+#      broadcasts the deletion. For `heading.id` the blast radius reaches OTHER PEOPLE S
+#      pages: the next publish mints a fresh anchor and every embed of that section, anywhere
+#      in the wiki, becomes a frame reading "this section no longer exists" about a section
+#      nobody removed.
+#   2. DEPTH IS ONE, and it is structural rather than a counter: `BlockView.svelte` renders an
+#      embed s blocks with an EMPTY `einbettungen` map, so a nested embed takes the same
+#      branch an unreadable one takes. Pass the map down instead and one page read expands a
+#      chain of pages, at one authorisation each, through the single SQLite connection.
+#
+# Run both by hand until this script grows a vitest arm:
+#
+#     cd web && cp src/lib/editor/extensions.ts /tmp/ext.bak \
+#       && sed -i "/id: { default: null, keepOnSplit: false, rendered: false }/d" \
+#          src/lib/editor/extensions.ts \
+#       && npx vitest run src/lib/editor/extensions.test.ts \
+#       ; cp /tmp/ext.bak src/lib/editor/extensions.ts
+#
+#     cd web && cp src/lib/components/BlockView.svelte /tmp/bv.bak \
+#       && sed -i "s/              einbettungen={{}}/              {einbettungen}/" \
+#          src/lib/components/BlockView.svelte \
+#       && npx vitest run src/lib/components/BlockView.test.ts \
+#       ; cp /tmp/bv.bak src/lib/components/BlockView.svelte
+#
+# A COPY, not `git checkout`: these files carry uncommitted work while the feature is being
+# built, and `git checkout` throws all of it away rather than only the mutation. That is not
+# hypothetical — it happened here, twice in one run, and cost both files.
+#
+# Verified on 2026-09-17, against this commit:
+#   - deleting the `id` declaration turns THREE cases red, and the new one is
+#     `keeps a heading's stable anchor, which every section embed of this page depends on`
+#     (the other two are the task-id pair, which shares the literal);
+#   - deleting `embed`'s `heading` attribute turns
+#     `does not delete an embed from the CRDT when the editor opens the page` red;
+#   - handing `einbettungen` down into the frame turns
+#     `renders an embed inside an embed as its label, so depth is one` red. That test was
+#     VACUOUS when first written — its nested embed named a target nothing resolved, so it
+#     passed either way — and this hand-run is what found it. Its fixture now names a target
+#     that IS in the map, which is the only shape that can tell the two apart.
 
 # --- crash recovery ------------------------------------------------------------------
 #
@@ -1707,6 +1849,9 @@ probe_for() {
     # The markdown renderer and the export round trip. Both integration binaries, plus the
     # crate's own unit tests, and nothing else in gw-api touches this file.
     crates/gw-api/src/export.rs) echo "-p gw-api --lib --test export --test export_markdown" ;;
+    # The document-reference and embed handlers. `docs.rs` is where both maps are put on the
+    # wire, and these two integration binaries are what assert what they may contain.
+    crates/gw-api/src/routes/docs.rs) echo "-p gw-api --test references --test embeds" ;;
     *) echo "" ;;
   esac
 }
