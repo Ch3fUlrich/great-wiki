@@ -219,9 +219,58 @@ describe('the editor schema', () => {
     // carried all five, `gw-collab::attrs_to_marks` copied them verbatim into `Mark::attrs`,
     // and `gw-api::export::render_file` — which compares the whole serialised tree against
     // what its own markdown re-imports as — refused every page containing a link, which fails
-    // the entire export run. `Anchor` in `extensions.ts` trims the declaration to `href`; this
-    // is what keeps it trimmed. See `crates/gw-api/tests/export.rs` for the other side.
-    expect(written.link).toEqual({ href: 'https://example.org' });
+    // the entire export run. `Anchor` in `extensions.ts` trims the declaration to the two
+    // attributes this system means anything by; this is what keeps it trimmed. See
+    // `crates/gw-api/tests/export.rs` for the other side.
+    //
+    // `doc: null` is here rather than absent, and that is the mint this pin exists to make
+    // visible: a DECLARED attribute is one ProseMirror fills in with its default on every
+    // mark it touches, and `marksToAttributes` writes the whole map. The Rust half —
+    // `reduce()` dropping a null-valued allow-listed attribute — is what stops that minted
+    // null refusing every page holding an external link from the owner's backup. If this
+    // line ever has to change, that one changes with it.
+    expect(written.link).toEqual({ href: 'https://example.org', doc: null });
+  });
+
+  it('carries a document reference through the CRDT instead of deleting it', () => {
+    // The guard against the mirror that DELETES, and the reason it is a TypeScript test:
+    // the deletion happens in the editor, not in the store. A link to another page of this
+    // wiki carries `{doc: <id>}` and no `href` (D-5). With `doc` undeclared on `Anchor`,
+    // ProseMirror's `computeAttrs` copies declared attributes only, the mark arrives as
+    // `{href: null}`, `updateYFragment` writes that back and broadcasts it — so the first
+    // person to type a word in that paragraph destroys the reference for everybody, and
+    // nothing on the page shows it was ever there.
+    //
+    // Remove `doc` from `Anchor.addAttributes` and this goes red. That is the whole test.
+    const id = '0199c0de-0000-7000-8000-00000000000a';
+    const referring = {
+      type: 'doc',
+      content: [
+        {
+          type: 'paragraph',
+          content: [
+            { type: 'text', text: 'Blutbild', marks: [{ type: 'link', attrs: { doc: id } }] }
+          ]
+        }
+      ]
+    };
+
+    const ydoc = prosemirrorJSONToYDoc(editorSchema, referring, CONTENT_FIELD);
+    const paragraph = ydoc.getXmlFragment(CONTENT_FIELD).get(0);
+    if (!(paragraph instanceof Y.XmlElement)) throw new Error('expected a paragraph element');
+
+    const written: Record<string, unknown> = {};
+    for (let i = 0; i < paragraph.length; i += 1) {
+      const child = paragraph.get(i);
+      if (!(child instanceof Y.XmlText)) continue;
+      for (const chunk of child.toDelta() as Array<{ attributes?: Record<string, unknown> }>) {
+        Object.assign(written, chunk.attributes ?? {});
+      }
+    }
+
+    // The id reached the wire, which is what `gw-collab::attrs_to_marks` copies verbatim
+    // into `Mark::attrs` and what `gw_store::links` reads the graph out of.
+    expect(written.link).toEqual({ href: null, doc: id });
   });
 
   it('drops an attribute it does not declare, which is the mechanism that loses them', () => {

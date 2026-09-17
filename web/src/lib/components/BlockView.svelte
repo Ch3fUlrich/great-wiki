@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Block, Mark } from '$lib/blocks/render';
+  import type { Block, Mark, Reference } from '$lib/blocks/render';
   import { slugify } from '$lib/slug';
   import { codeText, placedFile, plainText, safeHref } from '$lib/blocks/render';
   import { alignOf } from '$lib/blocks/table';
@@ -68,9 +68,41 @@
      * then renders exactly as typed and says nothing.
      */
     fences?: Fences | null;
+    /**
+     * Where this page's document references point, **for the reader this page is being
+     * rendered for** — `gw_store::Store::references_for`'s answer, keyed by document id.
+     *
+     * Passed down for `anhaenge`'s reason and one of its own. A link stores the target's
+     * IDENTITY (D-5), so its address and its name are resolved when the page is read rather
+     * than when it was written — which is what makes a link survive the target being renamed
+     * or moved. That resolution is a permission decision about a DIFFERENT page from the one
+     * being read, so it belongs to the server and to nobody else: a component that looked a
+     * target up itself would be a second answer to a question `Store::references_for`
+     * already answers, written where the answer cannot be trusted.
+     *
+     * **An id with no entry here renders as the author's own text and nothing else** — no
+     * anchor, no address, no tooltip. It is a page this reader may not read, one in the
+     * Papierkorb, one that was purged, one that never existed, or one past the per-page cap,
+     * and those are deliberately indistinguishable: telling them apart is itself the
+     * disclosure. The words stay because they are the author's and are in a body this reader
+     * is already reading; the target's current path and title do not, because they are the
+     * target's and a rename would otherwise keep reporting its new name. ADR 0019.
+     *
+     * `{}` by default, and honest for every caller with no page load behind it — the editor
+     * renders this component while TipTap mounts. Every reference then renders as text,
+     * which is the same thing a reference to an unreadable page does, so nothing there can
+     * disclose more than a reader would see.
+     */
+    verweise?: Record<string, Reference>;
   }
 
-  let { block, anhaenge = [], formeln = null, fences = null }: Props = $props();
+  let {
+    block,
+    anhaenge = [],
+    formeln = null,
+    fences = null,
+    verweise = {}
+  }: Props = $props();
 </script>
 
 <!-- Only known kinds render. An unknown block is skipped rather than emitted raw, which is
@@ -88,26 +120,26 @@
      markup — which is the containment ADR 0014 already requires for an uploaded SVG. -->
 
 {#if block.kind === 'doc'}
-  {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}
+  {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}
 {:else if block.kind === 'paragraph'}
-  <p>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}</p>
+  <p>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}</p>
 {:else if block.kind === 'heading'}
   {@const level = Math.min(6, Math.max(1, Number(block.attrs?.level ?? 1)))}
   {@const id = slugify(plainText(block))}
   <svelte:element this={`h${level}`} {id}>
-    {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}
+    {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}
   </svelte:element>
 {:else if block.kind === 'bulletList'}
-  <ul>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}</ul>
+  <ul>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}</ul>
 {:else if block.kind === 'orderedList'}
-  <ol>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}</ol>
+  <ol>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}</ol>
 {:else if block.kind === 'listItem'}
-  <li>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}</li>
+  <li>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}</li>
 {:else if block.kind === 'taskList'}
   <!-- A checklist. `data-type` is the attribute TipTap's own `TaskList` puts on its `<ul>`,
        so the editor and the reader can be styled by one rule instead of two that drift. -->
   <ul class="task-list" data-type="taskList">
-    {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}
+    {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}
   </ul>
 {:else if block.kind === 'taskItem'}
   {@const checked = block.attrs?.checked === true}
@@ -129,10 +161,10 @@
        every line beneath it as well. -->
   <li class="task-item" data-type="taskItem" data-checked={checked}>
     <input type="checkbox" {checked} disabled aria-label={plainText(block.content?.[0] ?? block)} />
-    <div>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}</div>
+    <div>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}</div>
   </li>
 {:else if block.kind === 'blockquote'}
-  <blockquote>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}</blockquote>
+  <blockquote>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}</blockquote>
 {:else if block.kind === 'codeBlock'}
   <!-- `codeText`, never `plainText`: the whitespace IS the content of a fence, and
        `plainText` collapses it — see its own doc comment for why widening THAT is not the
@@ -163,14 +195,14 @@
        no import cycle between the two components. -->
   <TableView {block} child={nested} />
 {:else if block.kind === 'tableRow'}
-  <tr>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}</tr>
+  <tr>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}</tr>
 {:else if block.kind === 'tableHeader'}
   <th scope="col" style:text-align={alignOf(block)}
-    >{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}</th
+    >{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}</th
   >
 {:else if block.kind === 'tableCell'}
   <td style:text-align={alignOf(block)}
-    >{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} />{/each}</td
+    >{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/each}</td
   >
 {:else if block.kind === 'attachment'}
   <!-- A file placed in the prose (D-15). Three outcomes, and which one applies is decided by
@@ -240,7 +272,7 @@
   {@render marked(block.text ?? '', block.marks ?? [])}
 {/if}
 
-{#snippet nested(child: Block)}<Self block={child} {anhaenge} {formeln} {fences} />{/snippet}
+{#snippet nested(child: Block)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} />{/snippet}
 
 <!-- A leaf's `marks`, applied outermost first — the order `gw_core::MARK_ORDER` already
      sorted them into (see `render.ts`'s `Block.marks` doc). Recursing one mark at a time
@@ -269,11 +301,37 @@
            run renders as text, the same fallthrough an unrecognised mark kind takes. -->
       {@const href = safeHref(mark.attrs?.href)}
       {#if typeof doc === 'string'}
-        <!-- Internal target, not yet resolved to a path — Task 7's job. A real `<a href>`
-             needs that resolution and an `<a>` with no `href` reads as broken, so this is
-             neither: the text and the target id are both here, nothing is clickable, and
-             nothing claims to navigate anywhere until it actually can. -->
-        <span data-doc={doc}>{@render marked(text, rest)}</span>
+        <!-- A reference to another page of this wiki, by identity (D-5), resolved for THIS
+             reader by the server. `verweise[doc]` is the whole of what may be said about the
+             target: it is there when the reader may read the page, and it is absent for a
+             page they may not read, one in the Papierkorb, one that was purged, one that
+             never existed and one past the per-page cap — four states that must answer
+             identically, because distinguishing them is itself the disclosure.
+
+             **The `doc` value never becomes an address.** It is an arbitrary string:
+             `gw-collab`'s `attrs_to_marks` copies whatever the Yjs attribute carries and
+             nothing between the collaboration socket and `documents.body` validates it, so
+             `{"doc": "javascript:…"}` is a thing a page can hold. What becomes an address is
+             the PATH the server resolved, and it goes through `safeHref` like every other
+             one — the same sink, not a second judgement of what is safe.
+
+             `title` is the target's CURRENT name. That is D-5's point and it is also why it
+             is withheld above: it is live, so a reference written when the reader could see
+             the page would otherwise go on reporting that page's new name after a rename.
+
+             `data-doc` stays on both branches. It is neither an address nor a name, and the
+             id is in the page's data either way — `+page.server.ts` returns the body — so it
+             discloses nothing this reader does not already have. It is what a browser check
+             finds the reference by. -->
+        {@const ziel = verweise[doc]}
+        {@const zielHref = ziel ? safeHref(ziel.path) : null}
+        {#if ziel && zielHref !== null}
+          <a href={zielHref} title={ziel.title} data-doc={doc} rel="noopener noreferrer"
+            >{@render marked(text, rest)}</a
+          >
+        {:else}
+          <span data-doc={doc}>{@render marked(text, rest)}</span>
+        {/if}
       {:else if href !== null}
         <!-- `rel="noopener noreferrer"` unconditionally, not only when `target="_blank"` is
              also set: this component never adds a `target`, but the protection costs nothing

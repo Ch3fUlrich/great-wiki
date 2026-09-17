@@ -1390,8 +1390,123 @@ mutation crates/gw-api/src/export.rs killed \
   's/^const CODE_BLOCK_ATTRS: \[&str; 1\] = \["language"\];/const CODE_BLOCK_ATTRS: [\&str; 0] = [];/' \
   'export: a fence keeps its language through the round-trip comparison'
 mutation crates/gw-api/src/export.rs killed \
-  's/            .retain(|key, _| CODE_BLOCK_ATTRS.contains(\&key.as_str()));/            .retain(|_, _| true);/' \
+  's/            .retain(|key, value| kept(\&CODE_BLOCK_ATTRS, key, value));/            .retain(|_, _| true);/' \
   'export: a fence carrying an undeclared attribute is reduced, not refused'
+
+# --- document references: the scheme, and who a reference resolves for --------------------
+#
+# D-5 stores a link's target as the page's IDENTITY so that renaming or moving it cannot break
+# the link, and ADR 0019 is how that is written down, read back, resolved and shown. Three
+# things here can fail silently and each has its own shape of failure.
+#
+# The SYNTAX, exactly as the placement syntax above: `render_file` re-imports its own output
+# and compares, so an importer and an exporter that disagree by one character produce a page
+# that can never be exported again — and `run()` writes the rest of the wiki anyway, so the
+# backup is quietly one page short rather than loudly absent. Both halves live in
+# `gw_core::markdown` on purpose; these break one half at a time, which is the drift having
+# them in one crate is supposed to make impossible.
+#
+# The DEGRADATION, which is subtler and is what D-21g is about: `dok:etwas` is a string
+# anybody with write access could have typed into the old link control at any time in the
+# past. It round-trips today as an ordinary href. A reader that accepted anything after the
+# colon would make that page re-import as a different tree — a page NOBODY EDITED becoming
+# permanently unexportable.
+#
+# And the DISCLOSURE, which is the one that matters most: a `doc` value is an id the AUTHOR
+# chose, on a page that may be world-readable, pointing at a page that may not be.
+
+# The scheme is what makes a destination a reference. Without it every ordinary link is one,
+# and `[Titel](/darm/labor)` re-imports as a reference to a document called `/darm/labor`.
+mutation crates/gw-core/src/markdown.rs killed \
+  's/    let id = dest.strip_prefix(DOCUMENT_SCHEME)?;/    let id = dest.trim_start_matches(DOCUMENT_SCHEME);/' \
+  'references: a destination is a reference only if it SAYS so, never because it looks like one'
+# The shape check is the degradation. Without it `dok:etwas` becomes `{doc: "etwas"}`, which
+# differs from the `{href: "dok:etwas"}` that is stored, and the page is refused for ever.
+mutation crates/gw-core/src/markdown.rs killed \
+  's/    (document_reference(\&written) == Some(id)).then_some(written)/    Some(written)/' \
+  'references: a destination the reader would not give back unchanged is never written'
+mutation crates/gw-core/src/markdown.rs killed \
+  's/^fn is_document_id(s: \&str) -> bool {/fn is_document_id(s: \&str) -> bool { return !s.is_empty();/' \
+  'references: only a document id reads back as a reference; anything else stays an ordinary link'
+# The importer's half. Reading every `dok:` back as an href loses the reference on the way in,
+# so a page exported and re-seeded silently becomes a page of dead links.
+mutation crates/gw-core/src/markdown.rs killed \
+  's/                Some(id) => Mark::link_to_doc_at(id, document_fallback_path(\&title)),/                Some(_) => Mark::link_to_url(\&dest_url),/' \
+  'references: a `dok:` destination is read back as a reference, not as an address'
+# The exporter's half. `Renderer::wrap` interpolates a destination with NO escaping and a
+# stored `doc` is an arbitrary attacker-controlled string, so writing it raw puts attacker
+# text straight into the owner's backup file.
+mutation crates/gw-api/src/export.rs killed \
+  's/                    .and_then(|id| markdown::document_destination(id).map(|dest| (id, dest)))/                    .map(|id| (id, format!("dok:{id}")))/' \
+  'references: a `doc` target is written through the destination writer, never interpolated raw'
+# The null rule, and it is the `LINK_ATTRS` disaster from the other side. The editor MUST
+# declare `doc` or y-tiptap deletes it from the CRDT and broadcasts the deletion — and a
+# declared attribute is one ProseMirror mints, so every ordinary external link is stored
+# `{href, doc: null}` the first time its paragraph is touched. An allow-list keeps a key
+# without inspecting its value, so without this clause every such page is refused from the
+# backup, permanently, with nobody having edited its content.
+mutation crates/gw-api/src/export.rs killed \
+  's/    allowed.contains(\&key) \&\& !value.is_null()/    { let _ = value; allowed.contains(\&key) }/' \
+  'export: a minted null-valued attribute compares equal to an absent one'
+
+# The fallback path, which is what stops identity costing the backup path. A seed mints every
+# id anew, so no `dok:` in a restored corpus can match: without the path beside it, an export
+# loaded into an empty database keeps every word and loses every internal connection.
+mutation crates/gw-api/src/export.rs killed \
+  's/                            .and_then(markdown::document_fallback)/                            .and_then(|_| None::<String>)/' \
+  'references: an exported reference carries the path its target had, so a restored backup keeps it'
+# And the ORDER between the two outcomes, which is the whole decision. A page renamed after the
+# export has a stale path in the file and a perfectly good identity; preferring the path would
+# reintroduce exactly the breakage identity exists to prevent, quietly, on a restore.
+mutation crates/gw-store/src/links.rs killed \
+  's/            \*mark = if live {/            *mark = if false {/' \
+  'references: a live id wins against the path a file carried, never the other way round'
+
+# THE one. `readable_target` is the permission-checked accessor reached by an id; the two
+# calls it wraps are the row lookup underneath it. With this swap a reference to a page the
+# READER may not read resolves anyway, and the reader is handed that page's current address
+# and its current title — the two things `backlinks_for` and `graph_for` refuse to disclose,
+# and worse than either because they are LIVE: a rename would keep reporting the new name to
+# somebody whose access had been taken away.
+#
+# It cannot pass vacuously. `crates/gw-api/tests/references.rs` puts a reference to a
+# restricted page called »Blutbild Müller« on a PUBLIC page, and asserts on the raw response
+# text rather than on a parsed field — a handler that leaked the title somewhere else in the
+# body would satisfy a test that deserialised one key. Its anti-vacuity half is a second
+# principal who MAY read the target and does get the title, so the fixture is known to
+# contain something to hide.
+mutation crates/gw-store/src/links.rs killed \
+  '/    async fn readable_target(/,/^    }$/ s/        self.document_for_id_with_baseline(principal, id, Action::Read, baseline)/        let Some(p) = self.document_path_unchecked(id).await? else { return Ok(None) }; self.document_by_path_unchecked(\&p)/' \
+  'references: a reference resolves through the permission-checked accessor, against the READER'
+# The publish-time half, and it is an existence oracle rather than a content leak: without the
+# check, an author with write on one page learns whether `/darm/befund-mueller` exists by
+# typing it into the link dialog and watching whether it survives the save as a reference.
+mutation crates/gw-store/src/links.rs killed \
+  '/    pub(crate) async fn resolve_references(/,/^    }$/ s/                .document_for_with_baseline(author, \&path, Action::Read, baseline)/                .document_by_path_unchecked(\&path)/' \
+  'references: an href is exchanged for an id only for a page the AUTHOR may read'
+# THE FOURTH HALF OF THIS FEATURE IS NOT IN THIS FILE, and that is a gap worth naming rather
+# than leaving for somebody to discover. `run_tests` runs `cargo test` and nothing else, so a
+# mutation in `web/` cannot be scored here — and the most destructive failure this feature has
+# is in TypeScript: with `doc` undeclared on `Anchor` (web/src/lib/editor/extensions.ts),
+# y-tiptap deletes the attribute from the Y.Doc and BROADCASTS the deletion, so one person
+# typing a word destroys a reference for everybody and the export then refuses the page.
+#
+# Run it by hand until this script grows a vitest arm:
+#
+#     cd web && sed -i '/doc: { default: null, rendered: false }/d' src/lib/editor/extensions.ts \
+#       && sed -i "s/href: { default: null, parseHTML: (element: HTMLElement) => element.getAttribute('href') },/href: { default: null, parseHTML: (element: HTMLElement) => element.getAttribute('href') }/" src/lib/editor/extensions.ts \
+#       && npx vitest run src/lib/editor/extensions.test.ts ; git checkout src/lib/editor/extensions.ts
+#
+# Verified on 2026-09-17: two cases go red — `writes a mark into the CRDT under gw-collab's
+# key` (the minted `doc: null` disappears from the wire) and `carries a document reference
+# through the CRDT instead of deleting it` (the id itself does).
+
+# The cap is an availability control, not a correctness one: every resolution is one
+# authorisation through the single SQLite connection the whole application shares, and nothing
+# caps how many marks a body holds.
+mutation crates/gw-store/src/links.rs killed \
+  's/^pub const MAX_REFERENCES_PER_PAGE: usize = 256;/pub const MAX_REFERENCES_PER_PAGE: usize = usize::MAX;/' \
+  'references: one page resolves a bounded number of references, whatever its body holds'
 
 # --- crash recovery ------------------------------------------------------------------
 #

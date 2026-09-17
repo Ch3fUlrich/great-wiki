@@ -64,9 +64,32 @@ Drei Dinge tut auch `--update` nicht:
 
 ## Was der Export nicht enthalten kann
 
-> Die Datenbank kennt keine Auszeichnung im Fließtext: kein fett, kein kursiv, keine
-> Verweise, keine Bilder. Diese Angaben gehen schon beim Einlesen verloren — der Import
-> sagt das Zeile für Zeile — und können deshalb auch nicht wieder herauskommen.
+> Bilder von anderswo und waagerechte Linien kennt die Datenbank nicht. Diese Angaben
+> gehen schon beim Einlesen verloren — der Import sagt das Zeile für Zeile — und können
+> deshalb auch nicht wieder herauskommen.
+
+Auszeichnung im Fließtext gehört **nicht mehr** dazu: fett, *kursiv*, ~~durchgestrichen~~,
+`Code` und Verweise kommen seit Kurzem beide Wege heil durch.
+
+## Ein Verweis auf eine Seite zeigt auf ihre Kennung, nicht auf ihre Adresse
+
+Ein Verweis auf eine andere Seite dieses Wikis speichert, **welche** Seite gemeint ist —
+nicht, wo sie gerade liegt. Deshalb übersteht er es, wenn die Seite später umbenannt oder
+verschoben wird. Im Export steht beides nebeneinander:
+
+`[Was schon geht](dok:<kennung> "/rundgang/was-schon-geht")`
+
+Die Kennung gilt, die Adresse ist nur der Rückfallweg. Beim Einlesen in **dieses** Wiki
+entscheidet die Kennung — auch dann, wenn die Seite inzwischen woanders liegt und die
+Adresse in der Datei veraltet ist. Beim Einlesen in eine **frische, leere** Datenbank
+werden alle Kennungen neu vergeben, keine passt mehr, und jeder Verweis nimmt stattdessen
+die mitgeführte Adresse: die Verbindung bleibt erhalten, nicht nur der Satz.
+
+Ohne beides geht es nicht. Ein Verweis, dessen Kennung hier unbekannt ist und der keine
+Adresse mitbringt, erscheint als der Text, den jemand geschrieben hat — ohne Verknüpfung.
+Genau das ist der Verweis in der nächsten Zeile, absichtlich:
+
+[Diese Kennung gibt es hier nicht](dok:0199c0de-0000-7000-8000-00000000dead)
 
 Alles andere kommt genau so zurück, wie es hineingegangen ist. Der Export prüft das für
 jede Seite einzeln: er wandelt seine eigene Ausgabe zurück und vergleicht. Was dabei nicht

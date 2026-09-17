@@ -16,6 +16,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+/// No reference resolves to anything, which is the honest state for a test with no store
+/// behind it: a reference is then written bare, with no fallback path beside it. The
+/// fallback is a property of the EXPORT RUN — `Store::references_for`'s answer for the
+/// account doing it — and inventing one here would be a second, unfiltered answer.
+fn no_paths() -> export::ReferencePaths {
+    export::ReferencePaths::new()
+}
+
 /// In `admins`, which D-M2-1 gives read reach over everything — including the corpus's
 /// deliberately restricted page, which a lesser account would silently leave out.
 fn admin() -> Principal {
@@ -91,6 +99,29 @@ async fn snapshot(store: &Store, principal: &Principal) -> BTreeMap<String, serd
         );
     }
     out
+}
+
+/// An account that really exists in `store` and may write `path` — what publishing needs.
+async fn signed_in_writer(store: &Store, path: &str) -> Principal {
+    let username = "autorin";
+    store
+        .create_local_principal(username, "Autorin", None, "$argon2id$fake")
+        .await
+        .unwrap();
+    let (principal, _) = store
+        .principal_by_username(username)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .add_grant(
+            path,
+            gw_auth::Subject::Principal(principal.id.clone()),
+            gw_auth::Permission::Write,
+        )
+        .await
+        .unwrap();
+    principal
 }
 
 async fn export_to(store: &Store, principal: &Principal, dir: &Path) -> ExportReport {
@@ -510,7 +541,8 @@ fn one_document_can_be_rendered_without_a_store_or_a_filesystem() {
     )
     .unwrap();
 
-    let file = export::render_file(&meta, &body).expect("this document is expressible");
+    let file =
+        export::render_file(&meta, &body, &no_paths()).expect("this document is expressible");
     assert!(file.starts_with("---\n"), "{file}");
     assert!(file.contains("title: Größe und Maß"), "{file}");
     assert!(file.contains("slug: groesse-und-mass"), "{file}");
@@ -526,7 +558,7 @@ fn one_document_can_be_rendered_without_a_store_or_a_filesystem() {
              "content":[{"kind":"text","text":"eine\nzweite Zeile"}]}]}"#,
     )
     .unwrap();
-    assert!(export::render_file(&meta, &broken)
+    assert!(export::render_file(&meta, &broken, &no_paths())
         .unwrap_err()
         .contains("line break"));
 }
@@ -566,7 +598,7 @@ fn a_link_carrying_the_editors_own_attributes_still_exports() {
     )
     .unwrap();
 
-    let file = export::render_file(&meta, &body).unwrap_or_else(|e| {
+    let file = export::render_file(&meta, &body, &no_paths()).unwrap_or_else(|e| {
         panic!("a link written by the editor must still export, and this one did not: {e}")
     });
     assert!(
@@ -583,7 +615,7 @@ fn a_link_carrying_the_editors_own_attributes_still_exports() {
     )
     .unwrap();
     assert!(
-        export::render_file(&meta, &no_href)
+        export::render_file(&meta, &no_href, &no_paths())
             .unwrap_err()
             .contains("href"),
         "a link the renderer cannot address must still be refused, not exported as bare text"
@@ -601,9 +633,10 @@ fn a_task_carrying_the_id_the_store_minted_still_exports() {
     // `{checked, id}`.
     //
     // Without a reduction those two trees differ and `render_file` refuses the page — and
-    // `export` fails the whole run on the first refusal, so ONE checkbox anywhere in the
-    // wiki would shut the owner's backup path permanently, for a difference that is not a
-    // difference in the document at all. The id is database identity; markdown has no
+    // `run()` pushes a `Refused` and CONTINUES, so ONE checkbox anywhere in the wiki would
+    // leave that page quietly missing from every export directory from then on, under a
+    // `FIDELITY` file calling the directory a faithful copy of the database — for a
+    // difference that is not a difference in the document at all. The id is database identity; markdown has no
     // spelling for it and never will.
     let meta = export::FileMeta {
         title: "Einkauf".into(),
@@ -625,7 +658,7 @@ fn a_task_carrying_the_id_the_store_minted_still_exports() {
     )
     .unwrap();
 
-    let file = export::render_file(&meta, &body).unwrap_or_else(|e| {
+    let file = export::render_file(&meta, &body, &no_paths()).unwrap_or_else(|e| {
         panic!("a task the store has reconciled must still export, and this one did not: {e}")
     });
     assert!(file.contains("- [ ] Milch kaufen"), "{file}");
@@ -642,7 +675,7 @@ fn a_task_carrying_the_id_the_store_minted_still_exports() {
     )
     .unwrap();
     assert!(
-        export::render_file(&meta, &mangled).is_err(),
+        export::render_file(&meta, &mangled, &no_paths()).is_err(),
         "the reduction must not start forgiving real differences"
     );
 }
@@ -680,7 +713,7 @@ fn a_task_item_that_states_no_checked_at_all_is_refused_rather_than_guessed_at()
     .unwrap();
 
     assert!(
-        export::render_file(&meta, &body).is_err(),
+        export::render_file(&meta, &body, &no_paths()).is_err(),
         "a task item stating no `checked` must be refused, not exported as unticked"
     );
 }
@@ -719,8 +752,363 @@ fn a_link_whose_address_markdown_would_mangle_is_refused_rather_than_truncated()
     .unwrap();
 
     assert!(
-        export::render_file(&meta, &body).is_err(),
+        export::render_file(&meta, &body, &no_paths()).is_err(),
         "an address markdown cannot state must be refused, not silently truncated"
+    );
+}
+
+#[test]
+fn a_document_reference_round_trips_through_markdown_unchanged() {
+    // The pin for both halves of the `dok:` syntax at once (ADR 0019), and it goes through
+    // `render_file` rather than through `render` for the reason every test for this feature
+    // has to: the refusal for a reference happens in the COMPARISON, not in the renderer, so
+    // a unit test of the renderer passes while the export refuses the page.
+    //
+    // Import → export → re-import, and the two trees are compared whole rather than through
+    // the exporter's own reduction: the reduction is what the comparison forgives, and a
+    // test that used it could not tell a round trip from a tolerance.
+    let id = "0199c0de-0000-7000-8000-00000000000a";
+    let source = format!("Siehe [Blutbild](dok:{id}) und [außen](https://example.invalid/x).\n");
+    let imported = gw_core::markdown::markdown_to_blocks(&source);
+
+    // The importer really produced a reference and not an href — otherwise everything below
+    // would hold just as well for a link that never became one.
+    let json = serde_json::to_value(&imported).unwrap();
+    let marks = json["content"][0]["content"][1]["marks"].clone();
+    assert_eq!(marks[0]["attrs"]["doc"], serde_json::json!(id), "{json:#}");
+    assert_eq!(marks[0]["attrs"].get("href"), None, "{json:#}");
+
+    let meta = export::FileMeta {
+        title: "Befunde".into(),
+        doc_type: "page".into(),
+        visibility: "restricted".into(),
+        language: "de".into(),
+        sort_key: 0,
+        slug: "befunde".into(),
+        tags: Vec::new(),
+    };
+    let file = export::render_file(&meta, &imported, &no_paths()).unwrap_or_else(|e| {
+        panic!("a page holding a reference must export, and this did not: {e}")
+    });
+    assert!(
+        file.contains(&format!("[Blutbild](dok:{id})")),
+        "the reference is written as the scheme, never as the target's path:\n{file}"
+    );
+
+    let (_, body) = gw_core::split_frontmatter(&file);
+    let reimported = gw_core::markdown::markdown_to_blocks(body);
+    assert_eq!(
+        serde_json::to_value(&reimported).unwrap(),
+        serde_json::to_value(&imported).unwrap(),
+        "the tree that came back is not the tree that went out:\n{file}"
+    );
+
+    // And the same round trip with the target's path beside the id. The FILE gains a link
+    // title; the DOCUMENT must not. `render_file` succeeding is what asserts that, because
+    // the comparison inside it is the thing the title could leak into — a stored `{doc}` and
+    // the `{doc, path}` its own markdown re-imports as have to compare equal, or a page
+    // holding a reference is refused from every export from then on.
+    let mut paths = export::ReferencePaths::new();
+    paths.insert(
+        id.to_string(),
+        gw_store::Reference {
+            path: "/darm/blutbild".into(),
+            title: "Blutbild".into(),
+        },
+    );
+    let with_path = export::render_file(&meta, &imported, &paths)
+        .unwrap_or_else(|e| panic!("the fallback path leaked into the round-trip comparison: {e}"));
+    assert!(
+        with_path.contains(&format!("[Blutbild](dok:{id} \"/darm/blutbild\")")),
+        "the target's path is not beside the id:\n{with_path}"
+    );
+
+    let (_, carried) = gw_core::split_frontmatter(&with_path);
+    let back = gw_core::markdown::markdown_to_blocks(carried);
+    let mark = serde_json::to_value(&back).unwrap()["content"][0]["content"][1]["marks"][0].clone();
+    assert_eq!(mark["attrs"]["doc"], serde_json::json!(id), "{mark}");
+    assert_eq!(
+        mark["attrs"]["path"],
+        serde_json::json!("/darm/blutbild"),
+        "the fallback did not come back, so nothing carries a restored corpus"
+    );
+}
+
+/// A page at `slug` whose only content is `body`. Returns its id.
+async fn reference_page(store: &Store, slug: &str, title: &str, body: Block) -> String {
+    store
+        .create_document(
+            Author::Import,
+            &NewDocument {
+                parent_path: None,
+                doc_type: DocumentType::Page,
+                title: title.into(),
+                slug: Some(slug.into()),
+                language: "de".into(),
+                visibility: Visibility::Public,
+                body,
+                sort_key: 0,
+                topics: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap()
+}
+
+/// The attributes of the one link mark in the body stored at `path`.
+async fn stored_link(store: &Store, path: &str) -> serde_json::Value {
+    let doc = store
+        .document_for(&admin(), path, Action::Read)
+        .await
+        .unwrap()
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&doc.body).unwrap();
+    fn find(node: &serde_json::Value) -> Option<serde_json::Value> {
+        for mark in node["marks"].as_array().into_iter().flatten() {
+            if mark["kind"] == serde_json::json!("link") {
+                return Some(mark["attrs"].clone());
+            }
+        }
+        node["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find_map(find)
+    }
+    find(&body).unwrap_or_else(|| panic!("`{path}` holds no link at all: {body}"))
+}
+
+#[tokio::test]
+async fn a_corpus_re_seeded_into_an_empty_database_keeps_the_connection_its_references_named() {
+    // The cost identity was about to charge, and the reason it no longer does. A seed mints
+    // every id fresh — `SeedMeta` has no `id` key — so a `dok:` in a restored corpus can never
+    // match anything there, and without the target's path beside it every internal link in a
+    // restored backup would come back as plain words: the text intact, the connection gone.
+    //
+    // End to end, because nothing smaller proves it: build a wiki whose page really holds a
+    // `doc` reference, export it, seed that export into an EMPTY store, and find the
+    // connection again there.
+    let source = Store::open("sqlite::memory:").await.unwrap();
+    // `anker` before `quelle` alphabetically, and that is load-bearing: the seeder walks the
+    // directory in filename order, and `replace_links` records no edge to a page that does
+    // not exist yet (SQLite's conflict resolution does not apply to foreign keys, so an edge
+    // to an absent document would abort the import). That is pre-existing behaviour for every
+    // address-shaped link and is unchanged here — a restored link whose target seeds LATER is
+    // still a working link, it simply waits for something to republish the page before it is
+    // an edge. Naming the pages this way keeps this test about the fallback rather than about
+    // that.
+    let ziel = reference_page(
+        &source,
+        "anker",
+        "Anker",
+        serde_json::from_str(
+            r#"{"kind":"doc","content":[{"kind":"paragraph","content":[
+             {"kind":"text","text":"Hier ist der Anker."}]}]}"#,
+        )
+        .unwrap(),
+    )
+    .await;
+    let von = reference_page(
+        &source,
+        "quelle",
+        "Quelle",
+        serde_json::from_str(
+            r#"{"kind":"doc","content":[{"kind":"paragraph","content":[
+                 {"kind":"text","text":"siehe dort",
+                  "marks":[{"kind":"link","attrs":{"href":"/anker"}}]}]}]}"#,
+        )
+        .unwrap(),
+    )
+    .await;
+
+    // Publishing is what exchanges an author's address for the target's identity, so the
+    // fixture reaches that state by being written rather than by being assembled.
+    let autor = signed_in_writer(&source, "/quelle").await;
+    let body: Block = serde_json::from_str(
+        &source
+            .document_for(&admin(), "/quelle", Action::Read)
+            .await
+            .unwrap()
+            .unwrap()
+            .body,
+    )
+    .unwrap();
+    source
+        .publish_revision(&autor, &von, &body, None)
+        .await
+        .unwrap()
+        .expect("the publish was refused");
+    assert_eq!(
+        stored_link(&source, "/quelle").await["doc"],
+        serde_json::json!(ziel),
+        "the fixture never held a reference, so nothing below is proved"
+    );
+
+    let out = tempfile::tempdir().unwrap();
+    let report = export_to(&source, &admin(), out.path()).await;
+    assert!(report.is_complete(), "{report}");
+    let file = std::fs::read_to_string(out.path().join("quelle.md")).unwrap();
+    assert!(
+        file.contains(&format!("(dok:{ziel} \"/anker\")")),
+        "the export carries the id but not the path to fall back to:\n{file}"
+    );
+
+    // A FRESH store. Nothing in it has ever heard of the ids in that directory.
+    let restored = Store::open("sqlite::memory:").await.unwrap();
+    let reload = seed::run(&restored, out.path()).await.unwrap();
+    assert!(reload.is_complete(), "{reload}");
+
+    let neues_ziel = restored
+        .document_for(&admin(), "/anker", Action::Read)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    assert_ne!(
+        neues_ziel, ziel,
+        "a seed must mint a new id, or this test proves nothing at all"
+    );
+
+    // It fell back to the path, and the connection is in the restored wiki's graph — which is
+    // the whole claim. A `doc` mark naming a stranger's id would have recorded no edge.
+    let mark = stored_link(&restored, "/quelle").await;
+    assert_eq!(
+        mark["href"],
+        serde_json::json!("/anker"),
+        "the reference did not fall back to the path it carried: {mark}"
+    );
+    assert_eq!(
+        mark.get("doc"),
+        None,
+        "a dead id was kept beside the address, so the two can disagree: {mark}"
+    );
+    let backlinks = restored.backlinks_for(&admin(), &neues_ziel).await.unwrap();
+    assert_eq!(
+        backlinks.len(),
+        1,
+        "the connection is not in the restored graph"
+    );
+    assert_eq!(backlinks[0].path, "/quelle");
+
+    // And the next publish there makes it an identity again, against THAT database's ids —
+    // so a restored corpus is not merely readable, it is back where it started.
+    let neuer_autor = signed_in_writer(&restored, "/quelle").await;
+    let neues_von = restored
+        .document_for(&admin(), "/quelle", Action::Read)
+        .await
+        .unwrap()
+        .unwrap();
+    let neuer_koerper: Block = serde_json::from_str(&neues_von.body).unwrap();
+    restored
+        .publish_revision(&neuer_autor, &neues_von.id, &neuer_koerper, None)
+        .await
+        .unwrap()
+        .expect("the publish was refused");
+    assert_eq!(
+        stored_link(&restored, "/quelle").await["doc"],
+        serde_json::json!(neues_ziel),
+        "the restored reference never became an identity again"
+    );
+}
+
+#[test]
+fn a_reference_to_something_that_is_not_a_document_id_is_refused_rather_than_written() {
+    // D-21f. A `doc` value is an arbitrary string that reached `documents.body` over the
+    // collaboration socket without passing any validation, and `Renderer::wrap` interpolates
+    // a destination with NO escaping — so a writer that emitted what it was handed would put
+    // attacker text into the owner's backup file: this one would export as
+    // `[Titel](dok:x) [siehe](https://angreifer.example/`, which is a second link the author
+    // never wrote.
+    //
+    // Refusing names the page and writes nothing. The round-trip comparison would also have
+    // caught this one, and that is not the design: it catches it only because the smuggled
+    // text happens to re-parse differently, and "happens to" is not a guarantee.
+    let meta = export::FileMeta {
+        title: "Quellen".into(),
+        doc_type: "page".into(),
+        visibility: "public".into(),
+        language: "de".into(),
+        sort_key: 0,
+        slug: "quellen".into(),
+        tags: Vec::new(),
+    };
+    for target in [
+        "x) [siehe](https://angreifer.example/",
+        "etwas",
+        "",
+        "../../etc/passwd",
+    ] {
+        let body: Block = serde_json::from_str(&format!(
+            r#"{{"kind":"doc","content":[{{"kind":"paragraph","content":[
+                 {{"kind":"text","text":"Titel",
+                  "marks":[{{"kind":"link","attrs":{{"doc":{}}}}}]}}]}}]}}"#,
+            serde_json::Value::String(target.into())
+        ))
+        .unwrap();
+        assert!(
+            export::render_file(&meta, &body, &no_paths()).is_err(),
+            "`{target}` is not a document id and must be refused, not written"
+        );
+    }
+}
+
+#[test]
+fn a_link_carrying_a_minted_null_attribute_still_exports() {
+    // D-21b, and it is the `LINK_ATTRS` disaster arrived at from the other side.
+    //
+    // The editor's `Anchor` has to DECLARE `doc`, or y-tiptap deletes it from the Y.Doc and
+    // broadcasts the deletion — a reference destroyed by somebody else typing a word in the
+    // same paragraph. But a declared attribute is one ProseMirror MINTS: `computeAttrs` fills
+    // the `null` default in, `marksToAttributes` writes the whole map, and `attrs_to_marks`
+    // copies it verbatim, so every ordinary external link on the site is stored
+    // `{href: "https://…", doc: null}` the first time anybody edits its paragraph.
+    //
+    // An allow-list keeps a key without inspecting its value, so `LINK_ATTRS` alone is blind
+    // to that: the stored mark reduces to two keys, its own markdown re-imports as one, and
+    // the page is refused from every export from then on. Nobody edited its content.
+    //
+    // The same holds for a block's allow-listed attributes, so the fence below carries a
+    // minted `language: null` beside the link.
+    let meta = export::FileMeta {
+        title: "Quellen".into(),
+        doc_type: "page".into(),
+        visibility: "public".into(),
+        language: "de".into(),
+        sort_key: 0,
+        slug: "quellen".into(),
+        tags: Vec::new(),
+    };
+    let body: Block = serde_json::from_str(
+        r#"{"kind":"doc","content":[
+             {"kind":"paragraph","content":[
+               {"kind":"text","text":"Studie",
+                "marks":[{"kind":"link","attrs":{"href":"https://example.invalid/a","doc":null}}]}]},
+             {"kind":"codeBlock","attrs":{"language":null},
+              "content":[{"kind":"text","text":"eins"}]}]}"#,
+    )
+    .unwrap();
+
+    let file = export::render_file(&meta, &body, &no_paths()).unwrap_or_else(|e| {
+        panic!("a minted null must compare equal to an absent key, and did not: {e}")
+    });
+    assert!(
+        file.contains("[Studie](https://example.invalid/a)"),
+        "{file}"
+    );
+
+    // And the tolerance is exactly that wide: a `doc` that carries a VALUE beside an `href`
+    // is a mark saying two different things, and it is still refused.
+    let both: Block = serde_json::from_str(
+        r#"{"kind":"doc","content":[{"kind":"paragraph","content":[
+             {"kind":"text","text":"Studie","marks":[{"kind":"link","attrs":{
+               "href":"https://example.invalid/a",
+               "doc":"0199c0de-0000-7000-8000-00000000000a"}}]}]}]}"#,
+    )
+    .unwrap();
+    assert!(
+        export::render_file(&meta, &both, &no_paths()).is_err(),
+        "a link stating both an address and a reference must not be quietly halved"
     );
 }
 
@@ -764,7 +1152,7 @@ fn a_code_block_carrying_a_second_attribute_is_reduced_rather_than_refused() {
     )
     .unwrap();
 
-    let file = export::render_file(&meta, &body).unwrap_or_else(|e| {
+    let file = export::render_file(&meta, &body, &no_paths()).unwrap_or_else(|e| {
         panic!("a fence carrying a stray attribute must still export, and this one did not: {e}")
     });
     assert!(file.contains("```mermaid"), "{file}");
@@ -804,7 +1192,7 @@ fn a_code_block_whose_language_its_own_markdown_would_lose_is_refused() {
     .unwrap();
 
     assert!(
-        export::render_file(&meta, &body).is_err(),
+        export::render_file(&meta, &body, &no_paths()).is_err(),
         "a fence whose language markdown cannot state must be refused, not quietly changed"
     );
 }
@@ -835,7 +1223,8 @@ fn a_pages_topics_are_stated_in_its_frontmatter_and_re_import_unchanged() {
     // `render_file` re-imports its own output and compares the metadata, so a file that
     // came back with different topics would be REFUSED rather than returned. Getting a
     // file at all is therefore already half the assertion.
-    let file = export::render_file(&meta, &body).expect("this document is expressible");
+    let file =
+        export::render_file(&meta, &body, &no_paths()).expect("this document is expressible");
     assert!(file.contains("tags:"), "{file}");
     assert!(file.contains("Medizin/Darm"), "{file}");
     assert!(file.contains("Ernährung"), "{file}");
@@ -863,7 +1252,7 @@ fn a_page_about_nothing_still_states_the_key() {
         tags: Vec::new(),
     };
     let body: Block = serde_json::from_str(r#"{"kind":"doc","content":[]}"#).unwrap();
-    let file = export::render_file(&meta, &body).unwrap();
+    let file = export::render_file(&meta, &body, &no_paths()).unwrap();
     assert!(file.contains("tags: []"), "{file}");
 }
 
@@ -940,7 +1329,7 @@ fn a_page_that_places_a_file_exports_and_re_imports_as_the_same_page() {
     )
     .unwrap();
 
-    let file = export::render_file(&befund_meta(), &body)
+    let file = export::render_file(&befund_meta(), &body, &no_paths())
         .unwrap_or_else(|e| panic!("a page that places a file must still export: {e}"));
     assert!(
         file.contains("![Befund vom März](anhang:befund.png)"),
@@ -987,7 +1376,7 @@ fn a_placement_is_compared_with_its_attributes_whole_and_no_reduction_forgives_t
     )
     .unwrap();
     assert!(
-        export::render_file(&befund_meta(), &body).is_err(),
+        export::render_file(&befund_meta(), &body, &no_paths()).is_err(),
         "an attribute markdown cannot state must be refused, not quietly dropped"
     );
 }
@@ -1000,7 +1389,7 @@ fn a_placement_that_names_no_file_is_refused_rather_than_written_as_an_empty_pic
         ))
         .unwrap();
         assert!(
-            export::render_file(&befund_meta(), &body).is_err(),
+            export::render_file(&befund_meta(), &body, &no_paths()).is_err(),
             "a placement naming no file must be refused: {attrs}"
         );
     }
@@ -1016,7 +1405,7 @@ fn a_description_holding_a_line_break_is_refused_the_way_a_paragraph_is() {
              {"kind":"attachment","attrs":{"filename":"a.png","alt":"eins\nzwei"}}]}"#,
     )
     .unwrap();
-    assert!(export::render_file(&befund_meta(), &body).is_err());
+    assert!(export::render_file(&befund_meta(), &body, &no_paths()).is_err());
 }
 
 #[test]
@@ -1029,7 +1418,7 @@ fn a_placement_the_importer_could_never_read_back_is_refused_by_name() {
              {"kind":"attachment","attrs":{"filename":"a/b.png","alt":""}}]}"#,
     )
     .unwrap();
-    let refusal = export::render_file(&befund_meta(), &body)
+    let refusal = export::render_file(&befund_meta(), &body, &no_paths())
         .expect_err("a name no page can give a file must be refused");
     assert!(refusal.contains("a/b.png"), "{refusal}");
 }
@@ -1046,7 +1435,7 @@ fn a_placement_nested_where_the_importer_will_not_read_one_is_refused_rather_tha
              {"kind":"attachment","attrs":{"filename":"a.png","alt":"x"}}]}]}"#,
     )
     .unwrap();
-    assert!(export::render_file(&befund_meta(), &body).is_err());
+    assert!(export::render_file(&befund_meta(), &body, &no_paths()).is_err());
 }
 
 #[test]
@@ -1062,7 +1451,7 @@ fn a_placement_naming_a_file_nothing_is_attached_to_still_exports_exactly_as_wri
              {"kind":"attachment","attrs":{"filename":"gibtsnicht.png","alt":"Fehlt"}}]}"#,
     )
     .unwrap();
-    let file = export::render_file(&befund_meta(), &body)
+    let file = export::render_file(&befund_meta(), &body, &no_paths())
         .expect("a reference to a file that is not attached is not a broken document");
     assert!(file.contains("![Fehlt](anhang:gibtsnicht.png)"), "{file}");
 }

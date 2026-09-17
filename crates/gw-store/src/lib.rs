@@ -28,7 +28,7 @@ pub use invites::{
     AcceptOutcome, CreateInviteOutcome, InviteOffer, InviteSummary, NewInvite, RevokeInviteOutcome,
     INVITE_TTL_SECONDS,
 };
-pub use links::{Backlink, Graph, GraphEdge, GraphNode};
+pub use links::{Backlink, Graph, GraphEdge, GraphNode, Reference, MAX_REFERENCES_PER_PAGE};
 pub use login_attempts::{LoginScope, LOGIN_FAILURE_LIMIT, LOGIN_LOCKOUT_SECONDS};
 pub use principals::TeamSummary;
 pub use reclaim::{Reclaim, ReclaimReport};

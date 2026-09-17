@@ -80,6 +80,24 @@ picture.
   reduction goes red. That is deliberate, because the two reductions that already exist were
   each switched off once without a test noticing.
 
+## Correction, 2026-09-17
+
+The Context above says that a block which does not survive the comparison "makes `export`
+refuse the page, and **one refusal fails the whole run**". The second half is wrong.
+`export::run` pushes a `Refused` and **continues**, writing every other page; only the CLI's
+exit code fails, through `is_complete()` and `main.rs`'s `bail!`.
+
+The correction makes the consequence worse rather than better: the directory exists, is
+missing pages, and looks like a backup. `ExportReport` says so on every run and
+`FIDELITY_WARNING` leaves the sentence in the directory, which is the only reason this is
+survivable.
+
+The decision itself is unaffected — a page that cannot be exported is still a page permanently
+absent from the owner's backup, which is what the reasoning rests on. This is a note rather
+than an edit because an Accepted ADR records what was decided and when. See
+[ADR 0019](0019-how-a-document-reference-is-written-in-markdown.md), which generalises this
+decision to document references and states the same correction.
+
 ## Switch-back criteria
 
 Revisit if either becomes true:

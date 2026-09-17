@@ -15,6 +15,7 @@ import { TAB_PARAM } from '$lib/tabs';
  */
 const tree: TreeNode[] = [
   {
+    id: '0199c0de-0000-7000-8000-000000000001',
     path: '/rundgang',
     slug: 'rundgang',
     title: 'Rundgang',
@@ -22,6 +23,7 @@ const tree: TreeNode[] = [
     visibility: 'restricted',
     children: [
       {
+        id: '0199c0de-0000-7000-8000-000000000002',
         path: '/rundgang/tabellen',
         slug: 'tabellen',
         title: 'Tabellen',

@@ -116,8 +116,10 @@ const Em = Italic.extend({ name: 'em' });
  * `gw-core::markdown` has no syntax for any of them. What they did do is fail `gw-api`'s
  * export: `render_file` compares the document against what its own markdown re-imports as,
  * `[text](href)` comes back as `{href}` alone, the trees differ, the page is refused — and
- * `export` bails on the first refusal, so one link made the whole wiki unexportable. That is
- * the owner's backup path, and `FIDELITY_WARNING` promises links survive it.
+ * `export`'s `run()` pushes a refusal and continues, so one link made every export directory
+ * from then on quietly missing that page — under a `FIDELITY` file calling the directory a
+ * faithful copy of the database. That is the owner's backup path, and `FIDELITY_WARNING`
+ * promises links survive it.
  *
  * `Link.configure({ HTMLAttributes: {…} })` is NOT this fix and was tried: it changes what
  * `renderHTML` puts in the editor's own DOM, while the declared attributes — the ones that
@@ -128,10 +130,45 @@ const Em = Italic.extend({ name: 'em' });
  * `"2024"` into the number 2024. `target`/`rel` are still emitted into the editor's DOM by
  * `renderHTML`, which merges `options.HTMLAttributes` — dropping the attributes does not drop
  * the protection on the editor's own rendered anchors.
+ *
+ * # …and the TWO the schema must declare, which is the mirror-image hazard again
+ *
+ * `doc` is the second, and leaving it out is the version of this bug that DESTROYS rather
+ * than refuses. A link to another page of this wiki stores `{doc: <id>}` and no `href`
+ * (D-5): it is the page's identity, so renaming or moving the page cannot break the link.
+ * With `doc` undeclared, `attributesToMarks` builds the mark through `schema.mark()`, whose
+ * `computeAttrs` copies DECLARED attributes only — `{doc: "01J8…"}` becomes `{href: null}` —
+ * and `updateYFragment`'s closing pass writes that back and broadcasts it. So somebody
+ * typing one word in a paragraph holding a reference deletes the reference for everyone, the
+ * janitor files the result as a revision, the reader falls through to plain text so nothing
+ * on the page shows it ever existed, and the export then refuses the page because a link
+ * with neither an `href` nor a `doc` has no address to write.
+ *
+ * **Declaring it is only half the fix**, and the other half is in Rust. A declared attribute
+ * is one ProseMirror MINTS: every ordinary external link becomes `{href: "https://…", doc:
+ * null}` the first time its paragraph is touched. `gw-api::export`'s `LINK_ATTRS` allow-list
+ * keeps a key without inspecting its value, so it would keep that `null`, the stored mark
+ * would reduce to two keys against the one its own markdown re-imports as, and every page
+ * holding an external link would be refused from the backup — the `target`/`rel`/`class`/
+ * `title` incident again, from the other side. `reduce()` therefore drops a null-valued
+ * allow-listed attribute. Neither edit is safe without the other; see
+ * `crates/gw-api/tests/export.rs::a_link_carrying_a_minted_null_attribute_still_exports`.
+ *
+ * `rendered: false` and `default: null` are exactly `TaskItem`'s `id` below, for exactly its
+ * reasons: a document id is database identity rather than markup, so it stays in the schema
+ * (which is all the CRDT needs) and out of the editor's DOM, where pasted HTML could claim
+ * it; and `gw_core::markdown` mints none, so the default has to be the absent value.
+ *
+ * **Note what a node's attributes get and a mark's do not.** y-tiptap null-filters node
+ * attributes — `createTypeFromElementNode` skips a null value and `updateYFragment` removes
+ * one — and does NOT filter a mark's: `marksToAttributes` writes `mark.attrs` back whole.
+ * That asymmetry is why `TaskItem`'s `id: { default: null }` is free and the same shape on a
+ * mark is not, and it is the reusable lesson here.
  */
 const Anchor = Link.extend({
   addAttributes: () => ({
-    href: { default: null, parseHTML: (element: HTMLElement) => element.getAttribute('href') }
+    href: { default: null, parseHTML: (element: HTMLElement) => element.getAttribute('href') },
+    doc: { default: null, rendered: false }
   })
 });
 
@@ -222,7 +259,8 @@ const Task = TaskItem.extend({
  * - A placement is written as an image standing alone in its own paragraph, and the importer
  *   reads one back **only at the top level of the document**. A placement anywhere else
  *   exports to markdown that re-imports as a paragraph of text, so `render_file` refuses the
- *   page and `export` fails the whole run on the first refusal.
+ *   page, and `export` writes the rest of the wiki anyway — so the backup is quietly one
+ *   page short rather than loudly absent.
  * - `listItem`'s content expression is `paragraph block*`, so a placement as an item's first
  *   child is a node ProseMirror cannot build — and `createNodeFromYElement` answers that by
  *   **deleting the element from the CRDT**, which is the silent destruction the module docs

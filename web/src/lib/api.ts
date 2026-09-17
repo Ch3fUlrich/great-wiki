@@ -1,7 +1,18 @@
 import { env } from '$env/dynamic/private';
-import type { Block } from '$lib/blocks/render';
+import type { Block, Reference } from '$lib/blocks/render';
+
+export type { Reference };
 
 export interface TreeNode {
+  /**
+   * The page's `documents.id`, which is what a link stores (D-5).
+   *
+   * Here so the editor's page picker can offer a page by title and record its **identity**,
+   * without a second listing of "which pages are there" existing anywhere to be filtered
+   * differently. `GET /api/tree` is already the one permission-filtered answer to that
+   * question, and an id says nothing beyond what the path and title beside it already say.
+   */
+  id: string;
   path: string;
   slug: string;
   title: string;
@@ -145,7 +156,27 @@ export interface StoredDocument {
  */
 export interface DocumentView extends StoredDocument {
   may_write?: boolean;
+  /**
+   * Where every `dok:` reference in this body points **for the caller this response was
+   * built for**, keyed by the document id the body names. Mirrors
+   * `gw_api::routes::docs::DocumentView::references`.
+   *
+   * D-5 stores a link's target as an id so that the path and the title are resolved when the
+   * page is read rather than baked in when it was written; this is that resolution, arriving
+   * with the page, so a reference is a working link in the first response and with
+   * JavaScript switched off.
+   *
+   * **An id with no entry here is not an error and must not be drawn as one.** It is a page
+   * this reader may not read, one in the Papierkorb, one that was purged, one that never
+   * existed, or one past the per-page cap — deliberately indistinguishable, because telling
+   * them apart is itself the disclosure. `BlockView` renders such a reference as the
+   * author's own text with no address and no title. Never assemble an address from the key:
+   * the key is an id, the resolution is the server's, and a client that guessed would be a
+   * second answer to a permission question. ADR 0019.
+   */
+  references?: Record<string, Reference>;
 }
+
 
 // `$env/dynamic/private` is server-only, which is correct: this module is imported only
 // from `+page.server.ts` files and must never end up in a client bundle.

@@ -175,6 +175,22 @@ impl MarkKind {
 /// internal one that could not be resolved). Never both: `target_doc` reading an `href`
 /// as an id would turn a URL into a document reference.
 ///
+/// # The one transient exception, and why it never reaches storage
+///
+/// A mark freshly imported from markdown may carry `doc` **and** [`Mark::FALLBACK_ATTR`] —
+/// the target's path as it stood when the file was written. That is not a second address the
+/// reader may follow and nothing outside the importer and `gw_store` ever sees it: the store
+/// settles it on the way in, either by dropping it (the id is a live document here) or by
+/// exchanging the whole mark for an `href` to that path (the id is unknown, which is what a
+/// re-seed into a FRESH database produces — every id is minted anew there).
+///
+/// Without it, restoring a backup into an empty database would turn every internal link into
+/// plain words: the text intact, the connection gone. With it, a fresh seed keeps every
+/// connection whose target was seeded too, by path, exactly as a backup made before D-5
+/// would have. What it must never do is win against a live id — a page RENAMED after the
+/// export has a stale path in the file and a perfectly good identity, and identity is the
+/// whole point.
+///
 /// Equality is by kind *and* attrs, because that is what decides whether two neighbouring
 /// leaves are one run of formatting or two: `[a](u)` beside `[b](u)` is one link, and
 /// `[a](u)` beside `[b](v)` is two.
@@ -186,6 +202,15 @@ pub struct Mark {
 }
 
 impl Mark {
+    /// The key holding an imported reference's fallback path. See the type's own doc
+    /// comment: transient, consumed by `gw_store`, never stored and never rendered.
+    ///
+    /// Deliberately NOT on `gw_api::export`'s `LINK_ATTRS`, so the round-trip comparison
+    /// discards it from both sides — a stored `{doc}` and the `{doc, path}` its own markdown
+    /// re-imports as are the same document, and a file that carried a path the exporter
+    /// resolved afresh must not refuse the page.
+    pub const FALLBACK_ATTR: &'static str = "path";
+
     pub fn link_to_doc(id: &str) -> Self {
         let mut attrs = serde_json::Map::new();
         attrs.insert("doc".into(), serde_json::Value::String(id.to_string()));
@@ -193,6 +218,32 @@ impl Mark {
             kind: MarkKind::Link,
             attrs,
         }
+    }
+
+    /// A reference to `id`, carrying the path that page had when the file was written.
+    ///
+    /// `None` for `fallback` is [`Mark::link_to_doc`] exactly — an older export, or one whose
+    /// target the exporting account could not read, carries no path to fall back to.
+    pub fn link_to_doc_at(id: &str, fallback: Option<&str>) -> Self {
+        let mut mark = Mark::link_to_doc(id);
+        if let Some(path) = fallback {
+            mark.attrs.insert(
+                Mark::FALLBACK_ATTR.into(),
+                serde_json::Value::String(path.to_string()),
+            );
+        }
+        mark
+    }
+
+    /// The path this reference would fall back to if its id named nothing here.
+    ///
+    /// Only ever `Some` between `gw_core::markdown` and `gw_store`; see the type's doc
+    /// comment.
+    pub fn fallback_path(&self) -> Option<&str> {
+        if self.kind != MarkKind::Link {
+            return None;
+        }
+        self.attrs.get(Mark::FALLBACK_ATTR).and_then(|v| v.as_str())
     }
 
     pub fn link_to_url(url: &str) -> Self {

@@ -86,6 +86,19 @@ export function safeHref(href: unknown): string | null {
   return LINK_SCHEMES.has(scheme) ? href : null;
 }
 
+/**
+ * One document reference, resolved for the reader this page is being rendered for: where the
+ * target is **now** and what it is called **now**. Mirrors `gw_store::Reference`.
+ *
+ * Here rather than in `$lib/api` because `BlockView` and the editor both need the type and
+ * `$lib/api` imports `$env/dynamic/private`, which is server-only. `$lib/api` re-exports it,
+ * so there is still one name for it.
+ */
+export interface Reference {
+  path: string;
+  title: string;
+}
+
 export interface Block {
   kind: BlockKind;
   attrs?: Record<string, unknown>;

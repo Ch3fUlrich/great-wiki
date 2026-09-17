@@ -5,6 +5,10 @@ import type { TreeNode } from '$lib/api';
 
 function node(path: string, title: string, children: TreeNode[] = []): TreeNode {
   return {
+    // A `documents.id` in shape only: what a tree row carries now, so the editor's page
+    // picker can record a page's IDENTITY rather than its address (D-5). Nothing here reads
+    // it; it is required by the type because the API really sends one.
+    id: `0199c0de-0000-7000-8000-${path.length.toString().padStart(12, '0')}`,
     path,
     slug: path.slice(path.lastIndexOf('/') + 1),
     title,

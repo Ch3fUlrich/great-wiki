@@ -376,7 +376,15 @@ pub async fn source(
     // That refusal is reported here as `problem` instead of failing the request: the design
     // JSON below is complete whatever markdown can do, and a version that cannot be exported
     // is exactly the version somebody most needs to look at.
-    let (markdown, meta_yaml, problem) = match export::render_file(&meta, &body) {
+    // The same permission-checked resolver the export itself uses, against THIS caller:
+    // the file shown here must be the file they would get, and a path they may not see must
+    // not appear in either.
+    let paths = state
+        .store
+        .references_for(&principal, &body)
+        .await
+        .map_err(ApiError::Internal)?;
+    let (markdown, meta_yaml, problem) = match export::render_file(&meta, &body, &paths) {
         Ok(file) => {
             let (yaml, markdown) = split_frontmatter(&file);
             (Some(markdown.to_string()), yaml.map(str::to_string), None)

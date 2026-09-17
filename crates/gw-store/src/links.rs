@@ -12,12 +12,21 @@
 //! graph edgeless. So an `href` counts as well, when it names a page in this wiki — see
 //! [`wiki_path`] for exactly which shapes those are and why.
 //!
-//! The author's body is NOT rewritten on the way past. Canonicalising an `href` into a
-//! `doc` mark would edit what somebody wrote, on publish, without being asked; the edge is
-//! recorded and the body is left alone. What that costs is stated in [`wiki_path`]: an edge
-//! from an `href` is resolved through the path, so moving the target page afterwards leaves
-//! the edge correct (it is stored by id) but the *link text in the body* stale, which is
-//! precisely the breakage D-5 exists to avoid and is not this task's to fix.
+//! **An internal `href` IS rewritten into a `doc` reference when the page is published**,
+//! and the paragraph this replaces said the opposite. It said that canonicalising would
+//! edit what somebody wrote without being asked — and named what leaving it alone costs:
+//! moving the target afterwards leaves the edge correct (it is stored by id) but the *link
+//! in the body* stale, which is precisely the breakage D-5 exists to avoid. The owner chose
+//! to pay the first cost rather than the second, so [`Store::resolve_references`] runs on
+//! publish: an `href` naming a page the AUTHOR may read becomes `{doc: <id>}` and the
+//! `href` is dropped, because a mark carrying both is a mark that can disagree with itself
+//! the day the target moves.
+//!
+//! Two things it deliberately does not do. It does not run on IMPORT — `Store::create_
+//! document` has no principal to authorise against, and the importer's job is fidelity to
+//! the file. And it never resolves an `href` to a page the author cannot read: that would
+//! be this crate answering a question about a page on behalf of somebody who may not ask
+//! it, and the link is left exactly as it was written.
 //!
 //! **An unresolvable internal link is not an error.** A link to a page that does not exist,
 //! or was deleted, is a fact about the body — the publish records no edge for it and
@@ -26,12 +35,13 @@
 //! constraints, so `INSERT OR IGNORE` of an edge to a document that is not there aborts the
 //! statement, and with it the publish.
 
-use crate::Store;
+use crate::acl::Baseline;
+use crate::{Store, StoredDocument};
 use anyhow::Result;
 use gw_auth::{Action, Principal};
 use gw_core::{Block, Mark, MarkKind};
 use serde::Serialize;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use url::Url;
 
 /// One page that links to the page being read.
@@ -56,6 +66,31 @@ pub struct GraphEdge {
     pub from: String,
     pub to: String,
 }
+
+/// A reference resolved for one reader: where the target is **now** and what it is called
+/// **now** (D-5).
+///
+/// Both fields are disclosures about the target page, so neither exists for a reader who
+/// may not read it — [`Store::references_for`] simply has no entry for that id, and there
+/// is no third state for a caller to get wrong. ADR 0019.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Reference {
+    pub path: String,
+    pub title: String,
+}
+
+/// How many DISTINCT references one page has resolved, in either direction.
+///
+/// Nothing caps how many marks a body holds — it is JSON over the collaboration socket —
+/// and every resolution is one authorisation through the single SQLite connection
+/// `Store::open` configures (`max_connections(1)`, deliberately: every query in the
+/// application is serialised through it). A page carrying a few thousand references would
+/// therefore stall the whole deployment for every other reader, repeatedly, on demand.
+///
+/// **Over the cap the remainder are simply not resolved**, which is the state a forbidden
+/// or absent target is already in — so the cap discloses nothing and needs no message. 256
+/// is far past any page a person writes and far short of a lever.
+pub const MAX_REFERENCES_PER_PAGE: usize = 256;
 
 /// The pages the caller may read and the links between them (D-4).
 #[derive(Debug, Clone, Default, Serialize)]
@@ -278,7 +313,88 @@ async fn document_with_id(conn: &mut sqlx::SqliteConnection, id: &str) -> Result
     )
 }
 
-/// Replace this document's edges. Takes a CONNECTION, not the pool, so it joins the
+/// Settle every freshly imported reference against the documents THIS database holds, and
+/// say whether anything changed.
+///
+/// `gw_core::markdown` reads `[Titel](dok:<id> "/pfad")` into a mark carrying both the id and
+/// the path the target had when the file was written ([`gw_core::Mark::FALLBACK_ATTR`]). That
+/// pair is transient by design and this is where it ends: a mark reaching `documents.body`
+/// carries an id or an address, never both, which is the invariant `gw_core::Mark` states and
+/// `Mark::target_doc` depends on.
+///
+/// Two outcomes, and the order between them is the whole decision:
+///
+/// - **The id names a live document here.** The reference stands and the path is dropped. It
+///   is dropped even when it disagrees — a page RENAMED after the export has a stale path in
+///   the file and a perfectly good identity, and preferring the path would reintroduce
+///   exactly the breakage D-5 exists to prevent.
+/// - **The id names nothing here.** That is what re-seeding an export into a FRESH database
+///   produces: `SeedMeta` has no `id` key, so every page is minted anew and no `dok:` in the
+///   file can match. The reference becomes an ordinary `href` to the carried path, which
+///   `replace_links` records as an edge as soon as the target exists and
+///   [`Store::resolve_references`] exchanges for *this* database's id on the next publish. A
+///   restored backup therefore keeps every connection whose target was restored too.
+///
+/// With no path carried — an older export, or one whose target the exporting account could
+/// not read — an unknown id stays an unresolved reference and renders as the author's own
+/// text, which is the state [`Store::references_for`] defines.
+///
+/// Takes a CONNECTION for [`replace_links`]' reason: it runs inside the caller's transaction,
+/// on the body that is about to be stored, so a rollback takes it back with everything else.
+/// It asks only whether a row exists — not who may read it — because it decides nothing about
+/// what is shown: the reader's verdict is re-asked on every read by [`Store::references_for`],
+/// and an author who may write this page may already name any id they like in it.
+pub(crate) async fn settle_references(
+    conn: &mut sqlx::SqliteConnection,
+    body: &mut Block,
+) -> Result<bool> {
+    let mut changed = false;
+    let mut settled: HashMap<String, bool> = HashMap::new();
+    settle_into(conn, body, &mut settled, &mut changed).await?;
+    Ok(changed)
+}
+
+/// The walk behind [`settle_references`]. Separate because recursion in an `async fn` needs a
+/// boxed future, and `Box::pin` belongs at the one place that recurses.
+fn settle_into<'a>(
+    conn: &'a mut sqlx::SqliteConnection,
+    body: &'a mut Block,
+    settled: &'a mut HashMap<String, bool>,
+    changed: &'a mut bool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        for mark in &mut body.marks {
+            let Some(id) = mark.target_doc().map(str::to_string) else {
+                continue;
+            };
+            let fallback = mark.fallback_path().map(str::to_string);
+            if fallback.is_none() {
+                continue;
+            }
+            // Memoised per body: a page linking to one target forty times asks once.
+            let live = match settled.get(&id) {
+                Some(live) => *live,
+                None => {
+                    let live = document_with_id(&mut *conn, &id).await?.is_some();
+                    settled.insert(id.clone(), live);
+                    live
+                }
+            };
+            *mark = if live {
+                Mark::link_to_doc(&id)
+            } else {
+                Mark::link_to_url(&fallback.expect("checked above"))
+            };
+            *changed = true;
+        }
+        for child in &mut body.content {
+            settle_into(&mut *conn, child, settled, changed).await?;
+        }
+        Ok(())
+    })
+}
+
+/// Replace this document's edges. Takes a CONNECTION, not the pool, so it joins the/// Replace this document's edges. Takes a CONNECTION, not the pool, so it joins the
 /// caller's transaction: a publish that fails afterwards must leave no edges behind for a
 /// revision that does not exist. Same reasoning as [`crate::revisions::append_revision`],
 /// which is its only caller — and the pool would not do even if the reasoning were absent,
@@ -360,6 +476,69 @@ pub(crate) async fn replace_links(
     Ok(())
 }
 
+/// Every distinct document id a `doc` mark in this body names, in no particular order.
+///
+/// Separate from [`collect`] because the two ask different questions: that one is building
+/// the graph and wants an `href` as well, this one is resolving references for a reader and
+/// an `href` is already an address the reader can follow.
+fn collect_docs(body: &Block, into: &mut BTreeSet<String>) {
+    for mark in &body.marks {
+        if let Some(doc) = mark.target_doc() {
+            into.insert(doc.to_string());
+        }
+    }
+    for child in &body.content {
+        collect_docs(child, into);
+    }
+}
+
+/// Every distinct wiki path an `href` in this body names, in no particular order.
+fn collect_hrefs(body: &Block, into: &mut BTreeSet<String>, from: &str, origin: Option<&Url>) {
+    for mark in &body.marks {
+        // A mark already carrying a `doc` is already a reference — resolving its `href` too
+        // would be resolving a mark that says two things, and `Mark` says it never does.
+        if mark.target_doc().is_some() {
+            continue;
+        }
+        if let Some(path) = internal_path(mark, from, origin) {
+            into.insert(path);
+        }
+    }
+    for child in &body.content {
+        collect_hrefs(child, into, from, origin);
+    }
+}
+
+/// Rewrite every `href` in this body that `resolved` has an id for into a `doc` reference.
+fn apply_references(
+    body: &mut Block,
+    resolved: &HashMap<String, String>,
+    from: &str,
+    origin: Option<&Url>,
+) {
+    for mark in &mut body.marks {
+        if mark.target_doc().is_some() {
+            continue;
+        }
+        let Some(path) = internal_path(mark, from, origin) else {
+            continue;
+        };
+        let Some(id) = resolved.get(&path) else {
+            continue;
+        };
+        // Cleared rather than extended. A mark holding BOTH an address and a reference can
+        // disagree with itself the moment the target moves, and `gw_core::Mark`'s own doc
+        // comment says a link carries one or the other; `target_doc` reading an `href` as an
+        // id is the mistake that invariant exists to prevent.
+        mark.attrs.clear();
+        mark.attrs
+            .insert("doc".into(), serde_json::Value::String(id.clone()));
+    }
+    for child in &mut body.content {
+        apply_references(child, resolved, from, origin);
+    }
+}
+
 impl Store {
     /// The pages that link *to* `document_id`, filtered to those the caller may read.
     ///
@@ -410,6 +589,165 @@ impl Store {
             });
         }
         Ok(out)
+    }
+
+    /// What every `doc` reference in `body` points at, **for this caller** — and nothing
+    /// about the ones it does not point at for them.
+    ///
+    /// D-5 says a link stores the target's id and that the title and path are resolved at
+    /// render time. This is that resolution, and it is the whole of it: there is no other
+    /// one, in this crate or above it.
+    ///
+    /// # What an unresolved reference renders as, and why it is one state and not four
+    ///
+    /// A target the caller **may not read**, one that **does not exist**, one that has been
+    /// **thrown away** (`deleted_at` set — the Papierkorb) and one that was **purged** are
+    /// all simply absent from the returned map, and a caller with no entry for an id renders
+    /// **the reference's own text, unlinked: no address, no title, no tooltip, nothing**.
+    ///
+    /// The split is deliberate and it is the author/target line. *The words are the
+    /// author's* — they are in the body, the author wrote them, the caller is already
+    /// reading that body, and blanking them would corrupt a sentence to hide something the
+    /// sentence does not contain. *The current path and the current title are the target's*,
+    /// and they are exactly what `backlinks_for` and `graph_for` refuse to disclose: a path
+    /// says a page exists and where, and a title says what it is about. Worse than either in
+    /// isolation, they are **live** — a reference written when the reader could see the page
+    /// would keep reporting that page's new name after a rename, so a reader who lost access
+    /// would go on being told what it is called now. The verdict is therefore re-asked on
+    /// every read and there is nothing to invalidate when a grant is revoked.
+    ///
+    /// The four cases answer identically because distinguishing them is itself the
+    /// disclosure — "you may not see this" and "there is nothing here" differ only in
+    /// confirming that something exists. It is the same closed conflation
+    /// [`Store::document_for`] makes.
+    ///
+    /// **A reference to the host page itself resolves normally.** It is the one case that
+    /// is not a disclosure at all: the reader is already reading that page, so its path and
+    /// title are in front of them. The plan's first draft folded it in with the three above
+    /// for uniformity; that was written before an internal `href` was resolved on publish,
+    /// and with that in place it would mean an ordinary same-page link silently becoming
+    /// unlinked text the first time its page was saved.
+    ///
+    /// # Why it lives here
+    ///
+    /// Beside `graph_for`, and for its reason. The hoisted `_with_baseline` accessors are
+    /// `pub(crate)`, so a resolver written in `gw-api` would pay a fresh
+    /// [`Store::baseline_for`] per reference — through the one SQLite connection every other
+    /// request in the deployment also needs. Here the baseline is resolved once per page and
+    /// the count is capped at [`MAX_REFERENCES_PER_PAGE`].
+    pub async fn references_for(
+        &self,
+        principal: &Principal,
+        body: &Block,
+    ) -> Result<BTreeMap<String, Reference>> {
+        let mut ids = BTreeSet::new();
+        collect_docs(body, &mut ids);
+        if ids.is_empty() {
+            // Not merely an optimisation: `baseline_for` is a query, and a body with no
+            // reference in it is every page on the site today.
+            return Ok(BTreeMap::new());
+        }
+        // Once, for the whole page. See `graph_for`, which hoists it for the same reason.
+        let baseline = self.baseline_for(principal).await?;
+        let mut out = BTreeMap::new();
+        for id in ids.into_iter().take(MAX_REFERENCES_PER_PAGE) {
+            // THE permission-checked accessor, reached by id, with the baseline already in
+            // hand. Not `document_path_unchecked` and not a batch `ids -> (path, title)`
+            // query: the ids came out of a body this caller may read, and that says nothing
+            // whatever about the pages they point at.
+            let Some(doc) = self.readable_target(principal, &id, baseline).await? else {
+                continue;
+            };
+            out.insert(
+                id,
+                Reference {
+                    path: doc.path,
+                    title: doc.title,
+                },
+            );
+        }
+        Ok(out)
+    }
+
+    /// The document `id` names, if `principal` may read it.
+    ///
+    /// THE permission-checked accessor, reached by an id, with the caller's baseline already
+    /// in hand — not `document_path_unchecked`, and not a batch `ids -> (path, title)` query
+    /// justified by "the ids came out of a body the caller may already read". They did, and
+    /// that says nothing whatever about the pages they point at.
+    ///
+    /// One line, in a function of its own, deliberately: `scripts/mutate.sh` replaces exactly
+    /// this call with the unchecked row lookup underneath it, and a mutation that can be
+    /// written as one line is one that cannot quietly miss half of what it was aimed at.
+    async fn readable_target(
+        &self,
+        principal: &Principal,
+        id: &str,
+        baseline: Baseline,
+    ) -> Result<Option<StoredDocument>> {
+        self.document_for_id_with_baseline(principal, id, Action::Read, baseline)
+            .await
+    }
+
+    /// Turn every internal `href` in `body` into a `doc` reference, for the pages `author`
+    /// may read. `Ok(true)` when something changed.
+    ///
+    /// D-5's write half: a link that names a page by path breaks the day the page moves, so
+    /// the path is exchanged for the page's identity at the one moment the system knows both
+    /// — when somebody publishes. The `href` is dropped in the same breath; see
+    /// [`apply_references`].
+    ///
+    /// **This is the only resolver.** Not the editor: a client that turned a typed path into
+    /// an id would be a second answer to a permission question, written where the answer
+    /// cannot be trusted, and it would have to be kept in step with this one for ever.
+    ///
+    /// # Why it is not inside the publish transaction, although its EFFECT is
+    ///
+    /// The rewrite belongs with `replace_links` — both derive from the body, both must
+    /// describe the revision that is actually stored — and `reconcile_tasks` does exactly
+    /// that, mutating the tree on the transaction's own connection. This cannot: authorising
+    /// a path needs [`Store::document_for`], which goes to the **pool**, and `Store::open`
+    /// gives the pool ONE connection (`max_connections(1)`). Asking it for a second one
+    /// while a transaction is holding the first waits until it times out — the deadlock
+    /// `replace_links`' own doc comment warns about.
+    ///
+    /// So [`Store::publish_revision`] calls this *before* it opens the transaction and hands
+    /// `append_revision` the rewritten body. Nothing is half-done by that: the body that is
+    /// stored, the body `replace_links` reads its edges out of and the body a reader gets
+    /// are one body, and a rollback discards all of it. What is genuinely outside the
+    /// transaction is only the permission *verdicts*, which are the author's own and were
+    /// true a moment earlier — a grant revoked in that window resolves one link the author
+    /// could have resolved by publishing a moment sooner, and the READER's verdict, which is
+    /// the one that discloses anything, is re-asked on every read by [`Store::references_for`].
+    pub(crate) async fn resolve_references(
+        &self,
+        author: &Principal,
+        from_path: &str,
+        body: &mut Block,
+    ) -> Result<bool> {
+        let mut paths = BTreeSet::new();
+        collect_hrefs(body, &mut paths, from_path, self.public_origin.as_ref());
+        if paths.is_empty() {
+            return Ok(false);
+        }
+        let baseline = self.baseline_for(author).await?;
+        let mut resolved: HashMap<String, String> = HashMap::new();
+        for path in paths.into_iter().take(MAX_REFERENCES_PER_PAGE) {
+            // Read, not Write. Being able to point at a page is being able to find it, which
+            // is what reading it already licenses; requiring write would mean an author could
+            // only make durable links to pages they may edit.
+            if let Some(doc) = self
+                .document_for_with_baseline(author, &path, Action::Read, baseline)
+                .await?
+            {
+                resolved.insert(path, doc.id);
+            }
+        }
+        if resolved.is_empty() {
+            return Ok(false);
+        }
+        apply_references(body, &resolved, from_path, self.public_origin.as_ref());
+        Ok(true)
     }
 
     /// The pages the caller may read and the links between them (D-4), optionally narrowed
@@ -1204,6 +1542,388 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.backlinks_for(&chef, &ziel).await.unwrap().len(), 1);
+    }
+
+    // --- references: resolved by identity, filtered by the reader -----------------------
+
+    /// Every link mark in `body`, outermost first, as `(href, doc)`.
+    fn link_marks(body: &Block) -> Vec<(Option<String>, Option<String>)> {
+        let mut out = Vec::new();
+        fn walk(b: &Block, out: &mut Vec<(Option<String>, Option<String>)>) {
+            for m in &b.marks {
+                if m.kind == gw_core::MarkKind::Link {
+                    out.push((
+                        m.attrs
+                            .get("href")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        m.target_doc().map(String::from),
+                    ));
+                }
+            }
+            for c in &b.content {
+                walk(c, out);
+            }
+        }
+        walk(body, &mut out);
+        out
+    }
+
+    /// The body `path` currently holds, as a tree.
+    async fn stored_body(store: &Store, path: &str) -> Block {
+        let doc = store
+            .document_by_path_unchecked(path)
+            .await
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(&doc.body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn publishing_exchanges_an_internal_href_for_the_targets_identity() {
+        // D-5's write half. The author typed a path — into the link dialog's free field, or
+        // in markdown that was pasted — and what is STORED is the target's id, so that
+        // moving the target afterwards cannot break the link.
+        let (store, chef, from, a, _b) = fixture_with_three_pages().await;
+        store
+            .publish_revision(&chef, &from, &body_linking_to_hrefs(&["/ziel-a"]), None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        let marks = link_marks(&stored_body(&store, "/von").await);
+        assert_eq!(
+            marks,
+            vec![(None, Some(a.clone()))],
+            "the href was not exchanged for the target's id, or it was kept beside it"
+        );
+
+        // And the edge is still exactly one — the same page reached by a different spelling
+        // must not become two links.
+        assert_eq!(edges(&store).await, vec![(from.clone(), a.clone())]);
+    }
+
+    #[tokio::test]
+    async fn a_resolved_reference_follows_the_page_when_it_is_renamed_and_moved() {
+        // The whole point of D-5, and the one thing a stored path cannot do. The body is
+        // untouched between the two reads below; only the target moved.
+        let (store, chef, from, a, _b) = fixture_with_three_pages().await;
+        store
+            .publish_revision(&chef, &from, &body_linking_to_hrefs(&["/ziel-a"]), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let body = stored_body(&store, "/von").await;
+
+        let before = store.references_for(&chef, &body).await.unwrap();
+        assert_eq!(before[&a].path, "/ziel-a");
+        assert_eq!(before[&a].title, "Ziel A");
+
+        // What a move and a rename do, and there is no other kind: the row changes, the
+        // bodies pointing at it do not.
+        sqlx::query("UPDATE documents SET path = ?1, slug = ?2, title = ?3 WHERE id = ?4")
+            .bind("/archiv/befunde")
+            .bind("befunde")
+            .bind("Befunde 2024")
+            .bind(&a)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let after = store.references_for(&chef, &body).await.unwrap();
+        assert_eq!(
+            after[&a].path, "/archiv/befunde",
+            "the reference did not follow the page to its new address"
+        );
+        assert_eq!(
+            after[&a].title, "Befunde 2024",
+            "the reference did not follow the page to its new name"
+        );
+        assert_eq!(
+            link_marks(&stored_body(&store, "/von").await),
+            vec![(None, Some(a))],
+            "nothing rewrote the linking page, which is the point of storing identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reference_to_a_page_the_reader_may_not_see_resolves_to_nothing_at_all() {
+        // THE disclosure property, and the anti-vacuity half is the second assertion: a
+        // reader who MAY see the target gets its current path and title, so the fixture
+        // really contains a reference for the first reader to be refused.
+        //
+        // `backlinks_for` and `graph_for` refuse exactly these two values about a page the
+        // caller cannot read, and a reference must not be the way round them — a batch
+        // `ids -> (path, title)` query, justified by "the ids came out of a body the caller
+        // may already read", would hand `leser` the restricted page's address and name.
+        let store = store().await;
+        let geheim = page(&store, "Geheim", Visibility::Restricted).await;
+        let von = page(&store, "Von", Visibility::Public).await;
+
+        let leser = Principal::test("leser", &[], &[]);
+        let chef = Principal::test("chef", &[], &[]);
+        for perm in [Permission::Read, Permission::Write] {
+            store
+                .add_grant("/von", Subject::Principal(chef.id.clone()), perm)
+                .await
+                .unwrap();
+        }
+        store
+            .add_grant(
+                "/geheim",
+                Subject::Principal(chef.id.clone()),
+                Permission::Read,
+            )
+            .await
+            .unwrap();
+
+        let body = body_linking_to(&[&geheim]);
+        store
+            .publish_revision(&chef, &von, &body, None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        assert!(
+            store
+                .references_for(&leser, &body)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a reference disclosed a page the reader may not read"
+        );
+
+        let seen = store.references_for(&chef, &body).await.unwrap();
+        assert_eq!(seen.len(), 1, "the fixture never had a reference to hide");
+        assert_eq!(seen[&geheim].path, "/geheim");
+        assert_eq!(seen[&geheim].title, "Geheim");
+    }
+
+    #[tokio::test]
+    async fn a_reference_to_a_page_that_is_gone_resolves_to_nothing_at_all() {
+        // Thrown away, purged and never-existed answer identically, and identically to
+        // "not for you" — distinguishing them is itself the disclosure.
+        let store = store().await;
+        let weg = page(&store, "Weg", Visibility::Public).await;
+        let chef = Principal::test("chef", &[], &[]);
+        store
+            .add_grant(
+                "/weg",
+                Subject::Principal(chef.id.clone()),
+                Permission::Write,
+            )
+            .await
+            .unwrap();
+
+        let body = body_linking_to(&[&weg, "0199c0de-0000-7000-8000-00000000dead"]);
+        let before = store.references_for(&chef, &body).await.unwrap();
+        assert_eq!(
+            before.len(),
+            1,
+            "an id naming no document must resolve to nothing, and a live one must resolve"
+        );
+
+        store.trash_document(&chef, "/weg").await.unwrap();
+        assert!(
+            store.references_for(&chef, &body).await.unwrap().is_empty(),
+            "a page in the Papierkorb still answered with its address and its name"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reference_to_the_page_it_is_written_on_still_resolves() {
+        // The one case that is not a disclosure: the reader is already reading that page.
+        // Folding it in with the three above would mean an ordinary same-page link becoming
+        // unlinked text the first time its own page was saved, because publishing exchanges
+        // that href for this page's id.
+        let (store, chef, from, _a, _b) = fixture_with_three_pages().await;
+        store
+            .publish_revision(&chef, &from, &body_linking_to_hrefs(&["/von"]), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let body = stored_body(&store, "/von").await;
+        assert_eq!(link_marks(&body), vec![(None, Some(from.clone()))]);
+
+        let seen = store.references_for(&chef, &body).await.unwrap();
+        assert_eq!(seen[&from].path, "/von");
+
+        // …and it is still not an EDGE. A self-loop is not a connection somebody drew.
+        assert!(edges(&store).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_href_to_a_page_the_author_may_not_read_is_left_exactly_as_written() {
+        // Resolution is the author's own question, asked with the author's own rights. An
+        // unfiltered one would let anybody with write on one page turn `/darm/befund-mueller`
+        // into a yes/no answer about whether that page exists — the existence oracle D-21d
+        // refuses for the picker, arrived at through the publish path instead.
+        let store = store().await;
+        let _geheim = page(&store, "Geheim", Visibility::Restricted).await;
+        let von = page(&store, "Von", Visibility::Public).await;
+        let autor = Principal::test("autor", &[], &[]);
+        store
+            .add_grant(
+                "/von",
+                Subject::Principal(autor.id.clone()),
+                Permission::Write,
+            )
+            .await
+            .unwrap();
+
+        store
+            .publish_revision(&autor, &von, &body_linking_to_hrefs(&["/geheim"]), None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        assert_eq!(
+            link_marks(&stored_body(&store, "/von").await),
+            vec![(Some("/geheim".into()), None)],
+            "an href naming a page the author cannot read was resolved anyway"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_external_link_is_never_turned_into_a_reference() {
+        let (store, chef, from, _a, _b) = fixture_with_three_pages().await;
+        let hrefs = [
+            "https://example.org/x",
+            "mailto:a@example.org",
+            "/gibt-es-nicht",
+        ];
+        store
+            .publish_revision(&chef, &from, &body_linking_to_hrefs(&hrefs), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            link_marks(&stored_body(&store, "/von").await),
+            hrefs
+                .iter()
+                .map(|h| (Some((*h).to_string()), None))
+                .collect::<Vec<_>>(),
+            "something other than a link to a readable page of this wiki was rewritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_carrying_more_references_than_the_cap_resolves_the_cap_and_no_more() {
+        // Every resolution is one authorisation through the ONE SQLite connection the whole
+        // application shares. Nothing caps how many marks a body holds, so without this a
+        // single attacker-controlled page fetched repeatedly is a lever on the availability
+        // of the entire deployment. Over the cap a reference is in the same state a
+        // forbidden one is in, so the cap discloses nothing.
+        let store = store().await;
+        let chef = Principal::test("chef", &[], &[]);
+        let mut ids = Vec::new();
+        for i in 0..(MAX_REFERENCES_PER_PAGE + 5) {
+            ids.push(page(&store, &format!("Ziel {i:03}"), Visibility::Public).await);
+        }
+        let body = body_linking_to(&ids.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(
+            store.references_for(&chef, &body).await.unwrap().len(),
+            MAX_REFERENCES_PER_PAGE
+        );
+    }
+
+    #[tokio::test]
+    async fn an_imported_reference_whose_id_is_live_here_ignores_the_path_it_carried() {
+        // The rule that makes identity worth storing at all, and the one an implementation
+        // gets backwards by being helpful: the path in a file is what the target was called
+        // WHEN THE FILE WAS WRITTEN. A page renamed or moved since then has a stale path and a
+        // perfectly good identity, and preferring the path would reintroduce exactly the
+        // breakage D-5 exists to prevent — quietly, on a restore, which is the worst moment.
+        let (store, chef, from, a, _b) = fixture_with_three_pages().await;
+
+        // What a move and a rename do. The file being imported below still says `/ziel-a`.
+        sqlx::query("UPDATE documents SET path = ?1, slug = ?2, title = ?3 WHERE id = ?4")
+            .bind("/archiv/befunde")
+            .bind("befunde")
+            .bind("Befunde 2024")
+            .bind(&a)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let body = linking_body(vec![Mark::link_to_doc_at(&a, Some("/ziel-a"))]);
+        store
+            .publish_revision(&chef, &from, &body, None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        assert_eq!(
+            link_marks(&stored_body(&store, "/von").await),
+            vec![(None, Some(a.clone()))],
+            "the stale path won against a live id, or was kept beside it"
+        );
+        let stored = stored_body(&store, "/von").await;
+        assert_eq!(
+            store.references_for(&chef, &stored).await.unwrap()[&a].path,
+            "/archiv/befunde",
+            "the reference did not follow the page to where it actually is"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_imported_reference_whose_id_means_nothing_here_falls_back_to_its_path() {
+        // What a re-seed into a fresh database produces: every id minted anew, so no `dok:`
+        // in the file can match. Without the fallback this page would keep its words and lose
+        // its link; with it, the reference becomes the address the file carried — and the
+        // publish that stores it records the edge and, on the next publish, exchanges the
+        // address for THIS database's id.
+        let (store, chef, from, a, _b) = fixture_with_three_pages().await;
+        let fremd = "0199c0de-0000-7000-8000-00000000dead";
+
+        let body = linking_body(vec![Mark::link_to_doc_at(fremd, Some("/ziel-a"))]);
+        store
+            .publish_revision(&chef, &from, &body, None)
+            .await
+            .unwrap()
+            .expect("the publish was refused");
+
+        assert_eq!(
+            link_marks(&stored_body(&store, "/von").await),
+            vec![(Some("/ziel-a".into()), None)],
+            "a dead id was stored as a reference instead of falling back to its path"
+        );
+        assert_eq!(edges(&store).await, vec![(from.clone(), a.clone())]);
+
+        // Publishing again — which is what an author does next — makes it an identity here.
+        let stored = stored_body(&store, "/von").await;
+        store
+            .publish_revision(&chef, &from, &stored, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            link_marks(&stored_body(&store, "/von").await),
+            vec![(None, Some(a))]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reference_with_no_path_to_fall_back_to_stays_exactly_as_it_arrived() {
+        // An older export, or one whose target the exporting account could not read, carries
+        // no path — and inventing one is the guess this crate does not make. The reference
+        // stays unresolved, which renders as the author's own text.
+        let (store, chef, from, _a, _b) = fixture_with_three_pages().await;
+        let fremd = "0199c0de-0000-7000-8000-00000000dead";
+        store
+            .publish_revision(&chef, &from, &body_linking_to(&[fremd]), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            link_marks(&stored_body(&store, "/von").await),
+            vec![(None, Some(fremd.to_string()))]
+        );
+        assert!(store
+            .references_for(&chef, &stored_body(&store, "/von").await)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     // --- the graph ----------------------------------------------------------------------

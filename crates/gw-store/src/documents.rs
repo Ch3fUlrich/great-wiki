@@ -82,6 +82,15 @@ pub struct StoredDocument {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TreeNode {
+    /// The page's `documents.id` — its identity, which is what a link stores (D-5).
+    ///
+    /// Here so that the editor's page picker can offer a page by its title and store its
+    /// **identity**, without a second, differently-filtered listing existing anywhere to
+    /// answer "which pages are there". This tree is already the one permission-filtered
+    /// answer to that question ([`Store::tree_for`]), and an id discloses nothing further
+    /// about a node whose path and title are already in the same row: existence and
+    /// location are what a listing gives away, and both are here either way.
+    pub id: String,
     pub path: String,
     pub slug: String,
     pub title: String,
@@ -306,6 +315,7 @@ impl Store {
     pub(crate) async fn tree(&self) -> Result<Vec<TreeNode>> {
         #[derive(FromRow)]
         struct Row {
+            id: String,
             path: String,
             parent_path: Option<String>,
             slug: String,
@@ -316,7 +326,7 @@ impl Store {
 
         let rows = sqlx::query_as::<_, Row>(
             r#"
-            SELECT path, parent_path, slug, title, doc_type, visibility
+            SELECT id, path, parent_path, slug, title, doc_type, visibility
             FROM documents
             WHERE deleted_at IS NULL
             ORDER BY parent_path NULLS FIRST, sort_key, slug
@@ -329,6 +339,7 @@ impl Store {
             rows.iter()
                 .filter(|r| r.parent_path.as_deref() == parent)
                 .map(|r| TreeNode {
+                    id: r.id.clone(),
                     path: r.path.clone(),
                     slug: r.slug.clone(),
                     title: r.title.clone(),

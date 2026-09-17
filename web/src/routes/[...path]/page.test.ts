@@ -7,6 +7,7 @@ import type { Block } from '$lib/blocks/render';
 import { typesetDocument } from '$lib/server/maths';
 import { highlightDocument } from '$lib/server/highlight';
 import type { SidebarMode, Topic, TopicSummary } from '$lib/topics';
+import type { Reference } from '$lib/blocks/render';
 import type { Attachment } from '$lib/attachments';
 
 /**
@@ -21,6 +22,10 @@ import type { Attachment } from '$lib/attachments';
  */
 function node(path: string, title: string, children: TreeNode[] = []): TreeNode {
   return {
+    // A `documents.id` in shape only: what a tree row carries now, so the editor's page
+    // picker can record a page's IDENTITY rather than its address (D-5). Nothing here reads
+    // it; it is required by the type because the API really sends one.
+    id: `0199c0de-0000-7000-8000-${path.length.toString().padStart(12, '0')}`,
     path,
     slug: path.slice(path.lastIndexOf('/') + 1),
     title,
@@ -122,7 +127,8 @@ function html(
     anhaengeDarfSchreiben = false,
     anhaengeFehler = null,
     hochgeladen = null,
-    form = null
+    form = null,
+    verweise = {}
   }: {
     me?: Me;
     edit?: boolean;
@@ -141,6 +147,7 @@ function html(
     anhaengeFehler?: string | null;
     hochgeladen?: Attachment | null;
     form?: { wo: 'thema' | 'loeschen' | 'anhang'; fehler: string; getippt: string } | null;
+    verweise?: Record<string, Reference>;
   } = {}
 ): string {
   return render(Page, {
@@ -160,6 +167,10 @@ function html(
         // And its fences, through the real walker for the same reason: a fixture that
         // stubbed this could not tell whether the page passes what the load produced.
         fences: highlightDocument(koerper),
+        // Where this page's references point, for whoever is reading (D-5). Empty here
+        // unless a test passes one: an id with no entry renders as the author's own text,
+        // which is the same thing a reference to an unreadable page does.
+        verweise,
         tree,
         backlinks,
         edit,

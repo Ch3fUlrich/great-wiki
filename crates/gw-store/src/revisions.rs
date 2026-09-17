@@ -206,6 +206,17 @@ pub(crate) async fn append_revision(
     // the price of extraction living in the ONE function every body change goes through,
     // rather than in each of its callers where a later third caller would forget it.
     let mut body: Block = serde_json::from_str(body_json)?;
+
+    // A reference freshly imported from markdown carries the target's path beside its id, as
+    // a fallback for a database that has never heard of that id — which is exactly what
+    // re-seeding an export into a fresh store produces. This is where that pair ends: the
+    // reference keeps its identity here, or becomes an address if the identity means nothing
+    // in this database. It runs BEFORE the edges are read out, because which of the two it
+    // becomes decides which edge `replace_links` records.
+    //
+    // Inside the transaction, on the connection, for `replace_links`' reason: it changes the
+    // body that is about to be stored, so a failure below takes it back with everything else.
+    let settled = crate::links::settle_references(&mut *conn, &mut body).await?;
     crate::links::replace_links(&mut *conn, document_id, &path, &body, public_origin).await?;
 
     // The board is derived from the body too, and joins the same transaction for the same
@@ -225,7 +236,7 @@ pub(crate) async fn append_revision(
     // is therefore measured after this rather than before it: the timeline's delta must
     // describe the revision that was actually written.
     let minted = crate::tasks::reconcile_tasks(&mut *conn, document_id, &mut body).await?;
-    let body_json = if minted {
+    let body_json = if minted || settled {
         Cow::Owned(serde_json::to_string(&body)?)
     } else {
         Cow::Borrowed(body_json)
@@ -342,7 +353,27 @@ impl Store {
             return Ok(None);
         }
 
-        let json = serde_json::to_string(body)?;
+        // D-5's write half, and it runs HERE — before the transaction — for a reason that
+        // is written out in full on `Store::resolve_references`: authorising a path goes to
+        // the pool, the pool holds one connection, and asking it for a second one inside a
+        // transaction waits for the transaction to finish. The body that comes out of this
+        // is the body that is stored, the body `replace_links` reads its edges out of, and
+        // the body a reader is given; a failure below discards all of it together.
+        //
+        // `document_path_unchecked` rather than a permission-checked read: the path is the
+        // BASE a bare relative href resolves against (`links::wiki_path`), not a disclosure
+        // — and the caller has already been granted Write on this document two lines up, so
+        // there is nothing here they may not know. An empty base would silently root-anchor
+        // every relative link on the page at `/`, naming pages the links do not go to.
+        let mut body = body.clone();
+        let from_path = self
+            .document_path_unchecked(document_id)
+            .await?
+            .unwrap_or_default();
+        self.resolve_references(author, &from_path, &mut body)
+            .await?;
+
+        let json = serde_json::to_string(&body)?;
 
         let mut tx = self.pool.begin().await?;
         let id = append_revision(

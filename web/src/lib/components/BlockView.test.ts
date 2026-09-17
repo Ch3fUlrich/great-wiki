@@ -8,6 +8,7 @@ import type { Fences } from '$lib/blocks/code';
 import { typesetDocument } from '$lib/server/maths';
 import { highlightDocument } from '$lib/server/highlight';
 import type { Attachment } from '$lib/attachments';
+import type { Reference } from '$lib/blocks/render';
 
 /// The component's markup, without the hydration markers Svelte interleaves — they are an
 /// implementation detail and would make every assertion about structure unreadable.
@@ -15,12 +16,12 @@ function html(
   block: Block,
   anhaenge: Attachment[] = [],
   formeln: Formulas | null = null,
-  fences: Fences | null = null
+  fences: Fences | null = null,
+  verweise: Record<string, Reference> = {}
 ): string {
-  return render(BlockView, { props: { block, anhaenge, formeln, fences } }).body.replace(
-    /<!--.*?-->/g,
-    ''
-  );
+  return render(BlockView, {
+    props: { block, anhaenge, formeln, fences, verweise }
+  }).body.replace(/<!--.*?-->/g, '');
 }
 
 /// A single formatted leaf, standalone: `BlockView` accepts any block kind at its root,
@@ -345,17 +346,81 @@ describe('BlockView', () => {
     }
   });
 
-  it('renders a doc link as a non-navigating span, since resolving it is Task 7', () => {
-    // `gw_core::Mark::link_to_doc` stores the target under `doc`, an internal document id the
-    // server has not resolved to a path yet. Emitting a real `<a href>` here would need that
-    // resolution; emitting one with no `href` would be a link that does nothing when clicked,
-    // which reads as broken rather than as "not implemented yet". A `<span>` is neither: it
-    // carries the text and the id for whenever Task 7 wires the resolution in, and it does
-    // not invite a click it cannot honour.
+  it('carries the resolution down every level of the recursion', () => {
+    // Not a detail. The recursion in `BlockView` is spelled out at THIRTEEN separate sites —
+    // one per block kind that has children, plus the snippet `TableView` calls back into —
+    // and a prop added to twelve of them renders every reference on the site as plain text
+    // while the thirteenth and every unit test of a bare leaf still pass. That is exactly how
+    // this shipped broken the first time: a leaf tested at the root resolves, and the same
+    // leaf inside a paragraph inside a blockquote does not.
+    //
+    // A blockquote holding a paragraph holding the leaf, so at least two levels are crossed.
+    const out = html(
+      {
+        kind: 'blockquote',
+        content: [
+          {
+            kind: 'paragraph',
+            content: [{ kind: 'text', text: 'Zieltext', marks: [{ kind: 'link', attrs: { doc: '019ff0' } }] }]
+          }
+        ]
+      },
+      [],
+      null,
+      null,
+      { '019ff0': { path: '/archiv/befunde', title: 'Befunde 2024' } }
+    );
+    expect(out).toContain('<a href="/archiv/befunde"');
+  });
+
+  it('renders a resolved reference as a link to where the page is now', () => {
+    // D-5. The body names the target by IDENTITY and never by address, so the address and
+    // the name come from `verweise` — the server's answer for this reader — and a rename or
+    // a move changes what this renders without touching the page that links here.
+    const out = html(textWithMark('Zieltext', 'link', { doc: '019ff0' }), [], null, null, {
+      '019ff0': { path: '/archiv/befunde', title: 'Befunde 2024' }
+    });
+    expect(out).toContain('<a href="/archiv/befunde"');
+    expect(out).toContain('title="Befunde 2024"');
+    expect(out).toContain('Zieltext');
+  });
+
+  it('renders an unresolved reference as the author\'s own text and nothing else', () => {
+    // The disclosure rule, and the reason the four states answer identically: a page this
+    // reader may not read, one in the Papierkorb, one that was purged and one that never
+    // existed all arrive here the same way — as an id with no entry. Telling them apart is
+    // itself the disclosure.
+    //
+    // The words stay: they are the author's, they are in a body this reader is already
+    // reading, and blanking them would corrupt a sentence to hide something the sentence
+    // does not contain. Nothing else does.
     const out = html(textWithMark('Zieltext', 'link', { doc: '019ff0' }));
     expect(out).not.toContain('<a ');
     expect(out).toContain('data-doc="019ff0"');
     expect(out).toContain('Zieltext');
+  });
+
+  it('never lets the stored doc value become an address', () => {
+    // The `doc` branch is evaluated before `safeHref`, and a `doc` value is NOT a uuid by
+    // construction: `attrs_to_marks` copies an arbitrary JSON object off the Yjs attribute
+    // and nothing between the collaboration socket and `documents.body` validates it. So
+    // `javascript:` smuggled in as a target must reach no attribute at all — and the server
+    // would never resolve such an id, which is what leaves it in the unlinked state.
+    const out = html(textWithMark('Zieltext', 'link', { doc: 'javascript:alert(1)' }));
+    expect(out).not.toContain('<a ');
+    expect(out).not.toContain('href');
+  });
+
+  it('puts a resolved path through the same sink every other address goes through', () => {
+    // `safeHref`, not a second judgement of what is safe. A path the server resolved should
+    // never be dangerous — it is `documents.path` — but the reader has exactly one place
+    // where an address is judged, and a branch that skipped it would be the one place a
+    // later change could not be checked at.
+    const out = html(textWithMark('Zieltext', 'link', { doc: '019ff0' }), [], null, null, {
+      '019ff0': { path: 'javascript:alert(1)', title: 'Böse' }
+    });
+    expect(out).not.toContain('<a ');
+    expect(out).not.toContain('javascript:');
   });
 
   it('leaves an unmarked leaf exactly as before', () => {

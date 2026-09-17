@@ -54,7 +54,8 @@
   import { Clipboard } from '@ark-ui/svelte/clipboard';
   import { Field } from '@ark-ui/svelte/field';
   import BlockView from '$lib/components/BlockView.svelte';
-  import type { Block } from '$lib/blocks/render';
+  import type { TreeNode } from '$lib/api';
+  import type { Block, Reference } from '$lib/blocks/render';
   import type { Formulas } from '$lib/blocks/maths';
   import type { Fences } from '$lib/blocks/code';
   import type { Attachment } from '$lib/attachments';
@@ -102,6 +103,20 @@
      * it is, which is what editing code means.
      */
     fences?: Fences | null;
+    /**
+     * Where this page's document references point, for the same reason `formeln` is here:
+     * the reading fallback below is the same `BlockView` the reader gets, and a reference
+     * must not look broken for the two seconds before TipTap mounts. Nothing in the editing
+     * surface uses it — TipTap shows a reference as the link it is, and what it stores is
+     * the target's identity.
+     */
+    verweise?: Record<string, Reference>;
+    /**
+     * The pages this caller may read, as the shell already asked for them — what the link
+     * dialog's picker offers. Handed straight through to the toolbar; see its own prop for
+     * why it is passed down rather than fetched.
+     */
+    seiten?: TreeNode[];
     /** The document's own language, so the editing surface reads as the page does. */
     language: string;
     /** Whoever is editing, for the presence caret. */
@@ -117,6 +132,8 @@
     anhaenge = [],
     formeln = null,
     fences = null,
+    verweise = {},
+    seiten = [],
     language,
     editorName,
     onLeave
@@ -366,7 +383,7 @@
 <section class="gw-ed" aria-label="Seite bearbeiten">
   <div class="gw-ed-bar">
     <div class="gw-ed-bar-row">
-      <EditorToolbar {editor} enabled={ready && mayType(session)} {path} {anhaenge} />
+      <EditorToolbar {editor} enabled={ready && mayType(session)} {path} {anhaenge} {seiten} />
 
       <div class="gw-ed-actions">
         {#if peers.length > 0}
@@ -448,7 +465,7 @@
 
   {#if !ready}
     <article class="prose" lang={language}>
-      <BlockView block={body} {anhaenge} {formeln} {fences} />
+      <BlockView block={body} {anhaenge} {formeln} {fences} {verweise} />
     </article>
   {/if}
 </section>

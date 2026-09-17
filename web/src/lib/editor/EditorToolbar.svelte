@@ -25,6 +25,9 @@
   import { safeHref } from '$lib/blocks/render';
   import { kindText, type Attachment } from '$lib/attachments';
   import { normalizeLinkAddress } from './linkAddress';
+  import LinkDialog from './LinkDialog.svelte';
+  import type { PageChoice } from './pagePicker';
+  import type { TreeNode } from '$lib/api';
 
   interface Props {
     /** `null` until the session is live and the surface exists. */
@@ -53,9 +56,92 @@
      * write a reference to a file that is not there without ever being told.
      */
     anhaenge?: Attachment[];
+    /**
+     * The pages this caller may read, as the shell already asked for them — what the link
+     * dialog's picker offers.
+     *
+     * **Handed down rather than fetched**, for `anhaenge`'s reason and one that is sharper
+     * here: an unfiltered page listing is a whole-corpus existence-and-title oracle for
+     * exactly the person in the threat model, somebody with write on one page who wants to
+     * know whether `/darm/befund-mueller` exists. `GET /api/tree` is `Store::tree_for`,
+     * already filtered per document through the same `can()` a page read goes through, and
+     * building the picker on it means there is no second listing to filter differently.
+     */
+    seiten?: TreeNode[];
   }
 
-  let { editor, enabled, path, anhaenge = [] }: Props = $props();
+  let { editor, enabled, path, anhaenge = [], seiten = [] }: Props = $props();
+
+  /** Whether the link dialog is open. */
+  let linkDialog = $state(false);
+
+  /**
+   * Store the chosen page's IDENTITY, not its address (D-5).
+   *
+   * `setMark` rather than TipTap's own `setLink`: that command reads `href` out of what it is
+   * handed and refuses anything its URI check does not like, and a document reference has no
+   * `href` at all. `preventAutolink` is set exactly as `setLink` sets it — without it the Link
+   * extension's autolink plugin can rewrite what was just written as soon as the next
+   * character is typed.
+   *
+   * With nothing selected there is no text for the mark to sit on, so the page's CURRENT
+   * title is inserted as the link text. That is D-5's "the link text follows the title",
+   * realised at the one moment it can be: the text is document content and has to round-trip
+   * through markdown, so it is a snapshot of the title, while the ADDRESS the reader lands on
+   * is resolved afresh on every read and does follow the page.
+   */
+  function linkToPage(e: Editor, seite: PageChoice) {
+    if (e.state.selection.empty) {
+      e.chain()
+        .focus()
+        .insertContent({
+          type: 'text',
+          text: seite.title,
+          marks: [{ type: 'link', attrs: { doc: seite.id } }]
+        })
+        .setMeta('preventAutolink', true)
+        .run();
+      return;
+    }
+    e.chain()
+      .focus()
+      .extendMarkRange('link')
+      .setMark('link', { doc: seite.id })
+      .setMeta('preventAutolink', true)
+      .run();
+  }
+
+  /**
+   * Store what was typed, as an address.
+   *
+   * Normalised at the one moment this code still knows two things `gw_store::links::wiki_path`
+   * deliberately does not: the browser's own origin, and the path of the page this link is
+   * being written on (`linkAddress.ts`). A same-origin absolute address (paste-the-address-bar)
+   * becomes its path; a relative one is resolved against THIS page rather than left for the
+   * server to root-anchor against the site root, which named the wrong page for anything
+   * without a leading slash.
+   *
+   * It is NOT resolved to a document id here. `Store::resolve_references` does that on publish,
+   * against the author's own permissions, and a second resolver in the client would be a second
+   * answer to a permission question.
+   */
+  function linkToAddress(e: Editor, typed: string) {
+    const normalized = normalizeLinkAddress(location.origin, path, typed);
+    // The renderer refuses to build an `<a>` for anything but http/https/mailto —
+    // `javascript:` in an href is stored XSS against every reader, and `BlockView` is where
+    // that is stopped for ALL writers, not just this one. Checking the same rule here as
+    // well is not the security boundary; it is the difference between being told and
+    // watching a link silently come out as plain text on the published page.
+    const href = safeHref(normalized);
+    if (href === null) {
+      window.alert(
+        'Diese Adresse wird nicht verlinkt. Erlaubt sind nur Adressen, die mit ' +
+          'http://, https:// oder mailto: beginnen.'
+      );
+      return;
+    }
+    e.chain().focus().setLink({ href }).run();
+  }
 
   /**
    * One entry per control: what it is called, whether it is on, and what pressing it does.
@@ -158,64 +244,19 @@
       label: 'Link',
       short: 'Link',
       on: (e: Editor) => e.isActive('link'),
-      // The one control here that is not a bare toggle: turning a link ON needs a URL from
-      // somewhere, and every other control in this table needs nothing beyond "is it on".
-      // `window.prompt` rather than a proper dialog is the scope this task actually asked
-      // for — a toolbar toggle, not a link-editing UI — and it is revisitable without
-      // touching anything else here, since `run` is the only place that would change.
+      // The one control here that is not a bare toggle: turning a link ON needs a
+      // destination from somewhere, and every other control in this table needs nothing
+      // beyond "is it on". It opens `LinkDialog`, which offers both destinations this system
+      // has — a page of this wiki, stored by IDENTITY (D-5), and an address — because they
+      // are two different acts and only one of them survives the target being moved.
       //
-      // `setLink`/`unsetLink` rather than the `setMark`/`unsetMark` primitives underneath
-      // them, for two reasons that both showed up as bugs. `unsetLink` passes
-      // `extendEmptyMarkRange: true`, which is what lets a caret sitting INSIDE a link
-      // remove it — `unsetMark`'s default is `false`, so with nothing selected the command
-      // matched no range, dispatched nothing, and the button bounced straight back to
-      // pressed. Both also set `preventAutolink`, without which the Link extension's
-      // autolink plugin can put back the link that was just removed as soon as the next
-      // character is typed.
-      //
-      // Changing an existing link's address still means removing it and adding it again.
-      // That is deliberate rather than unfinished: a ToggleGroup item has two states, and
-      // "edit the address, leaving it a link" is a third one — pressing a pressed toggle and
-      // having it stay pressed is a worse lie than the small detour. It wants a link dialog,
-      // which is a control this row does not have and Task 5 did not ask for.
+      // The dialog opens whether or not the caret is already in a link, and OFFERS the
+      // removal rather than performing it. Pressing a pressed toggle and having it stay
+      // pressed would be a lie; `apply` below puts the button back where the editor says it
+      // is, one microtask later, for exactly that reason.
       run: (e: Editor) => {
-        if (e.isActive('link')) {
-          e.chain().focus().unsetLink().run();
-          return;
-        }
-        // Leads with "a page in this wiki", not with `https://…`. The old wording told
-        // people to paste the address bar — `safeHref` accepts that, the link renders and
-        // works, and `gw_store::links::wiki_path` has no origin to compare it against, so it
-        // is always read as external: the ONE flow this prompt pointed at was the flow that
-        // recorded no edge and left the backlinks panel silently short. A relative address
-        // (this page's own path, or a page-relative reference like `../nachbar`) is what
-        // `wiki_path` can actually resolve, so it is offered first.
-        const typed = window.prompt(
-          'Wohin soll der Link führen? Seite in diesem Wiki (z. B. /darm/labor oder, von ' +
-            'hier aus, nachbar) oder vollständige Adresse (https://… oder mailto:…):'
-        );
-        if (typed === null || typed.trim() === '') return;
-        // Normalised at the one moment this code still knows two things `wiki_path` on the
-        // server deliberately does not: the browser's own origin, and the path of the page
-        // this link is being written on (`linkAddress.ts`). A same-origin absolute address
-        // (paste-the-address-bar) becomes its path; a relative one is resolved against THIS
-        // page rather than left for the server to root-anchor against the site root, which
-        // named the wrong page for anything without a leading slash.
-        const normalized = normalizeLinkAddress(location.origin, path, typed);
-        // The renderer refuses to build an `<a>` for anything but http/https/mailto —
-        // `javascript:` in an href is stored XSS against every reader, and `BlockView` is
-        // where that is stopped for ALL writers, not just this one. Checking the same rule
-        // here as well is not the security boundary; it is the difference between being
-        // told and watching a link silently come out as plain text on the published page.
-        const href = safeHref(normalized);
-        if (href === null) {
-          window.alert(
-            'Diese Adresse wird nicht verlinkt. Erlaubt sind nur Adressen, die mit ' +
-              'http://, https:// oder mailto: beginnen.'
-          );
-          return;
-        }
-        e.chain().focus().setLink({ href }).run();
+        void e;
+        linkDialog = true;
       }
     }
   ] as const;
@@ -330,6 +371,18 @@
     {/each}
   </ToggleGroup.Root>
 </div>
+
+<!-- Rendered beside the toolbar rather than inside it: a `<dialog>` inside a `role="toolbar"`
+     would put a whole form into a roving-tabindex set of toggles. It is in the DOM at all
+     times and shown with `showModal()`, which is what supplies the focus trap and Escape. -->
+<LinkDialog
+  bind:offen={linkDialog}
+  {seiten}
+  verknuepft={active.includes('link')}
+  onSeite={(seite) => editor && linkToPage(editor, seite)}
+  onAdresse={(adresse) => editor && linkToAddress(editor, adresse)}
+  onEntfernen={() => editor?.chain().focus().unsetLink().run()}
+/>
 
 <!-- The files this page carries, each one a button that puts it where the caret is.
      Deliberately NOT inside the toolbar above: those are toggles under Ark's roving

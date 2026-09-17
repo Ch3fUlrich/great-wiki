@@ -306,6 +306,7 @@
             anhaenge={data.anhaenge ?? []}
             formeln={data.formeln ?? null}
             fences={data.fences ?? null}
+            verweise={data.verweise ?? {}}
           />
         </article>
       {:then module}
@@ -317,6 +318,8 @@
           anhaenge={data.anhaenge ?? []}
           formeln={data.formeln ?? null}
           fences={data.fences ?? null}
+          verweise={data.verweise ?? {}}
+          seiten={data.tree ?? []}
           language={data.doc.language}
           {editorName}
           onLeave={() => (toggled = false)}
@@ -331,6 +334,7 @@
             anhaenge={data.anhaenge ?? []}
             formeln={data.formeln ?? null}
             fences={data.fences ?? null}
+            verweise={data.verweise ?? {}}
           />
         </article>
       {/await}
@@ -341,6 +345,7 @@
           anhaenge={data.anhaenge ?? []}
           formeln={data.formeln ?? null}
           fences={data.fences ?? null}
+          verweise={data.verweise ?? {}}
         />
       </article>
     {/if}

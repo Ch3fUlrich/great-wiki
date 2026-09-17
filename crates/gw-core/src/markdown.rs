@@ -16,6 +16,17 @@
 //! [`Builder::placement_is_possible`] and [`Builder::settle_placements`]: the reference must
 //! stand **alone in its own paragraph** and that paragraph must be at the **top level** of
 //! the document. Anywhere else it is an ordinary image and degrades exactly as one.
+//!
+//! # Pointing at another page (D-5, D-21)
+//!
+//! The same shape a second time: `[Titel](dok:<id>)` is a link to a page of this wiki *by
+//! identity*, so that renaming or moving the target cannot break it. Both halves live here
+//! too — [`document_destination`] writes it and [`document_reference`] reads it — and a
+//! `dok:` destination that is not shaped like a document id stays an ordinary link rather
+//! than becoming a broken reference. The destination may carry the target's path in
+//! CommonMark's link-title slot ([`document_fallback`]) — what a database that has never
+//! heard of that id falls back to, and nothing else. [ADR 0019](../../../docs/decisions/0019-how-a-document-reference-is-written-in-markdown.md)
+//! has the reasoning and the cost.
 
 use crate::block::{Block, BlockKind, Mark, MarkKind};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -112,6 +123,143 @@ pub fn attachment_reference(dest: &str) -> Option<&str> {
         return None;
     }
     Some(name)
+}
+
+/// What a link destination has to say to be a reference to another page of this wiki.
+///
+/// [`ATTACHMENT_SCHEME`]'s argument, generalised to the other half of D-15's reasoning, and
+/// it is D-5's: a link stores the target's document **id**, so that renaming or moving a
+/// page cannot break an inbound link. A file on disk has to spell that id somehow, and the
+/// obvious spelling — the resolved *path*, `[Titel](/darm/labor)` — is the one combination
+/// that permanently breaks the backup. The importer below reads a path as
+/// [`crate::Mark::link_to_url`] and can do nothing else (this crate has no store), so the
+/// stored `{doc: id}` and the re-imported `{href: "/darm/labor"}` differ, and
+/// `gw_api::export::render_file` refuses the page — for ever, since a page that cannot be
+/// exported cannot be exported later either.
+///
+/// So a reference is a **statement**, exactly as a placement is. Nothing predating this
+/// feature writes `dok:` and nothing writes it by accident; an import either finds that
+/// statement or it does not. The cost is the same one ADR 0015 accepted: `dok:01J8…` is an
+/// address no other renderer can follow, which is honest about a directory that
+/// `EXPORT-README.txt` already calls a faithful copy of *the database*.
+///
+/// German, for [`ATTACHMENT_SCHEME`]'s reason — this wiki's routes are `/papierkorb` and
+/// `/themen`, and somebody reading an exported file sees a German word rather than a bare
+/// uuid that looks like a broken relative link.
+pub const DOCUMENT_SCHEME: &str = "dok:";
+
+/// The markdown destination that names the document `id`, or `None` for an `id` this
+/// syntax cannot carry back unchanged.
+///
+/// The *writing* half of one agreement whose *reading* half is [`document_reference`], both
+/// here for [`attachment_destination`]'s reason: two copies of one rule in two crates stop
+/// agreeing the day one of them is edited, and the cost is an export that refuses every
+/// page holding a reference.
+///
+/// **`None` is the whole safety property, and it is not about aesthetics.** Nothing
+/// validates a mark's attributes on the write path — `gw_collab`'s `attrs_to_marks` copies
+/// whatever the Yjs attribute carries, so anyone with write access on one page can store
+/// `{"doc": "x) [siehe](https://angreifer.example/"}` over the collaboration socket — and
+/// `gw_api::export`'s renderer interpolates a link destination with no escaping at all. A
+/// writer that emitted whatever it was handed would put attacker text straight into the
+/// owner's backup file. Asking [`document_reference`] first means only a destination that
+/// reads back as the same id is ever written, and a uuid cannot contain a space, a bracket
+/// or a parenthesis — so no escaping is needed rather than merely omitted.
+pub fn document_destination(id: &str) -> Option<String> {
+    let written = format!("{DOCUMENT_SCHEME}{id}");
+    (document_reference(&written) == Some(id)).then_some(written)
+}
+
+/// The document a link destination names, or `None` for a destination that names none.
+///
+/// The reading half of [`document_destination`]. It accepts exactly the shape
+/// `Uuid::now_v7().to_string()` writes — eight, four, four, four and twelve hex digits,
+/// hyphen-separated — because that is what `gw_store::documents` mints a `documents.id` as,
+/// and nothing else in this system is a document id.
+///
+/// **A `dok:` destination that is not that shape is not a broken reference; it is an
+/// ordinary link.** It has to be. `dok:etwas` is a string anybody with write access could
+/// have typed into the old link control at any point in the past: it stores as an `href`,
+/// exports as `[T](dok:etwas)` and re-imports as the same `href` — and the day this reader
+/// learned to accept anything after the colon, that page would re-import as `{doc:
+/// "etwas"}`, differ from the stored `{href: "dok:etwas"}`, and be refused from every
+/// export from then on, without anybody having edited it. Degrading to an `href` keeps such
+/// a page exactly as harmless as it was.
+///
+/// Deliberately **not** an existence check and **not** a permission check, exactly as
+/// [`attachment_reference`] is neither: this crate has no store. Whether the id names a
+/// live page the reader may see is `gw_store`'s question and is re-asked on every read.
+pub fn document_reference(dest: &str) -> Option<&str> {
+    let id = dest.strip_prefix(DOCUMENT_SCHEME)?;
+    is_document_id(id).then_some(id)
+}
+
+/// Whether `s` is shaped like a `documents.id`: a hyphenated, lower- or upper-case hex uuid.
+///
+/// Case is not normalised and not refused — the string is handed back as it arrived, so
+/// either case round-trips — because the question here is "could this be an id", and the
+/// answer to "is it *this* wiki's id" belongs to the store.
+fn is_document_id(s: &str) -> bool {
+    let mut groups = s.split('-');
+    for len in [8usize, 4, 4, 4, 12] {
+        match groups.next() {
+            Some(g) if g.len() == len && g.bytes().all(|b| b.is_ascii_hexdigit()) => {}
+            _ => return false,
+        }
+    }
+    groups.next().is_none()
+}
+
+/// The path a `dok:` reference falls back to, written in CommonMark's **link title** slot —
+/// `[Titel](dok:<id> "/darm/labor")` — or `None` for a path this syntax cannot carry back
+/// unchanged.
+///
+/// # Why a reference carries a path at all, when the id is the point
+///
+/// Because an export re-seeded into a **fresh** database mints every id anew (`SeedMeta` has
+/// no `id` key), so every `dok:` in a restored corpus would point at nothing: the words
+/// intact, the connection gone. That is a regression of the backup path, and it is avoidable.
+/// The path is what the file already knew and what a pre-identity export would have carried.
+///
+/// **It is a fallback and never a second address.** `gw_store` settles it on the way in: the
+/// id names a live document here, so the path is dropped; or it does not, so the mark becomes
+/// an ordinary `href` to that path, which the next publish resolves to *this* database's id.
+/// A page RENAMED after the export therefore resolves by identity — the file's path is stale
+/// and the id is not — which is the whole reason identity is stored in the first place.
+///
+/// # Why the title slot
+///
+/// It is markdown's own place for a note about a destination, every CommonMark parser already
+/// reads it, and `pulldown-cmark` hands it over unescaped. Nothing else in this system writes
+/// a link title, and the importer throws one away everywhere else, so nothing is displaced.
+///
+/// `None` for anything the reader below would not give back unchanged. `documents.path` is
+/// built from slugs and is always a plain, rooted, ASCII path — so `None` means a
+/// hand-written or hostile value, and the exporter then writes the reference bare rather than
+/// smuggling text into the file: `Renderer::wrap` escapes nothing at all.
+pub fn document_fallback(path: &str) -> Option<String> {
+    (document_fallback_path(path) == Some(path)).then(|| format!("\"{path}\""))
+}
+
+/// The fallback path a link title states, or `None` if it states none.
+///
+/// The reading half of [`document_fallback`], asked by it rather than restated, so the two
+/// cannot drift. Accepts exactly the shape `Store::create_document`'s `resolved_path` builds:
+/// rooted, non-empty, and made of slug characters and separators. It is deliberately **not**
+/// an existence check and **not** a permission check — this crate has no store, exactly as it
+/// has none to resolve a `doc` target with.
+pub fn document_fallback_path(title: &str) -> Option<&str> {
+    if !title.starts_with('/') || title.len() < 2 || title.ends_with('/') {
+        return None;
+    }
+    if title.contains("//")
+        || !title
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+    {
+        return None;
+    }
+    Some(title)
 }
 
 /// A markdown construct the M1 block schema cannot represent, and what became of it.
@@ -745,12 +893,25 @@ impl Builder {
                 }
                 _ => self.note(Unsupported::Image),
             },
-            // This crate has no store, so a markdown link can never be resolved to a
-            // document id here — `[text](/darm/labor)` becomes an external href exactly
-            // like `[text](https://example.org)`, regardless of how internal it looks.
-            // Task 7 resolves internal-looking destinations against the store on publish;
-            // that resolution does not belong in this crate and must not be guessed here.
-            Tag::Link { dest_url, .. } => self.active.push(Mark::link_to_url(&dest_url)),
+            // A `dok:` destination names a document by id and becomes an internal
+            // reference (D-5); everything else becomes an href, including a destination
+            // that merely LOOKS internal. This crate has no store, so `[text](/darm/labor)`
+            // becomes an external href exactly like `[text](https://example.org)` —
+            // resolving a path to an id is `gw_store`'s job on publish and must not be
+            // guessed here. A `dok:` that is not shaped like an id is an href too; see
+            // [`document_reference`] for why that degradation is load-bearing rather than
+            // lenient.
+            Tag::Link {
+                dest_url, title, ..
+            } => self.active.push(match document_reference(&dest_url) {
+                // The title slot carries the target's path as it stood when the file was
+                // written — a FALLBACK for a database that does not know this id, never a
+                // second address. `gw_store` settles it; see [`document_fallback`].
+                Some(id) => Mark::link_to_doc_at(id, document_fallback_path(&title)),
+                // A title on any other link is still thrown away, as it always has been:
+                // nothing in this system stores one and `BlockView` renders none.
+                None => Mark::link_to_url(&dest_url),
+            }),
             Tag::Emphasis => self.active.push(mark(MarkKind::Em)),
             Tag::Strong => self.active.push(mark(MarkKind::Strong)),
             Tag::Strikethrough => self.active.push(mark(MarkKind::Strike)),
@@ -898,7 +1059,9 @@ fn block(kind: BlockKind) -> Block {
 mod tests {
     use crate::block::{Block, BlockKind, MarkKind};
     use crate::markdown::{
-        attachment_destination, attachment_reference, convert, markdown_to_blocks, Unsupported,
+        attachment_destination, attachment_reference, convert, document_destination,
+        document_fallback, document_fallback_path, document_reference, markdown_to_blocks,
+        Unsupported,
     };
 
     fn keys(md: &str) -> Vec<&'static str> {
@@ -1931,6 +2094,213 @@ mod tests {
                 "{md:?} came back naming a different file"
             );
         }
+    }
+
+    /// The `doc` mark on the single text leaf `md` produces, or `None`.
+    fn reference_in(md: &str) -> Option<String> {
+        let doc = markdown_to_blocks(md);
+        collect_text_leaves(&doc)
+            .iter()
+            .flat_map(|leaf| leaf.marks.clone())
+            .find(|m| m.kind == MarkKind::Link)
+            .and_then(|m| {
+                m.attrs
+                    .get("doc")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+    }
+
+    /// The `href` on the single link mark `md` produces, or `None`.
+    fn href_in(md: &str) -> Option<String> {
+        let doc = markdown_to_blocks(md);
+        collect_text_leaves(&doc)
+            .iter()
+            .flat_map(|leaf| leaf.marks.clone())
+            .find(|m| m.kind == MarkKind::Link)
+            .and_then(|m| {
+                m.attrs
+                    .get("href")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+    }
+
+    #[test]
+    fn every_id_a_document_can_have_survives_being_written_and_read_back() {
+        // `every_name_a_page_can_give_a_file_survives_being_written_and_read_back`'s twin,
+        // and it exists for that test's reason: the writer and the reader are one agreement
+        // and two copies of it stop agreeing the day one is edited. What that costs here is
+        // an export that refuses every page holding a reference.
+        for id in [
+            // What `Uuid::now_v7().to_string()` writes, which is what `documents.id` holds.
+            "01936c9e-7f3a-7c21-9a7e-2f0b1d4c5e6f",
+            "00000000-0000-0000-0000-000000000000",
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            // Upper case is not this system's spelling and is still a uuid; the string is
+            // handed back as it arrived, so it round-trips either way.
+            "01936C9E-7F3A-7C21-9A7E-2F0B1D4C5E6F",
+        ] {
+            let dest = document_destination(id)
+                .unwrap_or_else(|| panic!("`{id}` is a shape `documents.id` really holds"));
+            // No escaping, and none needed: a uuid holds nothing markdown reads as markup.
+            assert_eq!(dest, format!("dok:{id}"));
+            assert_eq!(
+                reference_in(&format!("Siehe [Titel]({dest}).\n")).as_deref(),
+                Some(id),
+                "{dest} did not come back as a reference to the same document"
+            );
+        }
+    }
+
+    #[test]
+    fn a_destination_that_names_no_document_is_an_ordinary_link() {
+        // The degradation D-21g is about, and it is the whole reason the reader checks the
+        // SHAPE rather than accepting anything after the colon. `dok:etwas` is a string
+        // anybody could have typed into the link control before this feature existed: it is
+        // stored as an href, exported verbatim, and must keep re-importing as the same href
+        // — otherwise a page nobody edited becomes unexportable for ever.
+        for dest in [
+            "dok:",
+            "dok:etwas",
+            "dok:01936c9e7f3a7c219a7e2f0b1d4c5e6f",
+            "dok:01936c9e-7f3a-7c21-9a7e-2f0b1d4c5e6",
+            "dok:01936c9e-7f3a-7c21-9a7e-2f0b1d4c5e6f7",
+            "dok:01936c9e-7f3a-7c21-9a7e-2f0b1d4c5e6g",
+            "dok:01936c9e-7f3a-7c21-9a7e-2f0b1d4c5e6f-0",
+            "dok:x) [siehe](https://angreifer.example/",
+            "DOK:01936c9e-7f3a-7c21-9a7e-2f0b1d4c5e6f",
+            // The scheme is stripped ONCE. `trim_start_matches` would strip it repeatedly
+            // and read this as a reference to the uuid — the one destination for which
+            // "does it say so" and "does it look like it" give different answers, and
+            // therefore the one that pins the difference. `scripts/mutate.sh` makes exactly
+            // that substitution.
+            "dok:dok:01936c9e-7f3a-7c21-9a7e-2f0b1d4c5e6f",
+            "/darm/labor",
+            "https://example.org",
+        ] {
+            assert_eq!(
+                document_reference(dest),
+                None,
+                "{dest} must not read as a document reference"
+            );
+        }
+        assert_eq!(
+            reference_in("[T](dok:etwas)\n"),
+            None,
+            "a `dok:` that is not an id must not become a reference"
+        );
+        assert_eq!(
+            href_in("[T](dok:etwas)\n").as_deref(),
+            Some("dok:etwas"),
+            "it degrades to the ordinary link it has always been"
+        );
+    }
+
+    #[test]
+    fn a_destination_a_writer_cannot_be_read_back_is_refused_rather_than_written() {
+        // D-21f, and the model is `attachment_destination`. `gw_api::export`'s renderer
+        // interpolates a destination with no escaping at all, and a `doc` value is an
+        // arbitrary attacker-controlled string: nothing between the collaboration socket
+        // and `documents.body` validates it. A writer that emitted what it was handed would
+        // put attacker text into the owner's backup file.
+        for id in [
+            "",
+            "etwas",
+            "x) [siehe](https://angreifer.example/",
+            "01936c9e-7f3a-7c21-9a7e-2f0b1d4c5e6f ",
+            " 01936c9e-7f3a-7c21-9a7e-2f0b1d4c5e6f",
+        ] {
+            assert_eq!(
+                document_destination(id),
+                None,
+                "`{id}` is not an id and must not be written as a destination"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reference_carries_the_path_its_target_had_when_the_file_was_written() {
+        // The fallback, and the only thing that stops a restored backup losing every internal
+        // connection: a seed mints new ids, so no `dok:` in a restored corpus can ever match.
+        // `gw_store` decides which of the two wins; this is only the carrying.
+        let id = "01936c9e-7f3a-7c21-9a7e-2f0b1d4c5e6f";
+        let md = format!("Siehe [Blutbild](dok:{id} \"/darm/blutbild\").\n");
+        let doc = markdown_to_blocks(&md);
+        let mark = collect_text_leaves(&doc)
+            .iter()
+            .flat_map(|leaf| leaf.marks.clone())
+            .find(|m| m.kind == MarkKind::Link)
+            .expect("the reference went missing entirely");
+        assert_eq!(mark.target_doc(), Some(id));
+        assert_eq!(mark.fallback_path(), Some("/darm/blutbild"));
+    }
+
+    #[test]
+    fn a_link_title_that_is_not_a_wiki_path_carries_nothing() {
+        // The writer's rule, asked of the reader so the two cannot drift. `documents.path` is
+        // built from slugs and is always plain, rooted ASCII — so anything else is a
+        // hand-written or hostile value, and `Renderer::wrap` escapes NOTHING.
+        for title in [
+            "",
+            "kein Pfad",
+            "darm/labor",
+            "/darm/labor/",
+            "/darm//labor",
+            "/",
+            "/a b",
+            "/a\"b",
+            "/a)b",
+            "/ümlaut",
+        ] {
+            assert_eq!(
+                document_fallback_path(title),
+                None,
+                "`{title}` must not be read as a wiki path"
+            );
+            assert_eq!(
+                document_fallback(title),
+                None,
+                "`{title}` must not be written as one either"
+            );
+        }
+        assert_eq!(document_fallback_path("/darm/labor"), Some("/darm/labor"));
+        assert_eq!(
+            document_fallback("/darm/labor"),
+            Some("\"/darm/labor\"".into())
+        );
+    }
+
+    #[test]
+    fn a_link_title_on_anything_but_a_reference_is_still_thrown_away() {
+        // Unchanged, and stated because `comparable()`'s allow-list depends on it: nothing in
+        // this system stores a link title and `BlockView` renders none, so an ordinary link
+        // with one must keep coming back without it.
+        let doc = markdown_to_blocks("[T](https://example.org \"ein Titel\")\n");
+        let mark = collect_text_leaves(&doc)
+            .iter()
+            .flat_map(|leaf| leaf.marks.clone())
+            .find(|m| m.kind == MarkKind::Link)
+            .unwrap();
+        assert_eq!(
+            mark.attrs.keys().collect::<Vec<_>>(),
+            vec!["href"],
+            "a link title reached the document: {:?}",
+            mark.attrs
+        );
+    }
+
+    #[test]
+    fn a_path_is_still_an_href_and_never_a_reference() {
+        // Restated as a test because it is the one combination that would break the backup
+        // permanently: this crate has no store, so it cannot resolve a path to an id, and
+        // an exporter that wrote the path instead of the scheme would produce a file whose
+        // re-import differs from what is stored.
+        assert_eq!(reference_in("[T](/darm/labor)\n"), None);
+        assert_eq!(
+            href_in("[T](/darm/labor)\n").as_deref(),
+            Some("/darm/labor")
+        );
     }
 
     #[test]

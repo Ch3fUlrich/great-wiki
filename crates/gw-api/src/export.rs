@@ -39,8 +39,8 @@
 use anyhow::{Context, Result};
 use gw_auth::{Action, Principal};
 use gw_core::{markdown, slugify, split_frontmatter, Block, BlockKind, Mark, MarkKind, SeedMeta};
-use gw_store::Store;
-use std::collections::BTreeSet;
+use gw_store::{Reference, Store};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -109,10 +109,19 @@ language, tables with their column alignment, and every character of the text it
 A file placed in the prose comes back as `![Beschreibung](anhang:datei.png)`, which
 names the file on its page and nothing else: the FILES THEMSELVES ARE NOT IN THIS
 DIRECTORY, so an export is a copy of the wiki's words and not of its attachments.
-What the tree still cannot hold is a picture from somewhere else, an internal link
-resolved to another page rather than a URL, and a horizontal rule — those are dropped
-when markdown is imported (the importer says so, page by page) and so they cannot come
-back out. `export` verifies every other construct per document and refuses to write one
+A link to another page of this wiki comes back as `[Titel](dok:<id> \"/pfad\")`. The
+id names that page by its DATABASE IDENTITY rather than by where it currently sits,
+which is what keeps such a link working when the page is renamed or moved; the path
+beside it is where that page was WHEN THIS FILE WAS WRITTEN, and it is a fallback and
+nothing else. Loading these files back into THIS wiki resolves every such link by id
+and ignores the path, even where the page has moved since. Loading them into a FRESH,
+EMPTY database mints new ids — so no id in these files can match there — and each link
+falls back to its path instead, finding the page of the same address in the restored
+copy. A link whose target is not in this directory (a page the exporting account could
+not read) carries no path and reads as plain words.
+What the tree still cannot hold is a picture from somewhere else and a horizontal
+rule — those are dropped when markdown is imported (the importer says so, page by
+page) and so they cannot come back out. `export` verifies every other construct per document and refuses to write one
 it cannot.
 
 Therefore: this directory is a faithful copy of what the DATABASE holds. It is NOT a
@@ -206,7 +215,12 @@ pub async fn run(store: &Store, principal: &Principal, content_dir: &Path) -> Re
             slug: doc.slug.clone(),
             tags: topics.into_iter().map(|t| t.display_path).collect(),
         };
-        let rendered = match render_file(&meta, &body) {
+        // Where this page's references point, through the ONE permission-checked resolver
+        // — so a reference to a page this account may not read carries no path into the file.
+        // Asked per page rather than built once for the corpus, because that is the shape
+        // that is filtered and capped; a map assembled here would be neither.
+        let paths = store.references_for(principal, &body).await?;
+        let rendered = match render_file(&meta, &body, &paths) {
             Ok(rendered) => rendered,
             Err(reason) => {
                 report.refused.push(Refused {
@@ -380,8 +394,12 @@ pub struct FileMeta {
 /// parsed back exactly the way [`crate::seed`] would parse it, and the resulting tree and
 /// metadata are compared with what came out of the database. A mismatch means this file
 /// would import as a different document, so it is not written.
-pub fn render_file(meta: &FileMeta, body: &Block) -> Result<String, String> {
-    let rendered = render(body);
+pub fn render_file(
+    meta: &FileMeta,
+    body: &Block,
+    paths: &ReferencePaths,
+) -> Result<String, String> {
+    let rendered = render_with(body, paths);
     if !rendered.problems.is_empty() {
         return Err(rendered.problems.join("; "));
     }
@@ -426,9 +444,13 @@ pub fn render_file(meta: &FileMeta, body: &Block) -> Result<String, String> {
 
 /// The attributes of a `Link` mark that this system can actually mean something by.
 ///
-/// `href` is the address markdown writes; `doc` is the internal target Task 7 resolves into
-/// one. There is no third: `gw_core::Mark`'s own doc comment says a link carries either, and
-/// nothing in the importer, the renderer below or `BlockView` reads any other key.
+/// `href` is the address markdown writes; `doc` is a reference to another page of this wiki
+/// by identity, which markdown writes as `dok:<id>` (D-5, ADR 0019). There is no third:
+/// `gw_core::Mark`'s own doc comment says a link carries either, and nothing in the
+/// importer, the renderer below or `BlockView` reads any other key.
+///
+/// A key on this list still has to carry a VALUE — see [`kept`], which is the guard against
+/// the editor minting `doc: null` onto every ordinary external link.
 const LINK_ATTRS: [&str; 2] = ["href", "doc"];
 
 /// The attributes of a `codeBlock` that markdown has a spelling for.
@@ -477,8 +499,12 @@ const TASK_ITEM_ATTRS: [&str; 1] = ["checked"];
 /// editor is stored as `{href, target, rel, class, title}`. `gw_core::markdown` never
 /// produces those and `BlockView` never reads them — it renders its own fixed `rel` and no
 /// `target` — so a byte-equal comparison refused every page containing such a link, and
-/// `export` bails on the first refusal. One link written in the editor made the entire wiki
-/// unexportable, on the one path that is the owner's backup.
+/// `run()` then pushes a `Refused` and CONTINUES, writing every other page — so one link
+/// written in the editor left the export directory quietly missing that page while
+/// `FIDELITY_FILE` called the directory a faithful copy of the database. (Only the CLI's
+/// exit code fails, via `is_complete()` and `main.rs`'s `bail!`. The tree states this the
+/// other way round in sixteen places; a partial backup that looks like a backup is worse
+/// than a run that stops.)
 ///
 /// `web/src/lib/editor/extensions.ts` now declares only `href`, so nothing new arrives this
 /// way. That fix cannot reach backwards: the Y.Docs and the revisions already written hold
@@ -535,21 +561,41 @@ pub(crate) fn comparable(block: &Block) -> serde_json::Value {
     serde_json::to_value(&copy).expect("a Block always serialises")
 }
 
+/// Whether an allow-listed key survives the reduction: it must be on the list AND carry a
+/// value.
+///
+/// **The `!is_null()` half is not tidiness; it is the other direction of the `LINK_ATTRS`
+/// incident.** An allow-list keeps a key *without inspecting its value*, so it is blind to
+/// a declared-but-empty attribute — and a declared attribute is exactly what ProseMirror
+/// MINTS. The editor's `Anchor` declares `doc: { default: null }` (it has to: an editor that
+/// does not declare an attribute deletes it from the Y.Doc and broadcasts the deletion), so
+/// the first time anybody edits a paragraph holding an ordinary external link, that link is
+/// stored `{href: "https://…", doc: null}`. Without this clause the stored mark reduces to
+/// two keys, its own markdown re-imports as one, the trees differ, and the page is refused
+/// from every export from then on — the `target`/`rel`/`class`/`title` disaster again,
+/// arrived at from the other side.
+///
+/// Applied symmetrically to marks and to the block allow-lists so that "a minted null is
+/// the same as an absent key" is one rule with no place left for it not to hold.
+fn kept(allowed: &[&str], key: &str, value: &serde_json::Value) -> bool {
+    allowed.contains(&key) && !value.is_null()
+}
+
 fn reduce(block: &mut Block) {
     if block.kind == BlockKind::TaskItem {
         block
             .attrs
-            .retain(|key, _| TASK_ITEM_ATTRS.contains(&key.as_str()));
+            .retain(|key, value| kept(&TASK_ITEM_ATTRS, key, value));
     }
     if block.kind == BlockKind::CodeBlock {
         block
             .attrs
-            .retain(|key, _| CODE_BLOCK_ATTRS.contains(&key.as_str()));
+            .retain(|key, value| kept(&CODE_BLOCK_ATTRS, key, value));
     }
     for mark in &mut block.marks {
         if mark.kind == MarkKind::Link {
             mark.attrs
-                .retain(|key, _| LINK_ATTRS.contains(&key.as_str()));
+                .retain(|key, value| kept(&LINK_ATTRS, key, value));
         }
     }
     for child in &mut block.content {
@@ -627,6 +673,14 @@ pub struct Rendered {
     pub problems: Vec<String>,
 }
 
+/// Where every reference in a body points, for the account doing the export.
+///
+/// Always [`gw_store::Store::references_for`]'s answer and never anything assembled here —
+/// which is what keeps a page the exporting account may not read out of the file. A
+/// reference whose target is missing from this map is written bare, with no path beside it,
+/// and that is the same state a reference to a page nobody may read is in.
+pub type ReferencePaths = BTreeMap<String, Reference>;
+
 /// Render a `doc` block as markdown, discarding what could not be expressed.
 ///
 /// Prefer [`render`] anywhere the caller can act on a problem.
@@ -635,8 +689,19 @@ pub fn blocks_to_markdown(doc: &Block) -> String {
 }
 
 /// Render a `doc` block as markdown and report what the format could not hold.
+///
+/// References are written bare, with no fallback path: this entry point has no store behind
+/// it and inventing one would be a guess. [`render_with`] is the one that carries them.
 pub fn render(doc: &Block) -> Rendered {
-    let mut r = Renderer::default();
+    render_with(doc, &ReferencePaths::new())
+}
+
+/// [`render`], with the paths a reference may carry as a fallback.
+pub fn render_with(doc: &Block, paths: &ReferencePaths) -> Rendered {
+    let mut r = Renderer {
+        problems: Vec::new(),
+        paths: paths.clone(),
+    };
     let markdown = r.blocks(&doc.content, Nesting::Block);
     let markdown = if markdown.is_empty() {
         markdown
@@ -658,9 +723,10 @@ enum Nesting {
     Item,
 }
 
-#[derive(Default)]
 struct Renderer {
     problems: Vec<String>,
+    /// Where each reference in this body points, as the exporting account may see it.
+    paths: ReferencePaths,
 }
 
 /// The two bullet characters, alternated so two adjacent lists stay two lists.
@@ -860,17 +926,53 @@ impl Renderer {
             MarkKind::Code => inner,
             MarkKind::Link => match mark.attrs.get("href").and_then(|v| v.as_str()) {
                 Some(href) => format!("[{inner}]({href})"),
-                // `attrs` holds `doc` instead: an internal link this crate cannot resolve,
-                // because `render` has no store. Task 7 resolves `doc` ids to a path in
-                // `run`, before the tree ever reaches this renderer — nothing produces one
-                // yet, so this arm exists only to refuse loudly instead of guessing.
-                None => {
-                    self.problem(
-                        "a link has no `href` to write — an internal link is resolved to a \
-                         path by Task 7, not by this renderer",
-                    );
-                    inner
-                }
+                // `attrs` holds `doc` instead: a reference to another page of this wiki, by
+                // identity (D-5). It is written as the SCHEME and never as the target's
+                // resolved path — `gw_core::markdown` reads a path back as an `href` and can
+                // do nothing else, so a file holding `[Titel](/darm/labor)` would re-import
+                // as a different tree and the page would be refused for ever. ADR 0019.
+                //
+                // The destination comes from `gw_core::markdown` rather than being formatted
+                // here, for the reason the placement's does: the writing and the reading half
+                // of one syntax live together or they drift. `None` is a refusal, not a
+                // guess — the stored `doc` is an arbitrary string that reached
+                // `documents.body` over the collaboration socket without passing any
+                // validation, and the `format!` above escapes nothing.
+                None => match mark
+                    .attrs
+                    .get("doc")
+                    .and_then(|v| v.as_str())
+                    .and_then(|id| markdown::document_destination(id).map(|dest| (id, dest)))
+                {
+                    Some((id, destination)) => {
+                        // The target's path, in the link-title slot, as a FALLBACK for a
+                        // database that has never heard of this id — which is what re-seeding
+                        // an export into a fresh store produces, since every id is minted
+                        // anew there. Without it a restored backup keeps the words and loses
+                        // every connection.
+                        //
+                        // From `references_for` and from nowhere else, so a page the
+                        // exporting account may not read contributes no path and the
+                        // reference is written bare. `document_fallback` refuses anything it
+                        // would not read back unchanged, because `wrap` escapes nothing.
+                        match self
+                            .paths
+                            .get(id)
+                            .map(|reference| reference.path.as_str())
+                            .and_then(markdown::document_fallback)
+                        {
+                            Some(fallback) => format!("[{inner}]({destination} {fallback})"),
+                            None => format!("[{inner}]({destination})"),
+                        }
+                    }
+                    None => {
+                        self.problem(
+                            "a link points at no address this format can write — it has \
+                             neither an `href` nor a `doc` that is shaped like a document id",
+                        );
+                        inner
+                    }
+                },
             },
             // `MarkKind` is `#[non_exhaustive]`: a kind added by a later milestone must
             // refuse loudly here rather than export as nothing.

@@ -212,6 +212,17 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
   return {
     doc: data,
     body,
+    /**
+     * Where this page's document references point, **for whoever is reading it** (D-5).
+     *
+     * Taken off the document response rather than asked for separately: it is the answer the
+     * very read that produced this page reached, against this caller, so a reference and the
+     * page it sits in cannot come from two different permission verdicts. `??  {}` only for a
+     * response from an older API that carries no such key — never as a second filter, which
+     * `gw_store::Store::references_for` has already applied and which no client may re-apply
+     * or widen.
+     */
+    verweise: data.references ?? {},
     formeln,
     fences: codeBloecke,
     // The tree is NOT fetched here any more: the shell renders it on every view, so
