@@ -268,10 +268,12 @@ async fn the_address_of_a_file_carries_the_page_and_never_the_hash() {
 }
 
 #[tokio::test]
-async fn a_list_needs_read_on_the_page_and_tells_absent_from_forbidden() {
+async fn a_list_needs_read_on_the_page_and_says_nothing_about_a_page_it_refuses() {
+    // The two used to be 403 and 404, which said which addresses hold a page. They are one
+    // answer now — `tests/withheld.rs` asserts it down to the bytes, for every endpoint.
     let store = fixture().await;
     let (status, _, _) = anonymous(&store, "GET", "/api/attachments/geheim").await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _, _) = anonymous(&store, "GET", "/api/attachments/gibt-es-nicht").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _, _) = as_user(&store, "leser", "GET", "/api/attachments/raum", Vec::new()).await;
@@ -333,7 +335,7 @@ async fn a_download_is_authorised_against_the_page_and_not_against_the_bytes() {
         Vec::new(),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(
         !contains(&body, b"DIESE-BYTES-SIND-VERTRAULICH"),
         "the response body carried the file: {}",
@@ -347,7 +349,7 @@ async fn a_download_is_authorised_against_the_page_and_not_against_the_bytes() {
 
     // And an anonymous caller gets the same refusal, so the boundary is not "signed in".
     let (status, _, body) = anonymous(&store, "GET", "/api/attachment/gleich.png/geheim").await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(!contains(&body, b"DIESE-BYTES-SIND-VERTRAULICH"));
 
     // Anti-vacuity for the other direction: the restricted page's own reader gets the file
@@ -680,10 +682,10 @@ async fn a_file_whose_bytes_have_gone_answers_503_and_not_404() {
     assert_eq!(json(&body)["attachments"].as_array().unwrap().len(), 1);
 
     // The page is resolved BEFORE the mount is touched, so a caller who may not read the page
-    // learns nothing about the mount's health: 403 here, 503 for the same file, on the same
-    // page, for somebody who may read it.
+    // learns nothing about the mount's health — and now nothing about the page either: 404
+    // here, 503 for the same file, on the same page, for somebody who may read it.
     let (status, _, _) = anonymous(&store, "GET", "/api/attachment/weg.png/geheim").await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _, _) = as_user(
         &store,
         "chefin",

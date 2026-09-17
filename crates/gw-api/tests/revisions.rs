@@ -198,8 +198,10 @@ async fn revision_ids(store: &Arc<Store>, username: &str, path: &str) -> Vec<Str
 #[tokio::test]
 async fn the_history_of_a_page_a_caller_cannot_read_is_refused() {
     let store = fixture().await;
+    // 404, and the same one `/api/revisions/document/gibt-es-nicht` gets below: a history
+    // says a page exists and who works on it, so the refusal must say neither.
     let (status, body) = get_as(&store, "fremder", "/api/revisions/document/geheim").await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert!(
         !body.contains("Geheime"),
         "a refusal disclosed the very content it refused: {body}"
@@ -210,7 +212,7 @@ async fn the_history_of_a_page_a_caller_cannot_read_is_refused() {
 async fn an_anonymous_caller_gets_no_history_for_a_restricted_page() {
     let store = fixture().await;
     let (status, _) = get_anonymous(&store, "/api/revisions/document/geheim").await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -392,7 +394,7 @@ async fn the_source_of_a_revision_of_a_page_the_caller_cannot_read_is_refused() 
         &format!("/api/revisions/{}/source?path=/geheim", ids[0]),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert!(!body.contains("Geheime"));
 }
 

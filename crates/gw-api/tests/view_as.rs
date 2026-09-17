@@ -566,9 +566,19 @@ async fn viewing_as_somebody_reaches_nothing_they_cannot() {
     chef.view_as(&gast).await;
 
     for uri in ADMIN_ONLY {
+        // The two document paths answer 404 rather than 403, because `gast` may not read
+        // them and a refusal no longer says which addresses hold a page (`tests/withheld.rs`).
+        // The administrative endpoints are not path-keyed and keep their 403. What is
+        // asserted either way is the same: the substituted principal is the one being
+        // authorised, and it is not reaching anything.
+        let expected = if uri.starts_with("/api/documents/") {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::FORBIDDEN
+        };
         assert_eq!(
             chef.get(uri).await.status,
-            StatusCode::FORBIDDEN,
+            expected,
             "{uri} was still reachable while viewing as somebody who may not read it"
         );
     }

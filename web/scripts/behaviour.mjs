@@ -3457,18 +3457,25 @@ await check('P9 being refused a page is said in German, not in English', async (
   // granted. It said "You do not have access to this page." until this flow was walked.
   //
   // `/rundgang/nur-intern` is restricted to a group this fixture's identity is not in.
+  //
+  // It is **404** now, not 403, and the sentence is the one about a page that is not there.
+  // That is the same walkthrough's second finding: the pair of status codes let a signed-in
+  // relative enumerate which addresses hold a page. P11 below is the half that pins the
+  // conflation; this is the half that pins that what they read is still German.
   const response = await page.goto(BASE + '/rundgang/nur-intern', {
     waitUntil: 'domcontentloaded'
   });
-  assert(response?.status() === 403, `expected 403, got ${response?.status()}`);
+  assert(response?.status() === 404, `expected 404, got ${response?.status()}`);
 
   const text = await page.locator('main').innerText();
-  assert(
-    text.includes('nicht für Sie freigegeben'),
-    `the refusal is not the German one: ${text}`
-  );
+  assert(text.includes('Diese Seite gibt es nicht'), `the refusal is not the German one: ${text}`);
   assert(text.includes('Zurück zur Startseite'), `the way back is not in German: ${text}`);
-  for (const phrase of ['You do not have access', 'Back to the start page', 'Something went wrong']) {
+  for (const phrase of [
+    'You do not have access',
+    'Back to the start page',
+    'Something went wrong',
+    'Page not found'
+  ]) {
     assert(!text.includes(phrase), `English survived on the refusal page (${phrase}): ${text}`);
   }
 
@@ -3499,6 +3506,71 @@ await check('P10 the Protokoll names an invitation in German, not as a dotted ve
   // Anti-vacuity: the raw verbs are what the API sends, so their ABSENCE is the assertion.
   assert(!text.includes('invite.create'), `a dotted English verb reached the German log: ${text}`);
   assert(!text.includes('invite.revoke'), `a dotted English verb reached the German log: ${text}`);
+});
+
+await check('P11 a withheld page and one that is not there answer identically', async (page) => {
+  // The existence oracle, closed. Before this, `/api/links/backlinks`, the revision list,
+  // the attachment list and the per-page task list answered 403 for a page this identity
+  // may not read and 404 for an address holding nothing — so a relative with an account
+  // could map the wiki by guessing words. Addresses are guessable; the titles behind them
+  // are what the grants are hiding.
+  //
+  // Asserted at the API rather than on the rendered page, deliberately: the rendered pages
+  // differ by design, because the tab strip title-cases the address the reader typed
+  // (`fromSlug` in `web/src/lib/tabs.ts`) and the two addresses are different words. The
+  // disclosure was never in the tab; it was in the status code, and this is where it lives.
+  //
+  // `page.request` is a plain HTTP fetch through the browser's networking stack: it carries
+  // this identity and renders nothing.
+  const WITHHELD = '/rundgang/nur-intern';
+  const ABSENT = '/rundgang/gibt-es-nicht-und-gab-es-nie';
+
+  const endpoints = [
+    (p) => `/api/documents${p}`,
+    (p) => `/api/links/backlinks${p}`,
+    (p) => `/api/revisions/document${p}`,
+    (p) => `/api/attachments${p}`,
+    (p) => `/api/tasks/document${p}`,
+    (p) => `/api/topics/document${p}`
+  ];
+
+  for (const endpoint of endpoints) {
+    const withheld = await page.request.get(BASE + endpoint(WITHHELD));
+    const absent = await page.request.get(BASE + endpoint(ABSENT));
+
+    assert(
+      withheld.status() === 404,
+      `${endpoint(WITHHELD)} answered ${withheld.status()} for a page this identity may not read`
+    );
+    assert(
+      absent.status() === 404,
+      `${endpoint(ABSENT)} answered ${absent.status()} for an address holding nothing`
+    );
+
+    const withheldBody = await withheld.text();
+    const absentBody = await absent.text();
+    assert(
+      withheldBody === absentBody,
+      `${endpoint(WITHHELD)} and ${endpoint(ABSENT)} differ in the body: ` +
+        `${withheldBody} vs ${absentBody}`
+    );
+    for (const header of ['content-type', 'content-length']) {
+      const a = withheld.headers()[header];
+      const c = absent.headers()[header];
+      assert(a === c, `${endpoint(WITHHELD)}: ${header} is "${a}" and "${c}" — they differ`);
+    }
+  }
+
+  // Anti-vacuity, and it is the whole of the check's weight: this identity administers
+  // INVITE_PATH, so the same endpoints must answer 200 about it. Without this the loop
+  // above would pass against an API that had simply stopped working.
+  for (const endpoint of endpoints) {
+    const allowed = await page.request.get(BASE + endpoint(INVITE_PATH));
+    assert(
+      allowed.status() === 200,
+      `${endpoint(INVITE_PATH)} answered ${allowed.status()} for a page this identity administers`
+    );
+  }
 });
 
 

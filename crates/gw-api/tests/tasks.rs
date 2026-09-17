@@ -1025,21 +1025,38 @@ async fn a_page_that_is_no_projects_home_answers_an_empty_board() {
     assert!(titles(&global).contains(&"Unabgelegte Zeile".to_string()));
 }
 
-/// A **path** splits 404 from 403; an **id** conflates everything unreachable into 404.
-/// The two rules disagree deliberately and this endpoint takes both, so the split lives on
-/// the parameter rather than on the route — which is exactly where somebody copying one of
-/// the two branches would get it wrong.
+/// Both bindings now conflate everything unreachable into 404 — a **path** because a refusal
+/// that told itself apart from "absent" was an existence oracle (`tests/withheld.rs`), an
+/// **id** because a uuid has no existence worth protecting. They arrive there by different
+/// arguments, and this endpoint takes both, so each is asserted on its own parameter.
 #[tokio::test]
 async fn the_global_boards_two_bindings_take_the_two_answers_this_crate_has_settled() {
     let w = wide().await;
 
-    // A path: absent is 404, refused is 403. `/projekt/geheim` exists and `leser` may not
-    // read it — a plain GET of that page already says as much, so a 404 here would be a
-    // third answer to a question this wiki has settled.
-    let (status, _) = get(&w.store, Some("chef"), "/api/board?seite=/gibt-es-nicht").await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, _) = get(&w.store, Some("leser"), "/api/board?seite=/projekt/geheim").await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    // A path: `/projekt/geheim` exists and `leser` may not read it, and that must be
+    // indistinguishable from an address holding nothing — byte for byte, because a board
+    // bound to a page is something a page loader asks about every page it renders.
+    let refused_path = raw(
+        &w.store,
+        Some("leser"),
+        Method::GET,
+        "/api/board?seite=/projekt/geheim",
+        None,
+    )
+    .await;
+    let missing_path = raw(
+        &w.store,
+        Some("leser"),
+        Method::GET,
+        "/api/board?seite=/gibt-es-nicht",
+        None,
+    )
+    .await;
+    assert_eq!(refused_path.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        refused_path, missing_path,
+        "a page the caller may not read is distinguishable from one that is not there"
+    );
 
     // An id: a uuid nobody guesses, so there is no existence to protect and a refusal must
     // be indistinguishable from a project that is not there — byte for byte, or the endpoint
@@ -1835,13 +1852,15 @@ async fn a_pages_own_cards_follow_that_pages_read() {
         "the page's own card is missing: {body}"
     );
 
+    // 404, and the same one an address holding no page gets: a card carries a page's words,
+    // so the list must not confirm that the page is there. See `tests/withheld.rs`.
     let (status, _) = get(
         &f.store,
         Some("leser"),
         "/api/tasks/document/projekt/geheim",
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     let (status, _) = get(&f.store, Some("chef"), "/api/tasks/document/gibt-es-nicht").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -1859,15 +1878,13 @@ async fn a_pages_own_cards_follow_that_pages_read() {
 async fn a_project_is_made_on_a_page_you_may_write() {
     let f = fixture().await;
 
-    // Keyed by a PATH, so the split is `/api/documents`' own: 404 for a page that is not
-    // there, 403 for one the caller may not write — including one they may not read at all.
-    // Collapsing the second into 404 would be a third answer to a question this wiki has
-    // already settled, and would reveal less than a plain `GET /api/documents` on the same
-    // path already does.
+    // Keyed by a PATH, so the refusal is `/api/documents`' own, through the one function that
+    // decides it: 403 for a page `leser` may read but not write, and 404 for one they may not
+    // read — which is the same 404 an address holding nothing gets.
     // `/projekt` is already a project's home, and `leser` may read it — so a handler that
     // looked for the conflict before it authorised the caller would answer 409 here and tell
     // a reader something a 403 does not.
-    for path in ["/projekt/geheim", "/projekt/offen", "/projekt"] {
+    for path in ["/projekt/offen", "/projekt"] {
         let (status, body) = post(
             &f.store,
             Some("leser"),
@@ -1876,6 +1893,17 @@ async fn a_project_is_made_on_a_page_you_may_write() {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+    }
+
+    for path in ["/projekt/geheim", "/gibt-es-nicht"] {
+        let (status, body) = post(
+            &f.store,
+            Some("leser"),
+            "/api/projects",
+            json!({ "home_path": path }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
     }
 
     let (status, _) = post(
@@ -2209,9 +2237,9 @@ async fn may_write_on_the_wire_agrees_with_what_a_write_actually_does() {
 /// refusal.
 ///
 /// This is the whole of its disclosure surface (ADR 0010), so it is pinned rather than
-/// argued: a page somebody may not read answers 403 with no body, and one that is not there
-/// answers 404 — neither grows a `may_write` that would say the path exists, or that it is
-/// the sort of page somebody could edit.
+/// argued: a page somebody may not read answers 404 with no more body than one that is not
+/// there — neither grows a `may_write` that would say the path exists, or that it is the sort
+/// of page somebody could edit.
 #[tokio::test]
 async fn a_page_the_caller_may_not_read_says_nothing_about_writing_it() {
     let f = fixture().await;
@@ -2219,9 +2247,9 @@ async fn a_page_the_caller_may_not_read_says_nothing_about_writing_it() {
         (
             Some("leser"),
             "/api/documents/projekt/geheim",
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
         ),
-        (None, "/api/documents/projekt/offen", StatusCode::FORBIDDEN),
+        (None, "/api/documents/projekt/offen", StatusCode::NOT_FOUND),
         (
             Some("chef"),
             "/api/documents/gibt-es-nicht",

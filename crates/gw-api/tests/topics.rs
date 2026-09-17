@@ -286,8 +286,11 @@ async fn a_pages_topics_are_readable_by_whoever_may_read_the_page() {
 #[tokio::test]
 async fn what_a_page_is_about_is_refused_to_somebody_who_may_not_read_it() {
     let store = fixture().await;
+    // One answer for both, which is what `/api/topics/tagged/` has done all along — the two
+    // disagreeing was the clearest sign the convention was never uniform. `tests/withheld.rs`
+    // asserts the bytes.
     let (status, _) = get(&store, Some("leser"), "/api/topics/document/geheim").await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = get(&store, Some("leser"), "/api/topics/document/gibt-es-nicht").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
@@ -303,7 +306,8 @@ async fn re_filing_a_page_replaces_its_topics_and_needs_write_on_it() {
         json!({"topics": ["Neu"]}),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    // `leser` may not read `/geheim` either, so the refusal says nothing about the page.
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     let (status, body) = put(
         &store,
@@ -363,6 +367,8 @@ async fn filing_a_page_is_refused_to_an_anonymous_caller() {
         json!({"topics": ["Neu"]}),
     )
     .await;
+    // 403 and not 404: `/offen` is public, so an anonymous caller may read it and the
+    // refusal is about writing — which tells them nothing they could not already see.
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 

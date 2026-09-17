@@ -14,6 +14,7 @@
 //! `collab::authorise` use — and hand back exactly what the store returns. A second filter
 //! applied to the list here would just be a second place for the same property to be wrong.
 
+use super::docs::withheld_or_absent;
 use super::AppState;
 use crate::error::ApiError;
 use axum::extract::{Path, Query, State};
@@ -133,10 +134,9 @@ fn full_path(captured: &str) -> String {
 
 /// Which pages link to the page at `path`, filtered to what the caller may read.
 ///
-/// Existence is checked before permission, exactly as `docs::get_document` and
-/// `collab::authorise` do it: an absent path is 404 and a forbidden one is 403, because
-/// collapsing either into the other either hides a configuration mistake or confirms the
-/// existence of every path somebody guesses.
+/// A page this caller may not read is 404, indistinguishable from one that is not there —
+/// `super::docs::withheld_or_absent` is the whole rule and the reason for it. This endpoint
+/// was one of the four the invitation walkthrough enumerated the wiki with.
 pub async fn get_backlinks(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -145,21 +145,14 @@ pub async fn get_backlinks(
     let principal = state.principal(&jar).await;
     let path = full_path(&captured);
 
-    if !state
-        .store
-        .document_exists(&path)
-        .await
-        .map_err(ApiError::Internal)?
-    {
-        return Err(ApiError::NotFound);
-    }
-
-    let document = state
+    let Some(document) = state
         .store
         .document_for(&principal, &path, Action::Read)
         .await
         .map_err(ApiError::Internal)?
-        .ok_or(ApiError::Forbidden)?;
+    else {
+        return Err(withheld_or_absent(&state, &principal, &path).await);
+    };
 
     let backlinks = state
         .store

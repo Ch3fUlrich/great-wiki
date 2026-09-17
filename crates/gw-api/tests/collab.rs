@@ -196,19 +196,24 @@ async fn refused(store: &Arc<Store>, username: Option<&str>, path: &str) -> Stat
 
 #[tokio::test]
 async fn an_anonymous_upgrade_is_refused() {
+    // 404, not 403: an anonymous caller may not read `/handbuch` either, and a refusal that
+    // said which addresses hold a page would make this socket an existence oracle the
+    // interface probes on every page somebody opens. See `tests/withheld.rs`.
     let store = fixture().await;
     assert_eq!(
         refused(&store, None, "handbuch").await,
-        StatusCode::FORBIDDEN
+        StatusCode::NOT_FOUND
     );
 }
 
 #[tokio::test]
 async fn an_account_with_no_grant_is_refused() {
+    // And told nothing about the page, for `an_anonymous_upgrade_is_refused`'s reason:
+    // `fremde` may not read `/handbuch`.
     let store = fixture().await;
     assert_eq!(
         refused(&store, Some("fremde"), "handbuch").await,
-        StatusCode::FORBIDDEN
+        StatusCode::NOT_FOUND
     );
 }
 
@@ -253,10 +258,13 @@ async fn a_public_page_is_not_publicly_editable() {
 }
 
 #[tokio::test]
-async fn a_page_that_does_not_exist_is_404_and_a_forbidden_one_is_403() {
-    // The same split `/api/documents` makes, for the same reason: collapsing both to 404
-    // hides configuration mistakes, collapsing both to 403 confirms the existence of every
-    // path somebody guesses.
+async fn a_refusal_says_what_was_refused_only_to_somebody_who_may_read_the_page() {
+    // The same rule `/api/documents` makes, through the same function. `leserin` may read
+    // `/handbuch`, so "you may not edit this" tells her nothing she did not already know and
+    // sends her to ask for write rather than to check her spelling. `autorin` holds write on
+    // `/handbuch` and still learns nothing about an address that holds no page — and a third
+    // party who may not read `/handbuch` gets that same 404 for it (see the two tests above),
+    // which is what closes the oracle.
     let store = fixture().await;
     assert_eq!(
         refused(&store, Some("autorin"), "gibt-es-nicht").await,

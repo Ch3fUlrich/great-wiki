@@ -59,6 +59,11 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
   // »Sie«, like every other screen an invited reader meets. This loader was German before
   // the page loader beside it was, but in the other register, and a wiki that switches
   // person on its refusals reads as two different products.
+  //
+  // A page this caller may not read arrives as 404 and falls to `missing` below, which is
+  // the point: a history that answered "not for you" would say the page is there. The 403
+  // branch stays for the reason the page loader's does — this maps a status, it does not
+  // decide one.
   if (status === 403) error(403, GERMAN_REFUSALS.forbiddenHistory);
   if (!doc) error(404, GERMAN_REFUSALS.missing);
 

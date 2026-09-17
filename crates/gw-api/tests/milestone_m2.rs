@@ -268,12 +268,15 @@ async fn a_guest_in_a_team_reads_the_granted_subtree_and_provably_nothing_else()
     );
     assert_eq!(
         status_of(&store, Some("gast"), "/intern").await,
-        StatusCode::FORBIDDEN,
+        // 404 rather than 403 throughout: a page this caller may not read answers what a
+        // page that is not there answers, so a grant on one space cannot be used to map the
+        // others. See `tests/withheld.rs`.
+        StatusCode::NOT_FOUND,
         "holding an account was mistaken for having been granted something"
     );
     assert_eq!(
         status_of(&store, Some("gast"), "/anderer-raum").await,
-        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
         "a restricted space granted to nobody was readable"
     );
 
@@ -314,7 +317,7 @@ async fn a_guest_in_a_team_reads_the_granted_subtree_and_provably_nothing_else()
     );
     assert_eq!(
         status_of(&store, Some("gast"), "/raum").await,
-        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
         "the subtree was still readable after the membership that granted it was removed"
     );
 }

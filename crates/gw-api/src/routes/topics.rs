@@ -55,6 +55,7 @@
 //! rather than reconciled, because renaming either would break something real: the file
 //! format, or the vocabulary of the feature.
 
+use super::docs::withheld_or_absent;
 use super::AppState;
 use crate::error::ApiError;
 use axum::extract::{Path, State};
@@ -239,12 +240,11 @@ pub async fn topic_page(
 
 /// What one page is about.
 ///
-/// Existence before permission, exactly as `super::docs::get_document` and
-/// `super::links::get_backlinks` do it: an absent path is 404 and a forbidden one is 403.
-/// That is the right way round *here* — unlike [`topic_page`] above — because the fact in
-/// question is a page's, and a page's presence at a path is not what its grants are hiding;
-/// collapsing the two would either hide a typo behind "you spelled it wrong" or confirm the
-/// existence of every path somebody guesses.
+/// A page this caller may not read is 404, indistinguishable from one that is not there —
+/// `super::docs::withheld_or_absent` is the whole rule, and it is the rule [`topic_page`]
+/// above has followed all along. That the two now agree is the point: `/api/topics/tagged/`
+/// answering 404 for both while `/api/topics/document/` answered 403 for one of them was the
+/// clearest sign the convention had never been uniform.
 pub async fn document_topics(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -287,20 +287,11 @@ pub async fn set_document_topics(
         // The reason names what was rejected and why, because a refusal nobody can act on is
         // not a refusal — the same standard `super::tasks` holds a bad status to.
         TopicOutcome::Rejected(reason) => Err(ApiError::Invalid(reason)),
-        // 404 for an absent page, 403 for one this caller may not write. The store conflates
-        // them; this is where the two are told apart, and it costs one read that has already
-        // been decided.
-        TopicOutcome::Refused => {
-            if !state
-                .store
-                .document_exists(&path)
-                .await
-                .map_err(ApiError::Internal)?
-            {
-                return Err(ApiError::NotFound);
-            }
-            Err(ApiError::Forbidden)
-        }
+        // 403 for a page this caller may read but not write, 404 for one they may not read
+        // and for one that is not there. The store conflates all three; `withheld_or_absent`
+        // is where the one distinction that may be drawn is drawn, and it costs one read on
+        // a request that has already been refused.
+        TopicOutcome::Refused => Err(withheld_or_absent(&state, &principal, &path).await),
     }
 }
 
@@ -310,23 +301,17 @@ async fn read_topics(
     principal: &Principal,
     path: &str,
 ) -> Result<Vec<TopicView>, ApiError> {
-    if !state
-        .store
-        .document_exists(path)
-        .await
-        .map_err(ApiError::Internal)?
-    {
-        return Err(ApiError::NotFound);
-    }
     // `document_topics_for` puts the page through the accessor itself and answers `None`
     // when it refuses; asking `document_for` here as well would be a second decision about
-    // the same page. The existence check above is not that — it decides a status code, not
-    // an outcome.
-    state
+    // the same page. `withheld_or_absent` is not that either — it decides a status code on a
+    // request that has already been refused, not an outcome.
+    match state
         .store
         .document_topics_for(principal, path)
         .await
         .map_err(ApiError::Internal)?
-        .map(|topics| topics.into_iter().map(Into::into).collect())
-        .ok_or(ApiError::Forbidden)
+    {
+        Some(topics) => Ok(topics.into_iter().map(Into::into).collect()),
+        None => Err(withheld_or_absent(state, principal, path).await),
+    }
 }

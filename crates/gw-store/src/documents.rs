@@ -288,12 +288,17 @@ impl Store {
     /// Whether anything lives at `path`. Public because it is the *only* thing a caller
     /// outside this crate is allowed to learn without a principal.
     ///
-    /// The HTTP layer needs it to tell 404 from 403: [`Store::document_for`] returns `None`
-    /// both for a path that is absent and for one the caller may not have, and collapsing
-    /// the two either hides configuration mistakes or confirms the existence of every path
-    /// somebody guesses. The seeder needs it too, to refuse to invent a parent and to name
-    /// a collision. A boolean is the whole answer, so this discloses strictly less than the
-    /// response it is used to choose.
+    /// **The HTTP layer no longer uses it to choose a status code, and that is the point of
+    /// this paragraph rather than an omission.** It used to: [`Store::document_for`] answers
+    /// `None` both for a path that is absent and for one the caller may not have, and
+    /// `gw-api` asked this to tell them apart — 404 for the first, 403 for the second. That
+    /// pair of status codes was an existence oracle (ADR 0022), so both are 404 now and the
+    /// question is not asked. Nothing outside this crate should start asking it again to
+    /// decide what a caller is told.
+    ///
+    /// What still needs it is the seeder, which refuses to invent a parent and names a
+    /// collision — neither of which is answered to a caller over the wire. A boolean is the
+    /// whole answer, so this discloses strictly less than anything built on it could.
     pub async fn document_exists(&self, path: &str) -> Result<bool> {
         let row: Option<(i64,)> =
             sqlx::query_as("SELECT 1 FROM documents WHERE path = ?1 AND deleted_at IS NULL")

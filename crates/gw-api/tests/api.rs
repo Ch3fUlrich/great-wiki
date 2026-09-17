@@ -155,12 +155,14 @@ async fn public_document_is_readable_anonymously() {
 }
 
 #[tokio::test]
-async fn restricted_document_is_forbidden_anonymously() {
-    // 403 not 404: the proxy already knows the path exists, and a misleading 404 makes
-    // debugging an authentication problem needlessly hard.
+async fn restricted_document_is_not_found_anonymously() {
+    // 404, and the same 404 `/api/documents/gibt-es-nicht` gets. This used to be 403 — "the
+    // proxy already knows the path exists, and a misleading 404 makes debugging an
+    // authentication problem needlessly hard" — which was true while the only caller who
+    // could meet it was the person who could fix it. `tests/withheld.rs` has the rest.
     assert_eq!(
         get(app(seed().await, None), "/api/documents/geheim").await,
-        StatusCode::FORBIDDEN
+        StatusCode::NOT_FOUND
     );
 }
 
@@ -179,11 +181,12 @@ async fn restricted_document_is_readable_by_the_admins_group() {
 async fn restricted_document_is_refused_to_an_authenticated_caller_with_no_groups() {
     // The rule M1's deleted visibility stub got wrong: holding an account was enough for
     // it, so creating one silently handed over everything not marked public. Under the
-    // engine an account by itself confers nothing beyond public (D-M2-1).
+    // engine an account by itself confers nothing beyond public (D-M2-1) — and the refusal
+    // does not confirm the path either.
     let identity = gw_api::Identity::dev("gast", &[]);
     assert_eq!(
         get(app(seed().await, Some(identity)), "/api/documents/geheim").await,
-        StatusCode::FORBIDDEN
+        StatusCode::NOT_FOUND
     );
 }
 
@@ -236,16 +239,18 @@ async fn a_granted_guest_reaches_only_the_granted_subtree() {
         get_as(&store, "guest", "/api/documents/handbuch/onboarding").await,
         StatusCode::OK
     );
-    // Not granted: refused, even though the same principal is authenticated.
+    // Not granted: refused, even though the same principal is authenticated — and refused
+    // with the answer a page that does not exist gets, so the grant they hold on
+    // `/handbuch` cannot be used to map the pages they hold nothing on.
     assert_eq!(
         get_as(&store, "guest", "/api/documents/geheim").await,
-        StatusCode::FORBIDDEN
+        StatusCode::NOT_FOUND
     );
     // An account is not a membership: `internal` follows the Authelia group (D-M2-1), and
     // a local guest has none.
     assert_eq!(
         get_as(&store, "guest", "/api/documents/intern").await,
-        StatusCode::FORBIDDEN
+        StatusCode::NOT_FOUND
     );
     // Public survives everything.
     assert_eq!(
@@ -283,7 +288,7 @@ async fn a_deactivated_principal_is_refused_everything_but_public() {
 
     assert_eq!(
         get_as(&store, "guest", "/api/documents/handbuch").await,
-        StatusCode::FORBIDDEN
+        StatusCode::NOT_FOUND
     );
     assert_eq!(
         get_as(&store, "guest", "/api/documents/oeffentlich").await,
@@ -297,10 +302,12 @@ async fn a_deactivated_principal_is_refused_everything_but_public() {
 }
 
 #[tokio::test]
-async fn an_absent_path_is_404_and_a_forbidden_one_is_403() {
-    // Both are `None` from the store on purpose; this layer decides which to reveal.
-    // Collapsing them either way loses something: 404 for everything hides configuration
-    // mistakes, 403 for everything confirms the existence of any path somebody guesses.
+async fn an_absent_path_and_a_withheld_one_are_one_answer() {
+    // Both are `None` from the store, and this layer now reveals the same thing about both.
+    // It used to reveal which was which, and that pair of status codes was an existence
+    // oracle: `guest` holds a grant on `/handbuch` and could have mapped the rest of the
+    // wiki by guessing addresses. `tests/withheld.rs` asserts the bytes; this asserts that
+    // the endpoint every other one copied has stopped telling them apart.
     let store = seed_with_acl().await;
     assert_eq!(
         get_as(&store, "guest", "/api/documents/gibt-es-nicht").await,
@@ -308,7 +315,7 @@ async fn an_absent_path_is_404_and_a_forbidden_one_is_403() {
     );
     assert_eq!(
         get_as(&store, "guest", "/api/documents/geheim").await,
-        StatusCode::FORBIDDEN
+        StatusCode::NOT_FOUND
     );
 }
 
@@ -344,5 +351,5 @@ async fn a_session_cookie_naming_a_real_user_confers_nothing_on_its_own() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }

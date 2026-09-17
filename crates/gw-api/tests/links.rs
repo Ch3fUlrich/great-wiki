@@ -4,8 +4,8 @@
 //! `gw-store`'s own `links` tests already pin the filtering property itself — a candidate
 //! the caller may not read is omitted, and the page being asked about answers nothing at
 //! all if the caller may not read IT. This file is about the wire on top of that: the route
-//! exists under its own prefix, an absent page is 404 and a forbidden one is 403 exactly as
-//! `/api/documents` and `/api/collab` already are, and the JSON shape is what the frontend
+//! exists under its own prefix, a page the caller may not read is 404 exactly as an absent
+//! one is — `/api/documents` and `/api/collab` answer the same — and the JSON shape is what the frontend
 //! was promised — `path` and `title`, and nothing that would leak an internal id.
 //!
 //! The fixture: `/ziel` is public and has no outgoing links. `/quelle` (public) and
@@ -156,9 +156,12 @@ async fn get_as(store: &Arc<Store>, username: &str, uri: &str) -> (StatusCode, S
 
 #[tokio::test]
 async fn backlinks_are_refused_to_somebody_who_cannot_read_the_page() {
+    // And refused with the answer an address holding no page gets, so a list of what points
+    // at a page cannot be used to find out that the page is there. `tests/withheld.rs`
+    // asserts the two are identical down to the bytes.
     let store = fixture().await;
     let (status, _) = get_anonymous(&store, "/api/links/backlinks/geheim").await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

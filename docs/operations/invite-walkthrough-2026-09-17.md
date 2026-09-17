@@ -64,7 +64,7 @@ invitee against every surface the owner named.
 
 | View | Result |
 |---|---|
-| The page itself (`/rundgang/nur-intern`) | 403, German refusal, none of its words |
+| The page itself (`/rundgang/nur-intern`) | 403, German refusal, none of its words — **404 since the decision below, and the German refusal is now the missing-page one** |
 | Page tree (sidebar and `/api/tree`) | absent |
 | Start page, "Alle Seiten" | absent |
 | Board (`/aufgaben`, `/api/board`) | absent |
@@ -74,9 +74,9 @@ invitee against every surface the owner named.
 | Projects (`/projekte`) | absent |
 | Link picker (editor, »Link«) | absent — eleven pages offered, not twelve |
 | Embed picker (editor, »Seite einbetten«) | absent |
-| Backlinks | 403 |
-| Revision history | 403 |
-| Attachments | 403 |
+| Backlinks | 403 — **404 since the decision below** |
+| Revision history | 403 — **404 since the decision below** |
+| Attachments | 403 — **404 since the decision below** |
 
 **The tab strip needs a note, because it looks like a leak and is not.** The refusal page's
 tab is labelled »Nur intern«, which is the page's real title. It is not the page's title: it
@@ -86,7 +86,16 @@ has exactly two sources, the tree and the slug, and `/api/tree` as this invitee 
 does not contain the page. The comment on `labelFor` already says this is the one place in
 the strip where a title could have leaked, and it does not.
 
-### One thing for the owner to decide, not a defect
+### One thing for the owner to decide, not a defect — **decided, the same day**
+
+> **Settled: 404 for both.** The owner reversed the split within hours of this walk. Every
+> path-keyed endpoint in the API now answers 404 for a page the caller may not read, byte for
+> byte what it answers for an address holding nothing; the diagnostic survives because whoever
+> administers a path can *read* what is at it and is shown the page. ADR 0022 has the whole
+> argument, `crates/gw-api/tests/withheld.rs` is the fence, and behaviour check **P11** walks
+> it. The rest of this section is left exactly as the walk found it, because what was true
+> before the decision is what makes the decision legible.
+
 
 Four derived endpoints answer **403 for a restricted page and 404 for a page that does not
 exist**:
@@ -377,7 +386,7 @@ instance administrator. That is the more interesting case, and it is what makes 
 this identity administers one page and may not attach a team, so the panel must withhold the
 field rather than offer a form that will be refused.
 
-The harness is **102/102** (was 92). Writing Group P turned up two things worth recording,
+The harness is **103/103** (102 as this was written; P11 came with the decision above). Writing Group P turned up two things worth recording,
 because both are the kind of failure that reports "ok":
 
 - **A group inserted before the reachability gate's `browser.close()` never runs, and the
