@@ -396,3 +396,21 @@ graph-full:
     run -m graphify extract . --backend openai --model deepseek-v4-flash
     run -m graphify cluster-only . --backend=openai --model=deepseek-v4-flash
     run -m graphify label . --backend=openai --model=deepseek-v4-flash
+
+# Reclaim the disk this repo's own gates fill. `cargo test` leaves every superseded test
+# binary behind in target/debug/deps — measured at 30 GB after a fortnight of agents — and
+# nothing prunes it; docker keeps every build layer; a superseded image tag stays local
+# after it is in Harbor. This box has hit 99% full twice from exactly these. Costs one full
+# rebuild (~10 min) the next time anything compiles; run it when nothing is building.
+reclaim:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if pgrep -f "cargo (test|build|run|clippy)" >/dev/null; then
+      echo "something is compiling; run this when nothing is." >&2; exit 1
+    fi
+    df -h / | tail -1
+    cargo clean
+    docker builder prune -f
+    docker image prune -f
+    git worktree prune
+    df -h / | tail -1

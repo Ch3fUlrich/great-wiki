@@ -125,7 +125,10 @@ rm -rf target/debug/incremental # safe any time nothing is building; it is pure 
 ```
 
 The repo's own `target/` is legitimately ~15–25 GB and must **not** be deleted while anything
-is building. `df -h /` before you conclude a strange failure is something cleverer.
+is building — but it also **grows without bound**: every `cargo test` after a dependency change
+leaves the previous test binaries in `target/debug/deps`, and nothing prunes them. Measured at
+30 GB after a fortnight, on a disk that was at 99%. `just reclaim` is the answer, when nothing
+is compiling. `df -h /` before you conclude a strange failure is something cleverer.
 
 ## Hard rules
 
