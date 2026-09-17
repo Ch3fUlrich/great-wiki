@@ -76,6 +76,15 @@ cargo run -p gw-api -- seed --content content-example    # loads content; exits 
 Every task ends green on all of the above before it is committed. A task that cannot end
 green is not finished — say so rather than moving on.
 
+**`just behaviour` is one at a time, across every agent on the machine.** It reseeds one
+shared file (`data/behaviour-fixture.db`) destructively and binds fixed ports; a second run
+started while one is live clobbers the fixture under it, and the result is failures that are
+purely the race — an edge count of two, a reference that "did not resolve" — that look like
+real defects and cost real time. Different ports are not enough. An orchestrator running
+agents in one checkout must tell them to wait for each other, and a failed run leaves
+`great-wiki serve`, `vite dev` and `node build/index.js` alive on their ports: check with
+`ps` before assuming the next refusal is somebody else's server.
+
 **Building in a worktree? Run `just agent-ci`, not `just ci`.** It is the same gate, pointed
 at the main checkout's target directory with incremental off — not as an optimisation, but as
 the thing that stops this filling the disk. If you need the exports by hand:
