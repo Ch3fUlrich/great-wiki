@@ -41,6 +41,7 @@
 //! says which operation it is.
 
 use super::admin::path_admin;
+use super::docs::withheld_or_absent;
 use super::AppState;
 use crate::error::ApiError;
 use axum::extract::{Path, State};
@@ -207,20 +208,11 @@ pub async fn delete_document(
     {
         TrashOutcome::Done(summary) => Ok(Json(summary.into())),
         TrashOutcome::Blocked(reason) => Err(ApiError::Conflict(reason)),
-        // 404 for an absent page, 403 for one this caller may not delete. The store conflates
-        // them; this is where they are told apart, and `document_exists` answers exactly the
-        // one bit needed to choose — the same call `super::docs::get_document` makes.
-        TrashOutcome::Refused => {
-            if !state
-                .store
-                .document_exists(&path)
-                .await
-                .map_err(ApiError::Internal)?
-            {
-                return Err(ApiError::NotFound);
-            }
-            Err(ApiError::Forbidden)
-        }
+        // 403 for a page this caller may read but not delete, 404 for one they may not read
+        // and for one that is not there. The store conflates all three; `withheld_or_absent`
+        // is the one place in this crate where the single distinction that may be drawn is
+        // drawn, and a delete refused by it has already changed nothing.
+        TrashOutcome::Refused => Err(withheld_or_absent(&state, &principal, &path).await),
     }
 }
 

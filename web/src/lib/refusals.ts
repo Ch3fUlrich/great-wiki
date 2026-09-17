@@ -15,12 +15,18 @@
  * and the history loader beside it must not drift apart: the same refusal reached by two
  * routes should read the same way.
  *
- * **Neither sentence names the page.** `/api/documents` answers 403 with no body, so there
- * is nothing here to leak by accident, and keeping these as constants keeps it that way — a
- * refusal that named the title would hand over exactly what the permission filter exists to
- * withhold. The 404 and the 403 stay distinguishable, which is the same deliberate split
- * `gw-api/src/routes/docs.rs` documents at the endpoint: collapsing them would hide a
- * misconfiguration behind "you spelled it wrong".
+ * **Neither sentence names the page.** The API answers a refusal with no body beyond a fixed
+ * word, so there is nothing here to leak by accident, and keeping these as constants keeps it
+ * that way — a refusal that named the title would hand over exactly what the permission
+ * filter exists to withhold.
+ *
+ * **`missing` is what an invited reader now meets on a page they were not granted, and
+ * `forbidden` is not.** `/api/documents` answers 404 for a page this caller may not read,
+ * byte for byte what it answers for a page that is not there — the split it used to make was
+ * an existence oracle, and `gw-api/src/routes/docs.rs` carries the whole argument. The 403
+ * sentence is kept and still thrown, because the loader maps a status rather than deciding
+ * one: if anything ever answers 403 about a page, saying "ask for access" is the right thing
+ * to say, and this is where it is said in German.
  */
 export const GERMAN_REFUSALS = {
   forbidden:

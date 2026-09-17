@@ -75,10 +75,10 @@
 //! # Two answers, and which questions get which
 //!
 //! For a **path** — `POST /api/projects`, `GET /api/tasks/document/…`, `GET /api/board?seite=`
-//! — an absent page is 404 and a refused one is 403, exactly as `/api/documents`,
-//! `/api/links/backlinks` and `/api/revisions/document` split them. Collapsing both into 404
-//! hides configuration mistakes; collapsing both into 403 confirms the existence of every
-//! path somebody guesses.
+//! — a page the caller may not read is 404, byte for byte what an address holding nothing
+//! answers, and a page they may read but not write is 403. That is `super::docs`'
+//! `withheld_or_absent`, which every path-keyed route in this crate ends in and which carries
+//! the whole argument, including what this file used to say instead (ADR 0022).
 //!
 //! For a **project or task id** — `GET /api/projects/{id}/board`, `GET /api/board?projekt=`
 //! — everything unreachable is 404 — an id is a uuid nobody guesses, so there is no
@@ -89,11 +89,13 @@
 //! thing first, and only a refusal asks the second, read-only question. A refused change
 //! writes nothing, so asking afterwards is free.
 //!
-//! **`GET /api/board` takes one of each, so the split lives on the parameter rather than on
-//! the route.** `?seite=` is path-keyed and gets 404/403; `?projekt=` is id-keyed and gets
-//! 404 for everything. That is not an inconsistency to be tidied away later: the two
-//! parameters are asking about two different kinds of thing, and a path is guessable where a
-//! uuid is not.
+//! **`GET /api/board` takes one of each, so the rule lives on the parameter rather than on
+//! the route.** `?seite=` is path-keyed and `?projekt=` is id-keyed. Both answer 404 for
+//! everything the caller cannot reach, and they reach that by different arguments — the path
+//! because a refusal that told itself apart from "absent" was an existence oracle, the id
+//! because a uuid has no existence worth protecting. Agreeing today is not the same as being
+//! one rule, and the two parameters are asking about two different kinds of thing: a path is
+//! guessable where a uuid is not, so a change to one is not a change to the other.
 //!
 //! # DEVIATION from the plan, and it is the trap this repository has hit twice
 //!
@@ -122,6 +124,7 @@
 //!   page, and both endpoints return the whole card, so a third way to fetch one adds
 //!   surface and answers nothing new.
 
+use super::docs::withheld_or_absent;
 use super::AppState;
 use crate::error::ApiError;
 use axum::extract::{Path, Query, State};
@@ -553,9 +556,10 @@ pub async fn list_projects(
 
 /// Make the page at `home_path` the home of a project (D-3).
 ///
-/// Keyed by path, so existence comes before permission: 404 for a page that is not there,
-/// 403 for one the caller may not write. `Store::create_project` asks the same accessor
-/// again on its own behalf and is the call that actually decides.
+/// Keyed by path, so the refusal goes through `super::docs::withheld_or_absent`: 403 for a
+/// page the caller may read but not write, 404 for one they may not read **and** for one that
+/// is not there. `Store::create_project` asks the same accessor again on its own behalf and
+/// is the call that actually decides.
 pub async fn create_project(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -564,22 +568,16 @@ pub async fn create_project(
     let principal = state.principal(&jar).await;
     let path = full_path(&body.home_path);
 
-    if !state
-        .store
-        .document_exists(&path)
-        .await
-        .map_err(ApiError::Internal)?
-    {
-        return Err(ApiError::NotFound);
-    }
     // Authorised before the conflict is looked for, so that somebody who may not write the
     // page never learns from a 409 whether it is already a project's home.
-    let home = state
+    let Some(home) = state
         .store
         .document_for(&principal, &path, Action::Write)
         .await
         .map_err(ApiError::Internal)?
-        .ok_or(ApiError::Forbidden)?;
+    else {
+        return Err(withheld_or_absent(&state, &principal, &path).await);
+    };
 
     if state
         .store
@@ -733,8 +731,9 @@ pub async fn board(
 ///
 /// - `?projekt=<id>` — an id, so everything unreachable is 404 and a refusal is
 ///   indistinguishable from a project that is not there.
-/// - `?seite=<pfad>` — a path, so an absent page is 404 and a refused one is 403, exactly as
-///   a plain `GET` of that page already answers. It is resolved to the project homed there
+/// - `?seite=<pfad>` — a path, so a page this caller may not read is 404 and so is one that
+///   is not there, exactly as a plain `GET` of that page already answers
+///   (`super::docs::withheld_or_absent`). It is resolved to the project homed there
 ///   through `projects_for`, which is the permission-filtered listing — the same one
 ///   `create_project` asks about a duplicate home — so "which project is this page the home
 ///   of" has one answer in this crate rather than a second, board-shaped one. A page that is
@@ -764,24 +763,19 @@ pub async fn global_board(
         ),
         (None, Some(captured)) => {
             let path = full_path(captured);
-            if !state
-                .store
-                .document_exists(&path)
-                .await
-                .map_err(ApiError::Internal)?
-            {
-                return Err(ApiError::NotFound);
-            }
             // Authorised on the page itself before anything is said about a project homed
             // there. Otherwise "is this page a project's home" is a question anybody could
             // ask of any page — and the answer names the project, its tag and when it was
             // made.
-            state
+            if state
                 .store
                 .document_for(&principal, &path, Action::Read)
                 .await
                 .map_err(ApiError::Internal)?
-                .ok_or(ApiError::Forbidden)?;
+                .is_none()
+            {
+                return Err(withheld_or_absent(&state, &principal, &path).await);
+            }
 
             let homed = state
                 .store
@@ -947,6 +941,11 @@ pub async fn remove_task(
 /// Keyed by path, and resolved through `document_for` exactly as `links::get_backlinks`
 /// resolves the id `backlinks_for` takes: the client already has the path, and an id it
 /// supplied would have to be turned back into a path to be authorised anyway.
+///
+/// A page this caller may not read is 404, indistinguishable from one that is not there —
+/// `super::docs::withheld_or_absent` is the whole rule. A card carries a page's words onto
+/// somebody else's board, so this was one of the four endpoints the invitation walkthrough
+/// enumerated the wiki with.
 pub async fn document_tasks(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -955,20 +954,14 @@ pub async fn document_tasks(
     let principal = state.principal(&jar).await;
     let path = full_path(&captured);
 
-    if !state
-        .store
-        .document_exists(&path)
-        .await
-        .map_err(ApiError::Internal)?
-    {
-        return Err(ApiError::NotFound);
-    }
-    let document = state
+    let Some(document) = state
         .store
         .document_for(&principal, &path, Action::Read)
         .await
         .map_err(ApiError::Internal)?
-        .ok_or(ApiError::Forbidden)?;
+    else {
+        return Err(withheld_or_absent(&state, &principal, &path).await);
+    };
 
     let tasks = state
         .store

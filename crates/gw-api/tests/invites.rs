@@ -1269,12 +1269,15 @@ async fn the_invited_account_reaches_the_invited_path_and_public_content_and_not
     );
     assert_eq!(
         status_of(&app, &mut jar, "/api/documents/intern").await,
-        StatusCode::FORBIDDEN,
+        // 404 and not 403: an invitee is exactly the caller the existence oracle was found
+        // by, so a page they were not granted answers what a page that is not there answers.
+        // See `tests/withheld.rs`.
+        StatusCode::NOT_FOUND,
         "an account by itself must not confer the internal wiki"
     );
     assert_eq!(
         status_of(&app, &mut jar, "/api/documents/anderer-raum").await,
-        StatusCode::FORBIDDEN
+        StatusCode::NOT_FOUND
     );
     assert_eq!(
         status_of(&app, &mut jar, "/api/documents/offen").await,
@@ -1329,8 +1332,8 @@ async fn a_team_carrying_invite_puts_them_in_the_team_and_they_reach_what_it_rea
     );
     assert_eq!(
         status_of(&app, &mut jar, "/api/documents/raum").await,
-        StatusCode::FORBIDDEN,
-        "the team's reach is not everybody's reach"
+        StatusCode::NOT_FOUND,
+        "the team's reach is not everybody's reach, and the refusal does not map the rest"
     );
 }
 

@@ -41,6 +41,11 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
     cookie
   );
 
+  // A page this caller may not read now arrives as 404, indistinguishable from one that is
+  // not there — see `gw-api/src/routes/docs.rs`, which argues why it used to be otherwise.
+  // So `missing` is the sentence an invited reader meets on a page they were not granted.
+  // The 403 branch stays because this loader maps a status rather than deciding one, and a
+  // refusal that does say "not yours" must still say it in German.
   if (status === 403) error(403, GERMAN_REFUSALS.forbidden);
   if (!data) error(404, GERMAN_REFUSALS.missing);
 

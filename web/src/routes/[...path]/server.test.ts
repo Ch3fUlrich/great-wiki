@@ -804,8 +804,13 @@ describe('being refused a page', () => {
 
   it('tells a refused reader nothing about the page beyond the address they typed', async () => {
     // A refusal that named the title would hand over the one thing the filter exists to
-    // withhold — and `/api/documents` answers 403 with no body at all, so there is nothing
-    // here to leak by accident. This pins that the message stays a constant.
+    // withhold — and the API answers a refusal with no body beyond a fixed word, so there is
+    // nothing here to leak by accident. This pins that the message stays a constant.
+    //
+    // 403 is no longer what `/api/documents` answers about a page somebody may not read (it
+    // answers 404, byte for byte what an absent page answers — `crates/gw-api/tests/withheld.rs`).
+    // This still exercises the branch, because the loader maps a status rather than deciding
+    // one, and the constant must stay a constant whatever produces it.
     const thrown = await refusal(403);
     expect(thrown.body.message).not.toContain('Tabellen');
     expect(thrown.body.message).not.toContain('/rundgang');

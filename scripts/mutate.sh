@@ -451,6 +451,45 @@ mutation crates/gw-store/src/acl.rs killed \
   's@        if !permits(principal, action, visibility, \&grants, baseline) {@        if false {@' \
   'documents: the one accessor every read goes through actually refuses'
 
+# --- what a refusal may say about the page it refuses (ADR 0022) -----------------------
+#
+# The existence oracle, and the one function that closes it. Every path-keyed handler in
+# `gw-api` ends its failing branch in `docs::withheld_or_absent`, which answers 403 only for
+# a caller who may already read the page and 404 for everybody else — the same 404, byte for
+# byte, that an address holding nothing answers. Before this, backlinks, the revision list,
+# the attachment list and the per-page task list each decided it themselves, and a signed-in
+# relative could map the wiki by asking them about addresses.
+#
+# Four mutations, and the reason there are four is that each of them is a DIFFERENT wrong
+# answer that a suite could plausibly miss:
+#
+#   - the 403 arm taken for a caller who may not read (the oracle, reinstated);
+#   - the 404 arm taken for one who may (a refusal that lies to somebody looking at the page,
+#     which is the failure mode that would make an interface unusable rather than unsafe, and
+#     which nothing would catch if the fence only ever asserted 404);
+#   - the wrong ACTION, which is the tempting refactor: asking whether they may *write*
+#     rather than *read* looks like it tightens the check and in fact hands the 404 to every
+#     reader; and
+#   - the wrong CALLER, which is the mutation that proves the verdict is about the person
+#     asking rather than a fixed principal the fixture happens to satisfy.
+#
+# None can pass vacuously. `tests/withheld.rs` sweeps fifteen path-keyed requests in both
+# directions and carries two anti-vacuity tests of its own — an admin of the path is shown
+# the page, and a reader who may not write is told what was refused — so a helper that
+# refused everybody, or permitted everybody, fails before a mutation is made.
+mutation crates/gw-api/src/routes/docs.rs killed \
+  '/pub(crate) async fn withheld_or_absent/,/^}$/ s/        Ok(Some(_)) => ApiError::Forbidden,/        Ok(Some(_)) => ApiError::NotFound,/' \
+  'withheld: a reader who may not write is told what was refused, not that the page is gone'
+mutation crates/gw-api/src/routes/docs.rs killed \
+  '/pub(crate) async fn withheld_or_absent/,/^}$/ s/        Ok(None) => ApiError::NotFound,/        Ok(None) => ApiError::Forbidden,/' \
+  'withheld: a page the caller may not read answers what an absent page answers'
+mutation crates/gw-api/src/routes/docs.rs killed \
+  '/pub(crate) async fn withheld_or_absent/,/^}$/ s/        .document_for(principal, path, Action::Read)/        .document_for(principal, path, Action::Write)/' \
+  'withheld: the question is whether they may READ the page, never whether they may write it'
+mutation crates/gw-api/src/routes/docs.rs killed \
+  '/pub(crate) async fn withheld_or_absent/,/^}$/ s/        .document_for(principal, path, Action::Read)/        .document_for(\&gw_auth::Principal::anonymous(), path, Action::Read)/' \
+  'withheld: the verdict is about the CALLER, not about some principal the fixture satisfies'
+
 # --- revisions: the append-only history under every page -----------------------------
 #
 # Two different kinds of wrong answer live here, and both are below.
@@ -1909,9 +1948,12 @@ probe_for() {
     # The markdown renderer and the export round trip. Both integration binaries, plus the
     # crate's own unit tests, and nothing else in gw-api touches this file.
     crates/gw-api/src/export.rs) echo "-p gw-api --lib --test export --test export_markdown" ;;
-    # The document-reference and embed handlers. `docs.rs` is where both maps are put on the
-    # wire, and these two integration binaries are what assert what they may contain.
-    crates/gw-api/src/routes/docs.rs) echo "-p gw-api --test references --test embeds" ;;
+    # The document-reference and embed handlers, and the refusal rule every path-keyed route
+    # in this crate ends in. `references` and `embeds` are what assert what those two maps may
+    # contain. `withheld` is named because nothing in the other two binaries
+    # asserts a status code, so without it every ADR 0022 mutation would fall through to a
+    # whole-workspace build.
+    crates/gw-api/src/routes/docs.rs) echo "-p gw-api --test references --test embeds --test withheld" ;;
     *) echo "" ;;
   esac
 }

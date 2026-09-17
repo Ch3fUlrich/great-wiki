@@ -55,6 +55,7 @@
 //! function and in
 //! `docs/decisions/0014-what-a-file-has-to-be-to-be-attached.md`.
 
+use super::docs::withheld_or_absent;
 use super::AppState;
 use crate::error::ApiError;
 use axum::body::Body;
@@ -185,22 +186,12 @@ fn percent_encode_segment(segment: &str) -> String {
     out
 }
 
-/// Tell 404 from 403 for a page-addressed attachment request.
-///
-/// The same two questions [`super::docs::get_document`] asks, in the same order and for the
-/// same reason: collapsing both to 404 hides configuration mistakes behind a status code that
-/// says "you spelled it wrong", and collapsing both to 403 confirms the existence of every
-/// path somebody guesses. Reached only after the operation has already been refused, so it
-/// costs nothing on the path that succeeds.
-async fn absent_or_forbidden(state: &AppState, path: &str) -> ApiError {
-    match state.store.document_exists(path).await {
-        Ok(false) => ApiError::NotFound,
-        Ok(true) => ApiError::Forbidden,
-        Err(error) => ApiError::Internal(error),
-    }
-}
-
 /// The `Anhänge` list of a page. Needs **read** on the page.
+///
+/// A page this caller may not read is 404, indistinguishable from one that is not there —
+/// [`withheld_or_absent`] is the whole rule. An attachment list names files somebody chose to
+/// put on a page, so it was one of the four endpoints the invitation walkthrough enumerated
+/// the wiki with.
 pub async fn list(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -217,7 +208,7 @@ pub async fn list(
         .await
         .map_err(ApiError::Internal)?
     else {
-        return Err(absent_or_forbidden(&state, &path).await);
+        return Err(withheld_or_absent(&state, &principal, &path).await);
     };
 
     Ok(Json(AttachmentsResponse {
@@ -249,10 +240,13 @@ pub async fn download(
         .await
         .map_err(ApiError::Internal)?
     else {
-        // Three ways to get here and they are different answers: no such page (404), a page
-        // this caller may not read (403), and a readable page carrying no such file (404).
-        // The store conflates the first two, so the page read is asked again — only on the
-        // failing path — to tell them apart.
+        // Three ways to get here — no such page, a page this caller may not read, and a
+        // readable page carrying no such file — and all three are 404. The first two are
+        // [`withheld_or_absent`]'s rule; the third is the ordinary meaning of the word. The
+        // readable case is asked FIRST and separately, because `withheld_or_absent` would
+        // answer 403 for it: the page is readable, so the refusal it describes is about the
+        // page, and here there is no refusal about the page at all — the file simply is not
+        // there. Only on the failing path, so a download that succeeds pays nothing for it.
         if state
             .store
             .document_for(&principal, &path, Action::Read)
@@ -262,7 +256,7 @@ pub async fn download(
         {
             return Err(ApiError::NotFound);
         }
-        return Err(absent_or_forbidden(&state, &path).await);
+        return Err(withheld_or_absent(&state, &principal, &path).await);
     };
 
     // Opened before a single header is sent, so "the row is here and the bytes are not" is a
@@ -495,7 +489,7 @@ pub async fn upload(
             Json(AttachmentView::of(attachment, &path)),
         )),
         AttachOutcome::Blocked(reason) => Err(ApiError::Conflict(reason)),
-        AttachOutcome::Refused => Err(absent_or_forbidden(&state, &path).await),
+        AttachOutcome::Refused => Err(withheld_or_absent(&state, &principal, &path).await),
     }
 }
 
@@ -530,7 +524,7 @@ pub async fn detach(
         // Told only to somebody who may already write the page, so it confirms nothing they
         // could not have listed.
         DetachOutcome::NoSuchFile => Err(ApiError::NotFound),
-        DetachOutcome::Refused => Err(absent_or_forbidden(&state, &path).await),
+        DetachOutcome::Refused => Err(withheld_or_absent(&state, &principal, &path).await),
     }
 }
 

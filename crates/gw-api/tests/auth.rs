@@ -880,7 +880,9 @@ async fn groups_are_replaced_on_every_sign_in_never_merged() {
         send(&app, "GET", "/api/documents/geheim", &mut jar)
             .await
             .status(),
-        StatusCode::FORBIDDEN,
+        // 404 rather than 403: a refusal no longer says the page is there. See
+        // `tests/withheld.rs`. What this asserts is the reach, which is unchanged.
+        StatusCode::NOT_FOUND,
         "losing `admins` must lose the reach it conferred"
     );
 }
@@ -983,7 +985,9 @@ async fn a_forged_session_cookie_confers_nothing() {
         send(&app, "GET", "/api/documents/geheim", &mut jar)
             .await
             .status(),
-        StatusCode::FORBIDDEN
+        // 404 rather than 403: a refusal no longer says the page is there. See
+        // `tests/withheld.rs`. What this asserts is the reach, which is unchanged.
+        StatusCode::NOT_FOUND
     );
 }
 
@@ -1010,7 +1014,9 @@ async fn an_expired_session_is_rejected() {
         send(&app, "GET", "/api/documents/geheim", &mut jar)
             .await
             .status(),
-        StatusCode::FORBIDDEN,
+        // 404 rather than 403: a refusal no longer says the page is there. See
+        // `tests/withheld.rs`. What this asserts is the reach, which is unchanged.
+        StatusCode::NOT_FOUND,
         "an expired session must not keep the reach it once had"
     );
 }
@@ -1081,7 +1087,9 @@ async fn deactivating_a_principal_ends_its_session_on_the_next_request() {
         send(&app, "GET", "/api/documents/geheim", &mut jar)
             .await
             .status(),
-        StatusCode::FORBIDDEN
+        // 404 rather than 403: a refusal no longer says the page is there. See
+        // `tests/withheld.rs`. What this asserts is the reach, which is unchanged.
+        StatusCode::NOT_FOUND
     );
     assert_eq!(
         send(&app, "GET", "/api/documents/oeffentlich", &mut jar)
@@ -1230,8 +1238,8 @@ async fn an_unverified_address_does_not_merge_and_reaches_nothing() {
         send(&app, "GET", "/api/documents/geheim", &mut jar)
             .await
             .status(),
-        StatusCode::FORBIDDEN,
-        "the attacker reached the invited account's page"
+        StatusCode::NOT_FOUND,
+        "the attacker reached the invited account's page (ADR 0022: withheld reads as absent)"
     );
 }
 
@@ -1261,7 +1269,8 @@ async fn an_absent_verification_claim_is_treated_exactly_like_a_false_one() {
         send(&app, "GET", "/api/documents/geheim", &mut jar)
             .await
             .status(),
-        StatusCode::FORBIDDEN
+        StatusCode::NOT_FOUND,
+        "ADR 0022: a page you may not read looks like a page that is not there"
     );
 }
 
@@ -1290,7 +1299,8 @@ async fn a_verified_address_reaches_only_the_account_that_carries_it() {
         send(&app, "GET", "/api/documents/geheim", &mut jar)
             .await
             .status(),
-        StatusCode::FORBIDDEN
+        StatusCode::NOT_FOUND,
+        "ADR 0022: a page you may not read looks like a page that is not there"
     );
 }
 

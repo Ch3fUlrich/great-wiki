@@ -39,10 +39,11 @@
 //!
 //! # Two answers, and which questions get which
 //!
-//! For a **path** — the timeline — an absent page is 404 and a forbidden one is 403, exactly
-//! as `/api/documents` and `/api/links/backlinks` split them: collapsing both into 404 hides
-//! configuration mistakes, and collapsing both into 403 confirms the existence of every path
-//! somebody guesses.
+//! For a **path** — the timeline — a page this caller may not read is 404, byte for byte the
+//! answer a page that does not exist gets. `docs::withheld_or_absent` is the rule and carries
+//! the reasoning, including what this file used to say instead and why it stopped being true.
+//! A history says who works on a page and when they were last at it, so it was one of the
+//! four endpoints the invitation walkthrough enumerated the wiki with.
 //!
 //! For a **revision id** everything unreachable is 404, and the conflation is deliberate. An
 //! id is a uuid nobody guesses, so there is no existence to protect; distinguishing "no such
@@ -68,6 +69,7 @@
 //! in the address bar), a path is resolved by the permission-checked accessor anyway, and an
 //! id supplied by the client would have to be turned back into a path to be authorised.
 
+use super::docs::withheld_or_absent;
 use super::AppState;
 use crate::error::ApiError;
 use crate::export::{self, FileMeta};
@@ -228,8 +230,10 @@ fn parse_body(revision: &Revision) -> Result<Block, ApiError> {
 
 /// The history of the page at `path`, newest first.
 ///
-/// Existence before permission, so an absent page is 404 and a forbidden one is 403 — the
-/// same split `docs::get_document` and `links::get_backlinks` make, for the same reason.
+/// A page this caller may not read is 404, indistinguishable from one that is not there —
+/// `super::docs::withheld_or_absent` is the whole rule and the reason for it. A history is a
+/// list of who wrote what and when, so this was among the four endpoints the invitation
+/// walkthrough enumerated the wiki with.
 pub async fn list(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -238,24 +242,17 @@ pub async fn list(
     let principal = state.principal(&jar).await;
     let path = full_path(&captured);
 
-    if !state
-        .store
-        .document_exists(&path)
-        .await
-        .map_err(ApiError::Internal)?
-    {
-        return Err(ApiError::NotFound);
-    }
-
     // The one permission-checked accessor. `revisions_for` below asks it again through
     // `may()`, which is not redundancy to be tidied away: this call decides the status code,
     // that one decides what is disclosed, and the property belongs to the store.
-    let document = state
+    let Some(document) = state
         .store
         .document_for(&principal, &path, Action::Read)
         .await
         .map_err(ApiError::Internal)?
-        .ok_or(ApiError::Forbidden)?;
+    else {
+        return Err(withheld_or_absent(&state, &principal, &path).await);
+    };
 
     let revisions = state
         .store
@@ -325,20 +322,14 @@ pub async fn source(
     let principal = state.principal(&jar).await;
     let path = full_path(&query.path);
 
-    if !state
-        .store
-        .document_exists(&path)
-        .await
-        .map_err(ApiError::Internal)?
-    {
-        return Err(ApiError::NotFound);
-    }
-    let document = state
+    let Some(document) = state
         .store
         .document_for(&principal, &path, Action::Read)
         .await
         .map_err(ApiError::Internal)?
-        .ok_or(ApiError::Forbidden)?;
+    else {
+        return Err(withheld_or_absent(&state, &principal, &path).await);
+    };
 
     let revision = readable(&state, &principal, &id).await?;
     // The two halves of the request have to be about the same page. Without this, a

@@ -101,6 +101,7 @@
 //! rather than here, where it would apply to one and read as though it applied to all.
 
 use crate::error::ApiError;
+use crate::routes::docs::withheld_or_absent;
 use crate::routes::AppState;
 use axum::extract::ws::{close_code, CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
@@ -383,9 +384,11 @@ fn full_path(captured: &str) -> String {
 ///    principal would write into the live document as them, and the next snapshot would
 ///    file it in the history under their name. Checked first, so no store read for a
 ///    document even happens in that mode.
-/// 2. **Existence, then permission.** The same split `/api/documents` makes: an absent path
-///    is 404 and a forbidden one is 403, because collapsing them either hides configuration
-///    mistakes or confirms the existence of every path somebody guesses.
+/// 2. **Permission, and then which refusal it earned.** The same rule `/api/documents` makes,
+///    through the same function: a page this caller may read but not write is 403, and one
+///    they may not read is 404 — byte for byte what a page that is not there answers. See
+///    [`super::docs::withheld_or_absent`]. An editing socket is a particularly loud oracle to
+///    leave open, because the interface probes it for every page somebody opens.
 /// 3. **[`Action::Write`], through the store.** `document_for` consults `can()`; nothing
 ///    here decides anything about grants, baselines or visibility.
 async fn authorise(
@@ -405,21 +408,14 @@ async fn authorise(
 
     let principal = state.principal(jar).await;
 
-    if !state
-        .store
-        .document_exists(path)
-        .await
-        .map_err(ApiError::Internal)?
-    {
-        return Err(ApiError::NotFound);
-    }
-
-    let document = state
+    let Some(document) = state
         .store
         .document_for(&principal, path, Action::Write)
         .await
         .map_err(ApiError::Internal)?
-        .ok_or(ApiError::Forbidden)?;
+    else {
+        return Err(withheld_or_absent(state, &principal, path).await);
+    };
 
     Ok((principal, document))
 }
