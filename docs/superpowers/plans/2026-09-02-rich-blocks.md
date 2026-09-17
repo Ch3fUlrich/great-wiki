@@ -1143,3 +1143,25 @@ The permission rule from the section above stands unchanged: the embedded page i
 through the same accessor as any read, per document; an unreadable target renders as the
 author's reference text and discloses neither title nor existence; depth is one; a cycle is
 stopped at render and named.
+
+### D-29: An orphaned embed stays, and says so (2026-09-17)
+
+When the heading a section-embed anchors to is deleted or merged away, the embedding page
+keeps its framed block, now reading that the section no longer exists, with a link to the
+source page. Rejected: falling back to the whole page — it never shows an empty frame, and it
+quietly swaps a dosage table for an entire page the author never meant to quote. Nothing here
+vanishes silently; the same rule a detached task follows (D-8), and for the same reason.
+
+### D-30: Embedded checkboxes are shown read-only, owned by the source
+
+A transcluded section may hold a checklist. Its boxes render inside the frame with their live
+state, and ticking one is done on the source page — a click goes there. One task, one record,
+one board (D-2: the record owns the state). Rejected: hiding the boxes in embeds, which is
+never ambiguous and makes a quoted checklist stop reading as a checklist. Consequence for
+reconciliation: a transclusion block has no children in the stored body — it is a reference —
+so publishing the embedding page mints no task records for it, and must not.
+
+### The invite walkthrough happens after this milestone
+
+The roadmap's note stands; the owner chose to finish transclusion first and then walk the
+invite flow end to end with everything in place, rather than before it.
