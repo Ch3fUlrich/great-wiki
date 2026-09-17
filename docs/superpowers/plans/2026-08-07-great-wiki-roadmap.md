@@ -199,3 +199,24 @@ library.
 out of the way and stays in the page's history. Rejected: hiding it into an archive (one more
 place to look) and author deletion (the only thing in this wiki that would vanish without
 trace — every other surface here appends, detaches or trashes).
+
+### Two more, from the invite walkthrough (2026-09-17)
+
+**A withheld page answers 404 to everyone but an admin of its path.** Backlinks, history,
+attachments and tasks answered 403 for a page the caller may not read and 404 for one that
+does not exist — an existence oracle a signed-in relative could enumerate paths with. That
+split was a written decision (403 keeps a grant mistake diagnosable) taken with one user.
+Now: 404 for both to anyone who is not an admin on the path; an admin still sees 403, so
+the diagnostic survives for exactly the person who can act on it. Topics already answered
+404 for both. Rejected: keeping 403 (paths are guessable words, but the *titles* are not, and
+a title is one grant away from a path that is known to exist).
+
+**One person, one identity: an Authelia account is merged into a local one by email.** An
+invitation names an email; the person accepts it and sets a password; when somebody later
+signs in through Authelia whose *verified* email matches, they are the same principal — same
+grants, same history, one credential each way and no second password to end up in a chat.
+Rejected: keeping the two flows apart with a sentence of guidance (two flows for one family
+is the thing that gets explained wrong), and an invitation that pre-grants a homelab
+username (a reference to an account that does not exist yet, and a username is not a thing
+a relative knows). The merge key is the email Authelia asserts as verified, never one the
+person types at sign-in.
