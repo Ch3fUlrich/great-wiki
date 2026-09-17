@@ -1,6 +1,18 @@
 # 0007 — The Content-Security-Policy is issued by the application, not by either proxy
 
-**Status:** Accepted (2026-08-20)
+**Status:** Accepted (2026-08-20), one directive amended (2026-09-17)
+
+> **Amendment, 2026-09-17 — `frame-src` is `'self'`, and one route answers with a policy of
+> its own.** [ADR 0018](0018-how-a-diagram-reaches-the-page.md)'s D-26 moved Mermaid into an
+> `<iframe>` served from `/_diagramm`, because the library injects a `<style>` element while it
+> measures text and `style-src 'self'` refused it four times per diagram — in production only.
+> So `frame-src` opens from `'none'` to `'self'` (one origin, this one, one document deep: the
+> frame's own response sets it back to `'none'`), and that one response is served
+> `style-src 'self' 'unsafe-inline'` by `$lib/csp`'s `diagramFramePolicy` in
+> `hooks.server.ts`. **`'unsafe-inline'` on `style-src` is still refused for every page of this
+> wiki**, which is what the frame exists to make possible; `script-src`, `frame-ancestors` and
+> everything else are unchanged on both. Group M of `web/scripts/behaviour.mjs` asserts all of
+> it against a production build.
 
 ## Context
 
@@ -65,7 +77,7 @@ inline to the `sveltekit()` plugin in `vite.config.ts` and split out by SvelteKi
 
 ```
 default-src 'self';
-frame-src 'none';
+frame-src 'self';        (was 'none' — see the amendment at the top)
 connect-src 'self';
 font-src 'self';
 img-src 'self' data:;
@@ -177,7 +189,9 @@ in production mode.
   deployment, and it is a decision of its own.
 - **The edge keeps its `X-Frame-Options: SAMEORIGIN`.** `frame-ancestors 'self'` says the
   same thing to a modern browser, but the edge's copy also covers every response that never
-  reaches either policy.
+  reaches either policy. It is also what makes `frame-src 'self'` safe to have opened: both
+  halves are needed for the diagram frame, and `SAMEORIGIN` permits exactly the one
+  this application does.
 - **`'strict-dynamic'` was tried and not adopted.** Added to `script-src` as a spike, it let
   the nonce'd bootstrap propagate trust to TipTap's and Yjs's dynamically imported chunks,
   and the editor worked fully with no other change — Chromium's console confirmed it was

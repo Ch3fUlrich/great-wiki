@@ -27,6 +27,7 @@ import type { SidebarMode, TopicSummary } from '$lib/topics';
 
 const tree: TreeNode[] = [
   {
+    id: '0199c0de-0000-7000-8000-000000000001',
     path: '/rundgang',
     slug: 'rundgang',
     title: 'Rundgang',
@@ -34,6 +35,7 @@ const tree: TreeNode[] = [
     visibility: 'restricted',
     children: [
       {
+        id: '0199c0de-0000-7000-8000-000000000002',
         path: '/rundgang/tabellen',
         slug: 'tabellen',
         title: 'Tabellen',
@@ -59,7 +61,8 @@ function html(
     nodes = tree,
     topics = themen,
     themenFehler = null,
-    seitenleiste = 'seiten'
+    seitenleiste = 'seiten',
+    rahmen = undefined
   }: {
     me?: Me;
     tabHrefs?: string[];
@@ -68,12 +71,13 @@ function html(
     topics?: TopicSummary[];
     themenFehler?: string | null;
     seitenleiste?: SidebarMode;
+    rahmen?: true;
   } = {},
   inhalt = '<p>Inhalt</p>'
 ): string {
   return render(Layout, {
     props: {
-      data: { me, tree: nodes, tabHrefs, hier, themen: topics, themenFehler, seitenleiste },
+      data: { me, tree: nodes, tabHrefs, hier, themen: topics, themenFehler, seitenleiste, ...(rahmen ? { rahmen } : {}) },
       children: createRawSnippet(() => ({ render: () => inhalt }))
     }
   }).body.replace(/<!--.*?-->/g, '');
@@ -281,5 +285,36 @@ describe('what the links in the shell carry', () => {
   it('leaves the skip link alone: it is a fragment, not a place', () => {
     const out = html({ tabHrefs: ['/rundgang', '/graph'], hier: '/graph' });
     expect(out).toContain('href="#content"');
+  });
+});
+
+describe('the diagram frame is not a view of this wiki (D-26)', () => {
+  // `/_diagramm` is a document loaded into a hidden `<iframe>` so that Mermaid has a DOM to
+  // measure text in under a policy of its own ($lib/csp's `diagramFramePolicy`). SvelteKit
+  // has no way for a route to opt out of the ROOT layout, so the opt-out is in the layout
+  // and this is what holds it there.
+  it('renders the routed view and nothing else at all', () => {
+    const out = html({ rahmen: true }, '<p>Zeichner</p>');
+    expect(out).toContain('<p>Zeichner</p>');
+    for (const nicht of [
+      'Zum Inhalt springen',
+      // Without the closing quote: Svelte appends its own scoping class to the attribute.
+      'class="shell',
+      'aria-label="Seitenbaum"',
+      'aria-label="Hauptbereiche"',
+      'great&#8209;wiki'
+    ]) {
+      expect(out, nicht).not.toContain(nicht);
+    }
+  });
+
+  it('is the one address that gets it, and every other page keeps the workspace', () => {
+    // The failure this rules out is the interesting direction: a shell that vanished for a
+    // real page would be obvious, and a frame that quietly grew one would not — it is
+    // invisible by construction, and the effect it would bring with it writes the reader's
+    // open tabs to a `localStorage` the frame SHARES with the page that created it.
+    const out = html();
+    expect(out).toContain('class="shell');
+    expect(out).toContain('Zum Inhalt springen');
   });
 });

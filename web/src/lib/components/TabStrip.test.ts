@@ -18,6 +18,7 @@ import type { TreeNode } from '$lib/api';
 
 const tree: TreeNode[] = [
   {
+    id: '0199c0de-0000-7000-8000-000000000001',
     path: '/rundgang',
     slug: 'rundgang',
     title: 'Rundgang',

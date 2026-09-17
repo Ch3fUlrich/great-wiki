@@ -10,9 +10,14 @@
    * requires for an uploaded SVG, and its reasoning is about the mechanism rather than about
    * where the bytes came from: generated SVG is not exempt because we generated it, since every
    * byte of it is a function of text somebody with write access to one page typed.
-   * `$lib/blocks/mermaid` documents what the library does to `document.body` while it draws, and
-   * which barrier holds during that window. See
-   * [ADR 0018](../../../../docs/decisions/0018-how-a-diagram-reaches-the-page.md).
+   *
+   * **And since D-26 the library is not in this document at all.** `drawDiagram` talks to a
+   * hidden `<iframe>` served from one route of this same application, with a policy scoped to
+   * that route; Mermaid measures text in THAT document's body and posts back a string. So the
+   * sentence above is now true of the whole of the drawing rather than of the finished picture
+   * only — author-written diagram text never enters this page in any form. `$lib/blocks/mermaid`
+   * carries the mechanism and `web/src/routes/_diagramm/rahmen.ts` carries the sandbox
+   * reasoning. See [ADR 0018](../../../../docs/decisions/0018-how-a-diagram-reaches-the-page.md).
    *
    * # Three states, and only one of them is a picture
    *
@@ -60,7 +65,9 @@
 
   /**
    * Too big to draw, decided from the text alone — so the answer is server-rendered and a
-   * reader with no JavaScript is told as much as one with it.
+   * reader with no JavaScript is told as much as one with it. Asked here rather than in the
+   * frame for exactly that reason: a refusal that had to cross a `postMessage` boundary could
+   * not be in the first response.
    */
   const zuGross = $derived(diagramRefusal(source));
 
@@ -71,9 +78,10 @@
    * Draw it, in the browser, after the page is already readable.
    *
    * An effect rather than a `load`: mermaid needs the DOM to measure text, so it cannot run on
-   * the server at all, and an effect does not run there. That is also what makes the library a
-   * fetch this page pays for only if it holds a diagram — see `$lib/blocks/mermaid` for why the
-   * `browser` guard around the import is what keeps it out of the server bundle.
+   * the server at all, and an effect does not run there. That is also what makes the whole of
+   * it — the frame, and the library inside it — something this page pays for only if it holds a
+   * diagram: the frame is created lazily, on the first call to `drawDiagram` and never before,
+   * so a page with no diagram loads no second document and fetches no renderer.
    */
   $effect(() => {
     const text = source;

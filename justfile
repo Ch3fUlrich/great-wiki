@@ -144,7 +144,15 @@ behaviour-fixture:
 #
 # Fully self-contained: provisions its own fixture ({{behaviour_db}}, via `behaviour-fixture`
 # above) and starts its own backend and web dev server against it, rather than trusting
-# whatever `just dev` a developer may already have pointed at their own database. That
+# whatever `just dev` a developer may already have pointed at their own database.
+#
+# THREE servers, not two, since D-26: the API, `npm run dev` on 5173, and a real production
+# build (adapter-node) on 4174. The third exists for Group M alone, because the
+# Content-Security-Policy is the one thing about this application that genuinely differs
+# between `npm run dev` and a deployment — SvelteKit adds `'unsafe-inline'` to `style-src` in
+# development — so a policy assertion made against the dev server passes vacuously. It is
+# built fresh each run and both extra ports are overridable
+# (`GW_BEHAVIOUR_PROD_PORT=4175 just behaviour`). That
 # used to be the whole bug — the harness passed or failed depending on what state a
 # developer's local database happened to be in, and a check that could not even run (no
 # grant to edit with) silently reported "ok" instead of failing loudly. A fresh clone with
@@ -192,6 +200,17 @@ behaviour: behaviour-fixture
     export GW_BIND="127.0.0.1:${api_port}"
     export GW_API="http://127.0.0.1:${api_port}"
     base="${SHOT_BASE:-http://127.0.0.1:5173}"
+    # A SECOND web server, and this one is a real production build (adapter-node).
+    #
+    # Every check above this line drives `npm run dev`, and dev is not production in exactly
+    # the place the Content-Security-Policy matters: SvelteKit adds `'unsafe-inline'` to
+    # `style-src` in development so it can inject its own component styles, so a check that
+    # asserted "no policy violation" against `just dev` would pass vacuously and say nothing
+    # about what a reader gets. Group M is the group that could not be written without this,
+    # and it exists because the alternative — ADR 0018's "verified by hand against a
+    # production build" — is a promise nobody can keep twice.
+    prod_port="${GW_BEHAVIOUR_PROD_PORT:-4174}"
+    prod_base="http://127.0.0.1:${prod_port}"
 
     # This recipe owns the dev stack for the run rather than sharing whatever is already on
     # these ports: the fixture above is only meaningful if the server under test is the one
@@ -210,6 +229,21 @@ behaviour: behaviour-fixture
       echo "Something is already answering on $base for the same reason. Stop it first." >&2
       exit 1
     fi
+    if curl -sS -o /dev/null -m 2 "$prod_base"; then
+      echo "Something is already answering on $prod_base, where this recipe wants to run the" >&2
+      echo "PRODUCTION build. Stop it, or pick another port:" >&2
+      echo "    GW_BEHAVIOUR_PROD_PORT=4175 just behaviour" >&2
+      exit 1
+    fi
+
+    # Built here rather than assumed: `web/build` may be stale, may be from another branch,
+    # or may not exist at all, and a Group M run against yesterday's policy is worse than no
+    # Group M at all. It is the same `npm run build` `just build` runs.
+    echo "building the production bundle for Group M ..."
+    # In a SUBSHELL, and that is not decoration: `cd web` in this shell would leave every
+    # line below it — the two `bash -c 'cd web …'` starts and the `$PWD` the docker volume
+    # mount is built from — resolving against `web/` instead of the repository root.
+    ( {{node}} cd web && npm run build >/dev/null )
 
     # `setsid` gives each process its own process group, so `kill -- -$pid` below can stop
     # BOTH it and whatever it forked (`cargo run` execs a child process for the built
@@ -222,9 +256,24 @@ behaviour: behaviour-fixture
     api_pid=$!
     setsid bash -c '{{node}} cd web && npm run dev' &
     web_pid=$!
+    # `ORIGIN` is adapter-node's: without it a POST is refused as cross-site. Nothing in
+    # Group M posts, and it is set anyway so that a check added later does not fail for a
+    # reason that has nothing to do with what it is checking. `GW_API` is already exported
+    # above and is what the server-side loads talk to — adapter-node proxies nothing, so
+    # `/api` from the BROWSER does not exist on this port. Group M reads pages; it must not
+    # grow a check that needs the API from the client.
+    # SINGLE-quoted, with the two variables passed through the environment instead of
+    # interpolated. `{{node}}` expands to text containing double quotes, so writing this as
+    # `bash -c "{{node}} … PORT=${prod_port} …"` ENDS the string at the first of them and the
+    # rest of the line runs in this shell — which manifests as `cd: web: No such file or
+    # directory` twice and a dev server that never starts, naming neither quoting nor this
+    # line. The recipe's other `bash -c` is single-quoted for the same reason.
+    PORT="${prod_port}" HOST=127.0.0.1 ORIGIN="${prod_base}" \
+      setsid bash -c '{{node}} cd web && node build/index.js' &
+    prod_pid=$!
     cleanup() {
-      kill -- "-$api_pid" "-$web_pid" >/dev/null 2>&1 || true
-      wait "$api_pid" "$web_pid" 2>/dev/null || true
+      kill -- "-$api_pid" "-$web_pid" "-$prod_pid" >/dev/null 2>&1 || true
+      wait "$api_pid" "$web_pid" "$prod_pid" 2>/dev/null || true
     }
     trap cleanup EXIT
 
@@ -242,9 +291,26 @@ behaviour: behaviour-fixture
       exit 1
     fi
 
+    echo "waiting for $prod_base (production build) ..."
+    up=""
+    for _ in $(seq 1 60); do
+      if curl -fsS -o /dev/null -m 2 "$prod_base/"; then
+        up=1
+        break
+      fi
+      sleep 1
+    done
+    if [ -z "$up" ]; then
+      echo "the production build never answered 200 on $prod_base — check the output above" >&2
+      echo "Group M is the only group that checks the REAL policy; a run without it is not a" >&2
+      echo "run, so this refuses rather than skipping." >&2
+      exit 1
+    fi
+
     docker run --rm --network host --user "$(id -u):$(id -g)" \
       -v "$PWD/web/scripts:/scripts:ro" -e HOME=/tmp \
-      -e SHOT_BASE="$base" -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+      -e SHOT_BASE="$base" -e SHOT_BASE_PROD="$prod_base" \
+      -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
       "$image" \
       sh -c 'mkdir -p /tmp/pw && cd /tmp/pw && npm init -y >/dev/null && npm i playwright@1.56.0 >/dev/null && cp /scripts/behaviour.mjs . && node behaviour.mjs'
 

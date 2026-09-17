@@ -105,12 +105,26 @@ export default defineConfig({
 					// the directive whose failure looks like "the editor just never connects".
 					'connect-src': ['self'],
 
-					// Nothing is embedded and nothing embeds this. `frame-ancestors 'self'` is
-					// the modern spelling of the X-Frame-Options: SAMEORIGIN the edge already
-					// sends; both are kept, because the edge's copy also covers the responses
-					// SvelteKit never renders.
+					// Nothing embeds this. `frame-ancestors 'self'` is the modern spelling of
+					// the X-Frame-Options: SAMEORIGIN the edge already sends; both are kept,
+					// because the edge's copy also covers the responses SvelteKit never renders.
+					// It is also what stops anyone else embedding the diagram frame below.
 					'frame-ancestors': ['self'],
-					'frame-src': ['none'],
+
+					// LOOSENED FROM 'none' TO 'self', and it is the only directive D-26 moves.
+					// One page of this application embeds one other page of this application:
+					// `/_diagramm` (see $lib/blocks/diagram's DIAGRAM_FRAME_PATH), the document
+					// Mermaid runs in. It has to be a real response rather than a `srcdoc` or an
+					// `about:blank` frame, because a frame with a local URL INHERITS its
+					// embedder's policy — which is the policy the frame exists to get away from.
+					//
+					// 'self' and nothing wider. In particular NOT `data:`, which is what
+					// mermaid's `securityLevel: 'sandbox'` would need and what ADR 0018 refuses
+					// by name: it would hand a general XSS-hosting primitive to this policy in
+					// exchange for a library setting. The frame's own response sets `frame-src`
+					// back to 'none' ($lib/csp's diagramFramePolicy), so the opening reaches
+					// exactly one document deep.
+					'frame-src': ['self'],
 
 					// Plugins. Nothing uses them; `<object>` and `<embed>` are script-execution
 					// sinks that survive most other hardening.

@@ -2501,12 +2501,13 @@ await check('K7 detaching a file leaves the prose exactly as it was, and the pag
 // Against `/rundgang/was-schon-geht`, which `content-example` seeds with one ```mermaid fence.
 // It needs no grant: these checks only read.
 //
-// ONE HONEST LIMITATION, because it is the shape of failure this feature is most likely to
-// have. This harness drives `npm run dev`, and SvelteKit adds `'unsafe-inline'` to `style-src`
-// in development (see `web/src/lib/csp.ts`), so the CSS-injection barrier ADR 0018 relies on is
-// NOT in force here. A green run says the diagram draws and that no console error was raised;
-// it does not say the production policy admits it. That is verified against a production build
-// by hand, and ADR 0018 says so.
+// THE LIMITATION THAT USED TO BE HERE IS NOW GROUP M'S JOB. This harness drives
+// `npm run dev`, and SvelteKit adds `'unsafe-inline'` to `style-src` in development (see
+// `web/src/lib/csp.ts`), so a policy assertion made here would pass vacuously. That was
+// written down as an honest limitation and then verified by hand against a production build,
+// which is a promise nobody keeps twice. `just behaviour` now starts an adapter-node server
+// on a second port as well, and Group M at the bottom of this file asks the real policy the
+// real question.
 const DIAGRAM_PAGE = '/rundgang/was-schon-geht';
 
 await check('L1 a diagram is text in the first response and a picture after it', async (page) => {
@@ -2555,16 +2556,16 @@ await check('L1 a diagram is text in the first response and a picture after it',
   const alt = await bilder.first().getAttribute('alt');
   assert(alt?.includes('graph TD;'), `the image has no description of the diagram: ${alt}`);
 
-  // One expected complaint is filtered, by name, and it is worth knowing about. In PRODUCTION
-  // every diagram logs `Refused to apply inline style … style-src 'self' 'nonce-…'`: mermaid
-  // inserts a `<style>` element while it measures text, and refusing an injected style element
-  // is precisely what that directive is for. Verified by hand against a production build — the
-  // drawing is unaffected, because that `<style>` is serialised into the returned SVG and is
-  // the image's own business once it is inside the `<img>`. It does not appear HERE, because
-  // SvelteKit adds `'unsafe-inline'` to `style-src` in development; the exclusion is written
-  // down so that a green run in dev is not read as a promise about production.
-  const echte = klagen.filter((zeile) => !/Refused to apply inline style/.test(zeile));
-  assert(echte.length === 0, `the browser complained while drawing: ${echte.join(' | ')}`);
+  // NOTHING is filtered any more, and that is the change (D-26).
+  //
+  // Until 2026-09-17 this line excluded `Refused to apply inline style … style-src 'self'
+  // 'nonce-…'` by name: mermaid ran on the page, inserted a style ELEMENT while it measured
+  // text, and the policy refused it — four times per diagram in production, invisibly here,
+  // because SvelteKit's development `style-src` carries `'unsafe-inline'`. The renderer now
+  // runs in a frame of its own, so there is no such complaint to exclude in either mode.
+  // Group M is what proves that against the REAL policy; this asserts the weaker,
+  // dev-shaped half of it and is worth keeping for the errors that are not about CSP.
+  assert(klagen.length === 0, `the browser complained while drawing: ${klagen.join(' | ')}`);
 });
 
 await check('L2 the picture shown is the one drawn for the theme in force', async (page) => {
@@ -2640,6 +2641,373 @@ await check('L3 a label with the documented line break is a picture, not a broke
   assert(
     fehlend.length === 0,
     `the label lost ${fehlend.join(', ')} — decoded drawing begins: ${quelle.slice(0, 300)}`
+  );
+});
+
+// ---------------------------------------------------------------------------------------
+// Group M — the production policy, against a production build
+//
+// Every other check in this file drives `npm run dev`. This group drives `node build/index.js`
+// (adapter-node) on a second port, because the Content-Security-Policy is the one thing about
+// this application that is genuinely DIFFERENT in the two: SvelteKit adds `'unsafe-inline'` to
+// `style-src` in development so it can inject its own component styles, so "the page raised no
+// policy violation" is true in dev of a page that violates the policy four times in production.
+// That is not a hypothetical — it is precisely the defect D-26 closed, and it survived from
+// 2026-09-02 to 2026-09-17 with a green harness the whole time, excluded by name a few hundred
+// lines above.
+//
+// `just behaviour` builds and starts that server and passes `SHOT_BASE_PROD`. If it is absent
+// the group FAILS rather than skipping: a check that silently does not run is the failure this
+// whole file's comments are about.
+// ---------------------------------------------------------------------------------------
+const PROD = process.env.SHOT_BASE_PROD ?? '';
+const FRAME_PATH = '/_diagramm';
+
+/** Every way a browser tells you it refused something, as one list. */
+function beschwerden(page) {
+  const klagen = [];
+  // `console` covers EVERY frame of the page, which matters here: the renderer is in a frame
+  // of its own and a violation inside it must not go unheard because the listener was on the
+  // top document.
+  page.on('console', (message) => {
+    const text = message.text();
+    if (/Content Security Policy|Refused to /i.test(text)) klagen.push(text);
+  });
+  page.on('pageerror', (err) => klagen.push(String(err)));
+  return klagen;
+}
+
+/** Directive → sources, from a header fetched without rendering anything. */
+async function policyAt(page, url) {
+  const response = await page.request.get(url);
+  const header = response.headers()['content-security-policy'] ?? '';
+  assert(header !== '', `${url} answered ${response.status()} with no Content-Security-Policy`);
+  return Object.fromEntries(
+    header
+      .split(';')
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .map((part) => {
+        const [name, ...sources] = part.split(/\s+/);
+        return [name.toLowerCase(), sources.join(' ')];
+      })
+  );
+}
+
+await check('M1 a production build is running, and this group is not silently skipped', async () => {
+  assert(
+    PROD !== '',
+    'SHOT_BASE_PROD is unset — Group M checks the real policy and must never be skipped. ' +
+      'Run it through `just behaviour`, which builds and starts the adapter-node server, or ' +
+      'set SHOT_BASE_PROD to one you started yourself.'
+  );
+});
+
+await check('M2 the page policy opens frame-src to self and nothing wider', async (page) => {
+  // The only directive D-26 moves. `'self'` because the renderer is one route of this same
+  // application; NOT `data:`, which is what mermaid's `securityLevel: 'sandbox'` would need
+  // and what ADR 0018 refuses by name.
+  const policy = await policyAt(page, PROD + DIAGRAM_PAGE);
+  assert(policy['frame-src'] === "'self'", `frame-src is ${policy['frame-src']}, expected 'self'`);
+  assert(
+    policy['style-src'] === "'self'" || /^'self' 'nonce-/.test(policy['style-src'] ?? ''),
+    `the PAGE must keep a strict style-src, got ${policy['style-src']}`
+  );
+  assert(
+    !(policy['style-src'] ?? '').includes("'unsafe-inline'"),
+    'the page policy gained unsafe-inline on style-src — the one loosening ADR 0007 refused'
+  );
+});
+
+await check('M3 the frame answers with its own policy, looser in one directive only', async (page) => {
+  const policy = await policyAt(page, PROD + FRAME_PATH);
+  assert(
+    policy['style-src'] === "'self' 'unsafe-inline'",
+    `the frame's style-src is ${policy['style-src']} — mermaid's own <style> would still be refused`
+  );
+  // A nonce beside `'unsafe-inline'` makes a browser IGNORE the `'unsafe-inline'`. This is the
+  // way the fix comes silently undone, and it is one line in hooks.server.ts away.
+  assert(
+    !(policy['style-src'] ?? '').includes('nonce-'),
+    `the frame's style-src carries a nonce, which switches its 'unsafe-inline' off: ${policy['style-src']}`
+  );
+  assert(policy['frame-src'] === "'none'", `the frame may frame nothing, got ${policy['frame-src']}`);
+  assert(
+    policy['frame-ancestors'] === "'self'",
+    `the frame must be embeddable by this origin only, got ${policy['frame-ancestors']}`
+  );
+  // The directive that keeps this same-origin, cookie-bearing document safe is UNTOUCHED.
+  const script = policy['script-src'] ?? '';
+  assert(script.includes("'self'"), `the frame's script-src lacks 'self': ${script}`);
+  assert(script.includes("'nonce-"), `the frame's script-src carries no nonce: ${script}`);
+  for (const forbidden of ["'unsafe-inline'", "'unsafe-eval'", "'wasm-unsafe-eval'"]) {
+    assert(!script.includes(forbidden), `the frame's script-src allows ${forbidden}`);
+  }
+});
+
+await check('M4 a page holding a diagram raises ZERO policy violations under the real policy', async (page) => {
+  // THE CHECK THIS GROUP EXISTS FOR. Before D-26 this page logged four `Refused to apply
+  // inline style` in production and none in development, and the harness excluded them by
+  // name. Nothing is excluded now, and the assertion is made where the policy is real.
+  const klagen = beschwerden(page);
+  await page.goto(PROD + DIAGRAM_PAGE, { waitUntil: 'networkidle' });
+
+  const bilder = page.locator('article.prose img[src^="data:image/svg+xml"]');
+  await bilder.first().waitFor({ state: 'visible', timeout: 60_000 });
+  const breiten = await bilder.evaluateAll((els) => els.map((el) => el.naturalWidth));
+  assert(breiten.length === 2, `D-24 draws once per theme, so expected two, got ${breiten.length}`);
+  assert(breiten.every((b) => b > 0), `a drawing did not decode: ${breiten.join(', ')}`);
+
+  // Both documents, because `page.on('console')` hears every frame: the page's policy did not
+  // refuse anything, and neither did the frame's — which is what says the module chunks the
+  // renderer needs actually load under `script-src 'self'` behind the sandbox.
+  assert(klagen.length === 0, `the policy refused something: ${klagen.join(' | ')}`);
+});
+
+await check('M5 mermaid runs in the frame, and leaves nothing of itself on the page', async (page) => {
+  // The other half of D-26, and the half a policy header cannot show. Mermaid appends a
+  // container to `document.body` while it measures; the claim is that the body it appends to
+  // is the FRAME's. Asserted after a drawing has certainly happened.
+  await page.goto(PROD + DIAGRAM_PAGE, { waitUntil: 'networkidle' });
+  await page.locator('article.prose img[src^="data:image/svg+xml"]').first()
+    .waitFor({ state: 'visible', timeout: 60_000 });
+
+  const auf = await page.evaluate(() => ({
+    rahmen: [...document.querySelectorAll('iframe')].map((el) => ({
+      src: el.getAttribute('src'),
+      sandbox: el.getAttribute('sandbox'),
+      hidden: el.getAttribute('aria-hidden')
+    })),
+    // Mermaid names every element it appends after the id it was given, and this application
+    // gives it `gw-diagramm-N`. None of them may be in the reader's document.
+    reste: document.querySelectorAll('[id*="gw-diagramm"]').length,
+    // …and no style element carrying mermaid's own generated rules, which is what
+    // `style-src 'self'` used to refuse four times per diagram.
+    stile: [...document.querySelectorAll('style')].filter((el) =>
+      (el.textContent ?? '').includes('#gw-diagramm')
+    ).length
+  }));
+
+  assert(auf.rahmen.length === 1, `expected exactly one frame on the page, found ${auf.rahmen.length}`);
+  assert(auf.rahmen[0].src === '/_diagramm', `the frame's src is ${auf.rahmen[0].src}`);
+  // `allow-same-origin` is REQUIRED and its absence would be silent: without it the frame has
+  // an opaque origin, `'self'` in its own policy matches nothing, and both `postMessage`
+  // origin checks would have to accept the string "null" — which any sandboxed frame can
+  // present. It is not an origin boundary and is not claimed as one; what it still removes is
+  // M6's subject.
+  assert(
+    auf.rahmen[0].sandbox === 'allow-scripts allow-same-origin',
+    `the frame's sandbox is "${auf.rahmen[0].sandbox}"`
+  );
+  assert(auf.rahmen[0].hidden === 'true', 'the renderer frame is offered to assistive technology');
+  assert(auf.reste === 0, `mermaid left ${auf.reste} of its own elements in the reader's document`);
+  assert(auf.stile === 0, `mermaid injected ${auf.stile} style elements into the reader's document`);
+});
+
+await check('M6 the sandbox is in force: the renderer cannot open a window', async (page) => {
+  // What the sandbox actually buys, asserted rather than asserted-about. `allow-popups` is
+  // not granted, so `window.open` answers null inside the frame — which is also a live proof
+  // that the attribute reached the browser rather than merely the markup.
+  await page.goto(PROD + DIAGRAM_PAGE, { waitUntil: 'networkidle' });
+  await page.locator('article.prose img[src^="data:image/svg+xml"]').first()
+    .waitFor({ state: 'visible', timeout: 60_000 });
+
+  const rahmen = page.frames().find((f) => f.url().endsWith(FRAME_PATH));
+  assert(rahmen !== undefined, 'the renderer frame has no execution context of its own');
+
+  // Same-origin, which is what lets it load its module chunks under `script-src 'self'`.
+  const eigen = await rahmen.evaluate(() => location.origin === window.parent.location.origin);
+  assert(eigen, 'the frame is not same-origin — its own script-src self would match nothing');
+
+  const geoeffnet = await rahmen.evaluate(() => {
+    try {
+      const w = window.open('about:blank');
+      if (w) w.close();
+      return w !== null;
+    } catch {
+      return false;
+    }
+  });
+  assert(!geoeffnet, 'the renderer frame opened a window — the sandbox attribute is not in force');
+});
+
+// ---------------------------------------------------------------------------------------
+// Group N — a link that points at a page's identity, not at its address (D-5, ADR 0019)
+//
+// A unit test can show that `Store::references_for` resolves an id and that `BlockView` draws
+// what it is handed. It cannot show that the two are wired to each other through the editor,
+// the CRDT, the publish and a plain fetch — and every silent failure this feature has is on
+// that path. `doc` is an attribute the editor's schema has to DECLARE: undeclared, y-tiptap
+// deletes it from the Y.Doc and broadcasts the deletion, so the reference is gone for
+// everybody, nothing on the page shows it was ever there, and the export refuses the page
+// from then on. Nothing throws and nothing is logged.
+//
+// This group runs last because N3 replaces `/rundgang`'s content, exactly as K6 does.
+// ---------------------------------------------------------------------------------------
+
+const VERWEIS_PAGE = '/rundgang';
+const VERWEIS_ZIEL_TITEL = 'Tabellen — was heute passiert';
+// The slugified title, not `tabellen.md`'s filename: `tabellen.md` states no `slug`, so the
+// address is derived from the title, and asserting on the shorter string would pass on a
+// prefix of the real one.
+const VERWEIS_ZIEL_PFAD = '/rundgang/tabellen-was-heute-passiert';
+
+/** The editing region on VERWEIS_PAGE, with a live session, or a failure that says why. */
+async function verweisEditor(page) {
+  await page.goto(BASE + VERWEIS_PAGE + '?edit=1', { waitUntil: 'networkidle' });
+  const region = page.locator('section[aria-label="Seite bearbeiten"]');
+  await region.waitFor({ state: 'visible', timeout: 10_000 });
+  const head = region.locator('.gw-ed-status-head');
+  const settled = await until(
+    async () => {
+      const saw = (await head.textContent())?.trim() ?? '';
+      return { ok: saw.length > 0 && !saw.includes('wird geöffnet'), saw };
+    },
+    'the editing session never settled into an answer',
+    10_000
+  );
+  // A check that cannot run must fail rather than exit quietly.
+  assert(
+    settled.saw.includes('Verbunden'),
+    `Group N needs a live editing session on ${VERWEIS_PAGE} and there isn't one — headline ` +
+      `says "${settled.saw}". Is the behaviour fixture's write grant missing?`
+  );
+  return region;
+}
+
+/** Opens the link dialog from the toolbar and returns it. */
+async function linkDialog(page, region) {
+  await region.getByRole('button', { name: 'Link', exact: true }).click();
+  const dialog = page.locator('dialog.gw-linkdialog');
+  await dialog.waitFor({ state: 'visible', timeout: 10_000 });
+  return dialog;
+}
+
+await check('N1 the link control opens a dialog offering a page and an address', async (page) => {
+  // Both halves, because they are two different acts: choosing a page stores that page's
+  // IDENTITY and survives a rename; typing an address stores an address. German, like every
+  // other surface here.
+  const region = await verweisEditor(page);
+  const dialog = await linkDialog(page, region);
+
+  const titel = (await dialog.locator('#gw-linkdialog-titel').textContent())?.trim();
+  assert(titel === 'Seite verknüpfen', `the dialog is called "${titel}"`);
+  await dialog.locator('#gw-linkdialog-suche').waitFor({ state: 'visible', timeout: 5_000 });
+  const adresse = dialog.locator('label[for="gw-linkdialog-adresse"]');
+  assert(
+    (await adresse.textContent())?.trim() === 'Adresse',
+    'the free field is not called "Adresse"'
+  );
+
+  // Keyboard, and not merely mouse: `showModal()` is what supplies the focus trap and the
+  // Escape, and a dialog opened with the `open` attribute instead has neither. Losing that
+  // is invisible by looking.
+  const drin = await page.evaluate(() => {
+    const d = document.querySelector('dialog.gw-linkdialog');
+    return d instanceof HTMLDialogElement && d.matches(':modal') && d.contains(document.activeElement);
+  });
+  assert(drin, 'the dialog is not modal, or focus never moved into it');
+
+  await page.keyboard.press('Escape');
+  await dialog.waitFor({ state: 'hidden', timeout: 5_000 });
+});
+
+await check('N2 the picker offers only pages this reader may read, and counts nothing', async (page) => {
+  // The picker is an aggregate view, and an unfiltered one is a whole-corpus
+  // existence-and-title oracle for exactly the person in the threat model: somebody with
+  // write on one page who wants to know whether a page they may not read exists. It is built
+  // on `GET /api/tree`, which is `Store::tree_for` — filtered per document, whole branches
+  // skipped — so `/rundgang/nur-intern` (restricted, granted to a group this identity is not
+  // in) is simply not there.
+  const region = await verweisEditor(page);
+  const dialog = await linkDialog(page, region);
+  const suche = dialog.locator('#gw-linkdialog-suche');
+
+  // Anti-vacuity FIRST: a page this identity may read is offered, so the refusal below is
+  // about the filter and not about a picker that offers nothing at all.
+  await suche.fill('Tabellen');
+  const treffer = dialog.locator('.gw-linkdialog-treffer button');
+  await treffer.first().waitFor({ state: 'visible', timeout: 5_000 });
+  assert(
+    (await treffer.allTextContents()).some((t) => t.includes(VERWEIS_ZIEL_PFAD)),
+    'the picker does not offer a page this identity may read'
+  );
+
+  await suche.fill('intern');
+  const text = (await dialog.textContent()) ?? '';
+  assert(
+    !text.includes('Nur intern') && !text.includes('nur-intern'),
+    `the picker offered a page this identity may not read: ${text}`
+  );
+  // And it does not say how many were left out. A count of what was hidden is the same
+  // disclosure with the name filed off — the rule the backlinks panel and the graph follow.
+  assert(
+    !/\d+\s*(weitere|verborgen|ausgeblendet)/i.test(text),
+    `the picker reported a count of what it hid: ${text}`
+  );
+
+  await page.keyboard.press('Escape');
+});
+
+await check('N3 a page chosen in the dialog survives the CRDT, the publish and a plain fetch', async (page) => {
+  // The end-to-end proof, and the only thing that shows the five layers are wired to each
+  // other. It reads the page back with `page.request` — a plain fetch, nothing hydrated — so
+  // what is asserted is what a reader with JavaScript switched off receives.
+  const region = await verweisEditor(page);
+
+  // Emptied first, so the reference is the whole document and nothing below can pass on prose
+  // that happened to be there already. `Mod-a` and `Backspace` are ProseMirror commands acting
+  // on `state.selection` inside one synchronous keydown — see E7 for why a native selection is
+  // not safe here.
+  const surface = region.locator('[contenteditable="true"]');
+  await surface.click();
+  await page.keyboard.press('Control+a');
+  await page.keyboard.press('Backspace');
+
+  const dialog = await linkDialog(page, region);
+  await dialog.locator('#gw-linkdialog-suche').fill('Tabellen');
+  const treffer = dialog.locator('.gw-linkdialog-treffer button');
+  await treffer.first().waitFor({ state: 'visible', timeout: 5_000 });
+  await treffer.first().click();
+  await dialog.waitFor({ state: 'hidden', timeout: 5_000 });
+
+  // With nothing selected the picker inserts the page's CURRENT title as the link text — D-5's
+  // "the link text follows the title", at the one moment it can be: the text is document
+  // content and has to round-trip through markdown, so it is a snapshot. The ADDRESS is not.
+  // Scoped to the editing surface, NOT to the region: the dialog is still in the DOM after it
+  // closes, and its own result row carries the same title.
+  await surface.getByText(VERWEIS_ZIEL_TITEL).first().waitFor({ state: 'visible', timeout: 10_000 });
+
+  const publish = region.getByRole('button', { name: 'Veröffentlichen' });
+  await publish.click();
+  await until(
+    async () => {
+      const saw = (await region.locator('.gw-ed-note').first().textContent())?.trim() ?? '';
+      return { ok: /gespeichert|veröffentlicht/i.test(saw), saw };
+    },
+    'the editor never confirmed the publish',
+    15_000
+  );
+
+  const html = await (await page.request.get(BASE + VERWEIS_PAGE)).text();
+  const article = html.match(/<article[^>]*class="prose[\s\S]*?<\/article>/)?.[0] ?? '';
+  assert(article !== '', 'the page came back without a document at all');
+  // Resolved at READ time, through `Store::references_for`: the address the reader is given is
+  // where that page is now, and the tooltip is what it is called now. Neither is in the body.
+  assert(
+    article.includes(`href="${VERWEIS_ZIEL_PFAD}"`),
+    `the reference did not resolve to the target's current address: ${article}`
+  );
+  assert(
+    article.includes(`title="${VERWEIS_ZIEL_TITEL}"`),
+    `the reference did not carry the target's current title: ${article}`
+  );
+  // And what the body stores is the IDENTITY, not the address — `data-doc` is a uuid, and the
+  // path next to it came from the server's resolution rather than from anything the editor
+  // wrote. A reference whose `doc` was deleted by the CRDT mirror would have neither.
+  assert(
+    /data-doc="[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"/.test(article),
+    `the stored reference is not a document id: ${article}`
   );
 });
 

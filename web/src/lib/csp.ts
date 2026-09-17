@@ -75,3 +75,77 @@ export function widenCspNonceToStyles(policy: string): string {
 
   return parts.join(';');
 }
+
+/**
+ * The policy for the one route Mermaid runs in (D-26, ADR 0018).
+ *
+ * # Why a second policy exists at all
+ *
+ * Mermaid needs a browser DOM to measure text, and while it measures it inserts a `<style>`
+ * ELEMENT into the document. `style-src 'self'` refuses that element — correctly, that is
+ * the CSS-injection class — so every diagram logged four *"Refused to apply inline style"*
+ * errors and mermaid measured its labels against the page's font rather than the one it was
+ * about to draw with. The library has no nonce hook (verified against `mermaid@11.17.2`),
+ * and `'unsafe-inline'` on the PAGE is the one loosening
+ * [ADR 0007](../../../docs/decisions/0007-content-security-policy.md) refused — it would
+ * also make [widenCspNonceToStyles] skip the directive and unstyle the editor in production
+ * only.
+ *
+ * So the library was moved out of the page instead. It runs in an `<iframe>` served from
+ * `DIAGRAM_FRAME_PATH` (`$lib/blocks/diagram`), and THAT response gets this policy.
+ *
+ * # Exactly two directives move, and both are stated rather than edited
+ *
+ * - **`style-src` becomes `'self' 'unsafe-inline'`.** This document holds the renderer and
+ *   nothing else: no session-bearing form, no editor, no page content, no route a reader is
+ *   ever sent to. What the loosening admits is one `<style>` element per render, built by
+ *   mermaid from a theme the diagram itself may not set (`SECURE_CONFIG_KEYS`). Any nonce
+ *   already in the list is REMOVED, because a source list containing a nonce makes browsers
+ *   ignore `'unsafe-inline'` beside it — the same rule [widenCspNonceToStyles] respects from
+ *   the other side, and the reason this function must be used INSTEAD of that one rather
+ *   than after it.
+ * - **`frame-src` becomes `'none'`.** It opens to `'self'` on the page so this frame can
+ *   exist; the frame itself frames nothing, and in particular not the
+ *   `<iframe src="data:text/html;base64,…">` mermaid's `securityLevel: 'sandbox'` would
+ *   emit, which ADR 0018 refuses for the page and refuses here for the same reason.
+ *
+ * Everything else is left byte-for-byte, and that is the load-bearing part.
+ * `script-src 'self' 'nonce-…'` in particular is untouched: the frame is a SAME-ORIGIN
+ * document (it has to be — see `web/src/routes/_diagramm/rahmen.ts` for why an opaque origin
+ * cannot load the module chunks it needs), so it holds the session cookie, and the directive
+ * that keeps an injected handler from executing is the one that must not move.
+ * `frame-ancestors 'self'` is likewise inherited unchanged, which is what stops anyone else
+ * embedding the renderer.
+ *
+ * Unlike [widenCspNonceToStyles] this function may not decline when a directive is absent.
+ * A `style-src` left to fall through to `default-src 'self'` is the defect still in place,
+ * and a `frame-src` left to fall through is a frame that can hang another frame — so both
+ * are appended when they are not already there. That is what "a policy scoped to this route"
+ * means: it says its own values instead of inheriting somebody's.
+ */
+export function diagramFramePolicy(policy: string): string {
+  return setzeDirektive(
+    setzeDirektive(policy, 'style-src', "'self' 'unsafe-inline'"),
+    'frame-src',
+    "'none'"
+  );
+}
+
+/**
+ * One directive given an exact value, keeping the rest of the header as it was — and
+ * appended if the policy never named it.
+ *
+ * The name is matched with a following space so that `style-src-attr` and `style-src-elem`
+ * are different directives, exactly as they are to a browser. That distinction is the one
+ * [widenCspNonceToStyles] also turns on, and getting it wrong here would take
+ * `style-src-attr`'s `'unsafe-inline'` away and unstyle every server-rendered `style="…"`
+ * attribute on the site.
+ */
+function setzeDirektive(policy: string, name: string, quellen: string): string {
+  const muster = new RegExp(`^\\s*${name}\\s`);
+  const teile = policy.split(';');
+  const index = teile.findIndex((teil) => muster.test(teil));
+  if (index === -1) return `${policy.replace(/;\s*$/, '')}; ${name} ${quellen}`;
+  teile[index] = ` ${name} ${quellen}`;
+  return teile.join(';').replace(/^\s+/, '');
+}

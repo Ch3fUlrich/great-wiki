@@ -268,6 +268,50 @@ export function istUeberbreit(groesse: DiagramSize | null): boolean {
 }
 
 /**
+ * Said when the frame never reported for duty — an offline reader, or a failed deploy.
+ *
+ * These three sentences live here rather than in the renderer because [diagramFailureNote]
+ * chooses between them and is the thing a test can hold. A German line that only a browser
+ * can reach is a German line nobody reads until a reader does.
+ */
+export const DIAGRAM_NICHT_GELADEN = 'Der Diagrammzeichner konnte nicht geladen werden.';
+
+/**
+ * Said when the frame was asked and would not draw it.
+ *
+ * Deliberately says nothing about what went wrong. Mermaid's own parse errors are English,
+ * are about its grammar rather than about this page, and arrive as a message it does not
+ * document the shape of; the source is shown above this line, which is the actionable part.
+ */
+export const DIAGRAM_NICHT_GEZEICHNET = 'Dieses Diagramm konnte nicht gezeichnet werden.';
+
+/**
+ * Said when the frame took the order and never answered (D-26).
+ *
+ * The state that did not exist before there was a frame, and the one that would otherwise be
+ * a picture that never appears and never explains itself. A diagram inside the caps costs
+ * seconds; past the renderer's budget the honest answer is the fence's own source with a
+ * line, which is what malformed source and every cap already do.
+ */
+export const DIAGRAM_KEINE_ANTWORT = 'Der Diagrammzeichner hat nicht geantwortet.';
+
+/**
+ * Which German line a failed drawing gets, from what the frame said — `null` meaning it said
+ * nothing at all.
+ *
+ * Three outcomes and three sentences, because a reader whose diagram is missing must be able
+ * to tell them apart: **it would not draw this** (mermaid threw), **it drew something this
+ * browser will not show** (the caller passes its own reason), and **nothing came back**. The
+ * middle one is the caller's to say; this function answers the other two and translates
+ * mermaid's edge cap on the way past, which is the one library message worth answering in
+ * the reader's own words.
+ */
+export function diagramFailureNote(fehler: string | null): string {
+  if (fehler === null) return DIAGRAM_KEINE_ANTWORT;
+  return diagramEdgeRefusal(new Error(fehler)) ?? DIAGRAM_NICHT_GEZEICHNET;
+}
+
+/**
  * Mermaid's own edge cap, said in German — or `null` for any other failure.
  *
  * [DIAGRAM_EDGE_LIMIT] is enforced by the library rather than by us, and the library throws an
@@ -386,4 +430,136 @@ export function diagramDataUri(svg: string): string | null {
   const looksLikeSvg = trimmed.startsWith('<svg') || /^<\?xml[^>]*\?>\s*<svg/.test(trimmed);
   if (!looksLikeSvg) return null;
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+}
+
+// ---------------------------------------------------------------------------------------
+//  The frame boundary (D-26)
+// ---------------------------------------------------------------------------------------
+//
+//  Mermaid does not run on this page any more. It runs in a document of its own, served
+//  from [DIAGRAM_FRAME_PATH], and the two documents talk over `postMessage`: the page sends
+//  a diagram's text and a theme, the frame sends back an SVG string or the reason there is
+//  none. See `docs/decisions/0018-how-a-diagram-reaches-the-page.md`.
+//
+//  **`postMessage` has no sender this application can trust by default.** A `message`
+//  listener hears every message its window is ever sent — from another frame on the page,
+//  from a window that opened it, from any page anywhere that holds a handle to it — and the
+//  payload is whatever the sender chose. Two fields cannot be chosen by the sender and are
+//  therefore the whole of the check: `event.source`, the sending window OBJECT, and
+//  `event.origin`, which the browser fills in. Both are compared, in both directions.
+//
+//  These live HERE, as pure functions over a plain object, rather than inline in the two
+//  listeners, for the reason the rest of this module exists: `web/src/lib/blocks/diagram.ts`
+//  is the one thing the page and the renderer share, it pulls in no library and no DOM, and
+//  a boundary check that can only be exercised in a browser is a boundary check that is
+//  exercised once, by hand, and then trusted forever.
+
+/**
+ * The one route the diagram frame is served from.
+ *
+ * Named once because three places must agree about it and two of them would fail silently
+ * if they did not: `hooks.server.ts` decides which response carries the frame's own
+ * (deliberately looser) policy by comparing the request path to this, and
+ * `$lib/blocks/mermaid` sets it as the iframe's `src`. A second spelling would be a frame
+ * served the PAGE's policy — which is the defect D-26 exists to close, back again and with
+ * nothing on screen to say so.
+ */
+export const DIAGRAM_FRAME_PATH = '/_diagramm';
+
+/**
+ * The word every message in both directions carries.
+ *
+ * Not security — `source` and `origin` are that — but hygiene: a page holds other people's
+ * `postMessage` traffic (a payment frame, a video embed, a dev-server client), and a
+ * listener that assumed every message it heard was for it would throw on somebody else's.
+ */
+export const DIAGRAM_FRAME_MARKE = 'gw-diagramm';
+
+/** What the page asks the frame to draw: one diagram, in one theme, under one number. */
+export interface DiagramAuftrag {
+  /** Which request this is. The answer carries it back, so a late answer cannot be mistaken
+   *  for the current one. */
+  id: number;
+  quelle: string;
+  thema: 'default' | 'dark';
+}
+
+/** What the frame says back. */
+export type DiagramAntwort =
+  /** The library is loaded and the frame will answer. Sent once, unprompted. */
+  | { art: 'bereit' }
+  /** The drawing, as a string. The page never parses it — see `$lib/blocks/mermaid`. */
+  | { art: 'svg'; id: number; svg: string }
+  /** Mermaid's own message, in English, for [diagramEdgeRefusal] to recognise or not. */
+  | { art: 'fehler'; id: number; fehler: string };
+
+/**
+ * A `MessageEvent` as a listener sees it, with every field admitted as `unknown`.
+ *
+ * Deliberately not `MessageEvent`: the whole point of these two functions is that nothing
+ * about the object is known until it has been checked, and a typed parameter would let a
+ * later edit destructure `data.quelle` because the compiler said it was a string.
+ */
+export interface RahmenNachricht {
+  source?: unknown;
+  origin?: unknown;
+  data?: unknown;
+}
+
+/** A plain object, or `null`. `typeof null === 'object'` is the trap this closes. */
+function alsObjekt(wert: unknown): Record<string, unknown> | null {
+  return typeof wert === 'object' && wert !== null ? (wert as Record<string, unknown>) : null;
+}
+
+/**
+ * The order the frame will act on, or `null` for every other message it hears.
+ *
+ * `fenster.eltern` is `window.parent`, `fenster.selbst` is the frame's own `window` and
+ * `fenster.origin` is its `location.origin`.
+ *
+ * **The `eltern === selbst` guard is not defensive noise.** `window.parent` IS `window` in a
+ * document nobody framed, so somebody who opens `/_diagramm` in a tab of their own — or is
+ * sent there — has a page that would accept an order from any script in it, including one
+ * reached through a `javascript:` bookmarklet or an extension. There is nothing to steal
+ * there today, and that is exactly the kind of sentence that stops being true later.
+ */
+export function rahmenAuftrag(
+  nachricht: RahmenNachricht,
+  fenster: { eltern: unknown; selbst: unknown; origin: string }
+): DiagramAuftrag | null {
+  if (!fenster.eltern || fenster.eltern === fenster.selbst) return null;
+  if (nachricht.source !== fenster.eltern) return null;
+  if (nachricht.origin !== fenster.origin) return null;
+
+  const data = alsObjekt(nachricht.data);
+  if (data === null || data.gw !== DIAGRAM_FRAME_MARKE) return null;
+  if (typeof data.id !== 'number' || !Number.isFinite(data.id)) return null;
+  if (typeof data.quelle !== 'string') return null;
+  if (data.thema !== 'default' && data.thema !== 'dark') return null;
+
+  return { id: data.id, quelle: data.quelle, thema: data.thema };
+}
+
+/**
+ * The answer the page will act on, or `null` for every other message it hears.
+ *
+ * `fenster.rahmen` is `iframe.contentWindow` — the one window this page created itself —
+ * and is `null` until the element is in the document, which is why the falsy guard comes
+ * first: a `null` expectation must never be satisfied by a `null` sender.
+ */
+export function rahmenAntwort(
+  nachricht: RahmenNachricht,
+  fenster: { rahmen: unknown; origin: string }
+): DiagramAntwort | null {
+  if (!fenster.rahmen) return null;
+  if (nachricht.source !== fenster.rahmen) return null;
+  if (nachricht.origin !== fenster.origin) return null;
+
+  const data = alsObjekt(nachricht.data);
+  if (data === null || data.gw !== DIAGRAM_FRAME_MARKE) return null;
+  if (data.bereit === true) return { art: 'bereit' };
+  if (typeof data.id !== 'number' || !Number.isFinite(data.id)) return null;
+  if (typeof data.svg === 'string') return { art: 'svg', id: data.id, svg: data.svg };
+  if (typeof data.fehler === 'string') return { art: 'fehler', id: data.id, fehler: data.fehler };
+  return null;
 }

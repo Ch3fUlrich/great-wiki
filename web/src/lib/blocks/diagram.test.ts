@@ -4,8 +4,16 @@ import {
   DIAGRAM_ASPECT_LIMIT,
   DIAGRAM_CHARACTER_LIMIT,
   DIAGRAM_EDGE_LIMIT,
+  DIAGRAM_FRAME_MARKE,
+  DIAGRAM_FRAME_PATH,
+  DIAGRAM_KEINE_ANTWORT,
+  DIAGRAM_NICHT_GELADEN,
+  DIAGRAM_NICHT_GEZEICHNET,
+  diagramFailureNote,
   DIAGRAM_STATEMENT_LIMIT,
   diagramStatements,
+  rahmenAntwort,
+  rahmenAuftrag,
   istUeberbreit,
   diagramDataUri,
   diagramEdgeRefusal,
@@ -16,13 +24,23 @@ import {
   SECURE_CONFIG_KEYS
 } from './diagram';
 
-// Part of this suite reads `mermaid.ts` as TEXT, the way `highlight.test.ts` reads its own
-// module and `server/maths.test.ts` reads its own. That is deliberate rather than lazy: the
-// things being protected — that `render` is called with two arguments and never three, that
+// Part of this suite reads two modules as TEXT, the way `highlight.test.ts` reads its own
+// and `server/maths.test.ts` reads its own. That is deliberate rather than lazy: the things
+// being protected — that `render` is called with two arguments and never three, that
 // `bindFunctions` is never called, that the library is behind the `browser` guard — are
 // properties of how the renderer is WRITTEN, and no assertion about its return value can see
 // any of them. There is no DOM in this suite, so the only alternative is a browser.
-const renderer = readFileSync(new URL('./mermaid.ts', import.meta.url), 'utf8');
+//
+// There are two since D-26, because the drawing now happens in a frame of its own:
+// `seite` is the page's side, which loads no library at all, and `rahmen` is the document
+// Mermaid actually runs in. Each is asserted for what it must contain AND for what the
+// other one must not — a `import('mermaid')` that reappeared on the page would put the
+// library back in the reader's own document and undo the whole decision silently.
+const seite = readFileSync(new URL('./mermaid.ts', import.meta.url), 'utf8');
+const renderer = readFileSync(
+  new URL('../../routes/_diagramm/rahmen.ts', import.meta.url),
+  'utf8'
+);
 
 describe('which fence is a diagram', () => {
   it('is ```mermaid and nothing that merely looks like it', () => {
@@ -194,6 +212,37 @@ describe('the renderer, as a piece of source text', () => {
     expect(renderer).not.toMatch(/^import .* from 'mermaid'/m);
   });
 
+  it('does not load mermaid on the page, which is the whole of D-26', () => {
+    // The page talks to a frame and holds no library. A `import('mermaid')` here would put
+    // the whole of it back in the reader's own document — where its `<style>` injection is
+    // refused by `style-src 'self'` and its text measurement is done against the wrong font
+    // — and nothing else in this suite could see it.
+    expect(seite).not.toMatch(/import\('mermaid'\)/);
+    expect(seite).not.toMatch(/^import .* from 'mermaid'/m);
+    // …and it reaches the frame through the ONE named route, never a second spelling.
+    expect(seite).toMatch(/DIAGRAM_FRAME_PATH/);
+    expect(seite).not.toMatch(/'\/_diagramm'/);
+  });
+
+  it('sandboxes the frame with allow-same-origin, which is required and would fail silently', () => {
+    // A sandboxed frame WITHOUT `allow-same-origin` has an opaque origin: `'self'` in its own
+    // policy then matches nothing — including the module chunks it must load, which cannot be
+    // nonced because a nonce does not reach a dynamic `import()` — and `event.origin` from it
+    // is the string "null", which any sandboxed frame anywhere can present. Dropping the flag
+    // to "tighten" the sandbox would break the renderer and weaken both origin checks at once.
+    expect(seite).toMatch(/'allow-scripts allow-same-origin'/);
+  });
+
+  it('never posts to a wildcard target, in either direction', () => {
+    // `postMessage(…, '*')` sends the author's diagram text — and the drawing made from it —
+    // to whatever document happens to be at the other end, which for a frame is a thing an
+    // embedder chooses. Both sides name this origin.
+    for (const quelle of [seite, renderer]) {
+      expect(quelle).toMatch(/postMessage\(/);
+      expect(quelle).not.toMatch(/postMessage\([^)]*'\*'/);
+    }
+  });
+
   it('shows no picture the browser has not already decoded', () => {
     // The guarantee `diagramDataUri` cannot make on its own, and the reason the promise
     // "malformed source is never a broken image" was false until now: that function is pure
@@ -206,8 +255,8 @@ describe('the renderer, as a piece of source text', () => {
     // the fence's own source, which is what the whole feature promises. Asserted as source
     // text because there is no DOM in this suite — the behaviour harness loads a diagram
     // with a `<br>` in it against a real browser, which is the other half of this.
-    expect(renderer).toMatch(/\.decode\(\)/);
-    expect(renderer).toMatch(/new Image\(\)/);
+    expect(seite).toMatch(/\.decode\(\)/);
+    expect(seite).toMatch(/new Image\(\)/);
   });
 });
 
@@ -385,6 +434,197 @@ describe('how big the drawing says it is', () => {
       '<svg viewBox="0 0 Infinity 50"/>'
     ]) {
       expect(diagramSize(bad), bad).toBeNull();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// The frame boundary (D-26). Mermaid runs in a document of its own now, and the diagram
+// crosses `postMessage` in one direction and the drawing crosses it back in the other.
+//
+// These two functions exist so that the check on each direction is a PURE one and can be
+// asserted here rather than only in a browser: `window`, `MessageEvent` and an iframe are
+// none of them available in this suite, and "the listener checks the origin" asserted as
+// source text would pass on a listener that checked it and then ignored the answer.
+// ---------------------------------------------------------------------------------------
+
+describe('what the frame accepts as an order to draw', () => {
+  // The frame's own document. `origin` is `location.origin` there, `selbst` is its `window`,
+  // and `eltern` is `window.parent` — a different object, because the frame is framed.
+  const ELTERN = { name: 'die Seite' };
+  const SELBST = { name: 'der Rahmen' };
+  const RAHMENFENSTER = { eltern: ELTERN, selbst: SELBST, origin: 'https://wiki.example' };
+
+  const AUFTRAG = { gw: DIAGRAM_FRAME_MARKE, id: 7, quelle: 'graph TD; A-->B;', thema: 'dark' };
+
+  function nachricht(teile: Record<string, unknown> = {}) {
+    return { source: ELTERN, origin: 'https://wiki.example', data: AUFTRAG, ...teile };
+  }
+
+  it('takes an order from the page that framed it', () => {
+    expect(rahmenAuftrag(nachricht(), RAHMENFENSTER)).toEqual({
+      id: 7,
+      quelle: 'graph TD; A-->B;',
+      thema: 'dark'
+    });
+  });
+
+  it('refuses a message from any window that is not the page that framed it', () => {
+    // A `postMessage` listener hears every message the window is sent, including from
+    // another frame on the page and from a window that opened this one. `event.source` is
+    // the sender's window object and cannot be forged by the sender.
+    for (const fremd of [{ name: 'ein anderes Fenster' }, null, undefined]) {
+      expect(rahmenAuftrag(nachricht({ source: fremd }), RAHMENFENSTER), String(fremd)).toBeNull();
+    }
+  });
+
+  it('refuses a message from another origin, even when it came from the parent window', () => {
+    // The frame is same-origin by construction (see `_diagramm/rahmen.ts` for why it has to
+    // be), so a message from anywhere else is not this application talking to itself.
+    for (const fremd of ['https://angreifer.example', 'null', '', undefined]) {
+      expect(rahmenAuftrag(nachricht({ origin: fremd }), RAHMENFENSTER), String(fremd)).toBeNull();
+    }
+  });
+
+  it('refuses everything when it is not framed at all', () => {
+    // Somebody opened /_diagramm in a tab of their own. `window.parent === window` there, so
+    // "the message came from my parent" would be satisfied by the document posting to itself
+    // — which is a thing any script on the page can arrange.
+    const allein = { eltern: SELBST, selbst: SELBST, origin: 'https://wiki.example' };
+    expect(rahmenAuftrag({ ...nachricht(), source: SELBST }, allein)).toBeNull();
+  });
+
+  it('refuses anything that is not the shape of an order', () => {
+    // Author-controlled text crosses this boundary, so the payload is untrusted data and
+    // every field is checked rather than destructured.
+    for (const kaputt of [
+      undefined,
+      null,
+      'graph TD; A-->B;',
+      42,
+      {},
+      { gw: 'etwas-anderes', id: 1, quelle: 'a', thema: 'dark' },
+      { gw: DIAGRAM_FRAME_MARKE, quelle: 'a', thema: 'dark' },
+      { gw: DIAGRAM_FRAME_MARKE, id: '7', quelle: 'a', thema: 'dark' },
+      { gw: DIAGRAM_FRAME_MARKE, id: Number.NaN, quelle: 'a', thema: 'dark' },
+      { gw: DIAGRAM_FRAME_MARKE, id: 7, quelle: 42, thema: 'dark' },
+      { gw: DIAGRAM_FRAME_MARKE, id: 7, quelle: 'a', thema: 'neon' },
+      { gw: DIAGRAM_FRAME_MARKE, id: 7, quelle: 'a' }
+    ]) {
+      expect(rahmenAuftrag(nachricht({ data: kaputt }), RAHMENFENSTER), JSON.stringify(kaputt)).toBeNull();
+    }
+  });
+});
+
+describe('what the page accepts as a drawing', () => {
+  // The page's side. `rahmen` is `iframe.contentWindow` — the one window it created itself.
+  const RAHMEN = { name: 'der Rahmen' };
+  const SEITE = { rahmen: RAHMEN, origin: 'https://wiki.example' };
+
+  function nachricht(data: unknown, teile: Record<string, unknown> = {}) {
+    return { source: RAHMEN, origin: 'https://wiki.example', data, ...teile };
+  }
+
+  it('takes the handshake, the drawing and the refusal from the frame it created', () => {
+    expect(rahmenAntwort(nachricht({ gw: DIAGRAM_FRAME_MARKE, bereit: true }), SEITE)).toEqual({
+      art: 'bereit'
+    });
+    expect(rahmenAntwort(nachricht({ gw: DIAGRAM_FRAME_MARKE, id: 3, svg: '<svg/>' }), SEITE)).toEqual({
+      art: 'svg',
+      id: 3,
+      svg: '<svg/>'
+    });
+    expect(
+      rahmenAntwort(nachricht({ gw: DIAGRAM_FRAME_MARKE, id: 3, fehler: 'Edge limit exceeded' }), SEITE)
+    ).toEqual({ art: 'fehler', id: 3, fehler: 'Edge limit exceeded' });
+  });
+
+  it('refuses a message from any window but the frame it created', () => {
+    // The page may hold several frames, and anything on the internet may `postMessage` a
+    // window it has a handle to. `event.source` is the only field the sender cannot choose.
+    for (const fremd of [{ name: 'ein anderer Rahmen' }, null, undefined]) {
+      expect(
+        rahmenAntwort(nachricht({ gw: DIAGRAM_FRAME_MARKE, id: 3, svg: '<svg/>' }, { source: fremd }), SEITE),
+        String(fremd)
+      ).toBeNull();
+    }
+  });
+
+  it('refuses a message from another origin', () => {
+    for (const fremd of ['https://angreifer.example', 'null', '']) {
+      expect(
+        rahmenAntwort(nachricht({ gw: DIAGRAM_FRAME_MARKE, id: 3, svg: '<svg/>' }, { origin: fremd }), SEITE),
+        fremd
+      ).toBeNull();
+    }
+  });
+
+  it('refuses everything before a frame exists', () => {
+    // `iframe.contentWindow` is null until the element is in the document, and a null
+    // expectation must never match a null sender.
+    expect(
+      rahmenAntwort(nachricht({ gw: DIAGRAM_FRAME_MARKE, id: 3, svg: '<svg/>' }, { source: null }), {
+        rahmen: null,
+        origin: 'https://wiki.example'
+      })
+    ).toBeNull();
+  });
+
+  it('refuses anything that is not the shape of an answer', () => {
+    for (const kaputt of [
+      undefined,
+      null,
+      '<svg/>',
+      {},
+      { gw: 'etwas-anderes', id: 3, svg: '<svg/>' },
+      { gw: DIAGRAM_FRAME_MARKE, id: 3 },
+      { gw: DIAGRAM_FRAME_MARKE, svg: '<svg/>' },
+      { gw: DIAGRAM_FRAME_MARKE, id: 3, svg: 42 },
+      { gw: DIAGRAM_FRAME_MARKE, id: 3, fehler: 42 },
+      { gw: DIAGRAM_FRAME_MARKE, bereit: 'ja' }
+    ]) {
+      expect(rahmenAntwort(nachricht(kaputt), SEITE), JSON.stringify(kaputt)).toBeNull();
+    }
+  });
+});
+
+describe('where the frame is served from', () => {
+  it('is one route, named once, so the policy and the iframe cannot disagree', () => {
+    // `hooks.server.ts` decides which response gets the frame's own policy by comparing the
+    // request path to this constant, and `$lib/blocks/mermaid` sets it as the iframe's `src`.
+    // Two spellings of it would be a frame served the page's policy — the exact defect D-26
+    // exists to close, silently back again.
+    expect(DIAGRAM_FRAME_PATH.startsWith('/')).toBe(true);
+    expect(DIAGRAM_FRAME_PATH).not.toContain('..');
+  });
+});
+
+describe('which line a diagram that was not drawn gets', () => {
+  it('tells "nothing came back" apart from "it would not draw this"', () => {
+    // The state D-26 introduced: the renderer is a second document now, and a document can
+    // stop answering in ways a function call cannot. A picture that simply never appears is
+    // the one failure this feature had no sentence for — every other one shows the fence's
+    // own source with a line, and so must this.
+    expect(diagramFailureNote(null)).toBe(DIAGRAM_KEINE_ANTWORT);
+    expect(diagramFailureNote('Parse error on line 2')).toBe(DIAGRAM_NICHT_GEZEICHNET);
+    // …and the three are genuinely three, not the same sentence written out three times.
+    expect(new Set([DIAGRAM_KEINE_ANTWORT, DIAGRAM_NICHT_GEZEICHNET, DIAGRAM_NICHT_GELADEN]).size).toBe(3);
+  });
+
+  it('still answers mermaid`s edge cap in German rather than repeating its English', () => {
+    // The library throws a sentence about ITS OWN CONFIGURATION, in English, at somebody who
+    // was drawing a flowchart. Crossing a `postMessage` boundary must not lose that
+    // translation — the message arrives as a plain string now rather than as an `Error`.
+    const note = diagramFailureNote('Edge limit exceeded. 201 edges found, but the limit is 200.');
+    expect(note).toContain('Verbindungen je Diagramm');
+    expect(note).not.toContain('Edge limit');
+  });
+
+  it('says nothing about mermaid to a reader, in any of the three', () => {
+    // The library's name is an implementation detail and its grammar is not this page's.
+    for (const note of [DIAGRAM_KEINE_ANTWORT, DIAGRAM_NICHT_GEZEICHNET, DIAGRAM_NICHT_GELADEN]) {
+      expect(note.toLowerCase(), note).not.toContain('mermaid');
+      expect(note.toLowerCase(), note).not.toContain('iframe');
     }
   });
 });

@@ -1,6 +1,17 @@
 # 0018 — How a diagram reaches the page
 
-**Status:** Accepted (2026-09-02)
+**Status:** Accepted (2026-09-02), amended (2026-09-17)
+
+> **Amendment, 2026-09-17 — Mermaid runs in a frame of its own (D-26).** The section
+> *"There are two barriers, and the CSP is the one that holds while the diagram is drawn"*
+> described a state this record no longer describes. Barrier one is now a **boundary** rather
+> than a policy holding while a dependency worked inside the reader's page: Mermaid runs in an
+> `<iframe>` served from `/_diagramm`, one route of this same application, with a policy scoped
+> to that route. The diagram's text crosses to it over `postMessage` and an SVG string crosses
+> back; the `<img>` is built exactly as before. The original text is kept below with the
+> amendment beside it rather than rewritten away, because the measurement that forced it — the
+> four refusals per diagram, visible only in production — is the reason this decision exists at
+> all.
 
 ## Context
 
@@ -65,7 +76,8 @@ the live document*. So during rendering the diagram — labels included — real
   `onerror`/`onload` that escaped mermaid's own DOMPurify pass.
 - `style-src ['self']` — refuses an injected `<style>` ELEMENT, which is the CSS-injection class.
 - `img-src ['self', 'data:']` — refuses a remote beacon.
-- `object-src`, `frame-src`, `base-uri` are `['none']` — close the rest.
+- `object-src`, `frame-src`, `base-uri` are `['none']` — close the rest. (`frame-src` is
+  `['self']` since the amendment below; the other two are still `['none']`.)
 
 Mermaid neither calls `eval` nor instantiates WebAssembly (checked across every `.mjs` it
 ships), so `script-src 'self'` costs it nothing.
@@ -73,22 +85,27 @@ ships), so `script-src 'self'` costs it nothing.
 **Barrier two, afterwards: the `<img>`.** No browser executes script in one, and it reaches no
 DOM. This is ADR 0014's containment, applied to bytes we produced rather than bytes we stored.
 
-**Barrier one visibly fires, and that is it working.** Verified in a real browser against a
-production build (`node build/index.js`, the real nonce-based policy on the response): every
-diagram logs
+**Barrier one visibly fired, and that is what D-26 came from.** Verified in a real browser
+against a production build (`node build/index.js`, the real nonce-based policy on the response):
+every diagram logged
 
 ```
 Refused to apply inline style because it violates the following Content Security Policy
 directive: "style-src 'self' 'nonce-…'"
 ```
 
-— once per render, so twice per diagram. That is the `<style>` element mermaid inserts while it
-measures, refused exactly as an injected style element should be. **The drawing is unaffected**:
-the same `<style>` is serialised into the returned string, and inside the `<img>` it is the
-image's own business, where this page's policy does not reach. What the refusal actually costs is
-that mermaid measures text against the page's own font rather than the one it is about to draw
-with — both are proportional sans faces at 16 px, mermaid's node padding absorbs the difference,
-and the checked-in example renders correctly with nothing clipped.
+— once per render, so twice per diagram, four lines for the pair. That was the `<style>` element
+mermaid inserts while it measures, refused exactly as an injected style element should be. The
+drawing was unaffected: the same `<style>` is serialised into the returned string, and inside the
+`<img>` it is the image's own business, where the page's policy does not reach. What the refusal
+actually cost was that mermaid measured text against the page's own font rather than the one it
+was about to draw with — both proportional sans faces at 16 px, with mermaid's node padding
+absorbing the difference.
+
+**Neither half of that was acceptable to leave documented.** Console noise sits in the one place
+a developer looks first when something else is wrong, and a measurement made against the wrong
+face is a defect even where padding hides it. So the amendment below moved the library instead of
+the policy.
 
 **The fix for that console line is never `'unsafe-inline'` in `style-src`.** Beyond being the one
 loosening ADR 0007 refused, it would make `widenCspNonceToStyles` skip the directive
@@ -103,14 +120,120 @@ under `npm run dev` and closed in production. A production-only difference is th
 and this is the second one in this repository — hence: **a diagram is verified against a
 production build and a real browser, never against `npm run dev`.**
 
+**That sentence used to end in "by hand", and that is what let the four refusals survive a
+fortnight of green harness runs.** Since D-26 it does not: `just behaviour` builds and starts an
+adapter-node server on a second port, and **Group M** is the group that asks the real policy the
+real question. See the amendment below for what it asserts.
+
+**And the `<style>`-in-the-live-document problem above is gone rather than contained**: mermaid's
+live document is now the frame's, not the reader's.
+
+### AMENDED (D-26): Mermaid runs in a frame of its own, and that is where barrier one is
+
+The library needs a DOM and injects a `<style>` into it. The three ways out of that were: leave
+it documented; loosen `style-src`; or give the library a document that is not the reader's page.
+The owner chose the third.
+
+**The mechanism.** `web/src/lib/blocks/mermaid.ts` — still the page's renderer, and now holding
+no library at all — creates one hidden `<iframe>` whose `src` is `DIAGRAM_FRAME_PATH`
+(`/_diagramm`, named once in `$lib/blocks/diagram` so the policy and the element cannot
+disagree). `web/src/routes/_diagramm/` is that document: it loads mermaid, listens for a
+diagram's text and a theme, renders with the **two-argument** `mermaid.render(id, text)` exactly
+as before, and posts the SVG **string** back. The page percent-encodes it into a
+`data:image/svg+xml` URI and sets it as an `<img src>`. Barrier two is untouched; the sink check
+still finds nothing and its exemption list is still empty.
+
+**The policy, and the one directive that moves.** SvelteKit's `kit.csp` is one configuration for
+the whole application, so the frame's response gets its own by replacement in
+`web/src/hooks.server.ts`: `$lib/csp`'s `diagramFramePolicy` sets `style-src 'self'
+'unsafe-inline'` and `frame-src 'none'` and leaves every other directive byte-for-byte —
+`script-src 'self' 'nonce-…'` in particular, because the frame is same-origin and therefore holds
+the session cookie. On the **page**, `frame-src` opens from `'none'` to `'self'` and nothing
+wider; `frame-ancestors 'self'` was already there and is what stops anyone else embedding the
+renderer. That is the whole of the policy change.
+
+**Why a nonce is not used on the frame's `style-src`, and why the two repairs are alternatives.**
+A source list containing a nonce makes browsers ignore `'unsafe-inline'` beside it — the rule
+`widenCspNonceToStyles` exists to respect. So the frame's response goes through
+`diagramFramePolicy` **instead of** the nonce widening, never after it. Getting that order wrong
+would leave a frame whose loosening is silently inert, in production only.
+
+**The sandbox flags, which are the easiest thing here to get wrong.** The element carries
+`sandbox="allow-scripts allow-same-origin"`. `allow-same-origin` is **required** and its absence
+would be silent: a frame sandboxed without it has an *opaque* origin, so `'self'` in its own
+policy matches nothing — including the module chunks it must load, which cannot be nonced because
+a nonce does not reach a dynamic `import()` — and `event.origin` from it is the string `"null"`,
+which any sandboxed frame anywhere can present. So the frame is same-origin by construction and
+**the sandbox is not an origin boundary**: this document can reach `parent.document` and the same
+`localStorage`, and nothing in the attribute prevents it. What the attribute still removes is
+top-level navigation, popups, form submission, downloads, modal dialogs and the
+pointer/presentation/orientation locks — defence in depth, not the barrier. The barrier is
+`script-src`, which did not move. **The real isolation is the document**: its own policy, its own
+`document.body` for mermaid to measure in, its own style context, and nothing author-controlled
+in the reader's DOM at any point.
+
+**Both directions of `postMessage` are checked, and both checks are pure functions with tests.**
+A `message` listener hears everything its window is sent, and the payload is whatever a sender
+chose; the two fields a sender cannot choose are `event.source` and `event.origin`, and both are
+compared at each end. `rahmenAuftrag` (the frame's side) requires the sender to be
+`window.parent`, requires `window.parent !== window` so that a directly-opened `/_diagramm`
+accepts nothing, requires `event.origin === location.origin`, and then validates the payload field
+by field. `rahmenAntwort` (the page's side) requires the sender to be the `iframe.contentWindow`
+this page created, requires the same origin, and validates likewise. They live in
+`$lib/blocks/diagram` so that they can be tested without a browser — a boundary check that can
+only be exercised by hand is one that is exercised once and then trusted forever.
+
+**A frame that never answers is a stated state.** The frame reports ready only once its library
+is in hand (60 s budget, which pays for the download), and each drawing has 30 s. Past either, the
+fence shows its own source with a German line, exactly as a cap or a malformed diagram does. A
+reader with JavaScript switched off is unaffected: the source and the `alt` are what they always
+were.
+
+**What did not move.** The caps, `securityLevel: 'strict'`, `htmlLabels: false`, the `secure`
+list, `suppressErrorRendering`, the two renders per theme (D-24), the `viewBox` sizing, the
+aspect-ratio rule and the decode check are all where they were — in `$lib/blocks/diagram`, which
+both documents import, rather than copied into each. Mermaid is still absent from
+`ssr.noExternal` and still reached through a `browser`-guarded dynamic import, now inside the
+frame's module; `web/scripts/check-server-bundle.sh` is what holds that.
+
+**And it is now checked rather than remembered.** `just behaviour` starts an adapter-node
+production build on a second port, and **Group M** asserts against the real policy: `frame-src
+'self'` on the page and nothing looser, the frame's own four directives, zero policy violations
+anywhere on a page holding a diagram (both documents, since `page.on('console')` hears every
+frame), no mermaid element or injected style left in the reader's document, the sandbox
+attribute's exact value, and — from inside the frame — that it is same-origin and that
+`window.open` still answers `null`. Group L's named exclusion for the four refusals is gone,
+because there is nothing left to exclude.
+
+**Cost.** A second document to keep in step with the first, one more page of this application
+that exists for machinery rather than for a reader, and `frame-src` open by one origin. The root
+layout carries a three-line opt-out for it, because SvelteKit has no way for a route to escape
+the root layout and the frame must not carry the workspace — not merely for the waste, but
+because the tab strip's effect writes to a `localStorage` the frame *shares* with the page that
+created it.
+
+**Rejected:** leaving it documented (the noise masks real errors in exactly the place a developer
+looks first), `'unsafe-inline'` on the page's `style-src` (the one loosening ADR 0007 refused,
+and it would make `widenCspNonceToStyles` skip the directive and unstyle the editor in production
+only), a nonce or a hash for mermaid's `<style>` (the library has no nonce hook — verified
+against `mermaid@11.17.2` — and a hash is a copy of a dependency's private constant), and
+pre-rendering at publish time with a headless browser on the API host (the cleanest result, and a
+large new dependency on the one host that must stay small).
+
 ### `securityLevel: 'sandbox'` is unavailable here, and that is not reconsiderable
 
 Every Mermaid advisory recommends `securityLevel: 'sandbox'` as its workaround. It emits
-`<iframe src="data:text/html;base64,…">`, and this application's `frame-src` is `['none']` —
+`<iframe src="data:text/html;base64,…">`, and this application's `frame-src` was `['none']` —
 written on the grounds that *"nothing is embedded and nothing embeds this"*. Loosening it to
 admit `data:` would hand a general XSS-hosting primitive to the policy in exchange for a library
 setting. The plan's own gate applies: if a directive turns out to be needed, that is the signal
 to reconsider the feature rather than the policy.
+
+**D-26 did not weaken this, and the distinction is the point.** `frame-src` is now `['self']` on
+the page — one origin, this one, serving one document written here — and `['none']` again on that
+document's own response. `data:` is still refused, so `securityLevel: 'sandbox'` is still
+unavailable and `'strict'` is still what is set, *inside the frame*. A frame this application
+serves and a frame whose contents arrive base64-encoded in a URL are not the same object.
 
 So `securityLevel: 'strict'` it is, `'loose'` and `'antiscript'` are never used, and
 `bindFunctions` is **never called** — it is what would wire a diagram's `click` interactions to

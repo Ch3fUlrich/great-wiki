@@ -63,6 +63,23 @@
 
   let { children, data } = $props();
 
+  /**
+   * Is this response the diagram frame rather than a view of the wiki? (D-26)
+   *
+   * `$lib/blocks/mermaid` loads `DIAGRAM_FRAME_PATH` into a hidden `<iframe>` so that
+   * Mermaid runs in a document with a policy of its own. That document is not a page and
+   * must not be wrapped in the workspace — see the markup below for what goes wrong when it
+   * is, which is not merely waste. SvelteKit offers no way for a route to opt out of the
+   * ROOT layout, so this is where the opt-out has to live.
+   *
+   * It arrives through `data` rather than from `$app/state`'s `page`, and that is not a
+   * style choice: `page` reads SvelteKit's own render context, which `render()` from
+   * `svelte/server` does not provide, so reaching for it here makes every test in
+   * `layout.test.ts` throw *"Cannot read properties of undefined"* — twenty-four of them at
+   * once. `+layout.ts` already has the address in hand and costs no round trip for it.
+   */
+  const rahmen = $derived(data.rahmen === true);
+
   /** The panel the tabs control. Named once; the tabs point at it and it points back. */
   const PANEL = 'gw-panel';
 
@@ -156,6 +173,11 @@
    * this application behaved before it had tabs at all.
    */
   $effect(() => {
+    // The diagram frame shares this origin, and therefore this `localStorage`, with the page
+    // that created it. Letting this effect run there would have a hidden renderer rewrite the
+    // reader's open tabs to `/_diagramm` — the one way in which putting the frame inside the
+    // shell would be a bug rather than an expense.
+    if (rahmen) return;
     const ausUrl = data.tabHrefs ?? [];
     const hier = data.hier ?? '/';
     const store = speicher();
@@ -216,6 +238,21 @@
   <link rel="icon" href={favicon} />
 </svelte:head>
 
+{#if rahmen}
+  <!-- The diagram frame (D-26) is a document, not a view: it is loaded into a hidden
+       `<iframe>` by `$lib/blocks/mermaid`, it has no content, and nobody navigates to it.
+       Wrapping it in the workspace would put a second copy of the whole shell inside every
+       page that holds a diagram — a second page tree, a second tab strip, a second account
+       menu, all hydrated and all invisible — and the tab strip's effect above writes to
+       `localStorage`, which the frame SHARES with the page that created it. That is not
+       waste, it is the frame quietly rewriting the reader's open tabs.
+
+       SvelteKit has no way for a route to opt out of the root layout, so the opt-out is
+       here. It is a render-time comparison and costs no round trip: nothing in this file's
+       `load` chain knows about it, so `+layout.server.ts` still ignores `url` and still runs
+       once per page rather than once per navigation. -->
+  {@render children()}
+{:else}
 <!-- Skip link first in the DOM: a keyboard user must be able to bypass the navigation
      without tabbing through every tree entry and every tab on every page. It is a
      fragment, not a place, so it never carries the workspace. -->
@@ -338,6 +375,7 @@
     </div>
   </div>
 </div>
+{/if}
 
 <style>
   /* --- The frame -----------------------------------------------------------------------
