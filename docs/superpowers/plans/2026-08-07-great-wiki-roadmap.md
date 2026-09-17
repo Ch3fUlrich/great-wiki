@@ -220,3 +220,28 @@ is the thing that gets explained wrong), and an invitation that pre-grants a hom
 username (a reference to an account that does not exist yet, and a username is not a thing
 a relative knows). The merge key is the email Authelia asserts as verified, never one the
 person types at sign-in.
+
+### M6 and M7, sized (2026-09-17, evening)
+
+**The digest goes through the homelab's existing relay** — the one Authelia and the health
+mails already use — so mail is one SMTP endpoint configured in one place and the wiki holds
+no provider credential of its own. First step of M6 is therefore to find that relay in the
+Server repo and confirm cloud.vm can reach it; the digest is not designed until it can.
+Rejected: a direct provider credential (one more secret to rotate, for one sender) and
+in-wiki only (the owner wants to hear about things without opening the wiki).
+
+**The digest covers four kinds of event:** replies and mentions; edits by somebody else to a
+page you wrote or last edited; tasks assigned to you and tasks you own coming due; and — for
+administrators only — accepted invitations and grant changes on pages you administer. That
+last one is what makes the wiki's population visible to the person responsible for it, and
+it is filtered like everything else: an event about a page reaches only a reader of that page.
+Consequence: this is the **event bus** the roadmap put in M6, and it now has four producers
+before it has one consumer. Design the bus once, with these four, rather than one at a time.
+
+**Search returns snippets, and also finds topics and tasks**, in separate result groups. A
+result is title, current path and the matching passage with the term marked; each snippet is
+from a page the reader is confirmed to read, so one permission check per hit is the price and
+is paid. Three retrievers — pages, topics, tasks — each already have a permission-checked
+accessor; search must go through them and never a fourth path (rule 2, and the reason the
+graph, the board and the topic index all filter per document). Rejected: title and path only
+(cheaper, and weak the moment the corpus grows past what a person remembers).
