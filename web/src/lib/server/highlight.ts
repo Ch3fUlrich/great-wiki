@@ -316,7 +316,18 @@ function longestLine(text: string): number {
  * `language="text"` when they cannot draw it, so a listing this walked would be work nobody
  * ever reads.
  */
-export function highlightDocument(block: Block | null | undefined): Fences {
+/**
+ * What the page budget reads time from. Real time in production; a test hands in its own so
+ * that which cap fires depends on the input and not on how busy the machine is. Under load
+ * the old tests timed out, or reached the time cap before the one they meant to test.
+ */
+export type Clock = () => number;
+const realClock: Clock = () => performance.now();
+
+export function highlightDocument(
+  block: Block | null | undefined,
+  clock: Clock = realClock
+): Fences {
   const fences: Fences = new Map();
   if (!block) return fences;
 
@@ -345,9 +356,9 @@ export function highlightDocument(block: Block | null | undefined): Fences {
     }
 
     attempts += 1;
-    const begonnen = performance.now();
+    const begonnen = clock();
     const fence = highlightFence(text, language);
-    spent += performance.now() - begonnen;
+    spent += clock() - begonnen;
     if (fence.kind !== 'highlighted') return fence;
 
     if (tokens + fence.tokens.length > PAGE_TOKEN_LIMIT) {

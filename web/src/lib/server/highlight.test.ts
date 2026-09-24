@@ -30,6 +30,15 @@ function printed(text: string, language: unknown): string {
   return fence.kind === 'highlighted' ? fence.tokens.map((token) => token.text).join('') : '';
 }
 
+/**
+ * A clock where every render costs exactly `ms`. Each reading is `ms` after the last, and a
+ * render is charged the difference between the reading before it and the one after.
+ */
+function ticking(ms: number) {
+  let now = 0;
+  return () => (now += ms);
+}
+
 describe('the regex engine', () => {
   it('is not WebAssembly — highlighting works with WebAssembly unreachable', async () => {
     // THE test of this step, and the only one that fails for the right reason. Shiki
@@ -373,32 +382,43 @@ describe('the caps that belong to the page rather than to one block', () => {
 
   it('stops at the page’s share of the server’s time', () => {
     // A page may hold fences that are each inside every character limit and still cost the
-    // one thread every other reader is queued behind more than it can spare. Two fences
-    // like these measure at about 600 ms each, so the budget is spent inside the first —
-    // and the second must then cost a lookup rather than a tokenisation.
-    const teuer = (n: number) => `${listing('const x = 1; ', 20_000)}\n// ${n}`;
-    const page = highlightDocument(doc(fence(teuer(1), 'typescript'), fence(teuer(2), 'typescript')));
+    // one thread every other reader is queued behind more than it can spare. With each fence
+    // charged more than the whole budget, the budget is spent inside the first, and the
+    // second must then cost a lookup rather than a tokenisation.
+    const page = highlightDocument(
+      doc(fence('const a = 1;', 'typescript'), fence('const b = 2;', 'typescript')),
+      ticking(PAGE_BUDGET_MS + 1)
+    );
 
-    expect(of(page, teuer(1), 'typescript').kind).toBe('highlighted');
-    const zweite = of(page, teuer(2), 'typescript');
+    expect(of(page, 'const a = 1;', 'typescript').kind).toBe('highlighted');
+    const zweite = of(page, 'const b = 2;', 'typescript');
     expect(zweite.kind).toBe('plain');
     if (zweite.kind !== 'plain') return;
     expect(zweite.note).toContain('Rechenzeit');
     expect(zweite.note).toContain(`${PAGE_BUDGET_MS}`);
   });
 
+  it('keeps colouring while the page is inside its time', () => {
+    // The other side of the line, so the test above cannot pass by refusing everything.
+    const page = highlightDocument(
+      doc(fence('const a = 1;', 'typescript'), fence('const b = 2;', 'typescript')),
+      ticking(PAGE_BUDGET_MS / 4)
+    );
+    expect(of(page, 'const b = 2;', 'typescript').kind).toBe('highlighted');
+  });
+
   it('tells a fence with nothing to explain nothing, even on an exhausted page', () => {
     // A page that has spent its budget still says nothing about a fence that states no
     // language, or `text`, or a language this wiki does not know: those have their own
     // answers already, and the page's budget is none of their business.
-    const teuer = listing('const x = 1; ', 20_000);
     const page = highlightDocument(
       doc(
-        fence(teuer, 'typescript'),
+        fence('const x = 1;', 'typescript'),
         fence('x', 'kotlin'),
         fence('x', 'text'),
         fence('x')
-      )
+      ),
+      ticking(PAGE_BUDGET_MS + 1)
     );
     expect(of(page, 'x', 'kotlin')).toEqual({ kind: 'plain', note: 'Unbekannte Sprache: kotlin' });
     expect(of(page, 'x', 'text')).toEqual({ kind: 'plain', note: null });

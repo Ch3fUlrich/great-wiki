@@ -151,7 +151,18 @@ export function katexOptions(): KatexOptions {
  * so the two sides cannot key on different strings. Identical fences share one entry and
  * one render.
  */
-export function typesetDocument(block: Block | null | undefined): Formulas {
+/**
+ * What the page budget reads time from. Real time in production; a test hands in its own so
+ * that which cap fires depends on the input and not on how busy the machine is. Under load
+ * the old tests timed out, or reached the time cap before the one they meant to test.
+ */
+export type Clock = () => number;
+const realClock: Clock = () => performance.now();
+
+export function typesetDocument(
+  block: Block | null | undefined,
+  clock: Clock = realClock
+): Formulas {
   const formulas: Formulas = new Map();
   if (!block) return formulas;
 
@@ -188,7 +199,7 @@ export function typesetDocument(block: Block | null | undefined): Formulas {
 
     attempts += 1;
     let html: string;
-    const begonnen = performance.now();
+    const begonnen = clock();
     try {
       html = renderToString(text, katexOptions());
     } catch {
@@ -201,7 +212,7 @@ export function typesetDocument(block: Block | null | undefined): Formulas {
       // In a `finally`, so a formula that threw is still charged for the time it burnt
       // getting there: a page of formulas that each fail expensively is the same lever as a
       // page of formulas that each succeed expensively.
-      spent += performance.now() - begonnen;
+      spent += clock() - begonnen;
     }
 
     if (markup + html.length > PAGE_MARKUP_LIMIT) {

@@ -6,6 +6,7 @@ import {
   FORMULA_CHARACTER_LIMIT,
   PAGE_FORMULA_LIMIT,
   PAGE_MARKUP_LIMIT,
+  PAGE_TYPESET_BUDGET_MS,
   katexOptions,
   typesetDocument
 } from './maths';
@@ -38,6 +39,15 @@ function markup(text: string): string {
   const formula = one(text);
   expect(formula.kind).toBe('typeset');
   return formula.kind === 'typeset' ? formula.html : '';
+}
+
+/**
+ * A clock where every render costs exactly `ms`. Each reading is `ms` after the last, and a
+ * render is charged the difference between the reading before it and the one after.
+ */
+function ticking(ms: number) {
+  let now = 0;
+  return () => (now += ms);
 }
 
 describe('the options KaTeX is called with', () => {
@@ -202,7 +212,12 @@ describe('the caps, which are generous and are still caps', () => {
     // bounds the parser's work and not the page's size, and this is the cap that does.
     const dense = 'x + '.repeat(1000);
     expect(dense.length).toBeLessThan(FORMULA_CHARACTER_LIMIT);
-    const page = typesetDocument(doc(...Array.from({ length: 4 }, (_, i) => fence(`${dense} ${i}`))));
+    // A clock that never moves: this test is about size, and on a loaded machine the time
+    // cap used to fire first and name the wrong limit.
+    const page = typesetDocument(
+      doc(...Array.from({ length: 4 }, (_, i) => fence(`${dense} ${i}`))),
+      () => 0
+    );
 
     const refused = [...page.values()].filter((formula) => formula.kind === 'source');
     expect(refused.length).toBeGreaterThan(0);
@@ -228,8 +243,10 @@ describe('the caps, which are generous and are still caps', () => {
     // note it was. No timing assertion, and nothing that changes with the machine.
     const dense = 'x + '.repeat(1000);
     const bomb = '{'.repeat(2000) + '}'.repeat(2000);
+    // A frozen clock, for the same reason as the test above: this is about size.
     const page = typesetDocument(
-      doc(...Array.from({ length: 4 }, (_, i) => fence(`${dense} ${i}`)), fence(bomb))
+      doc(...Array.from({ length: 4 }, (_, i) => fence(`${dense} ${i}`)), fence(bomb)),
+      () => 0
     );
 
     const refused = page.get(bomb)!;
@@ -241,31 +258,27 @@ describe('the caps, which are generous and are still caps', () => {
 
   it('stops at the page’s share of the server’s time, which the markup budget does not bound', () => {
     // The other half, and the reason the stop above is not the whole answer. Markup and CPU
-    // are not proportional: `\text{a a a …}` measures at about 20 ms for 15 kB of markup on
-    // this machine, so sixty-odd of them stay inside PAGE_MARKUP_LIMIT while costing well
-    // over a second of the one thread every reader's page load is queued behind.
+    // are not proportional: `\text{a a a …}` measured at about 20 ms for 15 kB of markup,
+    // so sixty-odd of them stay inside PAGE_MARKUP_LIMIT while costing well over a second of
+    // the one thread every reader's page load is queued behind.
     //
-    // Counted as time actually spent inside KaTeX, so a slow machine typesets fewer
-    // formulas rather than taking longer — the budget belongs to the deployment and not to
-    // the page.
-    //
-    // That ratio is what this test rests on, so it is written down: `\text{}` is the worst
-    // cost-per-byte shape found (127 ms per 100 kB of markup, against 8–28 for arrays,
-    // fractions and nested delimiters), which puts the time budget at about a fifth of the
-    // markup budget. On a machine five times faster than this one the markup stop would
-    // fire first and this test would go red naming the wrong limit — which is a diagnosable
-    // failure and the reason the number is here rather than in a commit message.
-    const slow = (n: number) => `\\text{${'a '.repeat(2400)}${n}}`;
-    const page = typesetDocument(doc(...Array.from({ length: 100 }, (_, i) => fence(slow(i)))));
+    // The clock is the test's own, so which limit fires depends on the input and not on the
+    // machine. It used to depend on real time, and said so here: a faster machine would have
+    // gone red naming the markup limit, and a loaded one did.
+    const small = (n: number) => `x_{${n}}`;
+    const page = typesetDocument(
+      doc(...Array.from({ length: 10 }, (_, i) => fence(small(i)))),
+      ticking(PAGE_TYPESET_BUDGET_MS / 3)
+    );
 
-    expect(page.get(slow(0))!.kind).toBe('typeset');
+    expect(page.get(small(0))!.kind).toBe('typeset');
     const notes = [...page.values()]
       .filter((formula) => formula.kind === 'source')
       .map((formula) => (formula.kind === 'source' ? formula.note : ''));
     expect(notes.length).toBeGreaterThan(0);
-    expect(notes.some((note) => note.includes('Rechenzeit'))).toBe(true);
+    expect(notes.every((note) => note.includes('Rechenzeit'))).toBe(true);
     // And the budget is spent on the formulas rather than on discovering it is spent: the
-    // stop means the hundredth fence costs a map lookup, not a render.
+    // stop means the tenth fence costs a map lookup, not a render.
     expect(notes.some((note) => note.includes('konnte nicht gesetzt werden'))).toBe(false);
   });
 });
