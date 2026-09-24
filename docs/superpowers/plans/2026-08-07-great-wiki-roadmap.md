@@ -280,9 +280,15 @@ another page's body.** Links resolve by identity at read time; that is the whole
 
 For the session that picks this up with a fresh context:
 
-- Main carries identity merge (ADR 0021), withheld-reads-as-absent (ADR 0022), and the userinfo
-  address fix. The `/admin` gate (anyone who administers nothing is sent to the sign-in page;
-  owner's choice) was in progress in this session — check `git log` for it.
+- **Production runs `3128ece`** (Semaphore task 112569, verified in a browser): identity merge
+  (ADR 0021), withheld pages read as absent (ADR 0022), the userinfo address fix, and the
+  `/admin` gate. Anyone who administers nothing, anonymous or signed in, gets a 303 to the
+  sign-in page, which names a signed-in caller and offers sign-out. `/api/me` carries
+  `administers`, computed by the same function as the audit reader's gate.
+- The web suite's "one failed, passed on rerun" was three budget tests racing real time. They
+  now use a clock the test controls; eight full runs under fourfold load were green.
+- The harness is at 109 checks. Its anonymous checks need a second API without the dev shim,
+  which `just behaviour` starts on the behaviour port plus 100.
 - The Authelia walkthrough leg is **skipped for now** by the owner. The production response
   shape (Authelia 4.39, no claims policy, email and email_verified at userinfo only) is pinned
   by a test instead.
