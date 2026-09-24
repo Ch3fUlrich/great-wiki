@@ -76,6 +76,11 @@ struct IdpScript {
     groups: Option<Vec<String>>,
     userinfo_groups: Option<Vec<String>>,
     userinfo_sub: Option<String>,
+    /// What userinfo says about the address. Authelia 4.39 with no claims policy keeps
+    /// `email` and `email_verified` there and out of the id token, so the path the
+    /// production provider actually takes needs a stand-in that can say it.
+    userinfo_email: Option<String>,
+    userinfo_email_verified: Option<bool>,
     issuer_claim: Option<String>,
     audience_claim: Option<String>,
     /// Seconds from now. Negative produces an already-expired token.
@@ -94,6 +99,8 @@ impl Default for IdpScript {
             groups: Some(vec!["admins".into()]),
             userinfo_groups: None,
             userinfo_sub: None,
+            userinfo_email: None,
+            userinfo_email_verified: None,
             issuer_claim: None,
             audience_claim: None,
             expires_in: 300,
@@ -233,11 +240,18 @@ async fn idp_token(
 
 async fn idp_userinfo(State(state): State<Arc<Mutex<IdpState>>>) -> Json<Value> {
     let script = state.lock().unwrap().script.clone();
-    Json(json!({
+    let mut body = json!({
         "sub": script.userinfo_sub.unwrap_or(script.sub),
         "preferred_username": script.preferred_username,
         "groups": script.userinfo_groups.unwrap_or_default(),
-    }))
+    });
+    if let Some(email) = script.userinfo_email {
+        body["email"] = json!(email);
+    }
+    if let Some(verified) = script.userinfo_email_verified {
+        body["email_verified"] = json!(verified);
+    }
+    Json(body)
 }
 
 // -------------------------------------------------------------------------------------
@@ -1202,6 +1216,83 @@ async fn a_verified_address_signs_in_as_the_account_that_was_invited() {
             .status(),
         StatusCode::OK
     );
+}
+
+#[tokio::test]
+async fn the_production_providers_shape_merges_an_address_only_userinfo_carries() {
+    // Authelia 4.39 with no claims policy: the id token is bare, and the username,
+    // groups, address and its verification all come from userinfo. This is the path
+    // every real sign-in takes, and until this test the stand-in could not take it.
+    let idp = Idp::start().await;
+    let store = seed().await;
+    let invited_id = invited(&store, "oma", "oma@example.de").await;
+    let app = app(&store, Some(&idp));
+
+    idp.script(|s| {
+        s.preferred_username = Some("erika.mueller".into());
+        s.email = None;
+        s.email_verified = None;
+        s.groups = None;
+        s.userinfo_groups = Some(vec!["users".into()]);
+        s.userinfo_email = Some("oma@example.de".into());
+        s.userinfo_email_verified = Some(true);
+    });
+
+    let mut jar = Jar::default();
+    assert_eq!(
+        sign_in(&app, &idp, &mut jar).await.status(),
+        StatusCode::FOUND
+    );
+    let me = json_body(send(&app, "GET", "/api/me", &mut jar).await).await;
+    assert_eq!(
+        me["username"],
+        json!("oma"),
+        "a second account was made: {me}"
+    );
+    assert_eq!(store.list_principals().await.unwrap().len(), 1);
+    assert_eq!(
+        store
+            .principal_by_username("oma")
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .id,
+        invited_id
+    );
+}
+
+#[tokio::test]
+async fn an_id_token_without_an_address_still_asks_userinfo_for_one() {
+    // A claims policy that puts the username and groups in the id token but leaves the
+    // address at userinfo. Asking only when the username or groups are missing would
+    // never learn the address, and nobody would merge again — silently.
+    let idp = Idp::start().await;
+    let store = seed().await;
+    invited(&store, "oma", "oma@example.de").await;
+    let app = app(&store, Some(&idp));
+
+    idp.script(|s| {
+        s.preferred_username = Some("erika.mueller".into());
+        s.email = None;
+        s.email_verified = None;
+        s.groups = Some(vec!["users".into()]);
+        s.userinfo_email = Some("oma@example.de".into());
+        s.userinfo_email_verified = Some(true);
+    });
+
+    let mut jar = Jar::default();
+    assert_eq!(
+        sign_in(&app, &idp, &mut jar).await.status(),
+        StatusCode::FOUND
+    );
+    let me = json_body(send(&app, "GET", "/api/me", &mut jar).await).await;
+    assert_eq!(
+        me["username"],
+        json!("oma"),
+        "the address was never asked for: {me}"
+    );
+    assert_eq!(store.list_principals().await.unwrap().len(), 1);
 }
 
 #[tokio::test]

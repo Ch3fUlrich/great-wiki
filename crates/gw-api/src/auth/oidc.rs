@@ -438,7 +438,9 @@ impl OidcClient {
         let mut email_verified = claims.email_verified.unwrap_or(false);
         let mut groups = claims.groups;
 
-        if username.is_none() || groups.is_none() {
+        // An absent address is asked for too: without it nobody merges, and nothing
+        // would say so beyond one log line per sign-in.
+        if username.is_none() || groups.is_none() || email.is_none() {
             let discovery = self.discovery().await?;
             let endpoint = discovery.userinfo_endpoint.as_deref().ok_or_else(|| {
                 rejected("the id token is incomplete and there is no userinfo endpoint to ask")
