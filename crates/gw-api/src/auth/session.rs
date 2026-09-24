@@ -127,6 +127,19 @@ pub struct Me {
     /// banner is rendered from — the target alone would not say whose session this really
     /// is, and the viewer alone would not say what is being shown.
     pub view_as: Option<crate::view_as::ViewAsView>,
+    /// Whether this caller administers at least one path — the instance, or any subtree,
+    /// directly or through a team. The web console reads it before it fetches anything
+    /// and sends everybody for whom it is `false` to the sign-in page.
+    ///
+    /// Answered by [`crate::routes::admin::administers_anything`], the audit reader's own
+    /// gate, so it cannot disagree with the endpoints the console would go on to call.
+    /// Like every field above it describes the SUBSTITUTED person while an administrator is
+    /// viewing as somebody else: that is who every admin endpoint runs as, so the console is
+    /// shut for exactly as long as all of its panels would refuse.
+    ///
+    /// Reporting, never deciding: each admin endpoint still runs its own gate. A `true`
+    /// here opens no door, and a `false` only spares a page of refusals.
+    pub administers: bool,
 }
 
 pub async fn me(State(state): State<AppState>, jar: CookieJar) -> Result<Json<Me>, ApiError> {
@@ -137,6 +150,8 @@ pub async fn me(State(state): State<AppState>, jar: CookieJar) -> Result<Json<Me
         .baseline_for(&principal)
         .await
         .map_err(ApiError::Internal)?;
+
+    let administers = crate::routes::admin::administers_anything(&state, &principal).await?;
 
     let signed_in = principal.is_authenticated() && principal.active;
     Ok(Json(Me {
@@ -158,6 +173,7 @@ pub async fn me(State(state): State<AppState>, jar: CookieJar) -> Result<Json<Me
         login_available: state.oidc.is_some(),
         source,
         view_as,
+        administers,
     }))
 }
 

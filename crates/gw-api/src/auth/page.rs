@@ -26,7 +26,7 @@
 //! reaching across to the front end for a stylesheet would be an external dependency on
 //! the one page that must never have one.
 
-use crate::routes::AppState;
+use crate::routes::{AppState, PrincipalSource};
 use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -72,11 +72,99 @@ impl Notice {
     }
 }
 
+/// Who is already here, as far as this page needs to know.
+///
+/// The console at `/admin` sends everybody who administers nothing to this page — anonymous
+/// visitors and signed-in readers alike. A reader who lands here with no word about why
+/// would sign in again as the same person, be sent back, and land here again. So a caller
+/// who is already signed in is told who they are and what the Verwaltung needs, and is
+/// offered the way to become somebody else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Caller {
+    /// Nobody, or a refusal page where the question does not arise.
+    Nobody,
+    /// Signed in. `can_sign_out` is false for the development shim, which has no session to
+    /// end — the same reason `/api/me` reports its source.
+    SignedIn {
+        display_name: String,
+        username: String,
+        can_sign_out: bool,
+    },
+    /// An administrator viewing as somebody else (D-M2-17). A sign-out would be refused
+    /// while the mode is active — every POST but the exit is — so the exit is offered
+    /// instead.
+    ViewingAs { viewer: String, target: String },
+}
+
+impl Caller {
+    /// Resolved through the same functions every request uses, so the page cannot name
+    /// somebody the permission engine would not treat as the caller.
+    pub async fn of(state: &AppState, jar: &CookieJar) -> Self {
+        if let Some(view) = state.viewing_as(jar).await {
+            return Caller::ViewingAs {
+                viewer: view.viewer.display_name,
+                target: view.target.display_name,
+            };
+        }
+        let (principal, source) = state.principal_with_source(jar).await;
+        if principal.is_authenticated() && principal.active {
+            Caller::SignedIn {
+                display_name: principal.display_name,
+                username: principal.username,
+                can_sign_out: source == PrincipalSource::Session,
+            }
+        } else {
+            Caller::Nobody
+        }
+    }
+
+    fn block(&self) -> String {
+        match self {
+            Caller::Nobody => String::new(),
+            Caller::SignedIn {
+                display_name,
+                username,
+                can_sign_out,
+            } => {
+                // The dev shim is named but offered no sign-out: there is no session to end,
+                // and a button that quietly does nothing is worse than none.
+                let (switch, sign_out) = if *can_sign_out {
+                    (
+                        " Um ein anderes Konto zu nutzen, zuerst abmelden und dann neu anmelden.",
+                        "    <form method=\"post\" action=\"/auth/logout\">\n      \
+                         <button type=\"submit\">Abmelden</button>\n    </form>\n",
+                    )
+                } else {
+                    ("", "")
+                };
+                format!(
+                    "  <section class=\"konto\" aria-labelledby=\"konto-titel\">\n    \
+                     <h2 id=\"konto-titel\">Angemeldet als {name} ({user})</h2>\n    \
+                     <p class=\"hint\">Die Verwaltung braucht ein Konto mit \
+                     Verwaltungsrechten.{switch}</p>\n{sign_out}  </section>\n",
+                    name = escape(display_name),
+                    user = escape(username),
+                )
+            }
+            Caller::ViewingAs { viewer, target } => format!(
+                "  <section class=\"konto\" aria-labelledby=\"konto-titel\">\n    \
+                 <h2 id=\"konto-titel\">Angemeldet als {viewer}, Ansicht als {target}</h2>\n    \
+                 <p class=\"hint\">Solange die Ansicht als {target} läuft, ist die Verwaltung \
+                 nicht erreichbar — sie braucht ein Konto mit Verwaltungsrechten.</p>\n    \
+                 <form method=\"post\" action=\"/api/admin/view-as/exit\">\n      \
+                 <button type=\"submit\">Ansicht beenden</button>\n    </form>\n  </section>\n",
+                viewer = escape(viewer),
+                target = escape(target),
+            ),
+        }
+    }
+}
+
 /// Minimal HTML escaping for attribute and text content.
 ///
-/// Only the CSRF token is interpolated today and it is base64url, so nothing here can
-/// currently be reached. It is applied anyway: the next person to add a field to this
-/// page should find escaping already in the path rather than have to think of it.
+/// Applied to the CSRF token and to the caller's names. Names are chosen by people —
+/// an invited account sets its own display name — so this is the one thing standing
+/// between a display name and markup on the sign-in page.
 fn escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for character in value.chars() {
@@ -98,7 +186,7 @@ fn escape(value: &str) -> String {
 /// rather than present-and-broken — the same choice `/api/me`'s `login_available` already
 /// made, for the same reason: sending somebody to a control that answers 503 is worse
 /// than not offering it.
-pub fn render(homelab: bool, csrf: &str, notice: Option<Notice>) -> String {
+pub fn render(homelab: bool, csrf: &str, notice: Option<Notice>, caller: &Caller) -> String {
     let homelab_block = if homelab {
         r#"    <a class="homelab" href="/auth/oidc" rel="nofollow">Mit Homelab-Konto anmelden</a>
     <p class="hint">Für alle, die ein Konto im Homelab haben. Die Anmeldung läuft über
@@ -120,6 +208,8 @@ pub fn render(homelab: bool, csrf: &str, notice: Option<Notice>) -> String {
         ),
         None => String::new(),
     };
+
+    let caller_block = caller.block();
 
     format!(
         r##"<!doctype html>
@@ -194,6 +284,12 @@ button {{
 }}
 button:hover {{ border-color: var(--ink-faint); }}
 :focus-visible {{ outline: 2px solid var(--focus); outline-offset: 2px; }}
+.konto {{
+  padding: 1rem; margin-block-end: 1.5rem;
+  border: 1px solid var(--border); border-radius: 4px; background: var(--bg-sunken);
+}}
+.konto .hint {{ margin-block-end: 0.75rem; }}
+.konto p:last-child {{ margin-block-end: 0; }}
 .zurueck {{ display: block; margin-block-start: 1.5rem; color: var(--ink-muted); font-size: 0.889rem; }}
 </style>
 </head>
@@ -201,7 +297,7 @@ button:hover {{ border-color: var(--ink-faint); }}
   <main>
     <h1>Bei great-wiki anmelden</h1>
     <p class="hint">Öffentliche Seiten sind ohne Anmeldung lesbar.</p>
-{notice_block}{homelab_block}    <h2>Gastzugang</h2>
+{caller_block}{notice_block}{homelab_block}    <h2>Gastzugang</h2>
     <form method="post" action="/auth/local">
       <input type="hidden" name="csrf" value="{csrf}">
       <label for="username">Benutzername</label>
@@ -232,6 +328,7 @@ pub fn respond(
     homelab: bool,
     notice: Option<Notice>,
     status: StatusCode,
+    caller: &Caller,
 ) -> Response {
     let existing = jar
         .get(CSRF_COOKIE)
@@ -256,24 +353,25 @@ pub fn respond(
             // shared cache holding one would hand it to the next person through.
             (header::CACHE_CONTROL, "no-store"),
         ],
-        render(homelab, &token, notice),
+        render(homelab, &token, notice, caller),
     )
         .into_response()
 }
 
 /// `GET /auth/login` — the page D-M2-11 put in front of both mechanisms.
 pub async fn show(State(state): State<AppState>, jar: CookieJar) -> Response {
-    respond(jar, state.oidc.is_some(), None, StatusCode::OK)
+    let caller = Caller::of(&state, &jar).await;
+    respond(jar, state.oidc.is_some(), None, StatusCode::OK, &caller)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{escape, render, Notice};
+    use super::{escape, render, Caller, Notice};
 
     #[test]
     fn the_homelab_button_appears_only_when_a_provider_is_configured() {
-        assert!(render(true, "t", None).contains("/auth/oidc"));
-        let without = render(false, "t", None);
+        assert!(render(true, "t", None, &Caller::Nobody).contains("/auth/oidc"));
+        let without = render(false, "t", None, &Caller::Nobody);
         assert!(!without.contains("/auth/oidc"), "{without}");
         assert!(
             without.contains("/auth/local"),
@@ -283,25 +381,27 @@ mod tests {
 
     #[test]
     fn the_token_is_carried_in_the_form() {
-        assert!(render(true, "abc123", None).contains(r#"name="csrf" value="abc123""#));
+        assert!(
+            render(true, "abc123", None, &Caller::Nobody).contains(r#"name="csrf" value="abc123""#)
+        );
     }
 
     #[test]
     fn markup_in_a_token_cannot_escape_the_attribute() {
         // Unreachable today — tokens are base64url — and asserted so that it stays that
         // way if anything else is ever interpolated here.
-        let page = render(true, r#"" onload="alert(1)"#, None);
+        let page = render(true, r#"" onload="alert(1)"#, None, &Caller::Nobody);
         assert!(!page.contains(r#"onload="alert"#), "{page}");
         assert_eq!(escape(r#"<a href="x">"#), "&lt;a href=&quot;x&quot;&gt;");
     }
 
     #[test]
     fn the_two_notices_say_different_things_and_neither_names_an_account() {
-        let failed = render(true, "t", Some(Notice::Failed));
-        let throttled = render(true, "t", Some(Notice::Throttled));
+        let failed = render(true, "t", Some(Notice::Failed), &Caller::Nobody);
+        let throttled = render(true, "t", Some(Notice::Throttled), &Caller::Nobody);
         assert!(failed.contains("Anmeldung fehlgeschlagen"), "{failed}");
         assert!(throttled.contains("Zu viele"), "{throttled}");
         assert_ne!(failed, throttled);
-        assert!(render(true, "t", None).contains("Bei great-wiki anmelden"));
+        assert!(render(true, "t", None, &Caller::Nobody).contains("Bei great-wiki anmelden"));
     }
 }

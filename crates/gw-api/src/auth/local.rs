@@ -193,8 +193,18 @@ pub async fn sign_in(
     (jar.add(session_cookie(token)), redirect).into_response()
 }
 
+// A refusal names nobody, even when the browser already holds a session: the page is the
+// answer to a failed attempt, and what it must say is that the attempt failed — the same
+// bytes for every caller, as `a_wrong_password_and_an_unknown_username_are_indistinguishable`
+// compares them.
 fn failed(jar: CookieJar, homelab: bool) -> Response {
-    page::respond(jar, homelab, Some(Notice::Failed), StatusCode::UNAUTHORIZED)
+    page::respond(
+        jar,
+        homelab,
+        Some(Notice::Failed),
+        StatusCode::UNAUTHORIZED,
+        &page::Caller::Nobody,
+    )
 }
 
 fn throttled(jar: CookieJar, homelab: bool) -> Response {
@@ -203,6 +213,7 @@ fn throttled(jar: CookieJar, homelab: bool) -> Response {
         homelab,
         Some(Notice::Throttled),
         StatusCode::TOO_MANY_REQUESTS,
+        &page::Caller::Nobody,
     )
 }
 

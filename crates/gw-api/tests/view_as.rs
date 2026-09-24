@@ -791,3 +791,56 @@ async fn a_substitution_does_not_outlive_its_deadline() {
         "/api/me reported a mode whose deadline had passed"
     );
 }
+
+// -------------------------------------------------------------------------------------
+// The console's gate, while viewing as somebody.
+// -------------------------------------------------------------------------------------
+
+/// `administers` on `/api/me` describes the SUBSTITUTED person, like every other field
+/// there — because that is who every admin endpoint runs as too. An administrator viewing
+/// as a reader is refused the admin API for the length of the mode, so a console that
+/// opened would be seven refusals in a frame; the flag says so before any of them is asked.
+#[tokio::test]
+async fn while_viewing_as_a_reader_the_administrator_administers_nothing() {
+    let store = fixture().await;
+    let gast = id_of(&store, "gast").await;
+    let mut chef = Browser::signed_in_as(&store, "chef").await;
+
+    assert_eq!(chef.get("/api/me").await.json()["administers"], true);
+
+    chef.view_as(&gast).await;
+    let me = chef.get("/api/me").await.json();
+    assert_ne!(me["view_as"], Value::Null, "the mode never took effect");
+    assert_eq!(me["administers"], false);
+    // And the endpoints agree, which is the reason for the choice.
+    assert_eq!(
+        chef.get("/api/admin/audit").await.status,
+        StatusCode::FORBIDDEN
+    );
+
+    chef.exit().await;
+    assert_eq!(chef.get("/api/me").await.json()["administers"], true);
+}
+
+/// Where the console sends them. A sign-out would be refused here — every POST but the
+/// exit is, while the mode is active — so the page offers the exit instead, and says whose
+/// view is being shown.
+#[tokio::test]
+async fn the_sign_in_page_offers_the_way_out_of_the_mode_not_a_sign_out_that_would_be_refused() {
+    let store = fixture().await;
+    let gast = id_of(&store, "gast").await;
+    let mut chef = Browser::signed_in_as(&store, "chef").await;
+    chef.view_as(&gast).await;
+
+    let page = chef.get("/auth/login").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(
+        page.body
+            .contains(r#"<form method="post" action="/api/admin/view-as/exit">"#),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("Gast Konto"), "{}", page.body);
+    assert!(page.body.contains("Chef"), "{}", page.body);
+    assert!(!page.body.contains("/auth/logout"), "{}", page.body);
+}

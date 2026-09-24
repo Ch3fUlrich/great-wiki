@@ -3758,6 +3758,134 @@ await check('Q3 a second invitation for the same address is refused, in German, 
 });
 
 
+// ---------------------------------------------------------------------------------------
+// Group R — the console's door: who is turned away from /admin, and where to
+// ---------------------------------------------------------------------------------------
+//
+// In production an anonymous visitor opening /admin got a 200 and the whole console frame —
+// »Verwaltung«, the lede, every panel — with each panel saying in German that it could not
+// be loaded. Nothing leaked, because every endpoint refused, but the page never decided
+// whether the caller belonged there. It now asks `/api/me` for `administers` before it
+// fetches anything, and everybody for whom that is not `true` gets a 303 to the sign-in
+// PAGE — never to `/auth/oidc`, which would send a signed-in reader round Authelia and back
+// for ever.
+//
+// Both halves need a browser this harness otherwise does not have. Every request here
+// arrives as `sergej:editors` through the development shim, which applies whenever there is
+// no session — so R1 and R2 run against a second, shim-less API with the production build
+// in front of it (`SHOT_BASE_ANON`, started by `just behaviour`), and R3 holds a real
+// session, which outranks the shim, by accepting an invitation.
+
+const ANON = process.env.SHOT_BASE_ANON ?? '';
+const ANON_API = process.env.SHOT_API_ANON ?? '';
+
+await check('R1 an anonymous visitor asking for /admin is sent to the sign-in page, and shown no console', async (page) => {
+  assert(
+    ANON && ANON_API,
+    'SHOT_BASE_ANON / SHOT_API_ANON are unset — the anonymous case must never be skipped. ' +
+      'Run through `just behaviour`, which starts the shim-less pair.'
+  );
+  // What the server answers for /admin itself, unfollowed: the redirect, and not a byte of
+  // the console in its body.
+  const direct = await page.request.get(ANON + '/admin', { maxRedirects: 0 });
+  assert(direct.status() === 303, `/admin answered ${direct.status()} to an anonymous visitor`);
+  assert(
+    direct.headers()['location'] === '/auth/login',
+    `/admin redirected to ${direct.headers()['location']}, not the sign-in page`
+  );
+  const body = await direct.text();
+  for (const word of ['Verwaltung', 'Personen', 'konnte nicht geladen werden']) {
+    assert(!body.includes(word), `the redirect carried the console with it (${word}): ${body}`);
+  }
+
+  // And in a browser: the navigation passes through that 303 and lands on the sign-in
+  // address. The production build does not proxy /auth — Caddy does that in production —
+  // so where it lands is asserted by address; R2 renders the page itself.
+  const response = await page.goto(ANON + '/admin', { waitUntil: 'domcontentloaded' });
+  assert(
+    new URL(page.url()).pathname === '/auth/login',
+    `the browser ended on ${page.url()}, not the sign-in page`
+  );
+  const hop = response?.request().redirectedFrom();
+  const hopStatus = (await hop?.response())?.status();
+  assert(hopStatus === 303, `the hop from /admin was ${hopStatus}, not a 303`);
+
+  // Anti-vacuity: the shim-less stack really is anonymous and really is up. Its home page
+  // renders, and says nobody is signed in — offering »Anmelden«.
+  await page.goto(ANON + '/', { waitUntil: 'domcontentloaded' });
+  const home = await page.locator('body').innerText();
+  assert(home.includes('Anmelden'), `the shim-less stack is not anonymous: ${home.slice(0, 400)}`);
+});
+
+await check('R2 the sign-in page an anonymous visitor lands on names nobody and offers both ways in', async (page) => {
+  assert(ANON_API, 'SHOT_API_ANON is unset — see R1');
+  const response = await page.goto(ANON_API + '/auth/login', { waitUntil: 'domcontentloaded' });
+  assert(response?.status() === 200, `the sign-in page answered ${response?.status()}`);
+  const text = await page.locator('body').innerText();
+  assert(text.includes('Bei great-wiki anmelden'), `not the sign-in page: ${text}`);
+  assert(!text.includes('Angemeldet als'), `an anonymous visitor was told they are signed in: ${text}`);
+  assert((await page.locator('form[action="/auth/local"]').count()) === 1, 'no guest form');
+  assert(
+    (await page.locator('form[action="/auth/logout"]').count()) === 0,
+    'a sign-out was offered to somebody with no session'
+  );
+});
+
+await check('R3 a signed-in reader is sent to the sign-in page, told who they are, and can switch', async (page) => {
+  // A real session, which outranks the development shim: an invitation into the one page
+  // this identity administers, accepted in this same browser. What it carries is read
+  // access — reading a page is not administering it.
+  const dialog = await openInviteDialog(page);
+  await dialog.getByRole('textbox', { name: 'Benutzername' }).fill('leserin');
+  await dialog.getByRole('textbox', { name: 'E‑Mail' }).fill('leserin@example.de');
+  await dialog.getByRole('button', { name: 'Einladung erstellen' }).click();
+  const block = page.locator('.gw-adm-invite-link');
+  await block.waitFor({ state: 'visible', timeout: 10_000 });
+  const link = (await block.locator('.gw-adm-invite-url').innerText()).trim();
+
+  // Followed on THIS origin, whatever host the link was minted for: the session cookie it
+  // issues is host-only, and it has to be the one the /admin request below carries.
+  await page.goto(BASE + new URL(link).pathname, { waitUntil: 'domcontentloaded' });
+  await page.locator('#display_name').fill('Leserin Lotte');
+  await page.locator('#password').fill('lotte-liest-gern-unter-dem-apfelbaum');
+  await Promise.all([
+    page.waitForURL((url) => url.pathname === '/', { timeout: 10_000 }),
+    page.locator('button[type=submit]').click()
+  ]);
+
+  // Now /admin, as her.
+  const response = await page.goto(BASE + '/admin', { waitUntil: 'domcontentloaded' });
+  assert(
+    new URL(page.url()).pathname === '/auth/login',
+    `a signed-in reader ended on ${page.url()}, not the sign-in page`
+  );
+  const hopStatus = (await response?.request().redirectedFrom()?.response())?.status();
+  assert(hopStatus === 303, `the hop from /admin was ${hopStatus}, not a 303`);
+
+  const text = await page.locator('body').innerText();
+  assert(text.includes('Angemeldet als Leserin Lotte'), `the page does not say who she is: ${text}`);
+  assert(text.includes('Verwaltungsrechten'), `the page does not say what the Verwaltung needs: ${text}`);
+  for (const word of ['Personen', 'konnte nicht geladen werden']) {
+    assert(!text.includes(word), `the console reached a reader (${word}): ${text}`);
+  }
+
+  // Switching accounts: the sign-out is there and works. Afterwards this browser is the
+  // shim's `sergej` again, who administers a page — so the console opens, which is also
+  // the proof that the door is not simply shut for everybody.
+  await Promise.all([
+    page.waitForURL((url) => url.pathname === '/', { timeout: 10_000 }),
+    page.getByRole('button', { name: 'Abmelden' }).click()
+  ]);
+  const again = await page.goto(BASE + '/admin', { waitUntil: 'domcontentloaded' });
+  assert(again?.status() === 200, `after signing out, /admin answered ${again?.status()}`);
+  assert(new URL(page.url()).pathname === '/admin', `after signing out, ended on ${page.url()}`);
+  assert(
+    (await page.getByRole('heading', { name: 'Verwaltung', level: 1 }).count()) === 1,
+    'the console did not open for an identity that administers a page'
+  );
+});
+
+
 await browser.close();
 
 // ---------------------------------------------------------------------------------------

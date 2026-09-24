@@ -1,4 +1,5 @@
-import { apiGet, type TreeNode } from '$lib/api';
+import { redirect } from '@sveltejs/kit';
+import { apiGet, type Me, type TreeNode } from '$lib/api';
 import {
   describeStatus,
   type AclView,
@@ -23,7 +24,33 @@ import type { PageServerLoad } from './$types';
  * Each endpoint is loaded independently and its failure kept beside its data. One dead
  * endpoint must not take the other three down — "Teams could not be loaded" is a useful
  * screen; "the admin console is broken" is not.
+ *
+ * **But first, whether the caller belongs here at all.** Before any panel is fetched,
+ * `/api/me` is asked, and anybody for whom it does not say `administers: true` — anonymous,
+ * or signed in and administering nothing — is sent to the sign-in page with a 303. Without
+ * this the console rendered its whole frame for anybody and let seven refusals fill it.
+ *
+ * The flag comes from the Rust gate the admin endpoints themselves use, so this cannot shut
+ * out somebody a panel would serve. It is the sign-in PAGE and never `/auth/oidc`: a
+ * signed-in reader sent through Authelia comes back as the same reader and would be sent
+ * again, for ever; the page tells them who they are signed in as instead. No return-to
+ * parameter, deliberately — it would be an open redirect to defend, for a convenience.
+ *
+ * Fail closed: an `/api/me` that errors, does not answer, or answers anything but the
+ * boolean `true` is a redirect.
  */
+
+/** Where everybody who administers nothing is sent. */
+const SIGN_IN = '/auth/login';
+
+async function administers(fetchFn: typeof fetch, cookie: string | null): Promise<boolean> {
+  try {
+    const { data } = await apiGet<Me>(fetchFn, '/api/me', cookie);
+    return data?.administers === true;
+  } catch {
+    return false;
+  }
+}
 
 const DEFAULT_LIMIT = 50;
 /** Mirrors the choices the Protokoll panel offers. Anything else falls back. */
@@ -47,6 +74,10 @@ async function loadOne<T>(
 
 export const load: PageServerLoad = async ({ fetch, request, url }) => {
   const cookie = request.headers.get('cookie');
+
+  // Awaited on its own, before the panels: nothing below may be asked on behalf of somebody
+  // who does not belong here.
+  if (!(await administers(fetch, cookie))) redirect(303, SIGN_IN);
 
   // Both selections live in the URL, so a link to "who can reach /handbuch" is a link
   // somebody can send, and the back button walks back through the paths they looked at.

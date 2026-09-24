@@ -104,6 +104,13 @@ export interface Me {
    * `null` is the ordinary case.
    */
   view_as: ViewAs | null;
+  /**
+   * Whether this caller administers at least one path — the instance, or any subtree,
+   * directly or through a team. Computed by the same Rust gate the admin endpoints use;
+   * `/admin` sends everybody for whom it is not `true` to the sign-in page. Reporting,
+   * never deciding: every admin endpoint still runs its own gate.
+   */
+  administers: boolean;
 }
 
 /** What the interface shows when the API cannot be reached: nobody, with nothing. */
@@ -117,7 +124,8 @@ export const ANONYMOUS: Me = {
   baseline: 'public',
   login_available: false,
   source: 'anonymous',
-  view_as: null
+  view_as: null,
+  administers: false
 };
 
 export interface StoredDocument {

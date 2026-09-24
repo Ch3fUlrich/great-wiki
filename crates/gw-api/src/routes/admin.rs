@@ -177,24 +177,48 @@ async fn signed_in(state: &AppState, jar: &CookieJar) -> Result<Principal, ApiEr
 /// space admin sees the entries scoped to a subtree they administer. This gate only
 /// decides whether there is any point asking, so that somebody who administers nothing is
 /// refused rather than handed an empty list to keep polling.
+async fn audit_reader(state: &AppState, jar: &CookieJar) -> Result<Principal, ApiError> {
+    let principal = state.principal(jar).await;
+    if administers_anything(state, &principal).await? {
+        Ok(principal)
+    } else {
+        Err(ApiError::Forbidden)
+    }
+}
+
+/// Whether `principal` administers at least one path: the instance, or any subtree.
+///
+/// The one definition of "may be in the console at all". The audit reader's gate asks it,
+/// and so does `/api/me` for the `administers` flag the web console reads before it fetches
+/// anything — so the console cannot open for somebody every panel then refuses, nor stay
+/// shut for somebody one of them would serve. It decides nothing itself: the baseline is
+/// `Store::baseline_for`'s answer and every grant's verdict is `gw_auth::can`'s, exactly as
+/// in [`instance_admin`] and [`path_admin`].
 ///
 /// "Administers something" is answered by asking `can()` once per path that carries a
 /// grant — the console's own index. Not by a prefix query: grants do not union up the
 /// tree, so holding `admin` at `/a` says nothing about `/a/b` once `/a/b` carries its own.
-async fn audit_reader(state: &AppState, jar: &CookieJar) -> Result<Principal, ApiError> {
-    let principal = state.principal(jar).await;
+/// Team grants are covered by the same call, because `can()` matches a team subject
+/// against the principal's teams.
+///
+/// Authentication first, for the reason the module comment gives: `can()` answers an
+/// `Anyone` grant before it asks who the caller is.
+pub(crate) async fn administers_anything(
+    state: &AppState,
+    principal: &Principal,
+) -> Result<bool, ApiError> {
     if !principal.is_authenticated() || !principal.active {
-        return Err(ApiError::Forbidden);
+        return Ok(false);
     }
 
     if state
         .store
-        .baseline_for(&principal)
+        .baseline_for(principal)
         .await
         .map_err(ApiError::Internal)?
         >= Baseline::Admin
     {
-        return Ok(principal);
+        return Ok(true);
     }
 
     for (path, _) in state
@@ -208,12 +232,12 @@ async fn audit_reader(state: &AppState, jar: &CookieJar) -> Result<Principal, Ap
             .grants_for_path(&path)
             .await
             .map_err(ApiError::Internal)?;
-        if can(&principal, Action::Admin, Visibility::Restricted, &grants) {
-            return Ok(principal);
+        if can(principal, Action::Admin, Visibility::Restricted, &grants) {
+            return Ok(true);
         }
     }
 
-    Err(ApiError::Forbidden)
+    Ok(false)
 }
 
 // -------------------------------------------------------------------------------------

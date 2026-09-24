@@ -234,6 +234,16 @@ behaviour: behaviour-fixture
     # production build" — is a promise nobody can keep twice.
     prod_port="${GW_BEHAVIOUR_PROD_PORT:-4174}"
     prod_base="http://127.0.0.1:${prod_port}"
+    # A THIRD pair, for Group R: an API with NO development shim, and the production build
+    # in front of it. Every other request this harness makes arrives as `sergej:editors`,
+    # because `GW_DEV_IDENTITY` applies to every request that carries no session — so without
+    # this pair there is no such thing as an anonymous browser here, and "an anonymous
+    # visitor is sent away from /admin" could only ever be a unit test. It is the exact case
+    # production got wrong. Same database, same binary; only the shim is missing.
+    anon_api_port="${GW_BEHAVIOUR_ANON_PORT:-$((api_port + 100))}"
+    anon_api="http://127.0.0.1:${anon_api_port}"
+    anon_port="${GW_BEHAVIOUR_ANON_WEB_PORT:-$((prod_port + 100))}"
+    anon_base="http://127.0.0.1:${anon_port}"
 
     # This recipe owns the dev stack for the run rather than sharing whatever is already on
     # these ports: the fixture above is only meaningful if the server under test is the one
@@ -258,6 +268,14 @@ behaviour: behaviour-fixture
       echo "    GW_BEHAVIOUR_PROD_PORT=4175 just behaviour" >&2
       exit 1
     fi
+    for anon in "$anon_api" "$anon_base"; do
+      if curl -sS -o /dev/null -m 2 "$anon"; then
+        echo "Something is already answering on $anon, where this recipe wants the shim-less" >&2
+        echo "pair Group R runs against. Stop it, or pick other ports:" >&2
+        echo "    GW_BEHAVIOUR_ANON_PORT=8193 GW_BEHAVIOUR_ANON_WEB_PORT=4274 just behaviour" >&2
+        exit 1
+      fi
+    done
 
     # Built here rather than assumed: `web/build` may be stale, may be from another branch,
     # or may not exist at all, and a Group M run against yesterday's policy is worse than no
@@ -294,9 +312,15 @@ behaviour: behaviour-fixture
     PORT="${prod_port}" HOST=127.0.0.1 ORIGIN="${prod_base}" \
       setsid bash -c '{{node}} cd web && node build/index.js' &
     prod_pid=$!
+    # Filled in once the shim-less pair below is started; empty until then, so an early
+    # exit kills only what exists.
+    anon_api_pid=""
+    anon_pid=""
     cleanup() {
       kill -- "-$api_pid" "-$web_pid" "-$prod_pid" >/dev/null 2>&1 || true
-      wait "$api_pid" "$web_pid" "$prod_pid" 2>/dev/null || true
+      if [ -n "$anon_api_pid" ]; then kill -- "-$anon_api_pid" >/dev/null 2>&1 || true; fi
+      if [ -n "$anon_pid" ]; then kill -- "-$anon_pid" >/dev/null 2>&1 || true; fi
+      wait "$api_pid" "$web_pid" "$prod_pid" $anon_api_pid $anon_pid 2>/dev/null || true
     }
     trap cleanup EXIT
 
@@ -314,6 +338,18 @@ behaviour: behaviour-fixture
       exit 1
     fi
 
+    # The shim-less pair, started only now that the first API has answered: `Store::open`
+    # runs the migrations, and two processes running them against one fresh file at the
+    # same instant is a race this recipe has no reason to take. `env -u` rather than an
+    # empty value: an empty `GW_DEV_IDENTITY` is a configuration the server has to
+    # interpret, an absent one is not.
+    GW_BIND="127.0.0.1:${anon_api_port}" \
+      setsid env -u GW_DEV_IDENTITY cargo run -q -p gw-api -- serve &
+    anon_api_pid=$!
+    PORT="${anon_port}" HOST=127.0.0.1 ORIGIN="${anon_base}" GW_API="${anon_api}" \
+      setsid bash -c '{{node}} cd web && node build/index.js' &
+    anon_pid=$!
+
     echo "waiting for $prod_base (production build) ..."
     up=""
     for _ in $(seq 1 60); do
@@ -330,9 +366,26 @@ behaviour: behaviour-fixture
       exit 1
     fi
 
+    echo "waiting for $anon_base (production build, no identity) ..."
+    up=""
+    for _ in $(seq 1 60); do
+      if curl -fsS -o /dev/null -m 2 "$anon_base/" && curl -fsS -o /dev/null -m 2 "$anon_api/api/health"; then
+        up=1
+        break
+      fi
+      sleep 1
+    done
+    if [ -z "$up" ]; then
+      echo "the shim-less pair never answered on $anon_base and $anon_api — check the output above" >&2
+      echo "Group R's anonymous checks are the only browser proof that /admin turns a visitor" >&2
+      echo "away, so this refuses rather than skipping." >&2
+      exit 1
+    fi
+
     docker run --rm --network host --user "$(id -u):$(id -g)" \
       -v "$PWD/web/scripts:/scripts:ro" -e HOME=/tmp \
       -e SHOT_BASE="$base" -e SHOT_BASE_PROD="$prod_base" \
+      -e SHOT_BASE_ANON="$anon_base" -e SHOT_API_ANON="$anon_api" \
       -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
       "$image" \
       sh -c 'mkdir -p /tmp/pw && cd /tmp/pw && npm init -y >/dev/null && npm i playwright@1.56.0 >/dev/null && cp /scripts/behaviour.mjs . && node behaviour.mjs'

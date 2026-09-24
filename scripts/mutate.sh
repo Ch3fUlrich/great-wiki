@@ -136,8 +136,24 @@ mutation crates/gw-api/src/routes/admin.rs killed \
   's/^    if can(&principal, Action::Admin, Visibility::Restricted, &grants) {/    if can(\&principal, Action::Read, Visibility::Restricted, \&grants) {/' \
   'admin: administering a space needs admin on it, not merely read'
 mutation crates/gw-api/src/routes/admin.rs killed \
-  's/^        if can(&principal, Action::Admin, Visibility::Restricted, &grants) {/        if can(\&principal, Action::Read, Visibility::Restricted, \&grants) {/' \
+  's/^        if can(principal, Action::Admin, Visibility::Restricted, &grants) {/        if can(principal, Action::Read, Visibility::Restricted, \&grants) {/' \
   'admin: reading the audit log needs admin on a path, not merely read'
+
+# --- the console's door: `administers` on /api/me ----------------------------------
+#
+# `/admin` asks `/api/me` whether the caller administers anything before it fetches a
+# single panel, and sends everybody else to the sign-in page. The flag is the audit
+# reader's own gate (`administers_anything`), so the first mutation breaks both at once —
+# a fall-through that answers yes for a reader. The second breaks only `/api/me`, which is
+# the one the audit tests cannot see: the flag always true, the console open to anyone.
+# `tests/administers.rs` holds a reader, a team reader and a deactivated space admin, so
+# neither can pass because nobody in the fixture was ever a "no".
+mutation crates/gw-api/src/routes/admin.rs killed \
+  's/^    Ok(false)$/    Ok(true)/' \
+  'administers: somebody holding no admin grant anywhere administers nothing'
+mutation crates/gw-api/src/auth/session.rs killed \
+  's/let administers = crate::routes::admin::administers_anything(&state, &principal).await?;/let administers = true;/' \
+  'administers: /api/me reports the flag the gate computed, not a constant'
 
 # --- audited mutations: the record and the change stand or fall together ------------
 mutation crates/gw-store/src/admin.rs killed \
@@ -1925,7 +1941,9 @@ probe_for() {
     # and `-p gw-api` on its own would build all six integration binaries — nearly the
     # whole workspace. This names the one that covers the admin routes. If that stops
     # being true the probe simply stops firing.
-    crates/gw-api/src/routes/admin.rs) echo "-p gw-api --test admin --test invites" ;;
+    crates/gw-api/src/routes/admin.rs) echo "-p gw-api --test admin --test invites --test administers" ;;
+    # `/api/me`'s `administers` flag, which the console's door reads. One binary asserts it.
+    crates/gw-api/src/auth/session.rs) echo "-p gw-api --test administers" ;;
     # The invite page needs both: the escaping lives in this crate's unit tests and the
     # flow in the integration binary, and a probe that ran only one of them would fall
     # through to the whole workspace for half the invite mutations.

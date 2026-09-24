@@ -17,7 +17,8 @@ const signedIn: Me = {
   baseline: 'admin',
   login_available: true,
   source: 'session',
-  view_as: null
+  view_as: null,
+  administers: true
 };
 
 describe('AccountMenu', () => {
