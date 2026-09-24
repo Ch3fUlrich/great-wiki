@@ -245,3 +245,48 @@ is paid. Three retrievers — pages, topics, tasks — each already have a permi
 accessor; search must go through them and never a fourth path (rule 2, and the reason the
 graph, the board and the topic index all filter per document). Rejected: title and path only
 (cheaper, and weak the moment the corpus grows past what a person remembers).
+
+## 2026-09-24 — rename and move come next, and how they behave
+
+Chosen ahead of M7 and M6 because nothing can rename or move a page yet, and identity links
+(ADR 0019) were built for exactly that and are proved only by a direct UPDATE in a Rust test.
+Four owner decisions:
+
+**Access follows the new place, and the dialog shows it first.** Grants are inherited from the
+nearest ancestor, so a move changes who can read the page. The page takes its new location's
+access; before confirming, the dialog names who gains and who loses reading access, computed
+by the permission engine against the destination. Widening needs admin rights on the
+destination. Rejected: copying today's effective grants onto the page (grants pile up and drift
+from the tree), and refusing every widening move (makes the admin do two operations for one).
+Open, recommended default: a move that removes somebody's access is allowed with write on
+the source and the destination parent, because it is shown in the same preview.
+
+**The old address forwards, until reused.** It forwards to the new address, but only for a
+caller who may read the page; everybody else gets the ordinary 404 (ADR 0022 still holds). A
+page later created at that address takes it over and the forward is dropped. Rejected: a plain
+404, which breaks every bookmark and chat link while the wiki's own links survive by identity.
+
+**A page moves with its whole subtree.** One move, one audit entry, every descendant's access
+recomputed and shown in the preview.
+
+**A dialog first, sidebar dragging later.** A page menu opens a dialog with the new title, a
+destination picker and the access preview; it works with a keyboard and without JavaScript.
+Dragging in the sidebar is a later layer that opens the same dialog.
+
+Constraint from ADR 0019 that the implementation must not break: **a move never rewrites
+another page's body.** Links resolve by identity at read time; that is the whole point.
+
+### Handoff state, 2026-09-24
+
+For the session that picks this up with a fresh context:
+
+- Main carries identity merge (ADR 0021), withheld-reads-as-absent (ADR 0022), and the userinfo
+  address fix. The `/admin` gate (anyone who administers nothing is sent to the sign-in page;
+  owner's choice) was in progress in this session — check `git log` for it.
+- The Authelia walkthrough leg is **skipped for now** by the owner. The production response
+  shape (Authelia 4.39, no claims policy, email and email_verified at userinfo only) is pinned
+  by a test instead.
+- Still open, already decided: M7 search (above), M6 comments and digest (above), templates,
+  the editor's du/Sie register, the `dok:` SELECT on the production database.
+- The Omnigraph and Graphify MCP bridges have failed to connect every session since late
+  August. Reasoning lives in ADRs and changelog fragments meanwhile.
