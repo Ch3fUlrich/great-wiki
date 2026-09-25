@@ -192,6 +192,10 @@ const WRITE_KEYED: &[Probe] = &[
     probe("POST", "/api/attachment/rezept.txt/{p}", Some("hallo")),
     probe("DELETE", "/api/attachment/rezept.txt/{p}", None),
     probe("POST", "/api/collab/{p}", Some("{}")),
+    // Moving needs write, so it belongs here — and its preview does too: a preview answers
+    // who may read the page, which is more than its existence.
+    probe("GET", "/api/move/{p}?title=Anders", None),
+    probe("POST", "/api/move/{p}", Some(r#"{"title":"Anders"}"#)),
 ];
 
 /// Assert that `who` is told the same thing about a page that is withheld from them and a
