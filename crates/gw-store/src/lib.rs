@@ -8,6 +8,7 @@ pub mod documents;
 pub mod invites;
 pub mod links;
 pub mod login_attempts;
+pub mod moves;
 pub mod principals;
 pub mod reclaim;
 pub mod revisions;
@@ -31,6 +32,7 @@ pub use invites::{
 };
 pub use links::{Backlink, Graph, GraphEdge, GraphNode, Reference, MAX_REFERENCES_PER_PAGE};
 pub use login_attempts::{LoginScope, LOGIN_FAILURE_LIMIT, LOGIN_LOCKOUT_SECONDS};
+pub use moves::{MoveMode, MoveOutcome, MovePlan, MoveRequest, ReaderChange};
 pub use principals::{
     canonical_email, MergeCandidate, MergeCandidateAccount, OidcSignIn, TeamSummary,
 };

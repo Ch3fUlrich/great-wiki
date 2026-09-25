@@ -171,7 +171,7 @@ pub struct PurgeReport {
 /// The subtree predicate, written once. `substr(...) = ?1 || '/'` rather than `LIKE ?1 ||
 /// '/%'`: `LIKE` reads `%` and `_` in a path as wildcards, and `/projektierung` is not inside
 /// `/projekt` — the same argument `crate::tasks` makes for the board's own subtree query.
-const SUBTREE: &str = "(path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/')";
+pub(crate) const SUBTREE: &str = "(path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/')";
 
 impl Store {
     /// Move a page and everything under it to the trash. Needs **write on every page that
@@ -659,7 +659,7 @@ impl Totals {
 /// A hole is silent, which is why this is an error and not a warning: the orphan stays
 /// readable at its own URL and on its board, and disappears only from the navigation and
 /// from the markdown export — where "it was never written" and "it was deleted" look the same.
-async fn refuse_a_hole_in_the_tree(tx: &mut sqlx::SqliteConnection) -> Result<()> {
+pub(crate) async fn refuse_a_hole_in_the_tree(tx: &mut sqlx::SqliteConnection) -> Result<()> {
     let orphans: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM documents c WHERE c.deleted_at IS NULL AND EXISTS ( \
            SELECT 1 FROM documents p \

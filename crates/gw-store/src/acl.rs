@@ -139,7 +139,7 @@ fn ancestors(path: &str) -> Vec<String> {
 /// Authentication is still checked before any group is looked at: `can()` runs first, and
 /// `baseline_for` refuses to look up a baseline for a caller who is not signed in and
 /// active. There is no path around that ordering.
-fn permits(
+pub(crate) fn permits(
     principal: &Principal,
     action: Action,
     visibility: Visibility,
@@ -167,6 +167,27 @@ fn permits(
         Visibility::Internal => baseline >= Baseline::Internal,
         Visibility::Restricted => baseline >= Baseline::Admin,
     }
+}
+
+/// [`Store::grants_for_path`], on ONE connection — the rule itself, which that method calls.
+///
+/// A connection rather than the pool for the reason [`baseline_on`] takes one: a move has to
+/// ask what the grants will be *after* it, from inside the transaction that has re-pathed
+/// them, and `Store::open` gives the pool one connection, so asking the pool from there would
+/// wait for itself. Two spellings of "the nearest ancestor with any rows wins" would be two
+/// answers to who may read a page, so there is this one and the method delegates to it.
+pub(crate) async fn grants_on(conn: &mut sqlx::SqliteConnection, path: &str) -> Result<Vec<Grant>> {
+    for candidate in ancestors(path) {
+        let rows: Vec<GrantRow> =
+            sqlx::query_as("SELECT subject_kind, subject_id, permission FROM acl WHERE path = ?1")
+                .bind(&candidate)
+                .fetch_all(&mut *conn)
+                .await?;
+        if !rows.is_empty() {
+            return Ok(rows.into_iter().filter_map(to_grant).collect());
+        }
+    }
+    Ok(Vec::new())
 }
 
 /// Whether `principal_id` carries a per-account promotion row (0006).
@@ -281,18 +302,8 @@ impl Store {
     /// the tree. Unioning would make it impossible to *narrow* access on a subtree — you
     /// could only ever widen it — and narrowing is the common case.
     pub async fn grants_for_path(&self, path: &str) -> Result<Vec<Grant>> {
-        for candidate in ancestors(path) {
-            let rows: Vec<GrantRow> = sqlx::query_as(
-                "SELECT subject_kind, subject_id, permission FROM acl WHERE path = ?1",
-            )
-            .bind(&candidate)
-            .fetch_all(&self.pool)
-            .await?;
-            if !rows.is_empty() {
-                return Ok(rows.into_iter().filter_map(to_grant).collect());
-            }
-        }
-        Ok(Vec::new())
+        let mut conn = self.pool.acquire().await?;
+        grants_on(&mut conn, path).await
     }
 
     /// The whole group-to-baseline mapping, for the admin console.
