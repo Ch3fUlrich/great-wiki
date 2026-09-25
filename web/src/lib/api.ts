@@ -278,7 +278,9 @@ export interface ApiFailure {
  */
 export async function apiSend<T>(
   fetchFn: typeof fetch,
-  method: 'POST' | 'PUT' | 'PATCH' | 'DELETE',
+  // `GET` for a read whose refusal carries words worth keeping — a move's preview answers
+  // 409 with the reason it would be refused, and `apiGet` drops a failed body.
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE',
   path: string,
   cookie: string | null,
   body?: unknown

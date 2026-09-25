@@ -189,7 +189,7 @@ function actionEvent(fetchFn: typeof fetch, fields: Record<string, string | File
 
 /** Run an action and give back whatever it threw or returned, whichever it was. */
 async function runAction(
-  which: 'themaHinzufuegen' | 'themaEntfernen' | 'loeschen' | 'anhaengen',
+  which: 'themaHinzufuegen' | 'themaEntfernen' | 'loeschen' | 'anhaengen' | 'verschieben',
   fetchFn: typeof fetch,
   fields: Record<string, string | File>
 ) {
@@ -457,6 +457,110 @@ describe('putting the page in the Papierkorb', () => {
     const { returned: thema } = await runAction('themaHinzufuegen', zweit, { thema: 'Neu' });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     expect((thema as any).data.wo).toBe('thema');
+  });
+});
+
+/**
+ * Renaming and moving (roadmap 2026-09-24): the dialog is an address, the preview is the API's
+ * measurement of the move, and the confirmation is a form. Nothing here decides who may move a
+ * page or who a move lets in — the API does, by making the move and rolling it back.
+ */
+describe('renaming and moving the page', () => {
+  const plan = {
+    from: '/rundgang/tabellen',
+    to: '/b/neu',
+    title: 'Neu',
+    pages: 2,
+    gains: [{ anonymous: false, name: 'Bernd', username: 'bernd', pages: 2 }],
+    losses: [],
+    refusal: null,
+    committed: false
+  };
+
+  it('opens the dialog from the address without measuring anything yet', async () => {
+    const { urls, fetchFn } = spyFetch({ '/api/move': { status: 200, body: plan } });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const data = (await runLoad(fetchFn, '?verschieben=1')) as any;
+    expect(data.verschieben).toBe(true);
+    expect(data.vorschau).toBeNull();
+    expect(urls.some((u) => u.includes('/api/move'))).toBe(false);
+  });
+
+  it('measures the move the submitted fields describe, through the API', async () => {
+    const { urls, fetchFn } = spyFetch({ '/api/move': { status: 200, body: plan } });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const data = (await runLoad(fetchFn, '?verschieben=1&titel=Neu&ziel=%2Fb&adresse=neu')) as any;
+    expect(urls.find((u) => u.includes('/api/move'))).toContain(
+      '/api/move/rundgang/tabellen?parent=%2Fb&title=Neu&slug=neu'
+    );
+    expect(data.vorschau).toEqual(plan);
+  });
+
+  it('says why a move could not be measured, in the API s own words', async () => {
+    const { fetchFn } = spyFetch({
+      '/api/move': { status: 409, body: { error: 'there is already a page at /b/neu' } }
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const data = (await runLoad(fetchFn, '?verschieben=1&titel=Neu&ziel=%2Fb&adresse=neu')) as any;
+    expect(data.vorschau).toBeNull();
+    expect(data.vorschauFehler).toContain('/b/neu');
+  });
+
+  it('moves through the API and lands on the new address', async () => {
+    const { sent, fetchFn } = spyFetch({}, { status: 200, body: { ...plan, committed: true } });
+    const { thrown } = await runAction('verschieben', fetchFn, {
+      ziel: '/b',
+      titel: 'Neu',
+      adresse: 'neu'
+    });
+    const call = sent.find((one) => one.method === 'POST');
+    expect(call?.url).toContain('/api/move/rundgang/tabellen');
+    expect(JSON.parse(call?.body ?? '{}')).toEqual({ parent: '/b', title: 'Neu', slug: 'neu' });
+    expect(isRedirect(thrown) && (thrown as { location: string }).location).toBe('/b/neu');
+  });
+
+  it('keeps a refused move on this page, under its own name', async () => {
+    const { fetchFn } = spyFetch({}, { status: 409, body: { error: 'widening access needs admin rights on /b' } });
+    const { returned } = await runAction('verschieben', fetchFn, { ziel: '/b', titel: 'Neu', adresse: '' });
+    expect(isActionFailure(returned)).toBe(true);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const failure = returned as any;
+    expect(failure.status).toBe(409);
+    expect(failure.data.wo).toBe('verschieben');
+    expect(failure.data.fehler).toContain('Es wurde nichts verschoben.');
+  });
+
+  it('refuses a move without a title itself, without asking the API', async () => {
+    const { sent, fetchFn } = spyFetch();
+    const { returned } = await runAction('verschieben', fetchFn, { ziel: '/b', titel: '  ', adresse: '' });
+    expect(isActionFailure(returned)).toBe(true);
+    expect(sent.some((one) => one.method === 'POST')).toBe(false);
+  });
+});
+
+describe('an address a page has moved away from', () => {
+  it('sends a reader on to where the page is now, keeping what they asked for', async () => {
+    const { fetchFn } = spyFetch({
+      '/api/documents': { status: 404 },
+      '/api/forwards': { status: 200, body: { path: '/b/neu' } }
+    });
+    try {
+      await runLoad(fetchFn, '?edit=1');
+      expect.unreachable('the loader did not redirect');
+    } catch (thrown) {
+      expect(isRedirect(thrown)).toBe(true);
+      // Temporary on purpose: the forward ends when the address is reused, and a browser
+      // caches a permanent redirect for as long as it likes.
+      expect(thrown).toMatchObject({ status: 307, location: '/b/neu?edit=1' });
+    }
+  });
+
+  it('is an ordinary missing page when nothing forwards from it', async () => {
+    const { fetchFn } = spyFetch({ '/api/documents': { status: 404 } });
+    await expect(runLoad(fetchFn)).rejects.toMatchObject({
+      status: 404,
+      body: { message: GERMAN_REFUSALS.missing }
+    });
   });
 });
 

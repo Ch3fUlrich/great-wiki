@@ -31,6 +31,16 @@ import {
   type Topic
 } from '$lib/topics';
 import { GERMAN_REFUSALS } from '$lib/refusals';
+import {
+  describeMove,
+  forwardApiPath,
+  moveApiPath,
+  moveBody,
+  movePreviewApiPath,
+  readFields,
+  MOVE_PARAM,
+  type MovePlan
+} from '$lib/moves';
 import type { Actions, PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
@@ -47,7 +57,21 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
   // The 403 branch stays because this loader maps a status rather than deciding one, and a
   // refusal that does say "not yours" must still say it in German.
   if (status === 403) error(403, GERMAN_REFUSALS.forbidden);
-  if (!data) error(404, GERMAN_REFUSALS.missing);
+  if (!data) {
+    // A page that has moved away from this address: the API names where it went, but only to
+    // somebody who may read it there (ADR 0022 — everybody else gets the same 404 an address
+    // nothing ever left gets). 307, not 308: a permanent redirect is cached by the browser
+    // indefinitely, and this one ends the moment another page takes the address.
+    if (status === 404) {
+      const weiter = await apiGet<{ path: string }>(
+        fetch,
+        forwardApiPath(`/${params.path}`),
+        cookie
+      ).catch(() => null);
+      if (weiter?.data?.path) redirect(307, `${weiter.data.path}${url.search}`);
+    }
+    error(404, GERMAN_REFUSALS.missing);
+  }
 
   const body = parseBody(data);
 
@@ -230,6 +254,30 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
    */
   const angekommen = url.searchParams.get(UPLOADED_PARAM);
 
+  /**
+   * The rename-and-move dialog, asked in the address like the delete question (`?verschieben=1`).
+   *
+   * Once its GET form has been submitted the address carries the fields too, and then this
+   * load asks the API to **measure** the move — which it does by carrying it out and rolling it
+   * back — so the reader sees who gains and who loses reading access in the first response,
+   * with no script. Asked only of somebody the page says may write it; the API decides the
+   * rest, including whether this caller could make the move (`refusal`).
+   */
+  const verschieben = url.searchParams.get(MOVE_PARAM) === '1';
+  const verschiebeFelder = verschieben ? readFields(url.searchParams) : null;
+  let vorschau: MovePlan | null = null;
+  let vorschauFehler: string | null = null;
+  if (verschiebeFelder && data.may_write === true) {
+    const answer = await apiSend<MovePlan>(
+      fetch,
+      'GET',
+      movePreviewApiPath(data.path, verschiebeFelder),
+      cookie
+    );
+    if (answer.data) vorschau = answer.data;
+    else vorschauFehler = describeMove(answer.status, answer.failure?.message ?? null);
+  }
+
   // Read here rather than from `$app/state` in the component, for two reasons: the flag is
   // then part of the page's data and a server-render test can set it, and the component
   // does not have to reach for a SvelteKit runtime that only exists inside a request.
@@ -281,6 +329,10 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
     // response — no dialog waiting for a bundle, and a state a test can assert with no DOM.
     // See `$lib/trash`'s `deleteHref`.
     loeschen: url.searchParams.get(DELETE_PARAM) === '1',
+    verschieben,
+    verschiebeFelder,
+    vorschau,
+    vorschauFehler,
     board,
     boardFehler,
     // What just happened on the board, checked against the board itself — the same function
@@ -407,6 +459,44 @@ export const actions: Actions = {
       303,
       `${TRASH_PATH}?${DELETED_PARAM}=${encodeURIComponent(path)}#${TRASH_REGION_ID}`
     );
+  },
+
+  /**
+   * Rename this page, move it, or both — with everything under it (roadmap 2026-09-24).
+   *
+   * **The same fields the preview was asked with**, carried in hidden inputs of the form the
+   * preview rendered, so what is confirmed is what was shown. The API measures the move again
+   * as it makes it, in the same transaction, and refuses with the reason if it would now let
+   * somebody in whom this caller may not let in — so a preview that went stale cannot be
+   * confirmed into something nobody saw.
+   *
+   * **A success goes to the page's new address**; the old one forwards there anyway, for
+   * readers. A refusal comes back as `fail()` on this page, which still exists.
+   */
+  verschieben: async ({ params, request, fetch }) => {
+    const felder = readFields(await request.formData());
+    if (!felder || !felder.titel) {
+      return fail(400, {
+        wo: 'verschieben' as const,
+        fehler: 'Bitte einen Titel angeben. Es wurde nichts verschoben.',
+        getippt: ''
+      });
+    }
+    const { status, data, failure } = await apiSend<MovePlan>(
+      fetch,
+      'POST',
+      moveApiPath(`/${params.path}`),
+      request.headers.get('cookie'),
+      moveBody(felder)
+    );
+    if (failure || !data) {
+      return fail(status === 0 ? 503 : status, {
+        wo: 'verschieben' as const,
+        fehler: describeMove(status, failure?.message ?? null),
+        getippt: ''
+      });
+    }
+    redirect(303, data.to);
   },
 
   /**

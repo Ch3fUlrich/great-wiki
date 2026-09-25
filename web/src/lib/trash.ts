@@ -146,7 +146,7 @@ export const DELETED_PARAM = 'geloescht';
 export const PURGED_PARAM = 'geleert';
 
 /** Percent-encode each segment of a path, and nothing else. */
-function encodeSegments(path: string): string {
+export function encodeSegments(path: string): string {
   return path.split('/').map(encodeURIComponent).join('/');
 }
 

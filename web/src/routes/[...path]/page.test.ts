@@ -9,6 +9,7 @@ import { highlightDocument } from '$lib/server/highlight';
 import type { SidebarMode, Topic, TopicSummary } from '$lib/topics';
 import type { Reference } from '$lib/blocks/render';
 import type { Attachment } from '$lib/attachments';
+import type { MoveFields, MovePlan } from '$lib/moves';
 
 /**
  * The whole reader page, rendered exactly as the server renders it.
@@ -122,6 +123,10 @@ function html(
     seitenThemenFehler = null,
     seitenleiste = 'seiten',
     loeschen = false,
+    verschieben = false,
+    verschiebeFelder = null,
+    vorschau = null,
+    vorschauFehler = null,
     dateien = anhaenge,
     koerper = body,
     anhaengeDarfSchreiben = false,
@@ -142,12 +147,20 @@ function html(
     seitenThemenFehler?: string | null;
     seitenleiste?: SidebarMode;
     loeschen?: boolean;
+    verschieben?: boolean;
+    verschiebeFelder?: MoveFields | null;
+    vorschau?: MovePlan | null;
+    vorschauFehler?: string | null;
     dateien?: Attachment[];
     koerper?: Block;
     anhaengeDarfSchreiben?: boolean;
     anhaengeFehler?: string | null;
     hochgeladen?: Attachment | null;
-    form?: { wo: 'thema' | 'loeschen' | 'anhang'; fehler: string; getippt: string } | null;
+    form?: {
+      wo: 'thema' | 'loeschen' | 'anhang' | 'verschieben';
+      fehler: string;
+      getippt: string;
+    } | null;
     verweise?: Record<string, Reference>;
     einbettungen?: Record<string, EmbeddedPage>;
   } = {}
@@ -181,6 +194,10 @@ function html(
         backlinks,
         edit,
         loeschen,
+        verschieben,
+        verschiebeFelder,
+        vorschau,
+        vorschauFehler,
         board,
         boardFehler,
         hinweis,
@@ -843,5 +860,80 @@ describe('a display formula on the page being read', () => {
     const out = html(container, { koerper: mitCode });
     expect(out).toContain('--token-hell');
     expect(out).toContain('SELECT');
+  });
+});
+
+describe('renaming and moving the page you are reading', () => {
+  const plan: MovePlan = {
+    from: '/rundgang/import-export',
+    to: '/rundgang/tabellen/import-export',
+    title: 'Import und Export',
+    pages: 2,
+    gains: [{ anonymous: true, name: 'Anonymous', username: null, pages: 2 }],
+    losses: [{ anonymous: false, name: 'Anna', username: 'anna', pages: 1 }],
+    refusal: null,
+    committed: false
+  };
+  const felder: MoveFields = { ziel: '/rundgang/tabellen', titel: 'Import und Export', adresse: 'import-export' };
+
+  it('is offered to the same people deleting is, as a link to a question', () => {
+    expect(html()).not.toContain('Verschieben');
+    expect(html({ ...container, may_write: false }, { me: signedIn })).not.toContain('Verschieben');
+    const out = html(container, { me: signedIn });
+    expect(out).toMatch(/<a[^>]*verschieben=1#gw-verschieben[^>]*data-sveltekit-reload/);
+    expect(out).not.toContain('?/verschieben');
+  });
+
+  it('asks with plain forms, prefilled with where the page is and what it is called', () => {
+    const out = html(container, { me: signedIn, verschieben: true });
+    expect(out).toMatch(/id="gw-verschieben"[^>]*tabindex="-1"|tabindex="-1"[^>]*id="gw-verschieben"/);
+    expect(out).toMatch(/<form[^>]*method="get"/);
+    expect(out).toMatch(/name="titel"[^>]*value="Import und Export"|value="Import und Export"[^>]*name="titel"/);
+    expect(out).toMatch(/name="adresse"[^>]*value="import-export"|value="import-export"[^>]*name="adresse"/);
+    expect(out).toMatch(/<option value="\/rundgang"[^>]*selected/);
+    expect(out).toContain('Abbrechen');
+    // Nothing is confirmed before something has been measured.
+    expect(out).not.toMatch(/action="\?\/verschieben"/);
+  });
+
+  it('never offers the page itself, or anything under it, as the place to put it', () => {
+    const out = html(container, { me: signedIn, verschieben: true });
+    expect(out).not.toContain('value="/rundgang/import-export"');
+    expect(out).not.toContain('value="/rundgang/import-export/heikler-text"');
+    expect(out).toContain('value="/rundgang/tabellen"');
+  });
+
+  it('names who gains and who loses reading access before anything moves', () => {
+    const out = html(container, { me: signedIn, verschieben: true, verschiebeFelder: felder, vorschau: plan });
+    expect(out).toContain('/rundgang/tabellen/import-export');
+    expect(out).toContain('Alle ohne Anmeldung');
+    expect(out).toContain('Anna (anna) — 1 von 2 Seiten');
+    expect(out).toMatch(/<form[^>]*method="post"[^>]*action="\?\/verschieben"/);
+    expect(out).toMatch(/type="hidden"[^>]*name="ziel"[^>]*value="\/rundgang\/tabellen"|name="ziel"[^>]*type="hidden"/);
+  });
+
+  it('offers no confirmation for a move this reader may not make, and says why', () => {
+    const out = html(container, {
+      me: signedIn,
+      verschieben: true,
+      verschiebeFelder: felder,
+      vorschau: { ...plan, refusal: 'widening access needs admin rights on /rundgang/tabellen' }
+    });
+    expect(out).not.toMatch(/action="\?\/verschieben"/);
+    expect(out).toContain('Verwaltungsrechte');
+    expect(out).toContain('widening access needs admin rights');
+  });
+
+  it('asks nobody who could not do it anyway, however the address was typed', () => {
+    const out = html({ ...container, may_write: false }, { me: signedIn, verschieben: true });
+    expect(out).not.toContain('gw-verschieben');
+  });
+
+  it('states a refused move on the page, and not in the topic field', () => {
+    const fehler = 'So lässt sich die Seite nicht verschieben. Es wurde nichts verschoben.';
+    const out = html(container, { me: signedIn, form: { wo: 'verschieben', fehler, getippt: '' } });
+    expect(out).toContain(fehler);
+    const themen = out.match(/<nav[^>]*aria-label="Themen dieser Seite"[\s\S]*?<\/nav>/)?.[0];
+    expect(themen).not.toContain(fehler);
   });
 });

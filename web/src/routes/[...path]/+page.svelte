@@ -12,6 +12,8 @@
   import { breadcrumb, childrenOf } from '$lib/pagemeta';
   import { chromeHref } from '$lib/tabs';
   import { deleteHref, DELETE_REGION_ID, TRASH_PATH } from '$lib/trash';
+  import MoveDialog from '$lib/components/MoveDialog.svelte';
+  import { moveHref } from '$lib/moves';
 
   let { data, form } = $props();
   const headings = $derived(outline(data.body));
@@ -92,6 +94,16 @@
   const fragtLoeschen = $derived(darfLoeschen && data.loeschen === true);
 
   /**
+   * Whether to offer renaming and moving: the same pair as deleting, for the same reason —
+   * `Store::move_document` refuses anybody who is not a signed-in, active account before it
+   * consults a grant, because a move is recorded under somebody's name. What neither this nor
+   * the page can know in advance (a subpage somebody else governs, the destination, whether
+   * the move widens access) is what the dialog's preview is for.
+   */
+  const darfVerschieben = $derived(darfLoeschen);
+  const fragtVerschieben = $derived(darfVerschieben && data.verschieben === true);
+
+  /**
    * The refusal that belongs to the delete, as against the one that belongs to the topics.
    *
    * Two controls on one page, two permissions, two sentences — and one `form`. Without the
@@ -100,6 +112,7 @@
    * control. The same split `/projekte` makes between its create form and its delete.
    */
   const loeschFehler = $derived(form?.wo === 'loeschen' ? form.fehler : null);
+  const verschiebeFehler = $derived(form?.wo === 'verschieben' ? form.fehler : null);
   const anhangFehler = $derived(form?.wo === 'anhang' ? form.fehler : null);
   // Matched POSITIVELY on its own name, not by excluding the others. It used to be
   // `wo !== 'loeschen'`, which quietly made the topic field the home of every refusal nobody
@@ -246,6 +259,13 @@
             >Löschen</a
           >
         {/if}
+        {#if darfVerschieben}
+          <!-- A link to a question, like Löschen and for its reasons: the dialog is where the
+               reader is shown who a move lets in and shuts out, before anything moves. -->
+          <a class="edit-start" href={gehZu(moveHref(data.doc.path))} data-sveltekit-reload
+            >Verschieben</a
+          >
+        {/if}
       </p>
     {/if}
 
@@ -254,6 +274,23 @@
            owns the action, and a delete that was refused left the reader exactly where they
            were. In words and announced, never a colour alone. -->
       <p class="notice notice--error no-print" role="alert">{loeschFehler}</p>
+    {/if}
+
+    {#if verschiebeFehler}
+      <p class="notice notice--error no-print" role="alert">{verschiebeFehler}</p>
+    {/if}
+
+    {#if fragtVerschieben}
+      <MoveDialog
+        path={data.doc.path}
+        title={data.doc.title}
+        slug={data.doc.slug}
+        tree={data.tree ?? []}
+        felder={data.verschiebeFelder ?? null}
+        vorschau={data.vorschau ?? null}
+        vorschauFehler={data.vorschauFehler ?? null}
+        abbrechen={gehZu(data.doc.path)}
+      />
     {/if}
 
     {#if fragtLoeschen}
