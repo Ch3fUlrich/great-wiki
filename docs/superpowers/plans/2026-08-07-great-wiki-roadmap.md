@@ -296,3 +296,24 @@ For the session that picks this up with a fresh context:
   the editor's du/Sie register, the `dok:` SELECT on the production database.
 - The Omnigraph and Graphify MCP bridges have failed to connect every session since late
   August. Reasoning lives in ADRs and changelog fragments meanwhile.
+
+### Rename and move, built (2026-09-25)
+
+Built as planned in [2026-09-25-rename-and-move](2026-09-25-rename-and-move.md); the open
+questions the four decisions left are answered in
+[ADR 0023](../../decisions/0023-how-a-page-moves.md). **Not deployed yet** — production still
+runs `3128ece`. Verified in a browser against a seeded copy of `content-example`: dialog,
+preview, move, 307 forward from the old address and from a subpage's, and the widening
+refusal with no confirm button. Nine mutations in `scripts/mutate.sh` (`move:`), all killed.
+
+Settled here rather than by the owner, and worth a look before deploying:
+
+- Grants **written on** the moved pages travel with them (and pending invitations); nothing
+  inherited is copied. The preview shows the net effect either way.
+- The top level needs instance administration, even to rename a page already there.
+- The dialog carries the address segment separately, prefilled, so a title fix need not
+  change the URL.
+
+Left for later: re-authorising an open editing socket by document id (a move currently closes
+it), forwarding sub-routes such as `/alt/history`, sidebar dragging onto the same dialog, and
+a behaviour-harness group for the dialog.

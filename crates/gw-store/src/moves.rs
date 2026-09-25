@@ -1158,6 +1158,36 @@ mod tests {
         }
     }
 
+    /// On a path carrying `anyone: write` — a public share link — the write verdict alone
+    /// would let somebody who has not said who they are move the page, and a move is
+    /// recorded under somebody's name. The account check is what refuses them.
+    #[tokio::test]
+    async fn anyone_write_does_not_let_an_anonymous_caller_move_a_page() {
+        let f = fixture().await;
+        f.store
+            .add_grant("/a", Subject::Anyone, Permission::Write)
+            .await
+            .unwrap();
+        f.store
+            .add_grant("/b", Subject::Anyone, Permission::Write)
+            .await
+            .unwrap();
+        assert!(matches!(
+            f.store
+                .move_document(
+                    &Principal::anonymous(),
+                    "/a/p",
+                    &to(Some("/b"), "P"),
+                    true,
+                    MoveMode::Commit
+                )
+                .await
+                .unwrap(),
+            MoveOutcome::Refused
+        ));
+        assert_eq!(path_of(&f.store, &f.p).await, "/a/p");
+    }
+
     #[tokio::test]
     async fn what_cannot_be_moved_is_refused_with_a_reason() {
         let f = fixture().await;

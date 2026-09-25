@@ -1187,6 +1187,49 @@ mutation crates/gw-store/src/trash.rs equivalent \
   's/            destroyed == pages.len() as i64,/            true,/' \
   'purge: the report names as many pages as the DELETE destroyed — unobservable until deleted_root gains a cascade'
 
+# --- moving a page: the one write that changes who may read something without a grant ----
+#
+# A move changes a page's access by changing its nearest ancestor, so the gates below are the
+# ones that keep "write here" from becoming "let people in there". The store fixture holds a
+# writer who administers nothing (`schreiber`), an administrator of the destination
+# (`chefin`) and two readers on either side (`anna`, `bernd`), so every gate is tested against
+# somebody who must still be refused. ADR 0023.
+mutation crates/gw-store/src/moves.rs killed \
+  's/        let refusal = (!gains.is_empty() && !administers_destination)/        let refusal = (false \&\& !administers_destination)/' \
+  'move: a move that lets anybody in needs admin rights on the destination'
+mutation crates/gw-api/src/routes/moves.rs killed \
+  's/        Err(ApiError::Forbidden) => false,/        Err(ApiError::Forbidden) => true,/' \
+  'move: the API asks path_admin of the destination, and a refusal there is not a yes'
+mutation crates/gw-store/src/moves.rs killed \
+  '/pub async fn move_document/,/^    }$/ s/        if !principal.is_authenticated() || !principal.active {/        if false {/' \
+  'move: moving needs a signed-in, active account even where anyone may write'
+mutation crates/gw-store/src/moves.rs killed \
+  's/            if !writable {/            if false {/' \
+  'move: a page moves with its subtree, so it needs write on every page under it'
+# Read first, then write: a destination this caller may not see must be refused in exactly
+# the words an absent one is (ADR 0022). Asking write first collapses the two refusals a
+# reader of the destination is owed apart.
+mutation crates/gw-store/src/moves.rs killed \
+  's/                    .document_access_with_baseline(principal, p, Action::Read, baseline)/                    .document_access_with_baseline(principal, p, Action::Write, baseline)/' \
+  'move: a destination is refused as absent only to somebody who may not read it'
+mutation crates/gw-store/src/moves.rs killed \
+  's/"UPDATE OR REPLACE acl SET path = {} WHERE {SUBTREE}",/"UPDATE OR REPLACE acl SET path = {} WHERE {SUBTREE} AND 0",/' \
+  'move: grants written on the moved pages travel with them rather than staying behind'
+# The forward is a retriever: it names where a page is, which is a disclosure about that
+# page. Resolving it for somebody who may read everything is what "filter afterwards" looks
+# like from the inside.
+mutation crates/gw-store/src/moves.rs killed \
+  's/            .document_for_id(principal, &document_id, Action::Read)/            .document_for_id(\&gw_auth::Principal::test("x", \&["admins"], \&[]), \&document_id, Action::Read)/' \
+  'move: an old address forwards only a caller who may read the page where it is now'
+# "Until reused": a page arriving at a forwarded address ends the forward. Without the
+# trigger the address would redirect away from the page that now lives at it.
+mutation crates/gw-store/migrations/0015_forwards.sql killed \
+  '/forwards_end_when_a_page_arrives_insert/,/^END;$/ s/    DELETE FROM forwards WHERE old_path = NEW.path;/    SELECT 1;/' \
+  'move: creating a page at a forwarded address ends the forward'
+mutation crates/gw-store/migrations/0015_forwards.sql killed \
+  '/forwards_end_when_a_page_arrives_update/,/^END;$/ s/    DELETE FROM forwards WHERE old_path = NEW.path;/    SELECT 1;/' \
+  'move: moving a page back to an address ends the forward from it'
+
 # --- attachments: the one path that returns BYTES rather than a title -------------------
 #
 # Every other disclosure in this system reveals that a page exists or what it is called. This
