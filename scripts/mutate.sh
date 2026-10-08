@@ -627,10 +627,10 @@ mutation crates/gw-api/src/routes/collab.rs killed \
 #   - the wrong action: asking for READ lets somebody who lost write at the new place keep
 #     typing into a page they may now only look at.
 mutation crates/gw-api/src/routes/collab.rs killed \
-  's/reauthorise(&state, &jar, room.document_id(), &path)/reauthorise(\&state, \&jar, \&path, \&path)/' \
+  '/async fn authorise_id/,/^}$/ s/\.document_for_id(&principal, document_id, Action::Write)/.document_for(\&principal, joined_at, Action::Write)/' \
   'collab: an open session is re-authorised by document id — a move must not end the session of an editor who still may write'
 mutation crates/gw-api/src/routes/collab.rs killed \
-  '/async fn authorise_id/,/^}$/ s/        None => Err(ApiError::Forbidden),/        None => Ok(principal),/' \
+  '/async fn authorise_id/,/^}$/ s/        _ => Err(ApiError::Forbidden),/        _ => Ok(principal),/' \
   'collab: a page moved out of the editor'"'"'s reach ends their open session'
 mutation crates/gw-api/src/routes/collab.rs killed \
   '/async fn authorise_id/,/^}$/ s/Action::Write/Action::Read/' \

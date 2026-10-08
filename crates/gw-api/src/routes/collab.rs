@@ -448,8 +448,10 @@ async fn authorise_id(
         .await
         .map_err(ApiError::Internal)?
     {
-        Some(_) => Ok(principal),
-        None => Err(ApiError::Forbidden),
+        // The id is checked on the way back: the id→path→page lookup is two queries, and a
+        // different page created at the path in between must not stand in for this one.
+        Some(document) if document.id == document_id => Ok(principal),
+        _ => Err(ApiError::Forbidden),
     }
 }
 
