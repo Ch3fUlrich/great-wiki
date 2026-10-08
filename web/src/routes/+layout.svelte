@@ -38,6 +38,7 @@
   import favicon from '$lib/assets/favicon.svg';
   import ThemeToggle from '$lib/components/ThemeToggle.svelte';
   import FontToggle from '$lib/components/FontToggle.svelte';
+  import NotificationBell from '$lib/components/NotificationBell.svelte';
   import AccountMenu from '$lib/components/AccountMenu.svelte';
   import TabStrip from '$lib/components/TabStrip.svelte';
   import TopicTree from '$lib/components/TopicTree.svelte';
@@ -306,6 +307,7 @@
       <!-- Two reading preferences, side by side, because they are the same kind of thing.
            They wrap under the brand on a narrow screen rather than squeezing it. -->
       <div class="prefs">
+        <NotificationBell count={data.ungelesen ?? null} />
         <AccountMenu me={data.me} />
         <FontToggle />
         <ThemeToggle />

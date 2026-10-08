@@ -1,0 +1,1 @@
+Neu: Die Seite „Benachrichtigungen“ (`/benachrichtigungen`) zeigt den Posteingang mit ungelesenen Einträgen, Links zur jeweiligen Seite und „Alle als gelesen markieren“. In der Kopfzeile zeigt eine Glocke die Zahl ungelesener Benachrichtigungen an; schlägt die Abfrage fehl, erscheint sie einfach nicht.
