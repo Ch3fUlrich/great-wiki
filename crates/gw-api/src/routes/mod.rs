@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod attachments;
 pub mod collab;
+pub mod comments;
 pub mod docs;
 pub mod links;
 pub mod moves;
@@ -408,6 +409,7 @@ pub fn build_router(state: AppState) -> Router {
             get(docs::get_document).delete(trash::delete_document),
         )
         .merge(collab::routes())
+        .merge(comments::routes())
         .merge(links::routes())
         .merge(moves::routes())
         .merge(revisions::routes())

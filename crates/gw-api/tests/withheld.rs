@@ -176,6 +176,7 @@ const READ_KEYED: &[Probe] = &[
     probe("GET", "/api/attachments/{p}", None),
     probe("GET", "/api/attachment/rezept.txt/{p}", None),
     probe("GET", "/api/tasks/document/{p}", None),
+    probe("GET", "/api/comments/document/{p}", None),
     probe("GET", "/api/topics/document/{p}", None),
     probe("GET", "/api/board?seite=/{p}", None),
     probe(
@@ -198,10 +199,23 @@ const WRITE_KEYED: &[Probe] = &[
     probe("POST", "/api/move/{p}", Some(r#"{"title":"Anders"}"#)),
 ];
 
+/// Path-keyed requests that need only **read**, so a reader legitimately succeeds at them and
+/// they cannot sit in [`WRITE_KEYED`] (whose reader assertion is 403). Swept for signed-in
+/// callers; an anonymous one is 401 here, the same for every path.
+const READ_KEYED_POST: &[Probe] = &[probe(
+    "POST",
+    "/api/comments/document/{p}",
+    Some(r#"{"body":"hallo"}"#),
+)];
+
 /// Assert that `who` is told the same thing about a page that is withheld from them and a
 /// page that is not there — on every endpoint, down to the bytes.
 async fn assert_indistinguishable(store: &Arc<Store>, who: Option<&str>, withheld_path: &str) {
-    for probe in READ_KEYED.iter().chain(WRITE_KEYED) {
+    for probe in READ_KEYED
+        .iter()
+        .chain(WRITE_KEYED)
+        .chain(READ_KEYED_POST.iter().filter(|_| who.is_some()))
+    {
         let withheld = ask(store, who, probe, withheld_path).await;
         let absent = ask(store, who, probe, "gibt-es-nicht").await;
 
@@ -240,6 +254,18 @@ async fn a_withheld_page_and_an_absent_one_are_byte_identical_to_somebody_withou
 async fn an_anonymous_visitor_cannot_tell_a_withheld_page_from_an_absent_one() {
     let store = fixture().await;
     assert_indistinguishable(&store, None, "geheim").await;
+}
+
+/// An anonymous read-keyed POST is 401 on a withheld and an absent page alike.
+#[tokio::test]
+async fn an_anonymous_read_keyed_post_is_the_same_401_everywhere() {
+    let store = fixture().await;
+    for probe in READ_KEYED_POST {
+        let withheld = ask(&store, None, probe, "geheim").await;
+        let absent = ask(&store, None, probe, "gibt-es-nicht").await;
+        assert_eq!(withheld.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(withheld, absent);
+    }
 }
 
 /// A grant is about one page. Holding read on `/geheim` must not make `/anderswo` visible as
