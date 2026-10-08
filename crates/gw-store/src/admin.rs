@@ -1075,7 +1075,7 @@ mod tests {
         assert!(entries(&store).await.is_empty());
     }
 
-    // --- bus producer (ADR 0024) --------------------------------------------------------
+    // --- bus producer (ADR 0025) --------------------------------------------------------
 
     #[tokio::test]
     async fn a_grant_change_reaches_a_path_admin_and_not_a_plain_reader() {

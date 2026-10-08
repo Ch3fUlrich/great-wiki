@@ -1,7 +1,7 @@
 import * as Y from 'yjs';
 
 /**
- * Client for page comments (`gw_api::routes::comments`, ADR 0025).
+ * Client for page comments (`gw_api::routes::comments`, ADR 0026).
  *
  * Anyone who may read a page may read and write its comments, so nothing here decides
  * permission; the API answers 404 for a page the caller may not read. There is no delete:

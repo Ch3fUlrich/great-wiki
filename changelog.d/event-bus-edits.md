@@ -8,5 +8,5 @@
   save. Pages first written by an import have no account as writer, so only the last editor
   is told. Nothing of the edit's text is stored, and whether a recipient may still read the
   page is asked when they look, not when the edit is made
-  ([ADR 0024](docs/decisions/0024-the-event-bus-records-who-might-hear-and-asks-again-at-delivery.md)).
+  ([ADR 0025](docs/decisions/0025-the-event-bus-records-who-might-hear-and-asks-again-at-delivery.md)).
   A failure to record is logged and never fails the save.

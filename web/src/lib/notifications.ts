@@ -1,5 +1,5 @@
 /**
- * Typed client for the notification inbox (`gw_api::routes::notifications`, ADR 0022/0024).
+ * Typed client for the notification inbox (`gw_api::routes::notifications`, ADR 0022/0025).
  *
  * Everything here is built from the fields the API returns: an actor's display name and the
  * page's title and path. Never page text. The API already filtered the list through the

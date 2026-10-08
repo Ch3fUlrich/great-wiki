@@ -1,4 +1,4 @@
-# 0024 — The event bus records who might hear, and asks again at delivery
+# 0025 — The event bus records who might hear, and asks again at delivery
 
 **Status:** accepted · **Date:** 2026-10-08 · Roadmap: "M6 and M7, sized" (2026-09-17)
 

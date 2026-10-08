@@ -1,4 +1,4 @@
--- Comments (ADR 0025): a comment is governed by exactly one page, its `doc_id`.
+-- Comments (ADR 0026): a comment is governed by exactly one page, its `doc_id`.
 --
 -- Whoever may Read the page may read and write comments on it; there is no comment
 -- permission. Every access goes through the permission-checked document accessor, so

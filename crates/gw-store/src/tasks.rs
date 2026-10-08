@@ -731,7 +731,7 @@ impl Store {
 
     /// Tell the assignee, if there is one and it is not the person who just assigned them.
     ///
-    /// A candidate only (ADR 0024): the assignment gate already required Read on the
+    /// A candidate only (ADR 0025): the assignment gate already required Read on the
     /// governing page, and delivery asks again. `doc_id` is the governing page — the anchor,
     /// or a standalone card's project home — so delivery has a page to check the reader
     /// against. Never fails the caller.
@@ -4432,7 +4432,7 @@ mod tests {
         assert!(listed.may_write, "the board dropped the bit the create set");
     }
 
-    // --- bus producers (ADR 0024) -------------------------------------------------------
+    // --- bus producers (ADR 0025) -------------------------------------------------------
 
     #[tokio::test]
     async fn assigning_somebody_else_tells_them_and_assigning_yourself_does_not() {

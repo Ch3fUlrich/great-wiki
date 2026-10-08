@@ -2,7 +2,7 @@
 //!
 //! # This module makes no permission decision
 //!
-//! `gw_store::comments` is the decision (ADR 0025): **Read on the page is the only check**, so
+//! `gw_store::comments` is the decision (ADR 0026): **Read on the page is the only check**, so
 //! a reader with a read-only grant may comment, and a page the caller may not read answers as
 //! an absent page does. The handlers turn a request into `comments_for_document` /
 //! `create_comment`, turn the answer into a status code and drop internal identifiers on the
@@ -26,14 +26,14 @@
 //!
 //! # Nothing can be deleted or edited
 //!
-//! ADR 0025 gives authors no delete and no edit of a body, so there is deliberately no
+//! ADR 0026 gives authors no delete and no edit of a body, so there is deliberately no
 //! `DELETE` or `PUT` route here: the method answers 405 and `tests/comments.rs` pins it.
 //!
 //! # Resolved threads stay in the list
 //!
 //! `POST /api/comments/{id}/resolve` and `/reopen` are open to anyone who may read the page.
 //! A resolved thread is never dropped from `GET`: it is flagged `resolved: true` with its
-//! replies, and the interface collapses it (history, ADR 0025).
+//! replies, and the interface collapses it (history, ADR 0026).
 //!
 //! # No field counts what was hidden
 //!

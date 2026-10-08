@@ -368,7 +368,7 @@ async fn comments_cannot_be_deleted_or_replaced() {
     let production = src.split("#[cfg(test)]").next().unwrap().to_lowercase();
     assert!(
         !production.contains("delete from comments") && !production.contains("fn delete"),
-        "the store grew a delete (ADR 0025)"
+        "the store grew a delete (ADR 0026)"
     );
 }
 

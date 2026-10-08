@@ -1,4 +1,4 @@
-# 0025 — What a comment discloses
+# 0026 — What a comment discloses
 
 **Status:** accepted · **Date:** 2026-10-08 · Builds on ADR 0011 and ADR 0022
 
@@ -15,7 +15,7 @@ A comment is governed by exactly one page, its `doc_id`, like a task (ADR 0009/0
 - **Comment ids are uuids; nothing is keyed by sequence number**, so there is no id gap to
   count by. Responses carry no total beyond the returned rows.
 - **Author names** are resolved only for a reader who may read the page (as assignee names).
-- **Mentions** (`@username`) emit a bus event (ADR 0024) to the named principal; the mention
+- **Mentions** (`@username`) emit a bus event (ADR 0025) to the named principal; the mention
   grants nothing — a mentioned person without read access never receives it (delivery check).
 - **Anchored comments** store a Yjs relative-position pair plus a short quoted snippet.
   The snippet is page text: it is returned only to readers of the page, and never placed in

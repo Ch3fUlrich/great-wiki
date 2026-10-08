@@ -1,4 +1,4 @@
-//! The event bus: what happened that a person might want to hear about (ADR 0024).
+//! The event bus: what happened that a person might want to hear about (ADR 0025).
 //!
 //! **Emit records candidates; delivery is the check.** A producer names the people an
 //! event might concern and writes a row each, with no permission check and no page words —
@@ -25,7 +25,7 @@ use gw_core::Visibility;
 use serde::Serialize;
 use sqlx::FromRow;
 
-/// Rows older than this are not read at all (ADR 0024, "Cost").
+/// Rows older than this are not read at all (ADR 0025, "Cost").
 const HORIZON: &str = "-90 days";
 
 /// What happened. The stored spelling is [`EventKind::as_str`].
@@ -124,7 +124,7 @@ struct EventRow {
 impl Store {
     /// Record that `ev.recipient` might want to hear of something.
     ///
-    /// **No permission check, on purpose** (ADR 0024 rule 1): delivery makes it. An event
+    /// **No permission check, on purpose** (ADR 0025 rule 1): delivery makes it. An event
     /// whose actor is its recipient is dropped — nobody needs telling what they just did.
     /// A repeat of a `(recipient, dedupe_key)` coalesces: the one row is bumped to now,
     /// credited to the latest actor and made unread again.
@@ -154,7 +154,7 @@ impl Store {
 
     /// [`Store::emit_event`] for a producer: a failed emit is logged and swallowed.
     ///
-    /// ADR 0024 ("Cost / revisit"): a lost notification is an annoyance, a failed save or
+    /// ADR 0025 ("Cost / revisit"): a lost notification is an annoyance, a failed save or
     /// grant because the bus hiccuped is a bug. Every producer goes through here so none of
     /// them can forget — and so the log line is one place to grep.
     pub(crate) async fn emit_logged(&self, ev: &NewEvent) {

@@ -166,7 +166,7 @@
   // and this one does not exist until the session is live.
   let editor = $state<Editor | null>(null);
 
-  // A passage comment (ADR 0025): offered while text is selected. The editor is only ever
+  // A passage comment (ADR 0026): offered while text is selected. The editor is only ever
   // shown to a signed-in writer, so there is no anonymous case here. Readers viewing the
   // rendered page have no editor session and cannot anchor a comment to a passage.
   let hasSelection = $state(false);

@@ -1,5 +1,5 @@
 <!--
-  The page's comment thread (ADR 0025), under the page.
+  The page's comment thread (ADR 0026), under the page.
 
   Whoever may read the page sees the list; the form is offered to signed-in users only (the
   API would refuse an anonymous POST, and a form that always fails is worse than none).

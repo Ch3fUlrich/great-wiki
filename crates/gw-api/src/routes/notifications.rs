@@ -5,7 +5,7 @@
 //!
 //! `gw_store::events` records at emit time only that somebody *might* want to hear about
 //! something, and asks again at **delivery** whether the reader may still see the page it is
-//! about (ADR 0024). Every function used here is that delivery: `notifications_for`,
+//! about (ADR 0025). Every function used here is that delivery: `notifications_for`,
 //! `unread_count_for`, `mark_event_read` and `mark_all_read` all filter through the store's
 //! permission-checked accessor. The handlers turn a request into those calls, turn the answer
 //! into a status code, and drop the internal identifiers on the way out. A check written here

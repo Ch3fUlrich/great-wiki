@@ -417,7 +417,7 @@ impl Store {
     /// Tell the people with a stake in a page that somebody else just changed it: whoever
     /// wrote it (the author of its first revision) and whoever edited it last before this.
     ///
-    /// Candidates, not recipients (ADR 0024 rule 1): nothing here asks whether they may
+    /// Candidates, not recipients (ADR 0025 rule 1): nothing here asks whether they may
     /// still read the page — delivery does, so a page they have lost sends them nothing and
     /// the row carries no text of the edit. `dedupe_key` is per page, so a run of edits
     /// coalesces into one row that is bumped, credited to the latest editor and made unread

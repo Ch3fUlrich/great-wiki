@@ -1,11 +1,11 @@
-//! Comments, governed by their page (ADR 0025).
+//! Comments, governed by their page (ADR 0026).
 //!
 //! A comment belongs to exactly one page, and **Read on that page is the only check**: a
 //! reader of a page may read and write its comments. Every function here asks the crate's
 //! one accessor, [`Store::document_for`] / [`Store::document_for_id`], and a page the
 //! caller may not read answers exactly as an absent page does (`None`). Nothing is counted
 //! or listed in SQL across pages, and the author's name is looked up only after the page
-//! check has passed. There is deliberately no delete here (ADR 0025).
+//! check has passed. There is deliberately no delete here (ADR 0026).
 
 use crate::events::{EventKind, NewEvent};
 use crate::revisions::byline;
@@ -185,7 +185,7 @@ impl Store {
         .execute(&self.pool)
         .await?;
 
-        // Candidates only; delivery checks (ADR 0024). No body text goes in an event.
+        // Candidates only; delivery checks (ADR 0025). No body text goes in an event.
         if let Some(to) = parent_author {
             self.emit_logged(&NewEvent {
                 kind: EventKind::CommentReply,
@@ -258,7 +258,7 @@ impl Store {
     }
 
     /// Resolve (`true`) or reopen (`false`) the thread `comment_id` belongs to (a reply id
-    /// acts on its thread root). Anyone who may **read** the page may do either (ADR 0025).
+    /// acts on its thread root). Anyone who may **read** the page may do either (ADR 0026).
     /// `Ok(None)` when the comment is absent or its page is withheld: one answer. Nothing is
     /// deleted and nothing is emitted; reopening clears `resolved_at` / `resolved_by`.
     /// Returns the thread root as it now stands.

@@ -6,4 +6,4 @@
   a page is all it takes to comment on it. A page you may not read answers exactly as a page
   that does not exist, on both verbs. A reply to a comment from another page, or to a reply,
   is a 400. Comments cannot be deleted or edited over the API, and the responses carry no
-  total ([ADR 0025](docs/decisions/0025-what-a-comment-discloses.md)).
+  total ([ADR 0026](docs/decisions/0026-what-a-comment-discloses.md)).

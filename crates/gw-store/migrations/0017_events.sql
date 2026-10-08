@@ -1,4 +1,4 @@
--- The event bus (ADR 0024): one row per (event, recipient), recording who MIGHT hear of
+-- The event bus (ADR 0025): one row per (event, recipient), recording who MIGHT hear of
 -- something — never who is entitled to.
 --
 -- **Ids and a kind, no words.** The row names the page by `doc_id`, the person by `actor`
