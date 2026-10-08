@@ -3,6 +3,7 @@ pub mod admin;
 pub mod attachments;
 pub mod audit;
 pub mod blobs;
+pub mod comments;
 pub mod crdt;
 pub mod documents;
 pub mod events;
