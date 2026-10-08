@@ -4,6 +4,7 @@ pub mod collab;
 pub mod docs;
 pub mod links;
 pub mod moves;
+pub mod notifications;
 pub mod revisions;
 pub mod tasks;
 pub mod topics;
@@ -411,6 +412,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(moves::routes())
         .merge(revisions::routes())
         .merge(tasks::routes())
+        .merge(notifications::routes())
         .merge(topics::routes())
         .merge(trash::routes())
         .merge(admin::routes())

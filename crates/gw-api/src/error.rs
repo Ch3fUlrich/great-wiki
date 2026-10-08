@@ -8,6 +8,10 @@ pub enum ApiError {
     NotFound,
     #[error("forbidden")]
     Forbidden,
+    /// There is nobody to answer to: the route is about the caller's own state and an
+    /// anonymous visitor has none.
+    #[error("unauthorized")]
+    Unauthorized,
     /// The request was understood and refused on its own terms — a password below the
     /// length floor, a missing field. The message is written here, never derived from an
     /// internal error, so nothing about the database can reach a client through it.
@@ -51,6 +55,7 @@ impl IntoResponse for ApiError {
         let (status, message) = match &self {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found"),
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
+            ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             ApiError::Invalid(message) => (StatusCode::BAD_REQUEST, message.as_str()),
             ApiError::Conflict(message) => (StatusCode::CONFLICT, message.as_str()),
             ApiError::TooLarge(message) => (StatusCode::PAYLOAD_TOO_LARGE, message.as_str()),
