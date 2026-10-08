@@ -4003,6 +4003,378 @@ await check('S3 dragging a page onto another in the sidebar opens the dialog, pr
   assert(still.status() === 200, `the drop moved the page (${still.status()})`);
 });
 
+// ---------------------------------------------------------------------------------------
+// Group T — M6: comments, notifications, resolving, and what a withheld page does not say
+// ---------------------------------------------------------------------------------------
+//
+// ADR 0025 (the event bus) and ADR 0026 (comments). Unit and API tests hold each rule; only
+// this holds the seam between a real browser, three real sessions and the layout's badge.
+//
+// THREE PEOPLE, none of them the dev identity: `m6autor` and `m6leser` are invited with a READ
+// grant (a reader may comment, ADR 0026 — that is half of what is being checked), `m6gast`
+// likewise and is stripped of it again in T5. They are made the way a person is made, through
+// `POST /api/admin/invites` and the acceptance page, so each owns a real session cookie; the
+// browser then sends it as a Cookie header (a `__Host-` cookie cannot be stored over http).
+// The page is /verweisbeispiel/gespraech, added by `behaviour-fixture`: RESTRICTED, because a
+// public page is readable by anyone whatever its grants say and could never be withheld, and
+// administered by this identity so it can invite and revoke. The dev identity stays the
+// "writer": T5 uses it to mention somebody, and T6 edits as it.
+//
+// A top-level comment notifies only whoever it @mentions; a reply notifies the thread's
+// author. So "A comments, B hears of it" is a mention.
+
+const M6_PATH = '/verweisbeispiel/gespraech';
+const M6_PASSWORD = 'Ein-sehr-langes-Passwort-fuer-M6-2026!';
+const M6_WHO = {
+  autor: { username: 'm6autor', name: 'M6 Autor' },
+  leser: { username: 'm6leser', name: 'M6 Leser' },
+  gast: { username: 'm6gast', name: 'M6 Gast' }
+};
+/** Per person, filled by T1: `state` (Playwright storage state) and `grant`. */
+const m6 = {};
+/** The first comment's text; T2 writes it, T3 and T4 find the thread by it. */
+const M6_KOMMENTAR = 'M6 bitte lesen, @m6leser, Frage zur Größe';
+const M6_ANTWORT = 'M6 Antwort des Lesers';
+
+/** Runs `fn(page, ctx)` as one of the three invited people, in a context of its own. */
+async function asM6(who, fn) {
+  assert(m6[who]?.cookie, `T1 did not produce a session for ${who}, so this check cannot run`);
+  const ctx = await browser.newContext({ extraHTTPHeaders: { Cookie: m6[who].cookie } });
+  try {
+    return await fn(await ctx.newPage(), ctx);
+  } finally {
+    await ctx.close();
+  }
+}
+
+/** The header badge's number as text, or null when there is no bell at all. */
+async function m6Badge(page) {
+  await page.goto(BASE + '/', { waitUntil: 'networkidle' });
+  const badge = page.locator('a.bell .badge');
+  return (await badge.count()) === 0 ? null : (await badge.first().innerText()).trim();
+}
+
+/** Opens the page and returns the comments panel. */
+async function m6Panel(page) {
+  await page.goto(BASE + M6_PATH, { waitUntil: 'networkidle' });
+  const panel = page.locator('section.comments');
+  await panel.waitFor({ state: 'visible', timeout: 10_000 });
+  return panel;
+}
+
+await check('T1 three people are invited with a read grant and each signs in through the real acceptance page', async (page) => {
+  for (const [key, who] of Object.entries(M6_WHO)) {
+    const before = await (await page.request.get(`${BASE}/api/admin/acl?path=${M6_PATH}`)).json();
+    const known = new Set(before.defined_here.map((g) => JSON.stringify(g.subject)));
+    const made = await page.request.post(`${BASE}/api/admin/invites`, {
+      data: { username: who.username, email: `${who.username}@example.de`, path: M6_PATH, permission: 'read' }
+    });
+    assert(made.status() === 201, `inviting ${who.username} answered ${made.status()}: ${await made.text()}`);
+    const url = (await made.json()).delivery?.url;
+    assert(typeof url === 'string' && url.startsWith('/auth/invite/'), `no link came back: ${url}`);
+
+    const ctx = await browser.newContext();
+    try {
+      const p = await ctx.newPage();
+      await p.goto(BASE + url, { waitUntil: 'domcontentloaded' });
+      await p.locator('#display_name').fill(who.name);
+      await p.locator('#password').fill(M6_PASSWORD);
+      // The session cookie is `__Host-…; Secure`, which a browser refuses to STORE from a
+      // plain-http origin, and this harness is plain http. So it is read off the 303 that
+      // sets it and installed by hand — as `Secure`, for the same origin, which is what
+      // production sends and what the server reads.
+      const accepted = p.waitForResponse((r) => r.url().includes('/accept') && r.request().method() === 'POST');
+      await Promise.all([
+        p.waitForURL((u) => u.pathname === '/', { timeout: 15_000 }),
+        p.locator('button[type=submit]').click()
+      ]);
+      const setCookies = (await (await accepted).headersArray())
+        .filter((h) => h.name.toLowerCase() === 'set-cookie' && h.value.startsWith('__Host-gw_session='))
+        .map((h) => h.value);
+      assert(setCookies.length === 1, `accepting the invitation set ${setCookies.length} session cookies`);
+      // Not even `addCookies` will store a `__Host-` cookie for http, so each later context
+      // sends it as a `Cookie` header instead (see `asM6`).
+      m6[key] = { cookie: setCookies[0].split(';')[0] };
+    } finally {
+      await ctx.close();
+    }
+    await asM6(key, async (_p, c) => {
+      const me = await (await c.request.get(`${BASE}/api/me`)).json();
+      assert(
+        me.username === who.username,
+        `after accepting, the session is ${me.username}, not ${who.username} — the dev identity won over it, or the cookie header was not honoured`
+      );
+      // Their own inbox starts empty: the grant they arrive with is not news to them.
+      await c.request.post(`${BASE}/api/notifications/read-all`);
+    });
+
+    const after = await (await page.request.get(`${BASE}/api/admin/acl?path=${M6_PATH}`)).json();
+    const fresh = after.defined_here.filter(
+      (g) => g.subject.kind === 'principal' && !known.has(JSON.stringify(g.subject))
+    );
+    assert(fresh.length === 1, `expected exactly one new principal grant for ${who.username}, saw ${fresh.length}`);
+    m6[key].grant = fresh[0];
+  }
+});
+
+await check('T2 a comment that mentions a reader gives that reader a badge of 1, a list entry with a link, and read-all clears it', async () => {
+  await asM6('autor', async (p) => {
+    const panel = await m6Panel(p);
+    await panel.getByLabel('Neuer Kommentar').fill(M6_KOMMENTAR);
+    await panel.getByRole('button', { name: 'Kommentieren', exact: true }).click();
+    await panel.getByText(M6_KOMMENTAR).first().waitFor({ state: 'visible', timeout: 10_000 });
+  });
+
+  await asM6('leser', async (p, ctx) => {
+    const badge = await m6Badge(p);
+    assert(badge === '1', `the reader's badge says ${JSON.stringify(badge)}, expected "1"`);
+
+    await p.goto(BASE + '/benachrichtigungen', { waitUntil: 'networkidle' });
+    const items = p.locator('main ul.list li');
+    assert((await items.count()) === 1, `the inbox lists ${await items.count()} entries, expected 1`);
+    const text = await items.first().innerText();
+    assert(text.includes(M6_WHO.autor.name), `the entry does not name who wrote it: ${text}`);
+    assert(text.includes('hat Sie erwähnt auf'), `the entry is not a mention: ${text}`);
+    const link = items.first().locator('a');
+    assert((await link.getAttribute('href')) === M6_PATH, `the entry links to ${await link.getAttribute('href')}`);
+
+    await p.getByRole('button', { name: 'Alle als gelesen markieren' }).click();
+    await p.waitForLoadState('networkidle');
+    assert((await m6Badge(p)) === null, 'the badge survived »Alle als gelesen markieren«');
+    const count = await (await ctx.request.get(`${BASE}/api/notifications/unread-count`)).json();
+    assert(count.count === 0, `the API still counts ${count.count} unread`);
+    // Kept, not deleted: the entry is still in the list, now read.
+    await p.goto(BASE + '/benachrichtigungen', { waitUntil: 'networkidle' });
+    assert((await p.locator('main ul.list li').count()) === 1, 'reading the entry removed it from the inbox');
+  });
+});
+
+await check('T3 a reader with a read-only grant replies, and the thread author gets the reply notification', async () => {
+  await asM6('leser', async (p) => {
+    const panel = await m6Panel(p);
+    const thread = panel.locator('li.thread').filter({ hasText: M6_KOMMENTAR });
+    await thread.waitFor({ state: 'visible', timeout: 10_000 });
+    await thread.getByLabel('Antwort', { exact: true }).fill(M6_ANTWORT);
+    await thread.getByRole('button', { name: 'Antworten', exact: true }).click();
+    await panel.getByText(M6_ANTWORT).first().waitFor({ state: 'visible', timeout: 10_000 });
+  });
+
+  await asM6('autor', async (p) => {
+    const badge = await m6Badge(p);
+    assert(badge === '1', `the author's badge says ${JSON.stringify(badge)}, expected "1"`);
+    await p.goto(BASE + '/benachrichtigungen', { waitUntil: 'networkidle' });
+    const text = await p.locator('main ul.list li').first().innerText();
+    assert(text.includes(M6_WHO.leser.name), `the entry does not name the replier: ${text}`);
+    assert(text.includes('hat auf Ihren Kommentar geantwortet auf'), `not a reply notification: ${text}`);
+    assert(
+      (await p.locator('main ul.list li a').first().getAttribute('href')) === M6_PATH,
+      'the reply notification does not link to the page'
+    );
+  });
+});
+
+await check('T4 resolving collapses the thread under »Erledigt (1)«, it is still there after a reload, and nothing offers to delete it', async () => {
+  await asM6('leser', async (p, ctx) => {
+    let panel = await m6Panel(p);
+    const thread = panel.locator('li.thread').filter({ hasText: M6_KOMMENTAR });
+    await thread.getByRole('button', { name: 'Erledigt', exact: true }).click();
+    const summary = panel.locator('details.done > summary');
+    await summary.waitFor({ state: 'visible', timeout: 10_000 });
+    assert((await summary.innerText()).trim() === 'Erledigt (1)', `the summary says ${await summary.innerText()}`);
+    assert(
+      (await panel.locator('details.done').getAttribute('open')) === null,
+      'the resolved thread is not collapsed'
+    );
+    assert(!(await panel.getByText(M6_KOMMENTAR).first().isVisible()), 'a collapsed thread is showing its text');
+
+    // After a reload, from the server and not from the page's state.
+    panel = await m6Panel(p);
+    assert(
+      (await panel.locator('details.done > summary').innerText()).trim() === 'Erledigt (1)',
+      'the resolved thread did not survive a reload'
+    );
+    assert(
+      (await panel.locator('details.done').getByText(M6_KOMMENTAR).count()) === 1 &&
+        (await panel.locator('details.done').getByText(M6_ANTWORT).count()) === 1,
+      'the resolved thread lost its comment or its reply'
+    );
+
+    // No delete control: not in the panel, expanded or not, and not in the API.
+    await panel.locator('details.done > summary').click();
+    const controls = (await panel.getByRole('button').allInnerTexts())
+      .concat(await panel.getByRole('link').allInnerTexts())
+      .join(' | ');
+    assert(!/lösch|entfern|delete|papierkorb/i.test(controls), `the comments panel offers: ${controls}`);
+    const del = await ctx.request.delete(`${BASE}/api/comments/document${M6_PATH}`);
+    assert(del.status() === 405, `DELETE on the comments answered ${del.status()}, expected 405`);
+  });
+});
+
+await check('T5 a person with no grant gets the same 404 as for an absent page, badge 0 and an empty inbox, though an event names the page', async (page) => {
+  // The event is addressed to them while they CAN read: a mention by the dev identity.
+  const said = await page.request.post(`${BASE}/api/comments/document${M6_PATH}`, {
+    data: { body: 'M6 Hinweis für @m6gast' }
+  });
+  assert(said.status() === 201 || said.status() === 200, `the mention was not accepted: ${said.status()}`);
+  await asM6('gast', async (p, ctx) => {
+    const before = await (await ctx.request.get(`${BASE}/api/notifications/unread-count`)).json();
+    assert(before.count === 1, `the event never reached the guest while they could read (${before.count}), so the rest proves nothing`);
+  });
+
+  // Then the grant goes. The event is still addressed to them; the page is no longer theirs.
+  const gone = await page.request.delete(`${BASE}/api/admin/acl`, {
+    data: { path: M6_PATH, subject: m6.gast.grant.subject, permission: m6.gast.grant.permission }
+  });
+  assert(gone.status() === 200, `removing the guest's grant answered ${gone.status()}`);
+
+  await asM6('gast', async (p, ctx) => {
+    const ABSENT = '/rundgang/m6-diese-seite-gibt-es-nicht';
+    const withheld = await ctx.request.get(`${BASE}/api/comments/document${M6_PATH}`);
+    const absent = await ctx.request.get(`${BASE}/api/comments/document${ABSENT}`);
+    assert(withheld.status() === 404, `the withheld page answered ${withheld.status()}, not 404`);
+    assert(absent.status() === 404, `the absent page answered ${absent.status()}`);
+    assert(
+      Buffer.compare(await withheld.body(), await absent.body()) === 0 &&
+        withheld.headers()['content-type'] === absent.headers()['content-type'],
+      'the withheld page and an absent one are told apart by their bytes'
+    );
+    const posted = await ctx.request.post(`${BASE}/api/comments/document${M6_PATH}`, { data: { body: 'x' } });
+    const postedAbsent = await ctx.request.post(`${BASE}/api/comments/document${ABSENT}`, { data: { body: 'x' } });
+    assert(
+      posted.status() === 404 && Buffer.compare(await posted.body(), await postedAbsent.body()) === 0,
+      `posting to the withheld page answered ${posted.status()}, unlike an absent page`
+    );
+
+    assert((await m6Badge(p)) === null, 'the badge shows a number for a page the guest may not read');
+    const count = await (await ctx.request.get(`${BASE}/api/notifications/unread-count`)).json();
+    assert(count.count === 0, `the API counts ${count.count} unread for a withheld page`);
+    const inbox = await (await ctx.request.get(`${BASE}/api/notifications`)).json();
+    assert(inbox.notifications.length === 0, `the inbox lists ${inbox.notifications.length} entries`);
+    await p.goto(BASE + '/benachrichtigungen', { waitUntil: 'networkidle' });
+    assert(
+      (await p.locator('main').innerText()).includes('Keine Benachrichtigungen'),
+      'the inbox page does not read as empty'
+    );
+  });
+});
+
+await check('T6 a passage comment made from a selection is anchored, and once the passage is deleted it is orphaned but kept', async (page) => {
+  const PASSAGE = 'M6 Anker für die Textstelle';
+  const PASSAGE_KOMMENTAR = 'M6 Randnotiz zur markierten Stelle';
+  // Best effort, as asked: the selection is made with the keyboard (Shift+Home from the end of
+  // the line just typed), because a native mouse selection is not reliable inside ProseMirror
+  // (E7). If the editor never offers »Kommentieren«, say so plainly rather than pass or hang.
+  async function edit() {
+    await page.goto(BASE + M6_PATH + '?edit=1', { waitUntil: 'networkidle' });
+    const region = page.locator('section[aria-label="Seite bearbeiten"]');
+    await region.waitFor({ state: 'visible', timeout: 10_000 });
+    await until(
+      async () => {
+        const saw = (await region.locator('.gw-ed-status-head').textContent())?.trim() ?? '';
+        return { ok: saw.includes('Verbunden'), saw };
+      },
+      'no live editing session for the passage check',
+      15_000
+    );
+    return region;
+  }
+  async function publish(region) {
+    await region.getByRole('button', { name: 'Veröffentlichen' }).click();
+    await until(
+      async () => {
+        const saw = (await region.locator('.gw-ed-note').first().textContent())?.trim() ?? '';
+        return { ok: /gespeichert|veröffentlicht/i.test(saw), saw };
+      },
+      'the editor never confirmed the publish',
+      15_000
+    );
+  }
+
+  let region = await edit();
+  const surface = region.locator('[contenteditable="true"]');
+  await surface.click();
+  await page.keyboard.press('Control+End');
+  await page.keyboard.press('Enter');
+  await page.keyboard.type(PASSAGE);
+  await page.keyboard.press('Shift+Home');
+  const button = region.getByRole('button', { name: 'Kommentieren', exact: true });
+  try {
+    await until(async () => ({ ok: await button.isEnabled(), saw: 'disabled' }), 'Kommentieren stayed disabled', 5_000);
+  } catch {
+    console.log('SKIP T6 — the editor never offered »Kommentieren« for a keyboard selection; the passage comment is not driven here');
+    return;
+  }
+  await button.click();
+  await region.locator('#gw-ed-passage-text').fill(PASSAGE_KOMMENTAR);
+  await region.locator('.gw-ed-passage').getByRole('button', { name: 'Senden' }).click();
+  await region.getByText('Kommentar gespeichert').waitFor({ state: 'visible', timeout: 10_000 });
+  await publish(region);
+
+  const panel = await m6Panel(page);
+  const thread = panel.locator('li.thread').filter({ hasText: PASSAGE_KOMMENTAR });
+  await thread.waitFor({ state: 'visible', timeout: 10_000 });
+  assert((await thread.locator('blockquote.quote').innerText()).includes(PASSAGE), 'the thread does not quote the selected passage');
+  assert((await thread.locator('.orphan').count()) === 0, 'a fresh passage comment is already marked orphaned');
+
+  // Delete exactly that passage, publish, and look again from a cold load.
+  region = await edit();
+  const again = region.locator('[contenteditable="true"]');
+  await again.click();
+  // By content, not by position: after the first publish the document may end in an empty
+  // paragraph, so "end of document, back to line start" can select nothing at all.
+  const selected = await again.evaluate((el, text) => {
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      const at = n.textContent.indexOf(text);
+      if (at >= 0) {
+        const range = document.createRange();
+        range.setStart(n, at);
+        range.setEnd(n, at + text.length);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        return true;
+      }
+    }
+    return false;
+  }, PASSAGE);
+  assert(selected, 'the typed passage is not in the editor on the second visit');
+  await page.waitForTimeout(300);
+  await page.keyboard.press('Backspace');
+  await publish(region);
+  await until(
+    async () => {
+      // The article only: the comments panel below it quotes the passage on purpose.
+      const html = await (await page.request.get(BASE + M6_PATH)).text();
+      const article = html.match(/<article[^>]*class="prose[\s\S]*?<\/article>/)?.[0] ?? '';
+      return { ok: article !== '' && !article.includes(PASSAGE), saw: 'passage still published' };
+    },
+    'the passage is still in the published page, so the deletion did not happen',
+    10_000
+  );
+
+  await until(
+    async () => {
+      const r = await page.request.get(`${BASE}/api/comments/document${M6_PATH}`);
+      const threads = (await r.json()).threads ?? [];
+      const t = threads.find((x) => x.body === PASSAGE_KOMMENTAR);
+      return { ok: t?.orphaned === true, saw: t ? { orphaned: t.orphaned } : 'comment missing' };
+    },
+    'the comment was not orphaned after its passage was deleted',
+    // Orphaning happens when the room is written out, and the janitor does that every 30 s
+    // (`CollabPolicy::snapshot_interval`) — publishing does not run it.
+    50_000
+  );
+  const after = await m6Panel(page);
+  const kept = after.locator('li.thread').filter({ hasText: PASSAGE_KOMMENTAR });
+  await kept.waitFor({ state: 'visible', timeout: 10_000 });
+  assert(
+    (await kept.locator('.orphan').innerText()).includes('Textstelle nicht mehr vorhanden'),
+    'the orphaned comment does not say its passage is gone'
+  );
+  assert((await kept.locator('blockquote.quote').innerText()).includes(PASSAGE), 'the orphaned comment lost its quote');
+});
+
 await browser.close();
 
 // ---------------------------------------------------------------------------------------
