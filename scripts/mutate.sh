@@ -936,12 +936,12 @@ mutation crates/gw-api/src/routes/tasks.rs killed \
 mutation crates/gw-api/src/routes/tasks.rs killed \
   's@TaskStatus::from_stored(&composed).ok_or_else@Some(TaskStatus::from_stored(\&composed).unwrap_or_default()).ok_or_else@' \
   'task api: an unrecognised status is refused, never quietly defaulted to Offen'
-# Existence before permission, for a PATH. Collapsing the refusal into 404 hides a
-# configuration mistake behind a status code that says "you spelled it wrong" — the split
-# `/api/documents`, `/api/links/backlinks` and `/api/revisions/document` all make.
+# A PATH refusal goes through `docs::withheld_or_absent` (ADR 0022): 403 only for a caller who
+# may already read the page, the same 404 as an absent address for everybody else. Hard-coding
+# 403 at the call site reinstates the existence oracle for the task list.
 mutation crates/gw-api/src/routes/tasks.rs killed \
-  '/pub async fn document_tasks/,/^}$/ s@.ok_or(ApiError::Forbidden)?@.ok_or(ApiError::NotFound)?@' \
-  "task api: a page's task list answers 404 for a page that is not there, 403 for one refused"
+  '/pub async fn document_tasks/,/^}$/ s@return Err(withheld_or_absent(&state, &principal, &path).await);@return Err(ApiError::Forbidden);@' \
+  "task api: a page's task list refuses through withheld_or_absent, so a page the caller may not read answers what an absent one does"
 # And the opposite rule for an ID, which is where somebody copying the pattern above goes
 # wrong. A project id is a uuid nobody guesses, so there is no existence to protect and
 # everything unreachable is 404; a 403 would be an answer about a board the caller cannot
@@ -1002,14 +1002,14 @@ mutation crates/gw-api/src/routes/tasks.rs killed \
   '/pub async fn global_board/,/^}$/ s@.ok_or(ApiError::NotFound)?@.ok_or(ApiError::Forbidden)?@' \
   'global board: projekt= is an id — unreachable is 404, never the 403 a path gets'
 mutation crates/gw-api/src/routes/tasks.rs killed \
-  '/pub async fn global_board/,/^}$/ s@.ok_or(ApiError::Forbidden)?@.ok_or(ApiError::NotFound)?@' \
-  'global board: seite= is a path — 404 for a page that is not there, 403 for one refused'
-# Existence before permission, for the path binding. With the check gone an absent page falls
-# through to the accessor and is refused as 403, which says nothing exists at a path where
-# nothing does — the configuration mistake this split exists to keep visible.
+  '/pub async fn global_board/,/^}$/ s@return Err(withheld_or_absent(&state, &principal, &path).await);@return Err(ApiError::Forbidden);@' \
+  'global board: seite= refuses through withheld_or_absent, so an unreadable page answers what an absent one does (ADR 0022)'
+# Authorise the page before saying anything about a project homed on it. With the check gone
+# an unreadable page falls through to the project lookup, and "is this page somebody's home"
+# is answered — naming the project — for a page the caller cannot read (ADR 0022).
 mutation crates/gw-api/src/routes/tasks.rs killed \
-  '/pub async fn global_board/,/^}$/ s@            if !state@            if false \&\& !state@' \
-  'global board: seite= asks whether the page is there before it asks who may read it'
+  '/pub async fn global_board/,/^}$/ s@            if state$@            if false \&\& state@' \
+  'global board: seite= authorises the page itself before saying anything about a project homed there'
 
 # --- may_write: the bit an interface offers a control on (0010) -------------------------
 #
