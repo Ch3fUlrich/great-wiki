@@ -5,6 +5,7 @@ pub mod audit;
 pub mod blobs;
 pub mod crdt;
 pub mod documents;
+pub mod events;
 pub mod invites;
 pub mod links;
 pub mod login_attempts;
