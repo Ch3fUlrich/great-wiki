@@ -396,17 +396,7 @@ async fn authorise(
     jar: &CookieJar,
     path: &str,
 ) -> Result<(Principal, StoredDocument), ApiError> {
-    if let Some(active) = crate::view_as::active(state, jar).await {
-        tracing::warn!(
-            path,
-            viewer = %active.viewer.username,
-            target = %active.target.username,
-            "refused: an editing session while viewing as somebody else"
-        );
-        return Err(ApiError::Forbidden);
-    }
-
-    let principal = state.principal(jar).await;
+    let principal = editor(state, jar, path).await?;
 
     let Some(document) = state
         .store
@@ -418,6 +408,49 @@ async fn authorise(
     };
 
     Ok((principal, document))
+}
+
+/// Step 1 of [`authorise`], and the principal: refused while viewing as somebody else, and
+/// otherwise whoever the cookies say. Shared by the path-keyed and the id-keyed question so
+/// that neither can drift from the other on the view-as rule.
+async fn editor(state: &AppState, jar: &CookieJar, path: &str) -> Result<Principal, ApiError> {
+    if let Some(active) = crate::view_as::active(state, jar).await {
+        tracing::warn!(
+            path,
+            viewer = %active.viewer.username,
+            target = %active.target.username,
+            "refused: an editing session while viewing as somebody else"
+        );
+        return Err(ApiError::Forbidden);
+    }
+    Ok(state.principal(jar).await)
+}
+
+/// [`authorise`], asked of a document by its id.
+///
+/// An open session is re-authorised with THIS, not with the path it joined on: a move
+/// (ADR 0023) changes the path and nothing else, so keyed by path an editor would be dropped
+/// for a page they may still edit, and a page moved out of their reach must still end their
+/// session. `document_for_id` resolves the id to the page's CURRENT path and asks the one
+/// accessor with [`Action::Write`], so the verdict is about where the page is now — who the
+/// move let in or shut out is decided by the same rule as a fresh handshake. A page in the
+/// trash, or deleted, resolves to nothing and the session ends.
+async fn authorise_id(
+    state: &AppState,
+    jar: &CookieJar,
+    document_id: &str,
+    joined_at: &str,
+) -> Result<Principal, ApiError> {
+    let principal = editor(state, jar, joined_at).await?;
+    match state
+        .store
+        .document_for_id(&principal, document_id, Action::Write)
+        .await
+        .map_err(ApiError::Internal)?
+    {
+        Some(_) => Ok(principal),
+        None => Err(ApiError::Forbidden),
+    }
 }
 
 /// Join the editing session for the page at `path`.
@@ -723,7 +756,7 @@ async fn run(
                         // line the bound is exact for the case that matters, which is the
                         // one where content changes.
                         if checked.elapsed() >= policy.reauth_interval {
-                            match reauthorise(&state, &jar, &path).await {
+                            match reauthorise(&state, &jar, room.document_id(), &path).await {
                                 Some(id) => { writer_id = id; checked = Instant::now(); }
                                 None => {
                                     close(&mut sink, close_code::POLICY,
@@ -784,7 +817,7 @@ async fn run(
                 // The other end of the re-check: a connection that sends nothing is closed
                 // too. Without this, revoking somebody's access would leave them subscribed
                 // to every keystroke of a page they may no longer read.
-                match reauthorise(&state, &jar, &path).await {
+                match reauthorise(&state, &jar, room.document_id(), &path).await {
                     Some(id) => { writer_id = id; checked = Instant::now(); }
                     None => {
                         close(&mut sink, close_code::POLICY,
@@ -813,11 +846,16 @@ async fn run(
 /// [`authorise`] is asked the same question it was asked at the handshake. A deactivated
 /// account, a revoked grant, an ended session, a deleted page and an administrator who has
 /// meanwhile entered view-as mode all come out of this as `None`.
-async fn reauthorise(state: &AppState, jar: &CookieJar, path: &str) -> Option<String> {
-    match authorise(state, jar, path).await {
-        Ok((principal, _)) => Some(principal.id),
+async fn reauthorise(
+    state: &AppState,
+    jar: &CookieJar,
+    document_id: &str,
+    joined_at: &str,
+) -> Option<String> {
+    match authorise_id(state, jar, document_id, joined_at).await {
+        Ok(principal) => Some(principal.id),
         Err(error) => {
-            tracing::info!(%path, %error, "ending a session that is no longer authorised");
+            tracing::info!(%joined_at, %error, "ending a session that is no longer authorised");
             None
         }
     }

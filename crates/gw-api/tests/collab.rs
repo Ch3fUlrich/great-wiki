@@ -1362,3 +1362,120 @@ async fn a_mark_survives_the_stored_state_and_does_not_survive_a_revision() {
          from a lossy `Block` snapshot rather than from the CRDT state"
     );
 }
+
+// -------------------------------------------------------------------------------------
+// A move under an open session (ADR 0023).
+// -------------------------------------------------------------------------------------
+//
+// The session joined on a PATH, and a move changes the path. Re-authorised by that path it
+// would be dropped for a page the editor may still edit; re-authorised by nothing it would
+// outlive a move that shut them out. It is asked by DOCUMENT ID, so the verdict is about
+// where the page is now. Both directions are tested, because a session that is never closed
+// and a session that is always closed pass one half each.
+
+/// Move `/handbuch/onboarding` under `parent`, as `chef` — given write on both ends, because
+/// an administrator is not a writer (D-M2-8) and a move needs write on the page it moves and
+/// on the new parent.
+async fn move_onboarding_under(store: &Arc<Store>, parent: &str) {
+    for path in ["/handbuch", "/oeffentlich"] {
+        let id = principal(store, "chef").await.id;
+        store
+            .add_grant(path, Subject::Principal(id), Permission::Write)
+            .await
+            .unwrap();
+    }
+    let chef = principal(store, "chef").await;
+    let outcome = store
+        .move_document(
+            &chef,
+            "/handbuch/onboarding",
+            &gw_store::MoveRequest {
+                parent: Some(parent.into()),
+                title: "Onboarding".into(),
+                slug: Some("onboarding".into()),
+            },
+            true,
+            gw_store::MoveMode::Commit,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, gw_store::MoveOutcome::Planned(ref plan) if plan.committed),
+        "the move this test relies on did not happen: {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_move_that_leaves_the_editor_in_reach_does_not_end_their_session() {
+    let store = fixture().await;
+    insert(
+        &store,
+        Some("/handbuch"),
+        "ablage",
+        "Ablage",
+        Visibility::Restricted,
+    )
+    .await;
+    let state = under(state_as(&store, "autorin").await, brisk());
+    let addr = serve(state).await;
+    let mut ws = connect(&addr, "handbuch/onboarding", None).await.unwrap();
+    let replica = sync(&mut ws).await;
+
+    move_onboarding_under(&store, "/handbuch/ablage").await;
+    // Several re-authorisation intervals: a session keyed by the old path is closed by the
+    // first of them.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    send_update(&mut ws, &edit(&replica, "nach dem Umzug")).await;
+    settle(&mut ws, &replica).await;
+
+    // And the edit landed in the room the page has at its new address: one page, one room.
+    let mut at_new = connect(&addr, "handbuch/ablage/onboarding", None)
+        .await
+        .unwrap();
+    let seen = sync(&mut at_new).await;
+    assert!(
+        seen.to_block().plain_text().contains("nach dem Umzug"),
+        "the session survived but its edit did not reach the page"
+    );
+}
+
+#[tokio::test]
+async fn a_move_out_of_the_editors_reach_ends_their_session_without_waiting_for_a_keystroke() {
+    let store = fixture().await;
+    let state = under(state_as(&store, "autorin").await, brisk());
+    let addr = serve(state).await;
+    let mut ws = connect(&addr, "handbuch/onboarding", None).await.unwrap();
+    sync(&mut ws).await;
+
+    // `/oeffentlich` carries no grant for `autorin`, so the page leaves her `write`.
+    move_onboarding_under(&store, "/oeffentlich").await;
+
+    assert_eq!(close_code(&mut ws).await, CloseCode::Policy);
+}
+
+#[tokio::test]
+async fn an_edit_sent_after_a_move_out_of_reach_is_refused_and_not_stored() {
+    let store = fixture().await;
+    let state = under(state_as(&store, "autorin").await, brisk());
+    let addr = serve(state.clone()).await;
+    let mut ws = connect(&addr, "handbuch/onboarding", None).await.unwrap();
+    let replica = sync(&mut ws).await;
+
+    move_onboarding_under(&store, "/oeffentlich").await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    send_update(&mut ws, &edit(&replica, "nach dem Entzug")).await;
+
+    assert_eq!(close_code(&mut ws).await, CloseCode::Policy);
+    sweep(&state).await;
+    let chef = principal(&store, "chef").await;
+    let id = document_id(&store, "chef", "/oeffentlich/onboarding").await;
+    let stored = store.crdt_state_for(&chef, &id).await.unwrap();
+    let text = stored
+        .map(|s| CollabDoc::from_state(&s).unwrap().to_block().plain_text())
+        .unwrap_or_default();
+    assert!(
+        !text.contains("Entzug"),
+        "an update sent after the page left her reach was stored"
+    );
+}

@@ -133,11 +133,14 @@ administer the page from now on are the ones entitled to read how it arrived), d
 - **ADR 0019's property is now proved by use.** The store test
   `a_move_leaves_every_other_body_and_history_alone_and_a_reference_follows_it` snapshots
   every body and the revision count across a move, and resolves a reference afterwards.
-- **An open editing session on a moved page is closed** at its next re-authorisation: the
-  socket is keyed by the path it joined on, and that path no longer holds the page. This is
-  fail-closed and loses nothing (the room persists by document id), but the editor has to be
-  reopened at the new address. Re-authorising the socket by document id is the fix, and it is
-  its own change to a security-reviewed path.
+- **An open editing session survives a move that leaves the editor in reach, and ends with
+  one that does not.** The socket joins on a path but is re-authorised by **document id**
+  (`collab::authorise_id` → `Store::document_for_id(.., Action::Write)`), which resolves to
+  the page's current path and asks the same accessor as a handshake. An editor who lost write
+  or read by the move (or whose page went to the trash) gets the policy close at the next
+  tick or update; one who keeps write stays connected, in the same room (rooms are keyed by
+  document id). Before this the session was closed for everybody. The view-as refusal is
+  shared with the handshake (`collab::editor`). Mutations `collab:` in `scripts/mutate.sh`.
 - **Links typed as a path to the old address** (an `href` that was never resolved to an id)
   keep the old path and work through the forward — until the address is reused.
 - **Sub-routes of an old address** (`/alt/history`) are forwarded by the same rule as the

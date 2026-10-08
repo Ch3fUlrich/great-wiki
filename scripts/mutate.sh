@@ -617,6 +617,25 @@ mutation crates/gw-api/src/routes/collab.rs killed \
   's/    if !state.collab.differs(document_id, &encoded) {/    if false {/' \
   'crdt state: an editing session in which nothing was typed writes no row, once per sweep for ever'
 
+# --- an open editing socket under a move (ADR 0023) --------------------------------------
+#
+# The session is re-authorised by DOCUMENT ID, so the verdict follows the page to wherever a
+# move put it. Three ways to get that wrong, each a different test:
+#   - keyed by the path it joined on: a move closes the session of an editor who may still
+#     edit the page (the page is "gone" from the old path);
+#   - the verdict ignored: a page moved out of the editor's reach keeps them subscribed to it;
+#   - the wrong action: asking for READ lets somebody who lost write at the new place keep
+#     typing into a page they may now only look at.
+mutation crates/gw-api/src/routes/collab.rs killed \
+  's/reauthorise(&state, &jar, room.document_id(), &path)/reauthorise(\&state, \&jar, \&path, \&path)/' \
+  'collab: an open session is re-authorised by document id — a move must not end the session of an editor who still may write'
+mutation crates/gw-api/src/routes/collab.rs killed \
+  '/async fn authorise_id/,/^}$/ s/        None => Err(ApiError::Forbidden),/        None => Ok(principal),/' \
+  'collab: a page moved out of the editor'"'"'s reach ends their open session'
+mutation crates/gw-api/src/routes/collab.rs killed \
+  '/async fn authorise_id/,/^}$/ s/Action::Write/Action::Read/' \
+  'collab: the open-session check asks for WRITE at the page'"'"'s new place, not read'
+
 # --- links: the graph, and who is allowed to see an edge of it ------------------------
 #
 # A backlinks panel is an aggregate view, and an aggregate view is where filtering gets
