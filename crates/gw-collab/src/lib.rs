@@ -33,6 +33,7 @@
 //! document; a `Block` snapshot is a lossy view of it.** A snapshot is safe to index,
 //! search and diff. It is not safe to write back over the CRDT.
 
+pub mod anchor;
 pub mod doc;
 pub mod room;
 

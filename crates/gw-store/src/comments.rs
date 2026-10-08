@@ -225,6 +225,38 @@ impl Store {
         Ok(Some(row.into()))
     }
 
+    /// Mark the document's anchored comments whose passage is gone as orphaned.
+    ///
+    /// `survives(start, end)` is asked once per not-yet-orphaned anchored comment. The flag
+    /// is sticky: it is never cleared (re-typing the text is new content, not the old
+    /// passage), and no comment or body is ever deleted. Returns how many were newly
+    /// orphaned. Not permission-checked: it reads no content out and writes one flag, and
+    /// is called from the persistence path after the writer has been authorised.
+    pub async fn orphan_lost_anchors(
+        &self,
+        document_id: &str,
+        survives: &(dyn Fn(&[u8], &[u8]) -> bool + Sync),
+    ) -> Result<u64> {
+        let rows: Vec<(String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, anchor_start, anchor_end FROM comments WHERE doc_id = ?1 \
+             AND orphaned = 0 AND anchor_start IS NOT NULL AND anchor_end IS NOT NULL",
+        )
+        .bind(document_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut n = 0;
+        for (id, start, end) in rows {
+            if !survives(&start, &end) {
+                n += sqlx::query("UPDATE comments SET orphaned = 1 WHERE id = ?1")
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await?
+                    .rows_affected();
+            }
+        }
+        Ok(n)
+    }
+
     /// The page's comments in created order, or `None` when the page is withheld or absent
     /// (the same answer for both, ADR 0022). Threading is the caller's. Author names are
     /// resolved only after the page check.
@@ -326,6 +358,38 @@ mod tests {
             parent_id: parent.map(str::to_string),
             anchor: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_lost_passage_orphans_its_comment_for_good() {
+        let s = store().await;
+        let (path, id) = page(&s, "Raum").await;
+        let a = account(&s, "anna").await;
+        grant(&s, &path, &a, Permission::Read).await;
+        let anchored = NewComment {
+            body: "hier".into(),
+            parent_id: None,
+            anchor: Some(CommentAnchor {
+                start: vec![1],
+                end: vec![2],
+                quote: "q".into(),
+            }),
+        };
+        s.create_comment(&a, &path, anchored)
+            .await
+            .unwrap()
+            .unwrap();
+        s.create_comment(&a, &path, new("ohne", None))
+            .await
+            .unwrap();
+        assert_eq!(s.orphan_lost_anchors(&id, &|_, _| true).await.unwrap(), 0);
+        assert_eq!(s.orphan_lost_anchors(&id, &|_, _| false).await.unwrap(), 1);
+        // Undo / re-insert makes the passage "survive" again; the flag must not revert.
+        assert_eq!(s.orphan_lost_anchors(&id, &|_, _| true).await.unwrap(), 0);
+        let list = s.comments_for_document(&a, &id).await.unwrap().unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list[0].orphaned && list[0].body == "hier");
+        assert!(!list[1].orphaned);
     }
 
     #[tokio::test]
