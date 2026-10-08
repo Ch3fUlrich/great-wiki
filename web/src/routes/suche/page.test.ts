@@ -4,7 +4,7 @@ import Page from './+page.svelte';
 import { NO_RESULTS, type SearchResults } from '$lib/search';
 
 function html(query: string, results: SearchResults = NO_RESULTS): string {
-  return render(Page, { props: { data: { query, results } } }).body.replace(/<!--.*?-->/g, '');
+  return render(Page, { props: { data: { query, results } as never } }).body.replace(/<!--.*?-->/g, '');
 }
 
 describe('the results page', () => {
