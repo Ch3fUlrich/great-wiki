@@ -73,6 +73,15 @@
     type SessionState
   } from './session';
   import EditorToolbar from './EditorToolbar.svelte';
+  import { absolutePositionToRelativePosition, ySyncPluginKey } from '@tiptap/y-tiptap';
+  import {
+    cleanBody,
+    describeWriteFailure,
+    encodeAnchor,
+    postComment,
+    quoteOf,
+    type CommentAnchor
+  } from '$lib/comments';
 
   interface Props {
     /** The document's stored path, leading slash included. */
@@ -156,6 +165,50 @@
   // Reactive on purpose: the toolbar cannot subscribe to an editor it is never told about,
   // and this one does not exist until the session is live.
   let editor = $state<Editor | null>(null);
+
+  // A passage comment (ADR 0025): offered while text is selected. The editor is only ever
+  // shown to a signed-in writer, so there is no anonymous case here. Readers viewing the
+  // rendered page have no editor session and cannot anchor a comment to a passage.
+  let hasSelection = $state(false);
+  let passage = $state<{ anchor: CommentAnchor } | null>(null);
+  let passageText = $state('');
+  let passageNote = $state<string | null>(null);
+  let passageBusy = $state(false);
+
+  function selectionAnchor(ed: Editor): CommentAnchor | null {
+    const { from, to, empty } = ed.state.selection;
+    if (empty) return null;
+    const y = ySyncPluginKey.getState(ed.state);
+    if (!y?.type || !y.binding) return null;
+    const quote = quoteOf(ed.state.doc.textBetween(from, to, ' '));
+    if (!quote) return null;
+    const start = absolutePositionToRelativePosition(from, y.type, y.binding.mapping);
+    const end = absolutePositionToRelativePosition(to, y.type, y.binding.mapping);
+    return encodeAnchor(y.doc, start, end, quote);
+  }
+
+  function startPassage() {
+    if (!editor) return;
+    const anchor = selectionAnchor(editor);
+    if (!anchor) return;
+    passage = { anchor };
+    passageNote = null;
+  }
+
+  async function sendPassage() {
+    const body = cleanBody(passageText);
+    if (!passage || !body || passageBusy) return;
+    passageBusy = true;
+    const r = await postComment(fetch, path, { body, anchor: passage.anchor });
+    passageBusy = false;
+    if (r.status >= 200 && r.status < 300) {
+      passage = null;
+      passageText = '';
+      passageNote = 'Kommentar gespeichert. Er erscheint unter der Seite.';
+    } else {
+      passageNote = describeWriteFailure(r.status);
+    }
+  }
 
   // `$derived` rather than a one-off: `path` is a prop, and a value read once at setup is a
   // value that silently belongs to whichever page happened to mount first.
@@ -339,6 +392,8 @@
       }
     });
     rescueText = editor.getText({ blockSeparator: '\n\n' });
+    const ed = editor;
+    ed.on('selectionUpdate', () => (hasSelection = !ed.state.selection.empty));
     ready = true;
   }
 
@@ -391,6 +446,15 @@
             Auch hier: {peers.join(', ')}
           </p>
         {/if}
+        <button
+          type="button"
+          class="gw-ed-btn"
+          disabled={!ready || !hasSelection}
+          title="Die markierte Textstelle kommentieren"
+          onclick={startPassage}
+        >
+          Kommentieren
+        </button>
         <button type="button" class="gw-ed-btn" onclick={onLeave}>Fertig</button>
       </div>
     </div>
@@ -400,6 +464,23 @@
          from the page and not from the record. The moment somebody needs to know that is
          the moment they are removing something, so it stays on screen the whole time. -->
     <p class="gw-ed-history">{HISTORY_WARNING}</p>
+
+    {#if passage}
+      <form
+        class="gw-ed-passage"
+        onsubmit={(e) => {
+          e.preventDefault();
+          void sendPassage();
+        }}
+      >
+        <blockquote>{passage.anchor.quote}</blockquote>
+        <label for="gw-ed-passage-text">Kommentar zur Textstelle</label>
+        <textarea id="gw-ed-passage-text" rows="2" bind:value={passageText}></textarea>
+        <button type="submit" class="gw-ed-btn" disabled={passageBusy}>Senden</button>
+        <button type="button" class="gw-ed-btn" onclick={() => (passage = null)}>Abbrechen</button>
+      </form>
+    {/if}
+    {#if passageNote}<p class="gw-ed-history" role="status">{passageNote}</p>{/if}
 
     <p
       class="gw-ed-status gw-ed-status--{description.tone}"
@@ -519,6 +600,15 @@
     font-size: var(--text-sm);
   }
 
+  :global(.gw-ed-passage) {
+    display: grid;
+    gap: var(--space-2);
+    justify-items: start;
+  }
+  :global(.gw-ed-passage textarea) {
+    font: inherit;
+    width: 100%;
+  }
   :global(.gw-ed-history) {
     color: var(--ink-muted);
     font-size: var(--text-sm);

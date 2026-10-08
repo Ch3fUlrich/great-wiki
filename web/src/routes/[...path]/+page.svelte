@@ -1,5 +1,6 @@
 <script lang="ts">
   import { browser } from '$app/environment';
+  import Comments from '$lib/components/Comments.svelte';
   import Backlinks from '$lib/components/Backlinks.svelte';
   import BlockView from '$lib/components/BlockView.svelte';
   import Board from '$lib/components/Board.svelte';
@@ -451,6 +452,12 @@
       hochgeladen={data.hochgeladen ?? null}
     />
 
+    <Comments
+      path={data.doc.path}
+      threads={data.kommentare ?? []}
+      fehler={data.kommentareFehler ?? null}
+      angemeldet={data.me?.authenticated === true}
+    />
   </main>
 
   <!-- A plain `<div>`, not an `<aside>`. Everything in it is already its own landmark with

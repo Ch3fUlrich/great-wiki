@@ -30,6 +30,7 @@ import {
   type DocumentTopicsResponse,
   type Topic
 } from '$lib/topics';
+import { commentsApiPath, describeCommentsFailure, type Thread } from '$lib/comments';
 import { GERMAN_REFUSALS } from '$lib/refusals';
 import {
   describeMove,
@@ -226,6 +227,20 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
   //
   // A failure is stated rather than rendered as "this page carries nothing", and never fails
   // the page: attachments are an addition to a page, exactly as the board and the chips are.
+  let kommentare: Thread[] = [];
+  let kommentareFehler: string | null = null;
+  try {
+    const answer = await apiGet<{ threads: Thread[] }>(
+      fetch,
+      commentsApiPath(data.path),
+      cookie
+    );
+    if (answer.data) kommentare = answer.data.threads ?? [];
+    else kommentareFehler = describeCommentsFailure(answer.status);
+  } catch {
+    kommentareFehler = describeCommentsFailure(0);
+  }
+
   let anhaenge: Attachment[] = [];
   let anhaengeDarfSchreiben = false;
   let anhaengeFehler: string | null = null;
@@ -320,6 +335,8 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
     anhaenge,
     anhaengeDarfSchreiben,
     anhaengeFehler,
+    kommentare,
+    kommentareFehler,
     // Matched against the listing that was just read — see `angekommen` above.
     hochgeladen: angekommen
       ? (anhaenge.find((anhang) => anhang.filename === angekommen) ?? null)

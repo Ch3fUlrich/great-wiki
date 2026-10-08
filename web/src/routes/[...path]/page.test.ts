@@ -215,6 +215,8 @@ function html(
         anhaenge: dateien,
         anhaengeDarfSchreiben,
         anhaengeFehler,
+        kommentare: [],
+        kommentareFehler: null,
         hochgeladen
       },
       form
