@@ -136,7 +136,8 @@ impl Store {
             "INSERT INTO events (id, kind, recipient, actor, doc_id, path, subject, dedupe_key) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
              ON CONFLICT (recipient, dedupe_key) WHERE dedupe_key IS NOT NULL DO UPDATE SET \
-             created_at = datetime('now'), actor = excluded.actor, read_at = NULL",
+             created_at = datetime('now'), actor = excluded.actor, read_at = NULL, \
+             digested_at = NULL",
         )
         .bind(uuid::Uuid::now_v7().to_string())
         .bind(ev.kind.as_str())
@@ -242,14 +243,64 @@ impl Store {
         principal: &Principal,
         limit: usize,
     ) -> Result<Vec<Notification>> {
-        self.visible_events(principal, Some(limit)).await
+        self.visible_events(principal, Some(limit), false).await
+    }
+
+    /// The newest `limit` notifications `principal` may still see that no digest has
+    /// carried yet. Cut from the same delivery-filtered set as the inbox (never a raw read),
+    /// so a withheld event cannot reach an email either. Nobody without an address gets any:
+    /// there is nowhere to send them.
+    pub async fn digest_for(
+        &self,
+        principal: &Principal,
+        limit: usize,
+    ) -> Result<Vec<Notification>> {
+        if principal
+            .email
+            .as_deref()
+            .is_none_or(|e| e.trim().is_empty())
+        {
+            return Ok(Vec::new());
+        }
+        self.visible_events(principal, Some(limit), true).await
+    }
+
+    /// Record that a digest carried these rows. Only the principal's own rows are touched.
+    pub async fn mark_digested(&self, principal: &Principal, ids: &[String]) -> Result<()> {
+        for id in ids {
+            sqlx::query(
+                "UPDATE events SET digested_at = COALESCE(digested_at, datetime('now')) \
+                 WHERE id = ?1 AND recipient = ?2",
+            )
+            .bind(id)
+            .bind(&principal.id)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Active accounts that have an email address: the only possible digest recipients.
+    pub async fn digest_recipients(&self) -> Result<Vec<Principal>> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM principals WHERE active = 1 AND email IS NOT NULL AND email <> ''",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some((p, _)) = self.principal_by_id(&id).await? {
+                out.push(p);
+            }
+        }
+        Ok(out)
     }
 
     /// How many unread notifications `principal` may still see: the length of the same
     /// filtered set the list is cut from, so badge and list cannot disagree.
     pub async fn unread_count_for(&self, principal: &Principal) -> Result<usize> {
         Ok(self
-            .visible_events(principal, None)
+            .visible_events(principal, None, false)
             .await?
             .iter()
             .filter(|n| !n.read)
@@ -285,7 +336,7 @@ impl Store {
 
     /// Mark everything `principal` can see as read. Withheld rows stay as they are.
     pub async fn mark_all_read(&self, principal: &Principal) -> Result<()> {
-        for n in self.visible_events(principal, None).await? {
+        for n in self.visible_events(principal, None, false).await? {
             if !n.read {
                 self.mark_event_read(principal, &n.id).await?;
             }
@@ -298,6 +349,7 @@ impl Store {
         &self,
         principal: &Principal,
         limit: Option<usize>,
+        undigested_only: bool,
     ) -> Result<Vec<Notification>> {
         if !principal.is_authenticated() {
             return Ok(Vec::new());
@@ -305,10 +357,12 @@ impl Store {
         let rows: Vec<EventRow> = sqlx::query_as(
             "SELECT id, kind, actor, doc_id, path, subject, created_at, read_at FROM events \
              WHERE recipient = ?1 AND created_at >= datetime('now', ?2) \
+             AND (?3 = 0 OR digested_at IS NULL) \
              ORDER BY created_at DESC, id DESC",
         )
         .bind(&principal.id)
         .bind(HORIZON)
+        .bind(undigested_only)
         .fetch_all(&self.pool)
         .await?;
         // Hoisted: the baseline belongs to the reader, not to the row.
@@ -631,5 +685,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(s.unread_count_for(&b).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_digest_carries_only_visible_undigested_rows_for_an_addressed_reader() {
+        let s = store().await;
+        let (path, id) = page(&s, "Geheim").await;
+        let a = account(&s, "anna").await;
+        let b = s
+            .create_local_principal("bert", "bert", Some("bert@example.org"), "hash")
+            .await
+            .unwrap();
+        grant(&s, &path, &b, Permission::Read).await;
+        s.emit_event(&ev(EventKind::Mention, &b, Some(&a), Some(&id)))
+            .await
+            .unwrap();
+        let d = s.digest_for(&b, 10).await.unwrap();
+        assert_eq!(d.len(), 1);
+        // Digested rows are gone from the digest but stay in the inbox.
+        s.mark_digested(&b, &[d[0].id.clone()]).await.unwrap();
+        assert!(s.digest_for(&b, 10).await.unwrap().is_empty());
+        assert_eq!(s.notifications_for(&b, 10).await.unwrap().len(), 1);
+        // A coalesced repeat is news again.
+        let mut again = ev(EventKind::Mention, &b, Some(&a), Some(&id));
+        again.dedupe_key = Some("k".into());
+        s.emit_event(&again).await.unwrap();
+        let first = s.digest_for(&b, 10).await.unwrap();
+        s.mark_digested(&b, &first.iter().map(|n| n.id.clone()).collect::<Vec<_>>())
+            .await
+            .unwrap();
+        s.emit_event(&again).await.unwrap();
+        assert_eq!(s.digest_for(&b, 10).await.unwrap().len(), 1);
+        // Grant removed: absent.
+        s.remove_grant(&path, &Subject::Principal(b.id.clone()), Permission::Read)
+            .await
+            .unwrap();
+        assert!(s.digest_for(&b, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_address_no_digest() {
+        let s = store().await;
+        let (path, id) = page(&s, "Geheim").await;
+        let (a, b) = (account(&s, "anna").await, account(&s, "bert").await);
+        grant(&s, &path, &b, Permission::Read).await;
+        s.emit_event(&ev(EventKind::Mention, &b, Some(&a), Some(&id)))
+            .await
+            .unwrap();
+        assert!(s.digest_for(&b, 10).await.unwrap().is_empty());
+        assert!(s.digest_recipients().await.unwrap().is_empty());
     }
 }

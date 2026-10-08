@@ -146,3 +146,15 @@ Delete the content from the host afterwards if it is personal.
 - **Harbor's robot could not push to a new project.** `robot$seeder` is system-scoped with
   per-namespace grants, and a new Harbor project is not in them. Both the push *and the
   deploy's pull* fail until it is granted.
+
+## Email digest (GW-MAIL-ENABLE is parked)
+
+The daily digest is built and tested but **off**. It sends only when `GW_DIGEST_ENABLED` is
+exactly `1` or `true`, and then needs `SMTP_HOST`, `SMTP_USER`, `SMTP_PASSWORD` and
+`SMTP_FROM` (port 587, STARTTLS) or the process refuses to start. `GW_DIGEST_HOUR` (UTC,
+default 7) picks the hour. Nothing is read from these variables while it is disabled.
+
+**GW-MAIL-ENABLE** — enabling it in production and the first real send — is left to the
+operator: the credential lives in the deployment environment, not in this repository, and
+no test ever touches a real mail server. Rows are marked digested only after a send
+succeeds, so a failed first attempt is retried the next day rather than lost.

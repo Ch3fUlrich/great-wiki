@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod config;
 pub mod csp;
+pub mod digest;
 pub mod error;
 pub mod export;
 pub mod identity;

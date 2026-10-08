@@ -374,6 +374,7 @@ async fn main() -> Result<()> {
             // Authelia's parameters. The check below is what makes that true of the
             // *process* rather than only of this line, since `AppState`'s fields are
             // public and a future edit could set one directly.
+            let state_store = store.clone();
             let state = gw_api::AppState::serving(
                 store,
                 blobs,
@@ -388,6 +389,17 @@ async fn main() -> Result<()> {
             // meant no test ever saw them and no route inside the crate could be excepted
             // from them; see `gw_api::routes::REQUEST_BODY_LIMIT`.
             let app = gw_api::build_router(state);
+            // Mail is off unless asked for, and asked-for-but-incomplete is a refusal to
+            // start (rule 3), never a silently mute digest.
+            if let Some(digest) = gw_api::digest::digest_from_env()? {
+                let mailer = gw_api::digest::SmtpMailer::new(&digest.smtp)?;
+                tracing::info!(hour = digest.hour, "daily email digest enabled");
+                tokio::spawn(gw_api::digest::run_forever(
+                    state_store.clone(),
+                    mailer,
+                    digest.hour,
+                ));
+            }
             let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
             tracing::info!(bind = %cfg.bind, "great-wiki listening");
             axum::serve(listener, app).await?;
