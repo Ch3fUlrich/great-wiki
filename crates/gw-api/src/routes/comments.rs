@@ -29,6 +29,12 @@
 //! ADR 0025 gives authors no delete and no edit of a body, so there is deliberately no
 //! `DELETE` or `PUT` route here: the method answers 405 and `tests/comments.rs` pins it.
 //!
+//! # Resolved threads stay in the list
+//!
+//! `POST /api/comments/{id}/resolve` and `/reopen` are open to anyone who may read the page.
+//! A resolved thread is never dropped from `GET`: it is flagged `resolved: true` with its
+//! replies, and the interface collapses it (history, ADR 0025).
+//!
 //! # No field counts what was hidden
 //!
 //! The list is `{ "threads": [...] }` and nothing else: no total, no count.
@@ -38,7 +44,7 @@ use super::AppState;
 use crate::error::ApiError;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
 use base64::engine::general_purpose::STANDARD;
@@ -64,6 +70,8 @@ pub struct CommentView {
     pub body: String,
     pub anchor: Option<AnchorView>,
     pub orphaned: bool,
+    /// A resolved thread stays in the list, flagged; the interface collapses it.
+    pub resolved: bool,
     pub resolved_at: Option<String>,
     pub created_at: String,
 }
@@ -85,6 +93,7 @@ impl From<&Comment> for CommentView {
             body: c.body.clone(),
             anchor,
             orphaned: c.orphaned,
+            resolved: c.resolved_at.is_some(),
             resolved_at: c.resolved_at.clone(),
             created_at: c.created_at.clone(),
         }
@@ -112,7 +121,49 @@ pub struct NewCommentBody {
 }
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/comments/document/{*path}", get(list).post(create))
+    Router::new()
+        .route("/api/comments/document/{*path}", get(list).post(create))
+        .route("/api/comments/{id}/resolve", post(resolve))
+        .route("/api/comments/{id}/reopen", post(reopen))
+}
+
+async fn resolve(
+    state: State<AppState>,
+    jar: CookieJar,
+    id: Path<String>,
+) -> Result<Json<CommentView>, ApiError> {
+    set_resolved(state, jar, id, true).await
+}
+
+async fn reopen(
+    state: State<AppState>,
+    jar: CookieJar,
+    id: Path<String>,
+) -> Result<Json<CommentView>, ApiError> {
+    set_resolved(state, jar, id, false).await
+}
+
+/// Anyone who may read the page resolves or reopens; the store decides, and an absent id
+/// and a withheld one are the same 404.
+async fn set_resolved(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+    resolved: bool,
+) -> Result<Json<CommentView>, ApiError> {
+    let principal = state.principal(&jar).await;
+    if !principal.is_authenticated() {
+        return Err(ApiError::Unauthorized);
+    }
+    match state
+        .store
+        .set_comment_resolved(&principal, &id, resolved)
+        .await
+        .map_err(ApiError::Internal)?
+    {
+        Some(c) => Ok(Json(CommentView::from(&c))),
+        None => Err(ApiError::NotFound),
+    }
 }
 
 fn full(path: &str) -> String {

@@ -257,6 +257,58 @@ impl Store {
         Ok(n)
     }
 
+    /// Resolve (`true`) or reopen (`false`) the thread `comment_id` belongs to (a reply id
+    /// acts on its thread root). Anyone who may **read** the page may do either (ADR 0025).
+    /// `Ok(None)` when the comment is absent or its page is withheld: one answer. Nothing is
+    /// deleted and nothing is emitted; reopening clears `resolved_at` / `resolved_by`.
+    /// Returns the thread root as it now stands.
+    pub async fn set_comment_resolved(
+        &self,
+        principal: &Principal,
+        comment_id: &str,
+        resolved: bool,
+    ) -> Result<Option<Comment>> {
+        let found: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT doc_id, parent_id FROM comments WHERE id = ?1")
+                .bind(comment_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some((doc_id, parent_id)) = found else {
+            return Ok(None);
+        };
+        if self.readable_page(principal, &doc_id).await?.is_none() {
+            return Ok(None);
+        }
+        let root = parent_id.as_deref().unwrap_or(comment_id);
+        if resolved {
+            sqlx::query(
+                "UPDATE comments SET resolved_at = datetime('now'), resolved_by = ?2 \
+                 WHERE id = ?1 AND resolved_at IS NULL",
+            )
+            .bind(root)
+            .bind(&principal.id)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query("UPDATE comments SET resolved_at = NULL, resolved_by = NULL WHERE id = ?1")
+                .bind(root)
+                .execute(&self.pool)
+                .await?;
+        }
+        let row: CommentRow =
+            sqlx::query_as(&format!("SELECT {COLUMNS} FROM comments WHERE id = ?1"))
+                .bind(root)
+                .fetch_one(&self.pool)
+                .await?;
+        let mut c: Comment = row.into();
+        if let Some(aid) = &c.author_id {
+            if let Some((who, _)) = self.principal_by_id(aid).await? {
+                c.author_name = byline(&who).to_string();
+            }
+        }
+        Ok(Some(c))
+    }
+
     /// The page's comments in created order, or `None` when the page is withheld or absent
     /// (the same answer for both, ADR 0022). Threading is the caller's. Author names are
     /// resolved only after the page check.

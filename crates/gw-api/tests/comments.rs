@@ -380,3 +380,83 @@ async fn the_list_carries_no_total_or_hidden_field() {
     let keys: Vec<&String> = l.as_object().unwrap().keys().collect();
     assert_eq!(keys, ["threads"]);
 }
+
+async fn act(store: &Arc<Store>, who: Option<&str>, id: &str, verb: &str) -> Answer {
+    let uri = format!("/api/comments/{id}/{verb}");
+    send(store, who, Method::POST, &uri, None).await
+}
+
+#[tokio::test]
+async fn a_read_only_reader_resolves_and_reopens_and_the_thread_stays_listed() {
+    let store = fixture().await;
+    let top = post(&store, Some("anna"), "geheim", json!({"body": "frage"}))
+        .await
+        .json();
+    let id = top["id"].as_str().unwrap().to_string();
+    let reply = post(
+        &store,
+        Some("leser"),
+        "geheim",
+        json!({"body": "antwort", "parent_id": id}),
+    )
+    .await
+    .json();
+    // Resolving by a reply id resolves the thread root.
+    let rid = reply["id"].as_str().unwrap();
+    let r = act(&store, Some("leser"), rid, "resolve").await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.json()["id"], id.as_str());
+    assert_eq!(r.json()["resolved"], true);
+    let l = get(&store, Some("anna"), "geheim").await.json();
+    assert_eq!(l["threads"][0]["resolved"], true);
+    assert_eq!(l["threads"][0]["replies"][0]["body"], "antwort");
+    let o = act(&store, Some("anna"), &id, "reopen").await;
+    assert_eq!(o.status, StatusCode::OK);
+    assert_eq!(o.json()["resolved"], false);
+    assert!(o.json()["resolved_at"].is_null());
+}
+
+#[tokio::test]
+async fn resolving_a_withheld_comment_is_the_404_of_an_absent_one_and_changes_nothing() {
+    let store = fixture().await;
+    let top = post(&store, Some("anna"), "geheim", json!({"body": "x"}))
+        .await
+        .json();
+    let id = top["id"].as_str().unwrap();
+    let nil = "00000000-0000-0000-0000-000000000000";
+    for verb in ["resolve", "reopen"] {
+        let withheld = act(&store, Some("fremde"), id, verb).await;
+        let absent = act(&store, Some("fremde"), nil, verb).await;
+        assert_eq!(withheld.status, StatusCode::NOT_FOUND);
+        assert!(
+            withheld.same_as(&absent),
+            "{verb} told withheld from absent"
+        );
+        assert_eq!(
+            act(&store, None, id, verb).await.status,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let l = get(&store, Some("anna"), "geheim").await.json();
+    assert_eq!(l["threads"][0]["resolved"], false);
+}
+
+#[tokio::test]
+async fn a_removed_grant_ends_the_right_to_resolve() {
+    let store = fixture().await;
+    let top = post(&store, Some("anna"), "geheim", json!({"body": "x"}))
+        .await
+        .json();
+    let id = top["id"].as_str().unwrap();
+    let (anna, _) = store.principal_by_username("anna").await.unwrap().unwrap();
+    store
+        .remove_grant("/geheim", &Subject::Principal(anna.id), Permission::Read)
+        .await
+        .unwrap();
+    assert_eq!(
+        act(&store, Some("anna"), id, "resolve").await.status,
+        StatusCode::NOT_FOUND
+    );
+    let l = get(&store, Some("leser"), "geheim").await.json();
+    assert_eq!(l["threads"][0]["resolved"], false);
+}
