@@ -376,7 +376,8 @@ fn full_path(captured: &str) -> String {
 }
 
 /// The one authorisation decision this endpoint makes, on the handshake and again on every
-/// re-check. There is deliberately no second spelling of it.
+/// re-check (which asks the same question of the document by id: [`authorise_id`]). There is
+/// deliberately no second rule, only a second key.
 ///
 /// The order is the security argument:
 ///
@@ -845,7 +846,8 @@ async fn run(
 ///
 /// The whole answer is re-derived: the principal is resolved from the request's cookies
 /// again — which re-reads the session and the account from the store (D-M2-7) — and
-/// [`authorise`] is asked the same question it was asked at the handshake. A deactivated
+/// [`authorise_id`] is asked the handshake's question of the document by id, so a page moved out
+/// of reach or into the trash ends the session too. A deactivated
 /// account, a revoked grant, an ended session, a deleted page and an administrator who has
 /// meanwhile entered view-as mode all come out of this as `None`.
 async fn reauthorise(
@@ -857,7 +859,7 @@ async fn reauthorise(
     match authorise_id(state, jar, document_id, joined_at).await {
         Ok(principal) => Some(principal.id),
         Err(error) => {
-            tracing::info!(%joined_at, %error, "ending a session that is no longer authorised");
+            tracing::info!(%joined_at, %document_id, %error, "ending a session that is no longer authorised");
             None
         }
     }

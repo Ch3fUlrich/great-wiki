@@ -3885,6 +3885,123 @@ await check('R3 a signed-in reader is sent to the sign-in page, told who they ar
   );
 });
 
+// ---------------------------------------------------------------------------------------
+// Group S — moving a page: the dialog, the access it shows, and where the old address goes
+// ---------------------------------------------------------------------------------------
+//
+// ADR 0023. Two pages exist for this group alone (`web/scripts/behaviour-extra`, seeded by
+// `behaviour-fixture`): /verweisbeispiel/verlegbar, restricted, and /verweisbeispiel/offener-hafen,
+// which ANYONE may read. Moving the first under the second would open it to the whole
+// internet, and this identity (write, not admin, on both) must be shown that and refused.
+// S1 and S2 are the two halves of that and run before the move that S3 makes; S4 is the
+// sidebar drag, which must open the dialog and move nothing.
+
+const MOVE_SOURCE = '/verweisbeispiel/verlegbar';
+const MOVE_OPEN = '/verweisbeispiel/offener-hafen';
+const MOVE_DIALOG = '#gw-verschieben';
+
+/** The dialog on `MOVE_SOURCE`, opened from the page's own »Verschieben« link. */
+async function openMoveDialog(page, path = MOVE_SOURCE) {
+  await page.goto(BASE + path, { waitUntil: 'networkidle' });
+  await page.getByRole('link', { name: 'Verschieben', exact: true }).click();
+  await page.locator(MOVE_DIALOG).waitFor({ state: 'visible', timeout: 5_000 });
+}
+
+await check('S1 the move dialog works from the keyboard and a widening move shows who gains and has no confirm button', async (page) => {
+  await openMoveDialog(page);
+  const dialog = page.locator(MOVE_DIALOG);
+  // Keyboard path: Titel → Adresse → »Liegt unter«, by Tab alone.
+  await dialog.getByRole('textbox', { name: 'Titel' }).focus();
+  await page.keyboard.press('Tab');
+  await page.keyboard.press('Tab');
+  const focused = await page.evaluate(() => document.activeElement?.getAttribute('name'));
+  assert(focused === 'ziel', `Tab did not reach the destination picker (focus is on ${focused})`);
+  await dialog.getByRole('combobox', { name: 'Liegt unter' }).selectOption(MOVE_OPEN);
+  // Submitted with Enter from a field, not by clicking: the measurement is a plain form.
+  await dialog.getByRole('textbox', { name: 'Titel' }).focus();
+  await page.keyboard.press('Enter');
+  await page.waitForURL((url) => url.searchParams.get('ziel') === MOVE_OPEN, { timeout: 10_000 });
+
+  const text = await page.locator(MOVE_DIALOG).innerText();
+  assert(text.includes('Was sich ändert'), `no access preview: ${text}`);
+  assert(text.includes(`${MOVE_OPEN}/verlegbar`), `the preview does not name the new address: ${text}`);
+  assert(text.includes('Alle ohne Anmeldung'), `the preview does not say everybody gains access: ${text}`);
+  assert(
+    text.includes('So kann diese Seite nicht verschoben werden'),
+    `a widening move this identity may not make was not refused: ${text}`
+  );
+  assert(
+    (await page.locator(MOVE_DIALOG).getByRole('button', { name: 'Jetzt verschieben' }).count()) === 0,
+    'a refused move still offers a confirm button'
+  );
+  // Nothing moved: the page is still where it was.
+  const still = await page.request.get(BASE + MOVE_SOURCE, { maxRedirects: 0 });
+  assert(still.status() === 200, `the refused move moved the page (${still.status()})`);
+});
+
+await check('S2 a move that only narrows is confirmed by keyboard, and the old address then forwards with a 307', async (page) => {
+  await openMoveDialog(page);
+  const dialog = page.locator(MOVE_DIALOG);
+  await dialog.getByRole('combobox', { name: 'Liegt unter' }).selectOption('/rundgang');
+  await dialog.getByRole('textbox', { name: 'Titel' }).focus();
+  await page.keyboard.press('Enter');
+  await page.waitForURL((url) => url.searchParams.get('ziel') === '/rundgang', { timeout: 10_000 });
+  const confirm = page.locator(MOVE_DIALOG).getByRole('button', { name: 'Jetzt verschieben' });
+  await confirm.waitFor({ state: 'visible', timeout: 5_000 });
+  await confirm.focus();
+  await Promise.all([
+    page.waitForURL((url) => url.pathname === '/rundgang/verlegbar', { timeout: 10_000 }),
+    page.keyboard.press('Enter')
+  ]);
+
+  // The old address: a 307 for a caller who may read the page there, for the page and for
+  // its history, query kept.
+  const forwarded = await page.request.get(BASE + MOVE_SOURCE + '?edit=1', { maxRedirects: 0 });
+  assert(forwarded.status() === 307, `the old address answered ${forwarded.status()}, not 307`);
+  assert(
+    forwarded.headers()['location'] === '/rundgang/verlegbar?edit=1',
+    `the old address forwards to ${forwarded.headers()['location']}`
+  );
+  const history = await page.request.get(BASE + MOVE_SOURCE + '/history?von=a', { maxRedirects: 0 });
+  assert(history.status() === 307, `the old history answered ${history.status()}, not 307`);
+  assert(
+    history.headers()['location'] === '/rundgang/verlegbar/history?von=a',
+    `the old history forwards to ${history.headers()['location']}`
+  );
+
+  // And to somebody who may not read the page, the old address is an address nothing ever
+  // left (ADR 0022): the shim-less stack is anonymous, the page is restricted.
+  assert(ANON, 'SHOT_BASE_ANON is unset — the anonymous half must never be skipped');
+  const stranger = await page.request.get(ANON + MOVE_SOURCE, { maxRedirects: 0 });
+  assert(stranger.status() === 404, `a stranger was answered ${stranger.status()} at the old address`);
+});
+
+await check('S3 dragging a page onto another in the sidebar opens the dialog, prefilled, and moves nothing', async (page) => {
+  await page.goto(BASE + '/rundgang/tabellen-was-heute-passiert', { waitUntil: 'networkidle' });
+  const tree = page.getByRole('navigation', { name: 'Seitenbaum' });
+  await tree.getByRole('link', { name: 'Offener Hafen', exact: true }).waitFor({ state: 'visible' });
+  // By address: the entry's title is longer than its slug suggests.
+  await tree
+    .locator('a[href$="/rundgang/tabellen-was-heute-passiert"]')
+    .dragTo(tree.getByRole('link', { name: 'Offener Hafen', exact: true }));
+  await page.waitForURL((url) => url.searchParams.get('ziel') === MOVE_OPEN, { timeout: 10_000 });
+  assert(new URL(page.url()).pathname === '/rundgang/tabellen-was-heute-passiert', `the drop went to ${page.url()}`);
+
+  const dialog = page.locator(MOVE_DIALOG);
+  await dialog.waitFor({ state: 'visible', timeout: 5_000 });
+  assert(
+    (await dialog.getByRole('textbox', { name: 'Titel' }).inputValue()).length > 0,
+    'the dialog is not prefilled with the dragged page'
+  );
+  assert(
+    (await dialog.getByRole('combobox', { name: 'Liegt unter' }).inputValue()) === MOVE_OPEN,
+    'the dialog does not have the drop target selected'
+  );
+  assert((await dialog.innerText()).includes('Was sich ändert'), 'the drop did not show the access preview');
+  // No move without the dialog: the page is still at its address, not forwarded.
+  const still = await page.request.get(BASE + '/rundgang/tabellen-was-heute-passiert', { maxRedirects: 0 });
+  assert(still.status() === 200, `the drop moved the page (${still.status()})`);
+});
 
 await browser.close();
 

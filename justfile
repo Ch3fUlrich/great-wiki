@@ -157,6 +157,16 @@ behaviour-fixture:
     # different one, and this comment is the thing that says so.
     cargo run -q -p gw-api -- grant --path /rundgang/groesse-und-mass-deutsch-im-system \
       --subject group:editors --permission admin --actor behaviour-fixture
+    # Group S (moving a page): two extra pages, kept out of `content-example` so no earlier
+    # group's counts change. /verweisbeispiel/verlegbar is restricted and inherits the editors'
+    # write grant; /verweisbeispiel/offener-hafen is readable by ANYONE, and the editors may
+    # write it. Moving the first under the second would open it to the whole internet, which
+    # this identity does not administer — the widening refusal Group S checks the dialog for.
+    cargo run -q -p gw-api -- seed --content web/scripts/behaviour-extra
+    cargo run -q -p gw-api -- grant --path /verweisbeispiel/offener-hafen \
+      --subject group:editors --permission write --actor behaviour-fixture
+    cargo run -q -p gw-api -- grant --path /verweisbeispiel/offener-hafen \
+      --subject anyone --permission read --actor behaviour-fixture
     echo "behaviour fixture ready:"
     echo "  GW_DATABASE_URL=$GW_DATABASE_URL"
     echo "  GW_MEDIA_DIR=$GW_MEDIA_DIR"
