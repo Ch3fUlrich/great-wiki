@@ -112,7 +112,7 @@ add no information (for example, statistics over public pages only).
 
 **Cost.** The permission check follows the index, one accessor call per candidate, up to a
 ceiling of 1000. Below it nothing is hidden by a window: a readable page is found however
-many withheld pages match, and however they would have ranked. A word on more than a thousand
+many withheld pages match, and however they would have ranked. A word (or a one- or two-letter prefix) on more than a thousand
 pages keeps the first thousand by the index's order, so a caller who may read little can get
 fewer hits than exist; that fails by under-reporting and says nothing about how many were
 dropped. Putting the check inside the SQL would remove the cost and duplicate the permission
@@ -131,3 +131,10 @@ Characters Rust calls alphanumeric and `unicode61` calls separators (circled and
 letters) are not word characters, and a word cut for length keeps its prefix star wherever
 it stands. The index is rebuilt at every `Store::open`, not only when rows were filled:
 it joins `documents` on an implicit rowid that a `VACUUM` may renumber.
+
+## Timing, stated
+
+Every candidate the index finds, withheld ones included, costs one accessor lookup before it
+is dropped, so response time grows with the number of withheld pages matching a word while
+the bytes stay identical. Out of scope here for the same reason ADR 0022 puts timing out of
+scope; a one-letter query can cost up to 1000 lookups and is the same cost, bounded by the cap.

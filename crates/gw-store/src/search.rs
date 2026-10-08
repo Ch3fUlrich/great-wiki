@@ -144,14 +144,17 @@ fn query_words(query: &str) -> Vec<(String, bool)> {
     word_ranges(&query)
         .into_iter()
         .map(|(s, e)| &query[s..e])
-        .filter(|w| !fold(w).is_empty())
-        .take(MAX_TERMS)
         .map(|w| {
             (
                 w.chars().take(MAX_TERM_CHARS).collect::<String>(),
                 w.chars().count() > MAX_TERM_CHARS,
             )
         })
+        // After the cut, not before: cutting a word of combining marks could leave one that
+        // folds to nothing, an empty phrase on the index side and "matches everything" on
+        // the in-memory side.
+        .filter(|(w, _)| !fold(w).is_empty())
+        .take(MAX_TERMS)
         .collect()
 }
 
@@ -925,6 +928,12 @@ mod tests {
 
     // --- hostile queries ----------------------------------------------------------------
 
+    #[test]
+    fn a_word_cut_to_nothing_is_dropped_not_matched_against_everything() {
+        let q = format!("{}a", "\u{301}".repeat(MAX_TERM_CHARS));
+        assert!(query_words(&q).iter().all(|(w, _)| !fold(w).is_empty()));
+    }
+
     #[tokio::test]
     async fn hostile_queries_return_without_error_and_without_operator_semantics() {
         let store = store().await;
@@ -1200,13 +1209,13 @@ mod tests {
         assert_eq!(
             found.pages.len(),
             3,
-            "the over-fetch reaches past the withheld"
+            "withheld pages do not use up the limit"
         );
         assert!(found.pages.iter().all(|p| p.title.starts_with("Seite")));
     }
 
     #[tokio::test]
-    async fn trashed_pages_do_not_use_up_the_over_fetch() {
+    async fn trashed_pages_are_not_candidates() {
         let store = store().await;
         for i in 0..5 {
             let id = page(&store, &format!("Mull {i}"), "x").await;
@@ -1216,7 +1225,7 @@ mod tests {
                 .unwrap();
         }
         page(&store, "Seite", "Mull im Text").await;
-        // Limit 1 fetches 5: if the index did not drop the trashed, they would fill it.
+        // The index drops the trashed itself; the accessor would refuse them too.
         let found = store
             .search_for(&Principal::anonymous(), "Mull", 1)
             .await
