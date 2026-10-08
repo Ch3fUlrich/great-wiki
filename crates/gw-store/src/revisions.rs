@@ -276,12 +276,16 @@ pub(crate) async fn append_revision(
     .await?;
 
     sqlx::query(
-        "UPDATE documents SET body = ?2, current_revision_id = ?3, \
+        "UPDATE documents SET body = ?2, body_text = ?4, current_revision_id = ?3, \
          updated_at = datetime('now') WHERE id = ?1",
     )
     .bind(document_id)
     .bind(body_json.as_ref())
     .bind(&id)
+    // The text search reads, written WITH the body and from the body that is stored — the
+    // settled one, not the caller's (ADR 0024). A body written by a path that skips this
+    // column is invisible to search; this function is the only place a body is written.
+    .bind(gw_core::body_plain_text(body_json.as_ref()))
     .execute(&mut *conn)
     .await?;
 

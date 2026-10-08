@@ -12,6 +12,7 @@ pub mod moves;
 pub mod principals;
 pub mod reclaim;
 pub mod revisions;
+pub mod search;
 pub mod sessions;
 pub mod tasks;
 pub mod topics;
@@ -102,6 +103,9 @@ impl Store {
         // rules that can disagree about whether two addresses are one person. Idempotent
         // and bounded by the number of accounts, so it is cheap to run at every start.
         store.backfill_email_keys().await?;
+        // 0016 adds `body_text` NULL to rows that already exist; fill it and index them.
+        // See `search.rs`.
+        store.backfill_search_text().await?;
         Ok(store)
     }
 

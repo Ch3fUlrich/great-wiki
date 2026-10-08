@@ -163,8 +163,9 @@ impl Store {
         sqlx::query(
             r#"
             INSERT INTO documents
-              (id, parent_path, path, slug, doc_type, title, language, visibility, body, sort_key)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+              (id, parent_path, path, slug, doc_type, title, language, visibility, body, sort_key,
+               body_text)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             "#,
         )
         .bind(&id)
@@ -177,6 +178,10 @@ impl Store {
         .bind(doc.visibility.as_str())
         .bind(&body)
         .bind(doc.sort_key)
+        // The index's text, in the same statement as the body it is made from (ADR 0024).
+        // `append_revision` below rewrites both once the body has been settled, so the
+        // value that outlives this call is the settled body's.
+        .bind(gw_core::body_plain_text(&body))
         .execute(&mut *tx)
         .await?;
 
