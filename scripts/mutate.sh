@@ -1827,6 +1827,105 @@ mutation crates/gw-store/src/transclusion.rs killed \
 #     passed either way — and this hand-run is what found it. Its fixture now names a target
 #     that IS in the map, which is the only shape that can tell the two apart.
 
+# --- M6: the event bus, comments and the digest (ADRs 0025, 0026) -------------------------
+#
+# What these three have in common is that each one DELIVERS something to somebody, and the
+# bug that matters is delivering it to the wrong person or at the wrong time. An event row
+# is a promise made when something happened; whether it may be shown is decided when it is
+# READ (`Store::deliver`), against the grants of the day. A comment is the same shape in the
+# other direction: a reader may write one, and a page the caller may not read is the 404 of
+# a page that does not exist. The digest is the third door, and the one that leaves the
+# system: once an email is sent it cannot be taken back.
+#
+# Entries are written against the real code rather than the plan: where the plan named a
+# mutant the code has no seam for ("author name resolved before page check" — author names
+# are resolved after the page check by construction), the nearest real ordering mutant is
+# used instead (the route validating before it asks about the page).
+
+# events: every row is re-authorised when read, never when written -------------------
+mutation crates/gw-store/src/events.rs killed \
+  '/async fn deliver/,/^    }$/ s/document_for_id_with_baseline(reader, doc_id, Action::Read, baseline)/document_for_id_with_baseline(reader, doc_id, Action::Read, Baseline::Admin)/' \
+  'events: delivery drops the Read check, so the list shows rows for pages the reader lost'
+mutation crates/gw-store/src/events.rs killed \
+  '/pub async fn unread_count_for/,/^    }$/ s/^        Ok(self$/        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE recipient = ?1 AND read_at IS NULL").bind(\&principal.id).fetch_one(\&self.pool).await?; if n >= 0 { return Ok(n as usize); } Ok(self/' \
+  'events: the unread count comes from an unfiltered SQL count, so it counts rows the list would not show'
+mutation crates/gw-store/src/events.rs killed \
+  '/async fn deliver/,/^    }$/ s/if kind.is_admin() \&\& !self.administers(reader, baseline, \&doc.path).await? {/if false {/' \
+  'events: an admin-kind event on a page needs admin on that page, not merely read'
+mutation crates/gw-store/src/events.rs killed \
+  '/async fn deliver/,/^    }$/ s/if kind.is_admin() \&\& self.administers(reader, baseline, path).await?/if kind.is_admin()/' \
+  'events: an admin-kind event with no page needs admin on its path, or it is shown to anybody'
+mutation crates/gw-store/src/events.rs killed \
+  '/pub async fn emit_event/,/^    }$/ s/if ev.actor.as_deref() == Some(ev.recipient.as_str()) {/if false {/' \
+  'events: what you did yourself is never an event for you'
+mutation crates/gw-store/src/events.rs killed \
+  '/pub async fn mark_event_read/,/^    }$/ s/AND recipient = ?2 AND created_at/AND ?2 IS NOT NULL AND created_at/' \
+  "events: marking read is the recipient's alone — somebody else's event id is not found"
+mutation crates/gw-store/src/events.rs killed \
+  '/pub async fn emit_event/,/^    }$/ s/\.bind(&ev\.dedupe_key)/.bind(None::<String>)/' \
+  'events: dedupe coalesces — the same thing twice is one row, not two'
+mutation crates/gw-store/src/events.rs killed \
+  '/pub async fn emit_event/,/^    }$/ s/read_at = NULL, \\/read_at = read_at, \\/' \
+  'events: a coalesced event is unread again, because it happened again'
+mutation crates/gw-store/src/events.rs killed \
+  '/async fn visible_events/,/^    }$/ s/let baseline = self.baseline_for(principal).await?;/let baseline = self.baseline_for(principal).await?; let baseline = if limit.is_some() { Baseline::Admin } else { baseline };/' \
+  "events: the notification list is filtered by the reader's own baseline, not an elevated one"
+
+# comments: any reader may comment, and a withheld page is an absent one ---------------
+mutation crates/gw-store/src/comments.rs killed \
+  '/pub async fn create_comment/,/^    }$/ s/self\.readable_page(principal, path_or_id)/self.document_by_path_unchecked(path_or_id)/' \
+  'comments: creating a comment skips the Read check on the page'
+mutation crates/gw-store/src/comments.rs killed \
+  '/pub async fn comments_for_document/,/^    }$/ s/self\.readable_page(principal, path_or_id)/self.document_by_path_unchecked(path_or_id)/' \
+  'comments: listing comments skips the Read check on the page'
+mutation crates/gw-store/src/comments.rs killed \
+  's/WHERE id = ?1 AND doc_id = ?2"/WHERE id = ?1 AND ?2 IS NOT NULL"/' \
+  'comments: a reply may not name a parent on another page'
+mutation crates/gw-store/src/comments.rs killed \
+  's/Some((author, None)) => parent_author = author,/Some((author, _)) => parent_author = author,/' \
+  'comments: a reply may not name a reply as its parent — threads are one deep'
+mutation crates/gw-api/src/routes/comments.rs killed \
+  '/^async fn list/,/^}$/ s/return Err(withheld_or_absent(&state, &principal, &full).await);/return Err(ApiError::Forbidden);/' \
+  'comments: listing a withheld page answers differently from an absent one'
+mutation crates/gw-api/src/routes/comments.rs killed \
+  '/^async fn create/,/^}$/ s/return Err(withheld_or_absent(&state, &principal, &full).await);/return Err(ApiError::Forbidden);/' \
+  'comments: posting to a withheld page answers differently from an absent one'
+mutation crates/gw-api/src/routes/comments.rs killed \
+  '/^async fn create/,/^}$/ s/if !readable {/if false {/' \
+  'comments: the body is validated before the page is asked about, so an invalid post tells withheld from absent'
+mutation crates/gw-store/src/comments.rs killed \
+  '/pub async fn set_comment_resolved/,/^    }$/ s/if self.readable_page(principal, &doc_id).await?.is_none() {/if false {/' \
+  'comments: resolving skips the page check, so anybody resolves a thread they cannot read'
+mutation crates/gw-store/src/comments.rs killed \
+  '/pub async fn orphan_lost_anchors/,/^    }$/ { s/ AND orphaned = 0 AND/ AND/; s/if !survives(&start, &end) {/let ok = survives(\&start, \&end); sqlx::query("UPDATE comments SET orphaned = ?2 WHERE id = ?1").bind(\&id).bind(!ok).execute(\&self.pool).await?; if !ok {/ }' \
+  'comments: an orphaned comment stays orphaned when its passage survives again'
+mutation crates/gw-store/src/comments.rs killed \
+  's/Ok(Some((who, _))) if who.active => {/Ok(Some((who, _))) => {/' \
+  'comments: a mention is emitted only to an active account'
+mutation crates/gw-store/src/comments.rs killed \
+  '0,/^impl Store {$/ s/^impl Store {$/impl Store { pub async fn delete_comment(\&self) {}/' \
+  'comments: no delete path exists (ADR 0026) — a `fn delete` in the store is caught'
+mutation crates/gw-store/src/comments.rs killed \
+  's/"SELECT id, anchor_start, anchor_end FROM comments WHERE doc_id = ?1 \\/"DELETE FROM comments WHERE 0 = 1; SELECT id, anchor_start, anchor_end FROM comments WHERE doc_id = ?1 \\/' \
+  'comments: no `delete from comments` statement exists in the store (ADR 0026)'
+
+# digest: the door that leaves the system ----------------------------------------------
+mutation crates/gw-store/src/events.rs killed \
+  '/pub async fn digest_for/,/^    }$/ s/self.visible_events(principal, Some(limit), true)/self.visible_events(principal, Some(limit), false)/' \
+  'digest: digest_for sends what was already mailed, because it no longer filters on digested_at'
+mutation crates/gw-api/src/digest.rs killed \
+  's/        match mailer.send(&to, SUBJECT, &build_body(&items)).await {/        store.mark_digested(\&who, \&items.iter().map(|n| n.id.clone()).collect::<Vec<_>>()).await?; match mailer.send(\&to, SUBJECT, \&build_body(\&items)).await {/' \
+  'digest: rows are marked digested only after the send succeeded, so a failed send is retried'
+mutation crates/gw-api/src/digest.rs killed \
+  's/if !matches!(enabled.as_deref(), Some("1") | Some("true")) {/if false {/' \
+  'digest: with the flag unset the digest is off, whatever else is configured'
+mutation crates/gw-api/src/digest.rs killed \
+  's/if !matches!(enabled.as_deref(), Some("1") | Some("true")) {/if enabled.is_none() {/' \
+  'digest: only 1 or true turns it on — "0" and "false" leave it off'
+mutation crates/gw-api/src/digest.rs killed \
+  's/\.field("password", &"<redacted>")/.field("password", \&self.password)/' \
+  'digest: the SMTP password never appears in Debug output'
+
 # --- crash recovery ------------------------------------------------------------------
 #
 # A trap does not survive SIGKILL, and a killed run leaves the mutated file in place.
@@ -2034,6 +2133,9 @@ probe_for() {
     # asserts a status code, so without it every ADR 0022 mutation would fall through to a
     # whole-workspace build.
     crates/gw-api/src/routes/docs.rs) echo "-p gw-api --test references --test embeds --test withheld" ;;
+    crates/gw-api/src/routes/comments.rs) echo "-p gw-api --test comments --test withheld" ;;
+    crates/gw-api/src/routes/notifications.rs) echo "-p gw-api --test notifications" ;;
+    crates/gw-api/src/digest.rs) echo "-p gw-api --lib" ;;
     *) echo "" ;;
   esac
 }

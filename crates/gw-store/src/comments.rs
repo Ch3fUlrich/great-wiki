@@ -561,6 +561,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_mention_of_a_deactivated_account_writes_no_event() {
+        let s = store().await;
+        let (path, _) = page(&s, "Raum").await;
+        let (a, b) = (account(&s, "anna").await, account(&s, "bert").await);
+        grant(&s, &path, &a, Permission::Read).await;
+        grant(&s, &path, &b, Permission::Read).await;
+        s.set_principal_active(&b.id, false).await.unwrap();
+        s.create_comment(&a, &path, new("@bert", None))
+            .await
+            .unwrap()
+            .unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE recipient = ?1")
+            .bind(&b.id)
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "a deactivated account must not accumulate events");
+    }
+
+    #[tokio::test]
     async fn the_body_length_is_validated() {
         let s = store().await;
         let (path, _) = page(&s, "Raum").await;
