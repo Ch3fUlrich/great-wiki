@@ -1,3 +1,9 @@
+<script module lang="ts">
+  // Shared by every level of the recursive tree: the entry being dragged, which a drop on
+  // another level's entry needs to know. `dataTransfer` would carry it as a string only.
+  let dragging: import('$lib/api').TreeNode | null = null;
+</script>
+
 <script lang="ts">
   import type { TreeNode } from '$lib/api';
   import Self from './Tree.svelte';
@@ -18,9 +24,15 @@
      * a fact about the page, not about how the link to it was spelled.
      */
     hrefFor?: (path: string) => string;
+    /**
+     * Dropping one entry onto another. When given, entries can be dragged; when absent the
+     * tree is exactly the list of links it always was. The handler OPENS the move dialog —
+     * it never moves anything (see `dropHref`), so a drop is a question, not an action.
+     */
+    onDrop?: (dragged: TreeNode, target: TreeNode) => void;
   }
 
-  let { nodes, current, hrefFor }: Props = $props();
+  let { nodes, current, hrefFor, onDrop }: Props = $props();
 </script>
 
 {#if nodes.length}
@@ -30,10 +42,22 @@
         <a
           href={hrefFor ? hrefFor(node.path) : node.path}
           aria-current={node.path === current ? 'page' : undefined}
+          draggable={onDrop ? 'true' : undefined}
+          ondragstart={onDrop ? () => (dragging = node) : undefined}
+          ondragend={onDrop ? () => (dragging = null) : undefined}
+          ondragover={onDrop ? (event) => dragging && event.preventDefault() : undefined}
+          ondrop={onDrop
+            ? (event) => {
+                event.preventDefault();
+                const von = dragging;
+                dragging = null;
+                if (von) onDrop(von, node);
+              }
+            : undefined}
         >
           {node.title}
         </a>
-        <Self nodes={node.children} {current} {hrefFor} />
+        <Self nodes={node.children} {current} {hrefFor} {onDrop} />
       </li>
     {/each}
   </ul>

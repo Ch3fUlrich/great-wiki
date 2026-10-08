@@ -33,7 +33,7 @@
   for print, where the document is the point and the frame is not.
 -->
 <script lang="ts">
-  import { replaceState } from '$app/navigation';
+  import { goto, replaceState } from '$app/navigation';
   import '$lib/styles/app.css';
   import favicon from '$lib/assets/favicon.svg';
   import ThemeToggle from '$lib/components/ThemeToggle.svelte';
@@ -59,6 +59,7 @@
     withSidebar,
     type SidebarMode
   } from '$lib/topics';
+  import { dropHref } from '$lib/moves';
   import { TRASH_PATH } from '$lib/trash';
 
   let { children, data } = $props();
@@ -353,7 +354,15 @@
       />
     {:else}
       <nav class="seitenbaum" aria-label="Seitenbaum">
-        <Tree nodes={data.tree ?? []} current={aktiverPfad} hrefFor={gehZu} />
+        <Tree
+          nodes={data.tree ?? []}
+          current={aktiverPfad}
+          hrefFor={gehZu}
+          onDrop={(von, ziel) => {
+            const href = dropHref(von, ziel);
+            if (href) void goto(href);
+          }}
+        />
       </nav>
     {/if}
   </div>

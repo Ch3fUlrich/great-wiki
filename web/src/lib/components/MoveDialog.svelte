@@ -6,7 +6,7 @@
    * in the address, the loader asks the API to measure the move, and the answer is in the next
    * first response. The second, drawn only under a measured move, POSTs the very fields that
    * were measured. Every control is native, so it works with a keyboard and with JavaScript
-   * switched off; dragging in the sidebar is a later layer that will open this same dialog.
+   * switched off; dragging in the sidebar (`dropHref`) opens this same dialog, prefilled and measured.
    *
    * **Nothing here decides anything.** Who gains and who loses reading access, and whether
    * this caller may make the move, are the API's answers (`MovePlan`), measured by carrying the

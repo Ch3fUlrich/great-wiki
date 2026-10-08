@@ -93,6 +93,31 @@ export function moveHref(path: string): string {
 }
 
 /**
+ * Where dropping `dragged` onto `target` (`null` for the top of the tree) goes: the dialog on
+ * the dragged page, prefilled and already measured. A drop never moves anything — the move is
+ * the dialog's own confirm button, behind the access preview.
+ *
+ * `null` for a drop that would not be a move at all: onto itself, onto something below
+ * itself, or onto the parent it already has. The dialog would refuse the first two; the third
+ * would preview a no-op as if it were a decision.
+ */
+export function dropHref(
+  dragged: { path: string; title: string },
+  target: { path: string } | null
+): string | null {
+  const ziel = target?.path ?? '';
+  if (ziel === dragged.path || ziel.startsWith(`${dragged.path}/`)) return null;
+  if (ziel === parentOf(dragged.path)) return null;
+  const query = new URLSearchParams({
+    [MOVE_PARAM]: '1',
+    [TITLE_FIELD]: dragged.title,
+    [SLUG_FIELD]: dragged.path.slice(dragged.path.lastIndexOf('/') + 1),
+    [PARENT_FIELD]: ziel
+  });
+  return `${dragged.path}?${query}#${MOVE_REGION_ID}`;
+}
+
+/**
  * The dialog's fields out of an address or a submitted form. `null` until a title has been
  * submitted at all, which is how the loader tells "the dialog was opened" from "show me what
  * this would do".

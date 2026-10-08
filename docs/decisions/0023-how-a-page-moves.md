@@ -18,7 +18,9 @@ next*):
    page later created there takes the address and the forward is dropped.
 3. **A page moves with its whole subtree**: one move, one audit entry.
 4. **A dialog first**, working with a keyboard and without JavaScript; sidebar dragging is a
-   later layer that opens the same dialog.
+   layer on top that opens the same dialog (`dropHref` in `web/src/lib/moves.ts`): dropping an
+   entry on another goes to `<page>?verschieben=1&titel=…&adresse=…&ziel=<target>`, so the
+   access preview is on screen and the only way to move is its confirm button.
 
 And one constraint from ADR 0019: a move never rewrites another page's body.
 
