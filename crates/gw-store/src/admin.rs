@@ -16,6 +16,7 @@
 //!   administrator reading "done" has concluded the opposite of what happened.
 
 use crate::acl::{active_instance_admins, permission_column, subject_columns};
+use crate::events::EventKind;
 use crate::principals::{apply_active, apply_instance_admin, insert_local_principal};
 use crate::Store;
 use anyhow::Result;
@@ -447,6 +448,8 @@ impl Store {
         )
         .await?;
         tx.commit().await?;
+        self.emit_admin_event(EventKind::GrantChanged, actor, path, None)
+            .await;
         Ok(true)
     }
 
@@ -493,6 +496,8 @@ impl Store {
         )
         .await?;
         tx.commit().await?;
+        self.emit_admin_event(EventKind::GrantChanged, actor, path, None)
+            .await;
         Ok(true)
     }
 
@@ -1068,5 +1073,84 @@ mod tests {
             VisibilityOutcome::NoSuchDocument
         );
         assert!(entries(&store).await.is_empty());
+    }
+
+    // --- bus producer (ADR 0024) --------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_grant_change_reaches_a_path_admin_and_not_a_plain_reader() {
+        let store = store().await;
+        let doc = store
+            .create_document(
+                Author::Import,
+                &NewDocument {
+                    parent_path: None,
+                    doc_type: DocumentType::Page,
+                    title: "Raum".into(),
+                    slug: None,
+                    language: "de".into(),
+                    visibility: Visibility::Restricted,
+                    body: Block {
+                        kind: gw_core::BlockKind::Doc,
+                        attrs: Default::default(),
+                        content: Vec::new(),
+                        text: None,
+                        marks: Vec::new(),
+                    },
+                    sort_key: 0,
+                    topics: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let path = store.document_path_unchecked(&doc).await.unwrap().unwrap();
+        let chef = admin(&store, "chef").await;
+        let (boss, leser, gast) = (
+            store
+                .create_local_principal("boss", "boss", None, "h")
+                .await
+                .unwrap(),
+            store
+                .create_local_principal("leser", "leser", None, "h")
+                .await
+                .unwrap(),
+            store
+                .create_local_principal("gast", "gast", None, "h")
+                .await
+                .unwrap(),
+        );
+        for (who, p) in [(&boss, Permission::Admin), (&leser, Permission::Read)] {
+            store
+                .add_grant(&path, Subject::Principal(who.id.clone()), p)
+                .await
+                .unwrap();
+        }
+        let subject = Subject::Principal(gast.id.clone());
+        assert!(store
+            .add_grant_audited(&chef, &path, &subject, Permission::Read)
+            .await
+            .unwrap());
+        assert_eq!(store.notifications_for(&boss, 10).await.unwrap().len(), 1);
+        assert!(store
+            .notifications_for(&leser, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store.notifications_for(&gast, 10).await.unwrap().is_empty());
+        assert!(store
+            .remove_grant_audited(&chef, &path, &subject, Permission::Read)
+            .await
+            .unwrap());
+        let list = store.notifications_for(&boss, 10).await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].kind, crate::events::EventKind::GrantChanged);
+        // The actor is never told about their own act.
+        let (chef_p, _) = store.principal_by_id(&chef).await.unwrap().unwrap();
+        assert!(store
+            .notifications_for(&chef_p, 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

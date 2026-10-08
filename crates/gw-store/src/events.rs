@@ -151,6 +151,91 @@ impl Store {
         Ok(())
     }
 
+    /// [`Store::emit_event`] for a producer: a failed emit is logged and swallowed.
+    ///
+    /// ADR 0024 ("Cost / revisit"): a lost notification is an annoyance, a failed save or
+    /// grant because the bus hiccuped is a bug. Every producer goes through here so none of
+    /// them can forget — and so the log line is one place to grep.
+    pub(crate) async fn emit_logged(&self, ev: &NewEvent) {
+        if let Err(err) = self.emit_event(ev).await {
+            tracing::warn!(kind = ev.kind.as_str(), error = %err, "event not recorded");
+        }
+    }
+
+    /// Record an admin event about `path` for every account that administers it.
+    ///
+    /// Candidates are enumerated by asking [`Store::administers`] of each active account —
+    /// the very rule delivery applies (instance admins and the admin baseline, plus Admin
+    /// grants on or above the path, directly, by team or by group). That is deliberately
+    /// the same function rather than a cheaper look-alike: a second spelling of "who
+    /// administers this" would be a second answer. It costs one grants lookup per account,
+    /// which is fine at wiki scale and runs only when an invitation is taken or a grant
+    /// changes. Delivery still re-asks, so a candidate who stops administering the path
+    /// before reading simply never sees the row.
+    ///
+    /// The row names the page when one lives at `path`, else only the path. Never fails the
+    /// caller; see [`Store::emit_logged`].
+    pub(crate) async fn emit_admin_event(
+        &self,
+        kind: EventKind,
+        actor: &str,
+        path: &str,
+        dedupe_key: Option<String>,
+    ) {
+        if let Err(err) = self
+            .try_emit_admin_event(kind, actor, path, dedupe_key)
+            .await
+        {
+            tracing::warn!(kind = kind.as_str(), error = %err, "admin event not recorded");
+        }
+    }
+
+    async fn try_emit_admin_event(
+        &self,
+        kind: EventKind,
+        actor: &str,
+        path: &str,
+        dedupe_key: Option<String>,
+    ) -> Result<()> {
+        let doc_id: Option<String> =
+            sqlx::query_scalar("SELECT id FROM documents WHERE path = ?1 AND deleted_at IS NULL")
+                .bind(path)
+                .fetch_optional(&self.pool)
+                .await?;
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM principals WHERE active = 1")
+            .fetch_all(&self.pool)
+            .await?;
+        for id in ids {
+            if id == actor {
+                continue;
+            }
+            let Some((who, _)) = self.principal_by_id(&id).await? else {
+                continue;
+            };
+            let baseline = self.baseline_for(&who).await?;
+            if !self.administers(&who, baseline, path).await? {
+                continue;
+            }
+            self.emit_logged(&NewEvent {
+                kind,
+                recipient: id,
+                actor: Some(actor.to_string()),
+                doc_id: doc_id.clone(),
+                // A page's own row is checked through the page; the path is only for a
+                // path with none.
+                path: if doc_id.is_some() {
+                    None
+                } else {
+                    Some(path.to_string())
+                },
+                subject: None,
+                dedupe_key: dedupe_key.clone(),
+            })
+            .await;
+        }
+        Ok(())
+    }
+
     /// The newest `limit` notifications `principal` may still see.
     pub async fn notifications_for(
         &self,
