@@ -5,6 +5,7 @@ pub mod docs;
 pub mod links;
 pub mod moves;
 pub mod revisions;
+pub mod search;
 pub mod tasks;
 pub mod topics;
 pub mod trash;
@@ -410,6 +411,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(links::routes())
         .merge(moves::routes())
         .merge(revisions::routes())
+        .merge(search::routes())
         .merge(tasks::routes())
         .merge(topics::routes())
         .merge(trash::routes())

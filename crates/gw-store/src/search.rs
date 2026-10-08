@@ -15,9 +15,14 @@
 //! The trait is the seam ADR 0003 promised: Tantivy or an external engine would be a second
 //! implementation of [`SearchIndex`], and nothing above it would change.
 
-use crate::Store;
+use crate::acl::Baseline;
+use crate::{Store, StoredDocument, TaskStatus};
 use anyhow::Result;
+use gw_auth::{Action, Principal};
+use serde::Serialize;
 use sqlx::SqlitePool;
+use unicode_normalization::char::is_combining_mark;
+use unicode_normalization::UnicodeNormalization;
 
 /// How many words of a query are used. A query is a few words; a pasted paragraph would
 /// otherwise become a MATCH expression with hundreds of terms for no better result.
@@ -30,7 +35,6 @@ const MAX_TERM_CHARS: usize = 64;
 /// One document the index thinks matches. **Unfiltered**: it has not been through any
 /// permission check, and a trashed page is the only thing already excluded.
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))] // consumed by `Store::search_pages_for` (Task 2)
 pub(crate) struct Candidate {
     pub doc_id: String,
     /// `bm25()` — lower is better, as SQLite defines it. Candidates arrive best first.
@@ -41,7 +45,6 @@ pub(crate) struct Candidate {
 }
 
 /// Something that can say which documents match a query.
-#[cfg_attr(not(test), allow(dead_code))] // consumed by `Store::search_pages_for` (Task 2)
 pub(crate) trait SearchIndex {
     /// At most `limit` candidates, best first. A query with nothing searchable in it is
     /// an empty answer, not an error — the caller cannot tell it from "no match", which is
@@ -51,12 +54,10 @@ pub(crate) trait SearchIndex {
 
 /// The SQLite FTS5 implementation (ADR 0003): the index lives in the same database as the
 /// documents, kept current by triggers (`0016_search.sql`).
-#[cfg_attr(not(test), allow(dead_code))] // consumed by `Store::search_pages_for` (Task 2)
 pub(crate) struct Fts5Index {
     pool: SqlitePool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // consumed by `Store::search_pages_for` (Task 2)
 impl Fts5Index {
     pub(crate) fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -132,7 +133,302 @@ pub(crate) fn match_expression(query: &str) -> Option<String> {
     )
 }
 
+/// The longest query that is searched, in characters, after trimming. A longer one is
+/// answered as an empty search rather than cut: a truncated query would quietly look for
+/// something other than what was typed, and "nothing found" is the answer the endpoint
+/// already gives for every query it will not run.
+pub const MAX_QUERY_CHARS: usize = 200;
+
+/// The most hits one group of an answer holds, whatever the caller asked for.
+const MAX_LIMIT: usize = 50;
+
+/// How many candidates are fetched per hit wanted, and the ceiling on the total.
+///
+/// Permission is applied *after* the index, one candidate at a time, so a page of ten hits
+/// may need more than ten candidates: the ones the caller may not read are skipped. This is
+/// the price of keeping the decision in the accessor instead of in the index (ADR 0024), and
+/// its limit is a real one — a caller who may read very little, searching a word that
+/// hundreds of withheld pages rank above the readable ones for, gets fewer hits than exist.
+/// That is the safe way for it to fail: it under-reports, it never over-discloses, and it
+/// does so without saying how many were skipped.
+const OVERFETCH: usize = 5;
+const MAX_CANDIDATES: usize = 200;
+
+/// Words of context kept before and after the first match in a snippet.
+const WORDS_BEFORE: usize = 6;
+const WORDS_AFTER: usize = 14;
+
+/// One run of a snippet. The wire form of "this part is the match": a client renders the
+/// segments as text, emphasising the `hit` ones, and never needs an HTML sink.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Segment {
+    pub text: String,
+    pub hit: bool,
+}
+
+/// A page the caller may read, found by words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PageHit {
+    pub title: String,
+    /// Where the page is **now**; the index holds no path (ADR 0024).
+    pub path: String,
+    pub snippet: Vec<Segment>,
+}
+
+/// A topic the caller may see, found by its name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TopicHit {
+    pub name: String,
+    pub display_path: String,
+    pub path: String,
+    /// As `topics_for` gave it to this caller: the length of the list they would be handed.
+    pub documents: usize,
+}
+
+/// A task on a board the caller may read, found by its title.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskHit {
+    pub id: String,
+    pub title: String,
+    pub status: TaskStatus,
+    /// The page the card hangs off, if it hangs off one — and only ever the path the board
+    /// already cleared for this caller (`Task::page`), never one looked up here.
+    pub page_path: Option<String>,
+}
+
+/// Everything a search found **for this caller**.
+///
+/// There is deliberately no count, total or "n more" anywhere in here: a number about the
+/// hits that were left out is a number about pages the caller may not read. The length of a
+/// list is the only count, and it is the length of what they were given.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct SearchResults {
+    pub pages: Vec<PageHit>,
+    pub topics: Vec<TopicHit>,
+    pub tasks: Vec<TaskHit>,
+}
+
+/// The query as it will be searched, or `None` if it is not to be searched at all.
+fn normalise(query: &str) -> Option<&str> {
+    let query = query.trim();
+    if query.is_empty() || query.chars().count() > MAX_QUERY_CHARS {
+        return None;
+    }
+    Some(query)
+}
+
+/// Lowercased and stripped of diacritics — the folding the FTS5 tokenizer
+/// (`unicode61 remove_diacritics 2`) applies, so a topic or a task title is found by the
+/// same typing a page is. `ß` is not expanded, as there.
+fn fold(word: &str) -> String {
+    word.nfd()
+        .filter(|c| !is_combining_mark(*c))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || is_combining_mark(c)
+}
+
+/// Byte ranges of the words of `text`.
+fn word_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = None;
+    for (i, c) in text.char_indices() {
+        match (is_word_char(c), start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                out.push((s, i));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        out.push((s, text.len()));
+    }
+    out
+}
+
+/// The folded words of a query — the same cut `match_expression` makes, for the parts of the
+/// search that do not go through the index.
+fn query_terms(query: &str) -> Vec<String> {
+    word_ranges(query)
+        .into_iter()
+        .take(MAX_TERMS)
+        .map(|(s, e)| fold(&query[s..e].chars().take(MAX_TERM_CHARS).collect::<String>()))
+        .collect()
+}
+
+/// Does this word start with one of the terms? Prefix, as the last term is in the index.
+fn word_hits(word: &str, terms: &[String]) -> bool {
+    let word = fold(word);
+    terms.iter().any(|t| word.starts_with(t.as_str()))
+}
+
+/// Does `text` hold, for every term, a word that term is a prefix of?
+fn text_matches(text: &str, terms: &[String]) -> bool {
+    let words: Vec<String> = word_ranges(text)
+        .into_iter()
+        .map(|(s, e)| fold(&text[s..e]))
+        .collect();
+    terms
+        .iter()
+        .all(|t| words.iter().any(|w| w.starts_with(t.as_str())))
+}
+
+/// An excerpt of `text` around its first matching word, as runs that say which are matches.
+///
+/// Built from whatever text it is given, so the caller decides whose text that is: for a
+/// response it is always the accessor's document, never the index's copy.
+fn segments(text: &str, terms: &[String]) -> Vec<Segment> {
+    let words = word_ranges(text);
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let hits: Vec<bool> = words
+        .iter()
+        .map(|&(s, e)| word_hits(&text[s..e], terms))
+        .collect();
+    let first = hits.iter().position(|h| *h).unwrap_or(0);
+    let from = first.saturating_sub(WORDS_BEFORE);
+    let to = (first + WORDS_AFTER).min(words.len());
+
+    let mut out: Vec<Segment> = Vec::new();
+    let mut push = |text: &str, hit: bool| {
+        if text.is_empty() {
+            return;
+        }
+        match out.last_mut() {
+            Some(last) if last.hit == hit => last.text.push_str(text),
+            _ => out.push(Segment {
+                text: text.to_string(),
+                hit,
+            }),
+        }
+    };
+    if from > 0 {
+        push("…", false);
+    }
+    let mut cursor = words[from].0;
+    for (i, &(s, e)) in words.iter().enumerate().take(to).skip(from) {
+        push(&text[cursor..s], false);
+        push(&text[s..e], hits[i]);
+        cursor = e;
+    }
+    if to < words.len() {
+        push("…", false);
+    }
+    out
+}
+
 impl Store {
+    /// Search pages, topics and tasks **as `principal`**, at most `limit` of each.
+    ///
+    /// **Every page hit has been through the accessor.** The index (`Fts5Index`, crate-private)
+    /// yields candidates — ids and a rank, no permission — and each one is put through
+    /// [`Store::document_for_id_with_baseline`] for `Action::Read`; a `None` is dropped without
+    /// trace. The title, the path and the snippet in a hit are those of the document the
+    /// accessor returned, not of the index row: the index's copy of the text is a ranking
+    /// artefact and is never shown. Topics and tasks come from [`Store::topics_for`] and
+    /// [`Store::board_for`], which filter by the same rule, and are matched in memory.
+    ///
+    /// **Nothing here counts what was left out.** No total, no "n hidden", and the loop stops
+    /// at `limit` visible hits rather than collecting every visible one to measure it.
+    ///
+    /// A blank, over-long or wordless query is an empty answer, the same value a query that
+    /// matched nothing returns.
+    pub async fn search_for(
+        &self,
+        principal: &Principal,
+        query: &str,
+        limit: usize,
+    ) -> Result<SearchResults> {
+        let Some(query) = normalise(query) else {
+            return Ok(SearchResults::default());
+        };
+        let terms = query_terms(query);
+        let limit = limit.min(MAX_LIMIT);
+        if terms.is_empty() || limit == 0 {
+            return Ok(SearchResults::default());
+        }
+
+        // Once, for the caller. It is a property of who is asking, so one value serves every
+        // candidate — and a value belonging to anyone else would be a hole that reads like
+        // an optimisation (see `document_for_id_with_baseline`).
+        let baseline = self.baseline_for(principal).await?;
+
+        let fetch = (limit * OVERFETCH).min(MAX_CANDIDATES).max(limit);
+        let candidates = Fts5Index::new(self.pool.clone())
+            .candidates(query, fetch)
+            .await?;
+        let mut pages = Vec::new();
+        for candidate in candidates {
+            let Some(document) = self
+                .readable_candidate(principal, &candidate.doc_id, baseline)
+                .await?
+            else {
+                continue;
+            };
+            let text = gw_core::body_plain_text(&document.body);
+            pages.push(PageHit {
+                title: document.title,
+                path: document.path,
+                snippet: segments(&text, &terms),
+            });
+            if pages.len() >= limit {
+                break;
+            }
+        }
+
+        let topics = self
+            .topics_for(principal)
+            .await?
+            .into_iter()
+            .filter(|summary| text_matches(&summary.topic.display_path, &terms))
+            .take(limit)
+            .map(|summary| TopicHit {
+                name: summary.topic.name,
+                display_path: summary.topic.display_path,
+                path: summary.topic.path,
+                documents: summary.documents,
+            })
+            .collect();
+
+        let tasks = self
+            .board_for(principal, None)
+            .await?
+            .into_iter()
+            .filter(|task| text_matches(&task.title, &terms))
+            .take(limit)
+            .map(|task| TaskHit {
+                id: task.id,
+                title: task.title,
+                status: task.status,
+                page_path: task.page.map(|page| page.path),
+            })
+            .collect();
+
+        Ok(SearchResults {
+            pages,
+            topics,
+            tasks,
+        })
+    }
+
+    /// One candidate, through the one accessor. A function of its own so that it is the
+    /// single place a search result is authorised.
+    async fn readable_candidate(
+        &self,
+        principal: &Principal,
+        document_id: &str,
+        baseline: Baseline,
+    ) -> Result<Option<StoredDocument>> {
+        self.document_for_id_with_baseline(principal, document_id, Action::Read, baseline)
+            .await
+    }
+
     /// Give every page that predates `0016_search.sql` its `body_text`, then rebuild the
     /// index from `documents`. Run by [`Store::open`]; returns how many rows it filled.
     ///
@@ -173,7 +469,7 @@ impl Store {
 mod tests {
     use super::*;
     use crate::trash::{Purge, PurgeOutcome};
-    use crate::{Author, NewDocument};
+    use crate::{Author, NewDocument, NewTask, TaskHome, TaskOutcome};
     use gw_auth::{Permission, Principal, Subject};
     use gw_core::{Block, DocumentType, Visibility};
 
@@ -673,5 +969,473 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(text.as_deref(), Some("Hallo Welt"));
+    }
+
+    // --- the accessor: what a caller is handed ---------------------------------------------
+    //
+    // The fixture for everything below. `/offen` is public; `/geheim` is restricted.
+    // `leser` holds read on `/geheim`; `fremde` is signed in and holds nothing — the invited
+    // relative; `chefin` administers `/geheim`.
+
+    async fn restricted(store: &Store, parent: Option<&str>, title: &str, text: &str) -> String {
+        store
+            .create_document(
+                Author::Import,
+                &NewDocument {
+                    parent_path: parent.map(Into::into),
+                    doc_type: DocumentType::Page,
+                    title: title.into(),
+                    slug: None,
+                    language: "de".into(),
+                    visibility: Visibility::Restricted,
+                    body: body(text),
+                    sort_key: 0,
+                    topics: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn account(store: &Store, name: &str) -> Principal {
+        store
+            .create_local_principal(name, name, None, "x")
+            .await
+            .unwrap()
+    }
+
+    async fn grant(store: &Store, path: &str, who: &Principal, permission: Permission) {
+        store
+            .add_grant(path, Subject::Principal(who.id.clone()), permission)
+            .await
+            .unwrap();
+    }
+
+    fn titles(results: &SearchResults) -> Vec<&str> {
+        results.pages.iter().map(|p| p.title.as_str()).collect()
+    }
+
+    fn flat(snippet: &[Segment]) -> String {
+        snippet.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    fn trash_sql(id: &str) -> String {
+        format!("UPDATE documents SET deleted_at = datetime('now'), deleted_root = path, deleted_by = 'x', deleted_by_name = 'x' WHERE id = '{id}'")
+    }
+
+    #[tokio::test]
+    async fn a_page_the_caller_may_not_read_is_not_a_hit_and_one_they_may_is() {
+        let store = store().await;
+        page(&store, "Offen", "Rezept Linsensuppe").await;
+        restricted(&store, None, "Geheim", "Rezept Passwort").await;
+        let leser = account(&store, "leser").await;
+        let chefin = account(&store, "chefin").await;
+        let fremde = account(&store, "fremde").await;
+        grant(&store, "/geheim", &leser, Permission::Read).await;
+        grant(&store, "/geheim", &chefin, Permission::Admin).await;
+
+        let anonym = Principal::anonymous();
+        for who in [&fremde, &anonym] {
+            let found = store.search_for(who, "Rezept", 10).await.unwrap();
+            assert_eq!(titles(&found), vec!["Offen"], "for {}", who.id);
+            let found = store.search_for(who, "Passwort", 10).await.unwrap();
+            assert_eq!(found, SearchResults::default(), "for {}", who.id);
+        }
+        // Anti-vacuity: the same queries, from people who may read it.
+        for who in [&leser, &chefin] {
+            let found = store.search_for(who, "Passwort", 10).await.unwrap();
+            assert_eq!(titles(&found), vec!["Geheim"], "for {}", who.id);
+            assert_eq!(found.pages[0].path, "/geheim");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_snippet_marks_the_match_and_carries_no_markup() {
+        let store = store().await;
+        page(
+            &store,
+            "Notiz",
+            "Der Polyp wurde <b>entfernt</b> & \"geprüft\"",
+        )
+        .await;
+        let found = store
+            .search_for(&Principal::anonymous(), "polyp", 10)
+            .await
+            .unwrap();
+        let snippet = &found.pages[0].snippet;
+        assert!(
+            snippet.iter().any(|s| s.hit && s.text == "Polyp"),
+            "{snippet:?}"
+        );
+        assert_eq!(flat(snippet), "Der Polyp wurde <b>entfernt</b> & \"geprüft");
+        assert!(snippet.windows(2).all(|w| w[0].hit != w[1].hit));
+    }
+
+    #[tokio::test]
+    async fn a_long_text_is_cut_around_the_first_match() {
+        let store = store().await;
+        let words: Vec<String> = (0..60).map(|i| format!("w{i}")).collect();
+        let text = format!("{} Ziel {}", words.join(" "), words.join(" "));
+        page(&store, "Lang", &text).await;
+        let found = store
+            .search_for(&Principal::anonymous(), "ziel", 10)
+            .await
+            .unwrap();
+        let flat = flat(&found.pages[0].snippet);
+        assert!(flat.starts_with('…') && flat.ends_with('…'), "{flat}");
+        assert!(flat.contains("Ziel") && flat.len() < text.len() / 2);
+    }
+
+    #[tokio::test]
+    async fn the_snippet_is_the_accessors_text_never_the_indexs() {
+        let store = store().await;
+        let id = page(&store, "Notiz", "Alpha steht im echten Text").await;
+        // The index row says something else: the state a drifted or poisoned index is in.
+        sqlx::query("UPDATE documents SET body_text = 'Alpha ENTSTELLT' WHERE id = ?1")
+            .bind(&id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(ids(&store, "ENTSTELLT").await, vec![id], "the index has it");
+
+        let found = store
+            .search_for(&Principal::anonymous(), "Alpha", 10)
+            .await
+            .unwrap();
+        let text = flat(&found.pages[0].snippet);
+        assert!(text.contains("echten Text"), "{text}");
+        assert!(!text.contains("ENTSTELLT"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn the_loop_stops_at_the_limit_of_visible_hits() {
+        let store = store().await;
+        for i in 0..5 {
+            page(&store, &format!("Seite {i}"), "gemeinsam").await;
+        }
+        let anonym = Principal::anonymous();
+        let n = |limit| {
+            let store = &store;
+            let anonym = &anonym;
+            async move {
+                store
+                    .search_for(anonym, "gemeinsam", limit)
+                    .await
+                    .unwrap()
+                    .pages
+                    .len()
+            }
+        };
+        assert_eq!(n(2).await, 2);
+        assert_eq!(n(0).await, 0);
+        assert_eq!(n(500).await, 5);
+    }
+
+    #[tokio::test]
+    async fn withheld_pages_ranking_first_do_not_use_up_the_limit() {
+        let store = store().await;
+        // Three withheld pages that outrank (title match) three readable ones (body match).
+        for i in 0..3 {
+            restricted(&store, None, &format!("Dienst {i}"), "x").await;
+            page(&store, &format!("Seite {i}"), "Dienst im Text").await;
+        }
+        let fremde = account(&store, "fremde").await;
+        let found = store.search_for(&fremde, "Dienst", 3).await.unwrap();
+        assert_eq!(
+            found.pages.len(),
+            3,
+            "the over-fetch reaches past the withheld"
+        );
+        assert!(found.pages.iter().all(|p| p.title.starts_with("Seite")));
+    }
+
+    #[tokio::test]
+    async fn trashed_pages_do_not_use_up_the_over_fetch() {
+        let store = store().await;
+        for i in 0..5 {
+            let id = page(&store, &format!("Mull {i}"), "x").await;
+            sqlx::query(&trash_sql(&id))
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+        page(&store, "Seite", "Mull im Text").await;
+        // Limit 1 fetches 5: if the index did not drop the trashed, they would fill it.
+        let found = store
+            .search_for(&Principal::anonymous(), "Mull", 1)
+            .await
+            .unwrap();
+        assert_eq!(titles(&found), vec!["Seite"]);
+    }
+
+    #[tokio::test]
+    async fn a_moved_page_is_a_hit_at_its_new_address() {
+        let store = store().await;
+        page(&store, "A", "x").await;
+        page(&store, "B", "x").await;
+        page_under(&store, Some("/a"), "Beweglich", "Alleinstellungswort").await;
+        let autorin = Principal::test("autorin", &[], &[]);
+        for p in ["/a", "/b"] {
+            grant(&store, p, &autorin, Permission::Write).await;
+        }
+        store
+            .move_document(
+                &autorin,
+                "/a/beweglich",
+                &MoveRequest {
+                    parent: Some("/b".into()),
+                    title: "Beweglich".into(),
+                    slug: None,
+                },
+                false,
+                MoveMode::Commit,
+            )
+            .await
+            .unwrap();
+        let found = store
+            .search_for(&Principal::anonymous(), "Alleinstellungswort", 10)
+            .await
+            .unwrap();
+        assert_eq!(found.pages[0].path, "/b/beweglich");
+    }
+
+    #[tokio::test]
+    async fn unsearchable_queries_are_the_empty_answer() {
+        let store = store().await;
+        page(&store, "Offen", "Hallo").await;
+        let anonym = Principal::anonymous();
+        let long = "a".repeat(MAX_QUERY_CHARS + 1);
+        for q in ["", "   ", "***", "\"", "()", "\u{0}", long.as_str()] {
+            assert_eq!(
+                store.search_for(&anonym, q, 10).await.unwrap(),
+                SearchResults::default(),
+                "for {q:?}"
+            );
+        }
+        let edge = "a".repeat(MAX_QUERY_CHARS);
+        store.search_for(&anonym, &edge, 10).await.unwrap();
+        for q in [
+            "NEAR(",
+            "title:Offen",
+            "Offen OR",
+            "Hallo*",
+            "'; DROP TABLE documents; --",
+        ] {
+            store.search_for(&anonym, q, 10).await.unwrap();
+        }
+    }
+
+    // --- topics and tasks ----------------------------------------------------------------
+
+    async fn topic_page(store: &Store, vis: Visibility, title: &str, topic: &str) {
+        store
+            .create_document(
+                Author::Import,
+                &NewDocument {
+                    parent_path: None,
+                    doc_type: DocumentType::Page,
+                    title: title.into(),
+                    slug: None,
+                    language: "de".into(),
+                    visibility: vis,
+                    body: body("x"),
+                    sort_key: 0,
+                    topics: vec![topic.into()],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_topic_is_found_by_its_folded_name_only_where_a_readable_page_is_under_it() {
+        let store = store().await;
+        topic_page(&store, Visibility::Public, "Offen", "Medizin/Größe").await;
+        topic_page(
+            &store,
+            Visibility::Restricted,
+            "Geheim",
+            "Kündigung Mietvertrag",
+        )
+        .await;
+        let fremde = account(&store, "fremde").await;
+
+        let found = store.search_for(&fremde, "GRÖßE", 10).await.unwrap();
+        assert_eq!(found.topics.len(), 1, "{:?}", found.topics);
+        let hit = &found.topics[0];
+        assert_eq!(hit.name, "Größe");
+        assert_eq!(hit.display_path, "Medizin/Größe");
+        assert_eq!(hit.documents, 1);
+        assert!(hit.path.starts_with("/medizin/"));
+        let found = store.search_for(&fremde, "medizin", 10).await.unwrap();
+        assert!(found.topics.iter().any(|t| t.display_path == "Medizin"));
+
+        // The restricted topic's name is the disclosure.
+        for q in ["kundigung", "Kündigung Mietvertrag", "mietvertrag"] {
+            let found = store.search_for(&fremde, q, 10).await.unwrap();
+            assert!(found.topics.is_empty(), "{q}: {:?}", found.topics);
+        }
+        // Anti-vacuity: a reader of that page is shown it, folded.
+        let leser = account(&store, "leser").await;
+        grant(&store, "/geheim", &leser, Permission::Read).await;
+        let found = store.search_for(&leser, "kundigung", 10).await.unwrap();
+        assert_eq!(found.topics.len(), 1);
+    }
+
+    async fn task_fixture() -> (Store, Principal, Principal) {
+        let store = store().await;
+        let offen = page(&store, "Offen", "x").await;
+        let geheim = restricted(&store, None, "Geheim", "x").await;
+        let chef = account(&store, "chef").await;
+        let fremde = account(&store, "fremde").await;
+        grant(&store, "/offen", &chef, Permission::Write).await;
+        grant(&store, "/geheim", &chef, Permission::Write).await;
+        for (doc, title) in [(offen, "Offene Aufgabe"), (geheim, "Geheime Aufgabe")] {
+            let outcome = store
+                .create_task(
+                    &chef,
+                    &NewTask {
+                        home: TaskHome::Anchored {
+                            doc_id: doc,
+                            block_id: None,
+                        },
+                        title: title.into(),
+                        status: TaskStatus::Laeuft,
+                        assignee: None,
+                        due_at: None,
+                        position: 0,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(matches!(outcome, TaskOutcome::Done(_)), "{outcome:?}");
+        }
+        (store, chef, fremde)
+    }
+
+    #[tokio::test]
+    async fn a_task_is_found_by_its_title_only_on_a_board_the_caller_may_read() {
+        let (store, chef, fremde) = task_fixture().await;
+        let found = store.search_for(&fremde, "aufgabe", 10).await.unwrap();
+        assert_eq!(found.tasks.len(), 1, "{:?}", found.tasks);
+        let hit = &found.tasks[0];
+        assert_eq!(hit.title, "Offene Aufgabe");
+        assert_eq!(hit.status, TaskStatus::Laeuft);
+        assert_eq!(hit.page_path.as_deref(), Some("/offen"));
+        assert!(!hit.id.is_empty());
+        let found = store.search_for(&fremde, "geheime", 10).await.unwrap();
+        assert!(found.tasks.is_empty());
+        // Every word must match, not one of them: "Geheime Aufgabe" shares `Aufgabe` with the
+        // card this caller may see, and must not be answered with it.
+        let found = store
+            .search_for(&fremde, "Geheime Aufgabe", 10)
+            .await
+            .unwrap();
+        assert!(found.tasks.is_empty(), "{:?}", found.tasks);
+        let found = store
+            .search_for(&fremde, "Offene Aufgabe", 10)
+            .await
+            .unwrap();
+        assert_eq!(found.tasks.len(), 1);
+        // Anti-vacuity: the person who may read it finds it.
+        let found = store.search_for(&chef, "geheime", 10).await.unwrap();
+        assert_eq!(found.tasks.len(), 1);
+        assert_eq!(found.tasks[0].page_path.as_deref(), Some("/geheim"));
+    }
+
+    #[tokio::test]
+    async fn a_standalone_task_names_no_page() {
+        let store = store().await;
+        page(&store, "Projekt", "x").await;
+        let chef = account(&store, "chef").await;
+        grant(&store, "/projekt", &chef, Permission::Write).await;
+        let project = store
+            .create_project(&chef, "/projekt", None)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .create_task(
+                &chef,
+                &NewTask {
+                    home: TaskHome::Standalone {
+                        project_id: project.id,
+                    },
+                    title: "Lose Karte".into(),
+                    status: TaskStatus::Offen,
+                    assignee: None,
+                    due_at: None,
+                    position: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let found = store.search_for(&chef, "karte", 10).await.unwrap();
+        assert_eq!(found.tasks.len(), 1);
+        assert_eq!(found.tasks[0].page_path, None);
+    }
+
+    #[test]
+    fn a_result_has_no_key_that_could_count_what_it_hid() {
+        let value = serde_json::to_value(SearchResults {
+            pages: vec![PageHit {
+                title: "t".into(),
+                path: "/p".into(),
+                snippet: vec![Segment {
+                    text: "x".into(),
+                    hit: true,
+                }],
+            }],
+            topics: vec![TopicHit {
+                name: "n".into(),
+                display_path: "n".into(),
+                path: "/n".into(),
+                documents: 1,
+            }],
+            tasks: vec![TaskHit {
+                id: "i".into(),
+                title: "t".into(),
+                status: TaskStatus::Offen,
+                page_path: None,
+            }],
+        })
+        .unwrap();
+        fn keys(v: &serde_json::Value, out: &mut Vec<String>) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    for (k, v) in m {
+                        out.push(k.clone());
+                        keys(v, out);
+                    }
+                }
+                serde_json::Value::Array(a) => a.iter().for_each(|v| keys(v, out)),
+                _ => {}
+            }
+        }
+        let mut all = Vec::new();
+        keys(&value, &mut all);
+        all.sort();
+        all.dedup();
+        assert_eq!(
+            all,
+            vec![
+                "display_path",
+                "documents",
+                "hit",
+                "id",
+                "name",
+                "page_path",
+                "pages",
+                "path",
+                "snippet",
+                "status",
+                "tasks",
+                "text",
+                "title",
+                "topics"
+            ]
+        );
     }
 }

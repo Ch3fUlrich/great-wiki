@@ -70,3 +70,35 @@ As ADR 0003: full-text queries beyond roughly 200 ms at p95, or a required ranki
 FTS5 lacks, measured rather than assumed. Additionally, if a second writer of `documents.body`
 appears, make `body_text` a generated column or route it through `append_revision` before
 accepting the second path.
+
+## Decision 5 — the API: one store method, no decision in the handler
+
+`GET /api/search?q=` calls `Store::search_for(principal, q, limit)` and serialises what it
+returns; the handler makes no permission decision (rule 2, and the reason `topics.rs` and
+`links.rs` are written the same way).
+
+- **Pages.** Candidates are fetched `limit × 5` (ceiling 200) and each is put through
+  `document_for_id_with_baseline(principal, id, Read, baseline)`, the baseline resolved once
+  for the caller. A `None` is dropped without trace and the loop stops at `limit` *visible*
+  hits. A hit is the accessor's title and current path, and a snippet cut from the accessor's
+  own body as `[{text, hit}]` segments around the first matching word — no HTML, so the web
+  needs no sink. The index row's snippet is never used.
+- **Topics and tasks** come from `topics_for` and `board_for(principal, None)`, which already
+  filter by the same rule, and are matched in memory on folded words (lowercase, diacritics
+  removed, as the tokenizer does; every query word must prefix some word of the name or
+  title). A task hit carries the page path only if the board gave the card one.
+- **No counts.** No total, no "n hidden", no page offset. A key that cannot exist cannot be
+  wrong later, so a test asserts the key set. `TopicHit.documents` is the one number and is
+  the length of the list that topic would show *this* caller.
+- **Unsearchable is empty, not an error.** Blank, over 200 characters, or without a word:
+  `200` with three empty lists, the value a query that matched nothing returns. A query that
+  matches only a withheld page is byte-identical to that, status, headers and body; the query
+  is never echoed. The raw query string is parsed leniently, so a bad escape or a repeated
+  `q` is the same empty answer rather than an extractor's 400.
+
+**Cost.** The permission check follows the index, so a caller who may read little, searching
+a word that more than ~200 withheld pages rank above the readable ones for, gets fewer hits
+than exist. It fails by under-reporting and does not say so. Putting the check inside the
+SQL would remove the cost and duplicate the permission rule in a second language; rejected for
+the reason Decision 2 gives. Topic and task matching is a scan over what the caller may see,
+fine for hundreds, to be revisited if a board or topic list grows to tens of thousands.

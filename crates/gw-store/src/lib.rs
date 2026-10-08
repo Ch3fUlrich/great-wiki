@@ -39,6 +39,7 @@ pub use principals::{
 };
 pub use reclaim::{Reclaim, ReclaimReport};
 pub use revisions::{Author, Revision, IMPORT_AUTHOR_ID, IMPORT_AUTHOR_NAME};
+pub use search::{PageHit, SearchResults, Segment, TaskHit, TopicHit, MAX_QUERY_CHARS};
 pub use sessions::SESSION_TTL_SECONDS;
 pub use tasks::{NewTask, Project, Task, TaskHome, TaskOutcome, TaskPage, TaskStatus, TaskUpdate};
 pub use topics::{
