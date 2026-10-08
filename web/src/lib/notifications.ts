@@ -1,5 +1,3 @@
-import { apiGet, apiSend } from '$lib/api';
-
 /**
  * Typed client for the notification inbox (`gw_api::routes::notifications`, ADR 0022/0024).
  *
@@ -26,37 +24,6 @@ export interface Notification {
 }
 
 export const NOTIFICATIONS_PATH = '/benachrichtigungen';
-
-type Fetch = typeof fetch;
-
-/** `GET /api/notifications?limit=` */
-export function listNotifications(fetchFn: Fetch, cookie: string | null, limit = 50) {
-  return apiGet<{ notifications: Notification[] }>(
-    fetchFn,
-    `/api/notifications?limit=${encodeURIComponent(String(limit))}`,
-    cookie
-  );
-}
-
-/** `GET /api/notifications/unread-count` */
-export function unreadCount(fetchFn: Fetch, cookie: string | null) {
-  return apiGet<{ count: number }>(fetchFn, '/api/notifications/unread-count', cookie);
-}
-
-/** `POST /api/notifications/{id}/read` */
-export function markRead(fetchFn: Fetch, cookie: string | null, id: string) {
-  return apiSend<unknown>(
-    fetchFn,
-    'POST',
-    `/api/notifications/${encodeURIComponent(id)}/read`,
-    cookie
-  );
-}
-
-/** `POST /api/notifications/read-all` */
-export function markAllRead(fetchFn: Fetch, cookie: string | null) {
-  return apiSend<unknown>(fetchFn, 'POST', '/api/notifications/read-all', cookie);
-}
 
 export interface Described {
   /** Who did it; `null` when the API names nobody or the kind has no actor (a due date). */

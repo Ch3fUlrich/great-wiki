@@ -5,7 +5,7 @@ import {
   type TopicSummary,
   type TopicsResponse
 } from '$lib/topics';
-import { unreadCount } from '$lib/notifications';
+import { unreadCount } from '$lib/notificationsApi';
 import type { LayoutServerLoad } from './$types';
 
 /**

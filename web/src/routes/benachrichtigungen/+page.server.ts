@@ -1,11 +1,6 @@
 import { redirect } from '@sveltejs/kit';
-import {
-  describeFailure,
-  listNotifications,
-  markAllRead,
-  NOTIFICATIONS_PATH,
-  type Notification
-} from '$lib/notifications';
+import { describeFailure, NOTIFICATIONS_PATH, type Notification } from '$lib/notifications';
+import { listNotifications, markAllRead } from '$lib/notificationsApi';
 import type { Actions, PageServerLoad } from './$types';
 
 /**

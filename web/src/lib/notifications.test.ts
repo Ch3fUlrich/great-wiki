@@ -1,11 +1,6 @@
 import { describe as suite, expect, it, vi } from 'vitest';
-import {
-  describe,
-  describeFailure,
-  markAllRead,
-  markRead,
-  type Notification
-} from './notifications';
+import { describe, describeFailure, type Notification } from './notifications';
+import { markAllRead, markRead } from './notificationsApi';
 
 function n(over: Partial<Notification> = {}): Notification {
   return {
