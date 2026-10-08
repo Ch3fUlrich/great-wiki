@@ -3885,6 +3885,118 @@ await check('R3 a signed-in reader is sent to the sign-in page, told who they ar
   );
 });
 
+// ---------------------------------------------------------------------------------------
+// Group S — search: the header box, the results page, and what it must never reveal
+// ---------------------------------------------------------------------------------------
+//
+// ADR 0024. The fixture identity reads the public pages and NOT `/rundgang/nur-intern`
+// (restricted on purpose), which is what makes it the guest case here; the shim-less stack
+// is the truly anonymous one. "Sichtbarkeitsangabe" occurs on that one page alone and
+// "Beweis" on an open one, so each query has exactly one possible source.
+
+const SEARCH_OPEN = '/rundgang/was-schon-geht';
+const SEARCH_WITHHELD = '/rundgang/nur-intern';
+
+await check('S1 searching finds an open page, with the matched word marked and a link to it', async (page) => {
+  await page.goto(BASE + '/', { waitUntil: 'domcontentloaded' });
+  const box = page.getByRole('search').getByRole('searchbox');
+  await box.fill('Beweis');
+  await Promise.all([
+    page.waitForURL((url) => url.pathname === '/suche', { timeout: 10_000 }),
+    box.press('Enter')
+  ]);
+  assert(new URL(page.url()).searchParams.get('q') === 'Beweis', `the address lost the query: ${page.url()}`);
+  for (const name of ['Seiten', 'Themen', 'Aufgaben']) {
+    assert(
+      (await page.getByRole('heading', { name, level: 2 }).count()) === 1,
+      `no "${name}" group heading`
+    );
+  }
+  const link = page.locator(`main a[href="${SEARCH_OPEN}"], #gw-panel a[href="${SEARCH_OPEN}"]`).first();
+  assert((await link.count()) === 1, 'the open page is not among the results');
+  const marked = await page.locator('#gw-panel mark').allInnerTexts();
+  assert(
+    marked.some((text) => text.toLowerCase().includes('beweis')),
+    `the matched word is not marked: ${JSON.stringify(marked)}`
+  );
+  // Visible focus: a keyboard user tabbing onto a result sees an outline.
+  await link.focus();
+  const outline = await link.evaluate((el) => getComputedStyle(el).outlineStyle);
+  assert(outline !== 'none', 'a focused result shows no outline');
+  // Anti-vacuity: a word nothing contains gives the empty state, not a crash.
+  await page.goto(BASE + '/suche?q=zzzqqqxxx', { waitUntil: 'domcontentloaded' });
+  assert(
+    (await page.locator('#suche-nichts').count()) === 1,
+    'a query matching nothing did not say so'
+  );
+  await page.goto(BASE + '/suche', { waitUntil: 'domcontentloaded' });
+  assert((await page.locator('#suche-leer').count()) === 1, 'a blank query did not ask for a term');
+});
+
+await check('S2 a guest never finds a restricted page, and its query is answered as one matching nothing', async (page) => {
+  assert(ANON && ANON_API, 'SHOT_BASE_ANON / SHOT_API_ANON are unset — see R1');
+  // As the fixture identity, rendered.
+  const shown = await page.request.get(BASE + '/suche?q=Sichtbarkeitsangabe');
+  assert(shown.status() === 200, `/suche answered ${shown.status()}`);
+  assert(!(await shown.text()).includes(SEARCH_WITHHELD), 'the fixture identity was shown the restricted page');
+
+  // As the anonymous visitor, at the API, byte for byte.
+  const withheld = await page.request.get(ANON_API + '/api/search?q=Sichtbarkeitsangabe');
+  const nothing = await page.request.get(ANON_API + '/api/search?q=zzzqqqxxx');
+  assert(withheld.status() === 200 && nothing.status() === 200, 'a status differs from 200');
+  const a = await withheld.text();
+  const b = await nothing.text();
+  assert(a === b, `the withheld query is told apart from a no-match: ${a} vs ${b}`);
+  assert(!a.includes('nur-intern'), `the restricted page leaked: ${a}`);
+  for (const header of ['content-type', 'content-length']) {
+    assert(
+      withheld.headers()[header] === nothing.headers()[header],
+      `${header} differs between the withheld and the empty answer`
+    );
+  }
+  // And through the anonymous web stack.
+  const page2 = await page.request.get(ANON + '/suche?q=Sichtbarkeitsangabe');
+  assert(!(await page2.text()).includes(SEARCH_WITHHELD), 'the anonymous results page named the restricted page');
+
+  // Anti-vacuity: the same anonymous stack does find an open page.
+  const open = await page.request.get(ANON_API + '/api/search?q=Beweis');
+  assert((await open.text()).includes(SEARCH_OPEN), 'the anonymous stack finds nothing at all — the check is vacuous');
+});
+
+await check('S3 the search form works with JavaScript off: a plain GET carries the result in the HTML', async (page) => {
+  void page;
+  const ctx = await browser.newContext({ javaScriptEnabled: false });
+  try {
+    const bare = await ctx.newPage();
+    await bare.goto(BASE + '/', { waitUntil: 'domcontentloaded' });
+    const form = bare.locator('form[role="search"]');
+    assert((await form.getAttribute('method'))?.toLowerCase() === 'get', 'the search form is not GET');
+    assert((await form.getAttribute('action')) === '/suche', 'the search form does not post to /suche');
+    await bare.locator('form[role="search"] input[type="search"][name="q"]').fill('Beweis');
+    await Promise.all([
+      bare.waitForURL((url) => url.pathname === '/suche', { timeout: 10_000 }),
+      bare.locator('form[role="search"] button[type="submit"]').click()
+    ]);
+    assert((await bare.content()).includes(SEARCH_OPEN), 'the script-less submit did not show the open page');
+  } finally {
+    await ctx.close();
+  }
+  // Plain HTTP, no browser at all.
+  const plain = await fetch(BASE + '/suche?q=Beweis');
+  const html = await plain.text();
+  assert(plain.status === 200 && html.includes(SEARCH_OPEN), 'the plain GET response lacks the result');
+  assert(html.includes('<mark'), 'the plain GET response has no marked hit');
+});
+
+await check('S4 / focuses the search box, but not while typing in a field', async (page) => {
+  await page.goto(BASE + '/', { waitUntil: 'networkidle' });
+  const box = page.getByRole('search').getByRole('searchbox');
+  await page.keyboard.press('/');
+  assert(await box.evaluate((el) => el === document.activeElement), '/ did not focus the search box');
+  await box.fill('');
+  await page.keyboard.type('a/b');
+  assert((await box.inputValue()) === 'a/b', `the / was swallowed while typing: ${await box.inputValue()}`);
+});
 
 await browser.close();
 
