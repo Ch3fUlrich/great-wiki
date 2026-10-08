@@ -1257,11 +1257,12 @@ mutation crates/gw-store/src/search.rs killed \
   's@            let text = gw_core::body_plain_text(\&document.body);@            let text = candidate.snippet.clone();@' \
   'search: the snippet is cut from the accessor document, never from the index row'
 # `deleted_at` is read live because the index holds no state. Dropped, the accessor would
-# still refuse a trashed page, so what this mutation changes is only whether trashed pages
-# crowd the visible ones out of the over-fetch window, which is why the test is about that.
+# still refuse a trashed page, so the visible answer is unchanged; the test that catches it is
+# the one that asks the index for its candidates directly, which is what ADR 0024 decision 2
+# promises (a trashed page is never a candidate, so it cannot use up the candidate cap).
 mutation crates/gw-store/src/search.rs killed \
   's@MATCH ?1 AND d.deleted_at IS NULL@MATCH ?1@' \
-  'search: a page in the trash is dropped by the index query and does not use up the over-fetch'
+  'search: a page in the trash is dropped by the index query itself'
 mutation crates/gw-store/src/search.rs killed \
   's@            .topics_for(principal)@            .topics_for(\&Principal::test("x", \&["admins"], \&[]))@' \
   'search: topics are those the caller may see, whose name is the disclosure'
@@ -1271,14 +1272,21 @@ mutation crates/gw-store/src/search.rs killed \
 mutation crates/gw-store/src/search.rs killed \
   's@format!("\\"{w}\\"\*")@format!("{w}*")@; s@format!("\\"{w}\\"")@format!("{w}")@' \
   'search: MATCH receives quoted words only, never what was typed'
-# The two halves of the loop. Without the stop a caller is handed everything the window held;
-# without the over-fetch a page of withheld hits ranked first empties the answer.
+# The answer is cut to `limit` AFTER ranking, from visible hits only; and the order is the
+# caller's own score, because bm25 would carry how common a word is across pages the caller
+# may not read (ADR 0024, decision 5).
 mutation crates/gw-store/src/search.rs killed \
-  's@            if pages.len() >= limit {@            if false {@' \
-  'search: the loop stops at the limit of VISIBLE hits'
+  's@        visible.truncate(limit);@        visible.truncate(usize::MAX);@' \
+  'search: the answer is cut to the limit of VISIBLE hits'
 mutation crates/gw-store/src/search.rs killed \
-  's@        let fetch = (limit \* OVERFETCH).min(MAX_CANDIDATES).max(limit);@        let fetch = limit;@' \
-  'search: more candidates than hits are fetched, so withheld ones do not empty the answer'
+  's@        visible.sort_by(|a, b| b.0.cmp(\&a.0).then_with(|| a.1.path.cmp(\&b.1.path)));@        visible.sort_by(|_, _| std::cmp::Ordering::Equal);@' \
+  'search: visible hits are ranked by their own score, not by the index order'
+mutation crates/gw-store/src/search.rs killed \
+  's@        let limit = limit.min(MAX_LIMIT);@        let limit = limit;@' \
+  'search: no caller can ask for more than the maximum number of hits'
+mutation crates/gw-store/src/search.rs killed \
+  '/pub async fn search_for/,/^    }$/ s@        let baseline = self.baseline_for(principal).await?;@        let baseline = Baseline::Internal;@' \
+  'search: the baseline is the callers own, not a constant that lets internal pages through'
 mutation crates/gw-store/src/search.rs killed \
   '/^fn text_matches/,/^}$/ s@        .all(|t| words.iter()@        .any(|t| words.iter()@' \
   'search: every word of the query must match a topic or task title, not just one'
@@ -2033,6 +2041,9 @@ note_drift() {
 # SOURCE file, which no amount of artefact separation separates.
 probe_for() {
   case "$1" in
+    # Before the generic store entry: every search mutation is caught by the search module's
+    # own tests, and the filter spares the rest of the crate's 400 unit tests.
+    crates/gw-store/src/search.rs) echo "-p gw-store --lib search::" ;;
     crates/gw-store/*) echo "-p gw-store --lib" ;;
     crates/gw-auth/*) echo "-p gw-auth --lib" ;;
     crates/gw-core/*) echo "-p gw-core --lib" ;;

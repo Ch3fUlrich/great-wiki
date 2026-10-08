@@ -109,20 +109,20 @@ impl SearchIndex for Fts5Index {
 /// as a quoted FTS5 string. Inside quotes an operator is just a word to look for, and since a
 /// word contains no `"` there is nothing to escape. The last word gets a prefix star, so a
 /// search-as-you-type query finds `Dar` → `Darm`; the words are ANDed.
+///
+/// The words are cut by [`query_words`], the same cut the in-memory matching of topics and
+/// tasks uses, so the two halves of a search cannot disagree about what was asked. A word
+/// that was cut short for length also gets the star wherever it sits: it stands for a longer
+/// word, and a quoted fragment without one would match nothing.
 pub(crate) fn match_expression(query: &str) -> Option<String> {
-    let words: Vec<String> = query
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .take(MAX_TERMS)
-        .map(|w| w.chars().take(MAX_TERM_CHARS).collect())
-        .collect();
+    let words = query_words(query);
     let last = words.len().checked_sub(1)?;
     Some(
         words
             .iter()
             .enumerate()
-            .map(|(i, w)| {
-                if i == last {
+            .map(|(i, (w, truncated))| {
+                if i == last || *truncated {
                     format!("\"{w}\"*")
                 } else {
                     format!("\"{w}\"")
@@ -131,6 +131,28 @@ pub(crate) fn match_expression(query: &str) -> Option<String> {
             .collect::<Vec<_>>()
             .join(" AND "),
     )
+}
+
+/// The words of a query, each with whether it was cut for length.
+///
+/// The query is put in composed form (NFC) first, so `u` + combining diaeresis and `ü` are
+/// one word to the index and to the in-memory matching alike. A word that the tokenizer would
+/// index as nothing — a run of characters Rust calls alphanumeric and `unicode61` calls
+/// separators, like `ⓐ` — is dropped: quoted, it would be an empty phrase.
+fn query_words(query: &str) -> Vec<(String, bool)> {
+    let query: String = query.nfc().collect();
+    word_ranges(&query)
+        .into_iter()
+        .map(|(s, e)| &query[s..e])
+        .filter(|w| !fold(w).is_empty())
+        .take(MAX_TERMS)
+        .map(|w| {
+            (
+                w.chars().take(MAX_TERM_CHARS).collect::<String>(),
+                w.chars().count() > MAX_TERM_CHARS,
+            )
+        })
+        .collect()
 }
 
 /// The longest query that is searched, in characters, after trimming. A longer one is
@@ -142,17 +164,16 @@ pub const MAX_QUERY_CHARS: usize = 200;
 /// The most hits one group of an answer holds, whatever the caller asked for.
 const MAX_LIMIT: usize = 50;
 
-/// How many candidates are fetched per hit wanted, and the ceiling on the total.
+/// The most candidates the index is asked for, which is every match up to this ceiling.
 ///
-/// Permission is applied *after* the index, one candidate at a time, so a page of ten hits
-/// may need more than ten candidates: the ones the caller may not read are skipped. This is
-/// the price of keeping the decision in the accessor instead of in the index (ADR 0024), and
-/// its limit is a real one — a caller who may read very little, searching a word that
-/// hundreds of withheld pages rank above the readable ones for, gets fewer hits than exist.
-/// That is the safe way for it to fail: it under-reports, it never over-discloses, and it
-/// does so without saying how many were skipped.
-const OVERFETCH: usize = 5;
-const MAX_CANDIDATES: usize = 200;
+/// Permission is applied *after* the index, one candidate at a time, and the visible hits are
+/// then ranked here (see `search_for`), so the index must hand over all of them: a window
+/// of "the best N" would be chosen by bm25 over pages the caller may not read, and a readable
+/// page ranked below it would silently vanish. Past this ceiling — a word on more than a
+/// thousand pages — which candidates are kept is still decided by the index's order, and a
+/// caller may get fewer hits than exist. That fails by under-reporting, never by
+/// over-disclosing, and says nothing about how many were dropped (ADR 0024).
+const MAX_CANDIDATES: usize = 1000;
 
 /// Words of context kept before and after the first match in a snippet.
 const WORDS_BEFORE: usize = 6;
@@ -209,8 +230,8 @@ pub struct SearchResults {
 }
 
 /// The query as it will be searched, or `None` if it is not to be searched at all.
-fn normalise(query: &str) -> Option<&str> {
-    let query = query.trim();
+fn normalise(query: &str) -> Option<String> {
+    let query: String = query.trim().nfc().collect();
     if query.is_empty() || query.chars().count() > MAX_QUERY_CHARS {
         return None;
     }
@@ -227,8 +248,15 @@ fn fold(word: &str) -> String {
         .collect()
 }
 
+/// Is `c` part of a word, as the index's tokenizer sees words?
+///
+/// Rust's `is_alphanumeric` is wider than `unicode61`'s letters, numbers and private-use
+/// characters: it includes circled and squared Latin letters, which are symbols to the
+/// tokenizer and so separate words there. Those ranges are excluded, so a query word is never
+/// one the index would read as nothing.
 fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || is_combining_mark(c)
+    let symbol_letter = matches!(c as u32, 0x24B6..=0x24E9 | 0x1F130..=0x1F189);
+    (c.is_alphanumeric() && !symbol_letter) || is_combining_mark(c)
 }
 
 /// Byte ranges of the words of `text`.
@@ -254,10 +282,9 @@ fn word_ranges(text: &str) -> Vec<(usize, usize)> {
 /// The folded words of a query — the same cut `match_expression` makes, for the parts of the
 /// search that do not go through the index.
 fn query_terms(query: &str) -> Vec<String> {
-    word_ranges(query)
+    query_words(query)
         .into_iter()
-        .take(MAX_TERMS)
-        .map(|(s, e)| fold(&query[s..e].chars().take(MAX_TERM_CHARS).collect::<String>()))
+        .map(|(word, _)| fold(&word))
         .collect()
 }
 
@@ -265,6 +292,27 @@ fn query_terms(query: &str) -> Vec<String> {
 fn word_hits(word: &str, terms: &[String]) -> bool {
     let word = fold(word);
     terms.iter().any(|t| word.starts_with(t.as_str()))
+}
+
+/// How well a page the caller may read answers a query: ten for each query word that starts
+/// a word of the title, one for each word of the text that starts with a query word.
+///
+/// A function of this page and the query only — no collection statistics — which is what
+/// keeps the order of the answer from depending on pages the caller was not shown.
+fn page_score(title: &str, text: &str, terms: &[String]) -> u64 {
+    let title_words: Vec<String> = word_ranges(title)
+        .into_iter()
+        .map(|(s, e)| fold(&title[s..e]))
+        .collect();
+    let in_title = terms
+        .iter()
+        .filter(|t| title_words.iter().any(|w| w.starts_with(t.as_str())))
+        .count() as u64;
+    let in_text = word_ranges(text)
+        .into_iter()
+        .filter(|&(s, e)| word_hits(&text[s..e], terms))
+        .count() as u64;
+    in_title * 10 + in_text
 }
 
 /// Does `text` hold, for every term, a word that term is a prefix of?
@@ -334,8 +382,8 @@ impl Store {
     /// artefact and is never shown. Topics and tasks come from [`Store::topics_for`] and
     /// [`Store::board_for`], which filter by the same rule, and are matched in memory.
     ///
-    /// **Nothing here counts what was left out.** No total, no "n hidden", and the loop stops
-    /// at `limit` visible hits rather than collecting every visible one to measure it.
+    /// **Nothing here counts what was left out.** No total, no "n hidden", and the answer is cut
+    /// to `limit` visible hits after ranking, by a score that never sees a withheld page.
     ///
     /// A blank, over-long or wordless query is an empty answer, the same value a query that
     /// matched nothing returns.
@@ -348,7 +396,7 @@ impl Store {
         let Some(query) = normalise(query) else {
             return Ok(SearchResults::default());
         };
-        let terms = query_terms(query);
+        let terms = query_terms(&query);
         let limit = limit.min(MAX_LIMIT);
         if terms.is_empty() || limit == 0 {
             return Ok(SearchResults::default());
@@ -359,11 +407,11 @@ impl Store {
         // an optimisation (see `document_for_id_with_baseline`).
         let baseline = self.baseline_for(principal).await?;
 
-        let fetch = (limit * OVERFETCH).min(MAX_CANDIDATES).max(limit);
+        // Every candidate the index has, not a window of the best: see `MAX_CANDIDATES`.
         let candidates = Fts5Index::new(self.pool.clone())
-            .candidates(query, fetch)
+            .candidates(&query, MAX_CANDIDATES)
             .await?;
-        let mut pages = Vec::new();
+        let mut visible: Vec<(u64, PageHit)> = Vec::new();
         for candidate in candidates {
             let Some(document) = self
                 .readable_candidate(principal, &candidate.doc_id, baseline)
@@ -372,15 +420,24 @@ impl Store {
                 continue;
             };
             let text = gw_core::body_plain_text(&document.body);
-            pages.push(PageHit {
-                title: document.title,
-                path: document.path,
-                snippet: segments(&text, &terms),
-            });
-            if pages.len() >= limit {
-                break;
-            }
+            let score = page_score(&document.title, &text, &terms);
+            visible.push((
+                score,
+                PageHit {
+                    title: document.title,
+                    path: document.path,
+                    snippet: segments(&text, &terms),
+                },
+            ));
         }
+        // Ranked here, from the pages the caller was handed, and NOT by the index's bm25.
+        // bm25 weighs a word by how rare it is across *every* indexed page, withheld ones
+        // included, so an order that followed it would let a caller learn how many pages
+        // mention a word they may not read. The score is a function of the visible page and
+        // the query alone; ties go by path, which the caller already holds.
+        visible.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.path.cmp(&b.1.path)));
+        visible.truncate(limit);
+        let pages: Vec<PageHit> = visible.into_iter().map(|(_, hit)| hit).collect();
 
         let topics = self
             .topics_for(principal)
@@ -437,8 +494,9 @@ impl Store {
     /// about where words end. **Why `rebuild` as well:** the migration indexed these rows by
     /// title alone and the triggers have kept the index consistent since, so this is belt and
     /// braces — but it is the one command that repairs an index that has drifted for any
-    /// reason, and it costs milliseconds at this corpus size, only when something was filled.
-    /// **Idempotent:** with nothing to fill, nothing is touched. A row a future writer inserts
+    /// reason, and it costs milliseconds at this corpus size, so it runs at EVERY start: the
+    /// index joins `documents` on its implicit rowid, which a `VACUUM` may renumber, and a
+    /// stale mapping would otherwise answer with the wrong pages. **Idempotent.** A row a future writer inserts
     /// without `body_text` is picked up at the next start rather than staying invisible for
     /// ever.
     pub(crate) async fn backfill_search_text(&self) -> Result<u64> {
@@ -447,9 +505,6 @@ impl Store {
             sqlx::query_as("SELECT id, body FROM documents WHERE body_text IS NULL")
                 .fetch_all(&mut *tx)
                 .await?;
-        if rows.is_empty() {
-            return Ok(0);
-        }
         for (id, body) in &rows {
             sqlx::query("UPDATE documents SET body_text = ?2 WHERE id = ?1")
                 .bind(id)
@@ -1437,5 +1492,205 @@ mod tests {
                 "topics"
             ]
         );
+    }
+
+    // --- review follow-ups ---------------------------------------------------------------
+
+    async fn internal(store: &Store, title: &str, text: &str) {
+        store
+            .create_document(
+                Author::Import,
+                &NewDocument {
+                    parent_path: None,
+                    doc_type: DocumentType::Page,
+                    title: title.into(),
+                    slug: None,
+                    language: "de".into(),
+                    visibility: Visibility::Internal,
+                    body: body(text),
+                    sort_key: 0,
+                    topics: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_internal_page_is_found_by_members_of_the_internal_group_only() {
+        let store = store().await;
+        internal(&store, "Hausordnung", "Ruhezeiten beachten").await;
+        let fremde = account(&store, "fremde").await;
+        let mitglied = Principal::test("mitglied", &["users"], &[]);
+
+        for who in [&fremde, &Principal::anonymous()] {
+            let found = store.search_for(who, "Ruhezeiten", 10).await.unwrap();
+            assert_eq!(found, SearchResults::default(), "for {}", who.id);
+        }
+        let found = store.search_for(&mitglied, "Ruhezeiten", 10).await.unwrap();
+        assert_eq!(titles(&found), vec!["Hausordnung"]);
+    }
+
+    #[tokio::test]
+    async fn a_topic_counts_only_the_pages_under_it_that_the_caller_may_read() {
+        let store = store().await;
+        topic_page(&store, Visibility::Public, "Offen", "Gemischt").await;
+        topic_page(&store, Visibility::Restricted, "Intern", "Gemischt").await;
+        let fremde = account(&store, "fremde").await;
+        let leser = account(&store, "leser").await;
+        grant(&store, "/intern", &leser, Permission::Read).await;
+
+        let fremde_sees = store.search_for(&fremde, "gemischt", 10).await.unwrap();
+        assert_eq!(fremde_sees.topics[0].documents, 1);
+        let leser_sees = store.search_for(&leser, "gemischt", 10).await.unwrap();
+        assert_eq!(leser_sees.topics[0].documents, 2);
+    }
+
+    #[tokio::test]
+    async fn every_word_of_the_query_must_be_in_a_topic_name() {
+        let store = store().await;
+        topic_page(&store, Visibility::Public, "Offen", "Mietvertrag Wohnung").await;
+        topic_page(
+            &store,
+            Visibility::Restricted,
+            "Geheim",
+            "Kündigung Mietvertrag",
+        )
+        .await;
+        let fremde = account(&store, "fremde").await;
+        let found = store
+            .search_for(&fremde, "Kündigung Mietvertrag", 10)
+            .await
+            .unwrap();
+        assert!(found.topics.is_empty(), "{:?}", found.topics);
+        let found = store.search_for(&fremde, "Mietvertrag", 10).await.unwrap();
+        assert_eq!(found.topics.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_order_of_hits_does_not_depend_on_pages_the_caller_cannot_read() {
+        // Two readable pages that differ only in which query word they repeat. bm25 would put
+        // them in an order that depends on how common each word is across the whole index,
+        // withheld pages included; the order handed out must be the same with or without them.
+        async fn order(withheld: usize) -> Vec<String> {
+            let store = store().await;
+            page(&store, "Pe", "alpha alpha alpha beta").await;
+            page(&store, "Qu", "alpha beta beta beta").await;
+            for i in 0..withheld {
+                restricted(&store, None, &format!("Zeug {i}"), "alpha").await;
+            }
+            let fremde = account(&store, "fremde").await;
+            store
+                .search_for(&fremde, "alpha beta", 10)
+                .await
+                .unwrap()
+                .pages
+                .into_iter()
+                .map(|p| p.path)
+                .collect()
+        }
+        assert_eq!(order(0).await, vec!["/pe", "/qu"]);
+        assert_eq!(order(30).await, vec!["/pe", "/qu"]);
+    }
+
+    #[tokio::test]
+    async fn a_title_match_ranks_above_a_text_match_and_more_mentions_above_fewer() {
+        let store = store().await;
+        page(&store, "Alltag", "Diabetes Diabetes Diabetes").await;
+        page(&store, "Diabetes", "nichts").await;
+        page(&store, "Ratgeber", "Diabetes einmal").await;
+        let found = store
+            .search_for(&Principal::anonymous(), "diabetes", 10)
+            .await
+            .unwrap();
+        let paths: Vec<&str> = found.pages.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(paths, vec!["/diabetes", "/alltag", "/ratgeber"]);
+    }
+
+    #[tokio::test]
+    async fn however_many_are_asked_for_at_most_the_maximum_comes_back() {
+        let store = store().await;
+        for i in 0..(MAX_LIMIT + 5) {
+            page(&store, &format!("Seite {i}"), "vielfach").await;
+        }
+        let found = store
+            .search_for(&Principal::anonymous(), "vielfach", 500)
+            .await
+            .unwrap();
+        assert_eq!(found.pages.len(), MAX_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn a_decomposed_query_finds_what_the_composed_one_does() {
+        let store = store().await;
+        page(&store, "Müller", "x").await;
+        let anonym = Principal::anonymous();
+        let composed = store.search_for(&anonym, "Müller", 10).await.unwrap();
+        let decomposed = store
+            .search_for(&anonym, "Mu\u{308}ller", 10)
+            .await
+            .unwrap();
+        assert_eq!(composed.pages.len(), 1);
+        assert_eq!(decomposed, composed);
+        assert_eq!(
+            match_expression("Mu\u{308}ller"),
+            match_expression("Müller")
+        );
+    }
+
+    #[tokio::test]
+    async fn characters_the_tokenizer_calls_separators_are_not_searched_for() {
+        let store = store().await;
+        page(&store, "Darm", "Polypen").await;
+        let anonym = Principal::anonymous();
+        assert_eq!(match_expression("ⓐ"), None);
+        assert_eq!(match_expression("Darm ⓐ").as_deref(), Some("\"Darm\"*"));
+        for q in ["ⓐ", "Ⓐⓐ", "🄰", "\u{301}"] {
+            assert_eq!(
+                store.search_for(&anonym, q, 10).await.unwrap(),
+                SearchResults::default(),
+                "for {q:?}"
+            );
+        }
+        let found = store.search_for(&anonym, "Darm ⓐ", 10).await.unwrap();
+        assert_eq!(titles(&found), vec!["Darm"]);
+    }
+
+    #[test]
+    fn a_word_cut_for_length_keeps_a_prefix_star_wherever_it_is() {
+        let long = "x".repeat(MAX_TERM_CHARS + 20);
+        let cut = "x".repeat(MAX_TERM_CHARS);
+        assert_eq!(
+            match_expression(&format!("{long} b")).unwrap(),
+            format!("\"{cut}\"* AND \"b\"*")
+        );
+        assert_eq!(
+            match_expression(&format!("a {cut}")).unwrap(),
+            format!("\"a\" AND \"{cut}\"*")
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_a_store_repairs_an_index_whose_rowids_no_longer_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("wiki.db").display());
+        let store = Store::open(&url).await.unwrap();
+        let id = page(&store, "Notiz", "Erinnerungswort").await;
+        assert_eq!(ids(&store, "Erinnerungswort").await, vec![id.clone()]);
+
+        // What a VACUUM may do to a table with a TEXT primary key.
+        sqlx::query("UPDATE documents SET rowid = rowid + 1000")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(
+            ids(&store, "Erinnerungswort").await.is_empty(),
+            "the mapping is broken, as set up"
+        );
+        store.pool.close().await;
+
+        let reopened = Store::open(&url).await.unwrap();
+        assert_eq!(ids(&reopened, "Erinnerungswort").await, vec![id]);
     }
 }

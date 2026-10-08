@@ -77,10 +77,10 @@ accepting the second path.
 returns; the handler makes no permission decision (rule 2, and the reason `topics.rs` and
 `links.rs` are written the same way).
 
-- **Pages.** Candidates are fetched `limit × 5` (ceiling 200) and each is put through
+- **Pages.** Every matching candidate is fetched (ceiling 1000) and each is put through
   `document_for_id_with_baseline(principal, id, Read, baseline)`, the baseline resolved once
-  for the caller. A `None` is dropped without trace and the loop stops at `limit` *visible*
-  hits. A hit is the accessor's title and current path, and a snippet cut from the accessor's
+  for the caller. A `None` is dropped without trace. The visible hits are then ranked in
+  Rust and cut to `limit` (see "Ranking" below). A hit is the accessor's title and current path, and a snippet cut from the accessor's
   own body as `[{text, hit}]` segments around the first matching word — no HTML, so the web
   needs no sink. The index row's snippet is never used.
 - **Topics and tasks** come from `topics_for` and `board_for(principal, None)`, which already
@@ -96,9 +96,38 @@ returns; the handler makes no permission decision (rule 2, and the reason `topic
   is never echoed. The raw query string is parsed leniently, so a bad escape or a repeated
   `q` is the same empty answer rather than an extractor's 400.
 
-**Cost.** The permission check follows the index, so a caller who may read little, searching
-a word that more than ~200 withheld pages rank above the readable ones for, gets fewer hits
-than exist. It fails by under-reporting and does not say so. Putting the check inside the
-SQL would remove the cost and duplicate the permission rule in a second language; rejected for
-the reason Decision 2 gives. Topic and task matching is a scan over what the caller may see,
-fine for hundreds, to be revisited if a board or topic list grows to tens of thousands.
+**Ranking, and a deliberate deviation from "BM25 ordering".** FTS5's `bm25()` weighs a word
+by how rare it is across the whole index, withheld pages included. An order that followed it
+would be a disclosure oracle: put two readable pages that differ in which word they repeat
+side by side, add withheld pages containing one of the words, and the order flips — the
+caller has measured pages they may not read. So the index's rank is used only to order
+*candidates* (which matters only past the ceiling below), and never reaches the visible
+order. That order is a score computed in Rust from the page the accessor returned and the
+query alone: ten for each query word that starts a word of the title, plus one for each word
+of the text that starts with a query word; ties go by path. [ADR 0003](0003-sqlite-fts5-behind-a-search-trait.md)
+keeps bm25 as what the `SearchIndex` trait offers; this decision is about what a response
+may be ordered by. **Revisit** if a ranking feature is wanted that needs corpus statistics:
+it would have to compute them over the pages the caller may read, per request, or be shown to
+add no information (for example, statistics over public pages only).
+
+**Cost.** The permission check follows the index, one accessor call per candidate, up to a
+ceiling of 1000. Below it nothing is hidden by a window: a readable page is found however
+many withheld pages match, and however they would have ranked. A word on more than a thousand
+pages keeps the first thousand by the index's order, so a caller who may read little can get
+fewer hits than exist; that fails by under-reporting and says nothing about how many were
+dropped. Putting the check inside the SQL would remove the cost and duplicate the permission
+rule in a second language; rejected for the reason Decision 2 gives. Topic and task matching
+is a scan over what the caller may see, fine for hundreds, to be revisited if a board or
+topic list grows to tens of thousands.
+
+**Timing is out of scope**, as it is for [ADR 0022](0022-what-a-refusal-may-say-about-a-page-it-refuses.md): a query
+that matches only withheld pages does more work (one accessor call per candidate) than one
+that matches nothing, and a caller with a clock can tell. Closing that would mean spending the
+same work on every query, which is not worth doing for a wiki this size.
+
+**Query handling.** The query is put in composed form (NFC) once, before both the MATCH
+expression and the in-memory matching, so the two cannot disagree about where words are.
+Characters Rust calls alphanumeric and `unicode61` calls separators (circled and squared
+letters) are not word characters, and a word cut for length keeps its prefix star wherever
+it stands. The index is rebuilt at every `Store::open`, not only when rows were filled:
+it joins `documents` on an implicit rowid that a `VACUUM` may renumber.

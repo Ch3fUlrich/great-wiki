@@ -459,6 +459,10 @@ async fn hostile_query_strings_are_answered_200() {
         "%",
         "ü",
         "𝔘𝔫𝔦",
+        "ⓐ",
+        "Darm ⓐ",
+        "Rezept ⓐ",
+        "Mu\u{308}ller",
     ];
     for who in [Some("fremde"), Some("chefin"), None] {
         for q in nasty {

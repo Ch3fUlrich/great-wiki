@@ -19,3 +19,11 @@
   anything left out, and a search for words that occur only on a page the caller may not read
   is answered byte for byte like a search for nothing — as are a blank query, an over-long
   one, and one made of punctuation. A trashed page is never a result.
+
+### Changed
+
+- **Search results are ordered by how well each page answers the query, counted on the page
+  itself** (a word in the title counts ten times a word in the text), not by how rare the
+  word is across the whole wiki. A rarity-based order would have let a signed-in visitor
+  infer how many pages they cannot read mention a word. A readable page is now found however
+  many unreadable pages match, and the index is rebuilt at every start.
