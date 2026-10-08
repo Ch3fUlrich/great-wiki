@@ -26,6 +26,7 @@
 //! as handing them the page, and it is the retriever's job to prevent it rather than the
 //! caller's (AGENTS.md, architecture rule 2).
 
+use crate::events::{EventKind, NewEvent};
 use crate::Store;
 use anyhow::Result;
 use gw_auth::{Action, Principal};
@@ -406,7 +407,68 @@ impl Store {
         )
         .await?;
         tx.commit().await?;
+        // After the commit, never before: an edit that did not land is not one to tell
+        // anybody about. `restore_revision` publishes through here, so a restore is told
+        // of exactly once and needs no emit of its own.
+        self.emit_page_edited(author, document_id).await;
         Ok(Some(id))
+    }
+
+    /// Tell the people with a stake in a page that somebody else just changed it: whoever
+    /// wrote it (the author of its first revision) and whoever edited it last before this.
+    ///
+    /// Candidates, not recipients (ADR 0024 rule 1): nothing here asks whether they may
+    /// still read the page — delivery does, so a page they have lost sends them nothing and
+    /// the row carries no text of the edit. `dedupe_key` is per page, so a run of edits
+    /// coalesces into one row that is bumped, credited to the latest editor and made unread
+    /// again rather than a row per keystroke-save. The actor is dropped by `emit_event`, so
+    /// editing your own page tells nobody. A page whose first revision came from an import
+    /// has no account for a writer ([`IMPORT_AUTHOR_ID`] names nobody), so only the last
+    /// editor can be told. Failures are logged and swallowed: the save has already
+    /// happened.
+    async fn emit_page_edited(&self, actor: &Principal, document_id: &str) {
+        let found: Result<Vec<String>> = async {
+            // The newest revision is the one just published; its parent is the last editor.
+            let last: Option<String> = sqlx::query_scalar(
+                "SELECT p.author_id FROM revisions r JOIN revisions p ON p.id = r.parent_id \
+                 WHERE r.document_id = ?1 ORDER BY r.created_at DESC, r.id DESC LIMIT 1",
+            )
+            .bind(document_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            let first: Option<String> = sqlx::query_scalar(
+                "SELECT author_id FROM revisions WHERE document_id = ?1 \
+                 ORDER BY created_at ASC, id ASC LIMIT 1",
+            )
+            .bind(document_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            let mut out: Vec<String> = Vec::new();
+            for id in last.into_iter().chain(first) {
+                if id != IMPORT_AUTHOR_ID && !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+            Ok(out)
+        }
+        .await;
+        match found {
+            Ok(recipients) => {
+                for recipient in recipients {
+                    self.emit_logged(&NewEvent {
+                        kind: EventKind::PageEdited,
+                        recipient,
+                        actor: Some(actor.id.clone()),
+                        doc_id: Some(document_id.to_string()),
+                        path: None,
+                        subject: None,
+                        dedupe_key: Some(format!("page-edited:{document_id}")),
+                    })
+                    .await;
+                }
+            }
+            Err(err) => tracing::warn!(error = %err, "page-edited recipients not found"),
+        }
     }
 
     /// The history of a document, newest first — for a caller who may read the document.
@@ -587,6 +649,154 @@ mod tests {
 
     async fn writer(store: &Store) -> Principal {
         granted(store, "autorin", Permission::Write).await
+    }
+
+    // --- the bus: edits by someone else ------------------------------------------------
+
+    /// Like [`granted`], but a real account row: the bus stores recipients as account ids
+    /// and delivery looks the reader up, so a `Principal::test` that was never created
+    /// would never be told anything.
+    async fn member(store: &Store, username: &str, permission: Permission) -> Principal {
+        let principal = store
+            .create_local_principal(username, username, None, "hash")
+            .await
+            .unwrap();
+        store
+            .add_grant(
+                "/notiz",
+                Subject::Principal(principal.id.clone()),
+                permission,
+            )
+            .await
+            .unwrap();
+        principal
+    }
+
+    /// `/notiz`, written by `author`'s own hand rather than by an import.
+    async fn page_written_by(store: &Store, author: &Principal) -> String {
+        store
+            .create_document(
+                Author::Account(author),
+                &NewDocument {
+                    parent_path: None,
+                    doc_type: DocumentType::Page,
+                    title: "Notiz".into(),
+                    slug: None,
+                    language: "de".into(),
+                    visibility: Visibility::Public,
+                    body: body("hallo"),
+                    sort_key: 0,
+                    topics: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn inbox(store: &Store, who: &Principal) -> Vec<crate::events::Notification> {
+        store.notifications_for(who, 10).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_edit_by_someone_else_tells_the_last_editor_not_the_editor() {
+        let store = store().await;
+        let id = page(&store, Visibility::Public).await;
+        let a = member(&store, "anna", Permission::Write).await;
+        let b = member(&store, "bert", Permission::Write).await;
+        store
+            .publish_revision(&a, &id, &body("a"), None)
+            .await
+            .unwrap();
+        assert!(
+            inbox(&store, &a).await.is_empty(),
+            "editing alone tells nobody"
+        );
+        store
+            .publish_revision(&b, &id, &body("b"), None)
+            .await
+            .unwrap();
+        let got = inbox(&store, &a).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].actor_name.as_deref(), Some("bert"));
+        assert!(inbox(&store, &b).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn later_edits_coalesce_and_the_previous_editor_is_told_too() {
+        let store = store().await;
+        let a = store
+            .create_local_principal("anna", "anna", None, "hash")
+            .await
+            .unwrap();
+        let id = page_written_by(&store, &a).await;
+        let b = member(&store, "bert", Permission::Write).await;
+        let c = member(&store, "carl", Permission::Write).await;
+        store
+            .publish_revision(&b, &id, &body("b"), None)
+            .await
+            .unwrap();
+        store
+            .publish_revision(&c, &id, &body("c"), None)
+            .await
+            .unwrap();
+        let for_a = inbox(&store, &a).await;
+        assert_eq!(for_a.len(), 1, "the writer, told twice, has one row");
+        assert_eq!(
+            for_a[0].actor_name.as_deref(),
+            Some("carl"),
+            "credited to the latest"
+        );
+        assert_eq!(
+            inbox(&store, &b).await.len(),
+            1,
+            "b was the last editor before c"
+        );
+        assert!(inbox(&store, &c).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reader_without_access_sees_no_edit_notification() {
+        let store = store().await;
+        let id = page(&store, Visibility::Restricted).await;
+        let a = member(&store, "anna", Permission::Write).await;
+        let b = member(&store, "bert", Permission::Write).await;
+        store
+            .publish_revision(&a, &id, &body("a"), None)
+            .await
+            .unwrap();
+        store
+            .publish_revision(&b, &id, &body("b"), None)
+            .await
+            .unwrap();
+        assert_eq!(inbox(&store, &a).await.len(), 1);
+        store
+            .remove_grant(
+                "/notiz",
+                &Subject::Principal(a.id.clone()),
+                Permission::Write,
+            )
+            .await
+            .unwrap();
+        assert!(inbox(&store, &a).await.is_empty(), "delivery asks again");
+        assert_eq!(store.unread_count_for(&a).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_restore_by_someone_else_notifies_too() {
+        let store = store().await;
+        let id = page(&store, Visibility::Public).await;
+        let a = member(&store, "anna", Permission::Write).await;
+        let b = member(&store, "bert", Permission::Write).await;
+        let first = store
+            .publish_revision(&a, &id, &body("a"), None)
+            .await
+            .unwrap()
+            .unwrap();
+        store.restore_revision(&b, &first).await.unwrap();
+        let got = inbox(&store, &a).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].actor_name.as_deref(), Some("bert"));
     }
 
     // --- what a publish does -----------------------------------------------------------
