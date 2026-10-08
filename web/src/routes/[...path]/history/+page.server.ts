@@ -1,4 +1,4 @@
-import { error } from '@sveltejs/kit';
+import { error, redirect } from '@sveltejs/kit';
 import { apiGet, type StoredDocument } from '$lib/api';
 import {
   isView,
@@ -7,6 +7,7 @@ import {
   type RevisionSource,
   type RevisionSummary
 } from '$lib/history';
+import { forwardApiPath } from '$lib/moves';
 import { GERMAN_REFUSALS } from '$lib/refusals';
 import type { PageServerLoad } from './$types';
 
@@ -65,7 +66,21 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
   // branch stays for the reason the page loader's does — this maps a status, it does not
   // decide one.
   if (status === 403) error(403, GERMAN_REFUSALS.forbiddenHistory);
-  if (!doc) error(404, GERMAN_REFUSALS.missing);
+  if (!doc) {
+    // The page may have moved. The forward is asked about the PAGE, not this sub-route, and
+    // the API names a target only to a caller who may read the page there (ADR 0022) — so
+    // 307 on an answer, and the ordinary missing page otherwise. Temporary for the same
+    // reason the page's own forward is.
+    if (status === 404) {
+      const weiter = await apiGet<{ path: string }>(
+        fetch,
+        forwardApiPath(`/${params.path}`),
+        cookie
+      ).catch(() => null);
+      if (weiter?.data?.path) redirect(307, `${weiter.data.path}/history${url.search}`);
+    }
+    error(404, GERMAN_REFUSALS.missing);
+  }
 
   const { status: listStatus, data: list } = await apiGet<{ revisions: RevisionSummary[] }>(
     fetch,

@@ -140,7 +140,11 @@ administer the page from now on are the ones entitled to read how it arrived), d
   its own change to a security-reviewed path.
 - **Links typed as a path to the old address** (an `href` that was never resolved to an id)
   keep the old path and work through the forward — until the address is reused.
-- **Sub-routes of an old address** (`/alt/history`) are not forwarded; the page itself is.
+- **Sub-routes of an old address** (`/alt/history`) are forwarded by the same rule as the
+  page: the loader asks `GET /api/forwards/alt` (the page, not the sub-route) after its own
+  404 and redirects 307 to `<new path>/history` with the query kept. A caller who may not read
+  the page at its new address gets the forward API's 404 and so the ordinary missing page. The
+  history page is the only `[...path]/*` route the web app has; a new one must do the same.
 - **Visibility does not change on a move.** It is a property of the page, not of its place.
   If the owner later wants "public" to follow the tree too, the preview is where that would
   show.
