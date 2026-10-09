@@ -23,10 +23,23 @@ failed without it (its own comment said so).
    re-authorises (a) immediately, even if it only listens (`push_revocation`), and (b) before
    applying any update, whenever the epoch moved or the interval passed. Check (b) has no
    switch and has its own test.
-3. **No laundering, by prevention.** An update from a connection whose authorisation is older
+   The answer is async, so the epoch is **looked at again once it is in** and the question is
+   asked again if it moved (`vet_until_stable`); the look and the apply have no await between
+   them. Without it a change landing between the answer and the apply let one lapsed update in.
+3. **Churn is bounded, not amplified.** The epoch is global, so anyone whose write moves it
+   (a logout, a move) would make every socket re-ask three queries on the one SQLite
+   connection. A watch already collapses a burst into one wake-up; `vet_gap` (250 ms) bounds
+   the rate: the first change after quiet is acted on at once, later ones wait out the gap, and
+   an update waits too (it is never applied unvetted — churn costs latency, not safety). A
+   hundred changes in a second cost a socket ≤ 8 answers (tested via `CollabState::vets`).
+   Rejected: **per-document epochs** — a grant on an ancestor, a team, a group baseline or an
+   instance admin reaches documents the writer does not name, so the store would have to
+   compute the affected set at write time, which is the check itself; and a wrong set is a
+   silent hole. Revisit if a deployment has thousands of sockets.
+4. **No laundering, by prevention.** An update from a connection whose authorisation is older
    than the current epoch is never applied, so nothing lapsed is in the room for a publish (or
    a sweep) to snapshot. No publish-side rule is needed for committed revocations.
-4. **View-as is asked by identity** (`Registry::is_viewing`): an open socket's cookies are
+5. **View-as is asked by identity** (`Registry::is_viewing`): an open socket's cookies are
    frozen at the upgrade and cannot show that its administrator entered the mode since.
 
 ## Alternatives rejected
@@ -47,7 +60,7 @@ failed without it (its own comment said so).
 
 ## Cost and residual
 
-An access change costs one authorisation (three queries) per open socket, at admin rate.
+An access change costs one authorisation (three queries) per open socket, at most once per `vet_gap` per socket. Under sustained churn a writing socket's updates are delayed by up to that gap.
 Changes that raise **no write** — a session or view-as record simply expiring by the clock —
 are still found only by the interval check, so their window stays `reauth_interval`. A change
 made by another process on the same database file (`seed`) is likewise not seen by the

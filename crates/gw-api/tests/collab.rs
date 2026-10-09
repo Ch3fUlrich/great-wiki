@@ -821,7 +821,7 @@ async fn a_demoted_writer_s_next_update_is_refused_with_a_close() {
     // The same property from the writing end: what a demoted client tries to save is
     // refused, and it is told so.
     let store = fixture().await;
-    let state = under(state_as(&store, "autorin").await, brisk());
+    let state = under(state_as(&store, "autorin").await, unpushed());
     let addr = serve(state.clone()).await;
     let mut ws = connect(&addr, "handbuch", None).await.unwrap();
     let replica = sync(&mut ws).await;
@@ -1457,7 +1457,7 @@ async fn a_move_out_of_the_editors_reach_ends_their_session_without_waiting_for_
 #[tokio::test]
 async fn an_edit_sent_after_a_move_out_of_reach_is_refused_and_not_stored() {
     let store = fixture().await;
-    let state = under(state_as(&store, "autorin").await, brisk());
+    let state = under(state_as(&store, "autorin").await, unpushed());
     let addr = serve(state.clone()).await;
     let mut ws = connect(&addr, "handbuch/onboarding", None).await.unwrap();
     let replica = sync(&mut ws).await;
@@ -1661,4 +1661,30 @@ async fn a_publish_by_another_writer_does_not_file_a_revoked_editors_update_in_t
         !history(&store).await.iter().any(|b| b.contains("Entzug")),
         "a revoked editor's update was filed in the history by somebody else's publish"
     );
+}
+
+#[tokio::test]
+async fn churn_in_the_epoch_costs_a_socket_a_bounded_number_of_re_authorisations() {
+    // The epoch is global: anyone who can make it move (a logout, a move) moves it for every
+    // open socket. A hundred changes in a second must not be a hundred re-authorisations of
+    // each — one SQLite connection serves them all.
+    let store = fixture().await;
+    let policy = CollabPolicy {
+        vet_gap: Duration::from_millis(200),
+        ..parked()
+    };
+    let (state, mut ws, replica) = listening(&store, policy, "handbuch").await;
+    let before = state.collab.vets();
+
+    for _ in 0..100 {
+        store.bump_access_epoch();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let vets = state.collab.vets() - before;
+
+    assert!(vets >= 1, "the socket never re-checked");
+    assert!(vets <= 8, "100 changes cost {vets} re-authorisations");
+    // And it is still a working session: the answers were all yes.
+    send_update(&mut ws, &edit(&replica, "trotz Unruhe")).await;
+    settle(&mut ws, &replica).await;
 }

@@ -668,6 +668,17 @@ mutation crates/gw-store/src/access_epoch.rs killed \
   's/handle.set_rollback_hook(move || dirty.store(false, Ordering::SeqCst));/handle.set_rollback_hook(move || ());/' \
   'access epoch: a rolled-back change leaves no dirty mark to announce a later, unrelated commit'
 
+# Two refinements from review (ADR 0027). The answer to "may she still write?" is async, so the
+# epoch is looked at again once it is in (a change landing between the answer and the apply
+# would let one lapsed update in); and the rate at which churn can make a socket ask is bounded
+# by `vet_gap`, because the epoch is global and one SQLite connection serves every socket.
+mutation crates/gw-api/src/routes/collab.rs killed \
+  's/        gate.last_vet = Instant::now();/        gate.last_vet = Instant::now(); if allowed { return true; }/' \
+  'collab: a change landing during the answer is vetted again before the update applies'
+mutation crates/gw-api/src/routes/collab.rs killed \
+  's/tokio::time::sleep_until((gate.last_vet + gate.policy.vet_gap).into()).await;/();/' \
+  'collab: churn in the access epoch is bounded to one re-authorisation per gap per socket'
+
 # --- links: the graph, and who is allowed to see an edge of it ------------------------
 #
 # A backlinks panel is an aggregate view, and an aggregate view is where filtering gets
