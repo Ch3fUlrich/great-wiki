@@ -150,7 +150,6 @@ ends sessions.
   (`docs/operations/running-in-production.md`, "Deploying a new version").
 - **Enable the digest** (`GW_MAIL_ENABLE`) — waits for the operator; the control-character
   fix it depended on is merged.
-- **The `dok:` SELECT on the production database** — read-only, needs production access.
 - **Rotate the Cloudflare token** (`CF_TOKEN_KINDERTAGESPFLEGE`) — recorded 2026-08-08,
   not re-checked since; it belongs to the Server repository.
 - Left for later from rename and move: sidebar dragging is built; forwarding of further
