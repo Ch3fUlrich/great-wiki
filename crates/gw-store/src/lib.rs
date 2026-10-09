@@ -17,6 +17,7 @@ pub mod revisions;
 pub mod search;
 pub mod sessions;
 pub mod tasks;
+pub mod templates;
 pub mod topics;
 pub mod transclusion;
 pub mod trash;
@@ -44,6 +45,7 @@ pub use revisions::{Author, Revision, IMPORT_AUTHOR_ID, IMPORT_AUTHOR_NAME};
 pub use search::{PageHit, SearchResults, Segment, TaskHit, TopicHit, MAX_QUERY_CHARS};
 pub use sessions::SESSION_TTL_SECONDS;
 pub use tasks::{NewTask, Project, Task, TaskHome, TaskOutcome, TaskPage, TaskStatus, TaskUpdate};
+pub use templates::{CreateOutcome, CreateRequest, TemplateEntry, TEMPLATE_ROOT};
 pub use topics::{
     canonical_topic, Topic, TopicDocument, TopicListing, TopicOutcome, TopicSummary,
     MAX_TOPIC_DEPTH, MAX_TOPIC_NAME_CHARS,

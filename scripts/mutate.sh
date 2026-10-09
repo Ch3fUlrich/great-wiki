@@ -2113,6 +2113,57 @@ note_drift() {
   drifted_at+=("$description")
 }
 
+# --- templates: a NEW write path (ADR 0028) -----------------------------------------------
+#
+# `POST /api/pages` is the first way to create a page over HTTP, so every check on it gets a
+# mutation. Each is an address range over `create_page_for`: `can_write` style lines recur in
+# the tests below it, and a global substitution would mutate the fixtures instead.
+mutation crates/gw-store/src/templates.rs killed \
+  '/pub async fn create_page_for/,/^    }$/ s/if !principal.is_authenticated() || !principal.active {/if false {/' \
+  'templates: an anonymous or deactivated caller creates nothing'
+mutation crates/gw-store/src/templates.rs killed \
+  '/pub async fn create_page_for/,/^    }$/ s/principal, p, Action::Write, baseline/principal, p, Action::Read, baseline/' \
+  'templates: creating needs write on the parent, not read'
+mutation crates/gw-store/src/templates.rs killed \
+  '/pub async fn create_page_for/,/^    }$/ s/"there is no page at {p}"/"you may not add pages under {p}"/' \
+  'templates: a parent the caller cannot read answers like a missing one'
+mutation crates/gw-store/src/templates.rs killed \
+  '/pub async fn create_page_for/,/^    }$/ s/None if !administers_destination =>/None if false =>/' \
+  'templates: the top level needs administration of the whole wiki'
+mutation crates/gw-store/src/templates.rs killed \
+  '/pub async fn create_page_for/,/^    }$/ s/principal, t, Action::Read, baseline/principal, t, Action::Read, Baseline::Admin/' \
+  'templates: a template the caller cannot read answers like a missing one'
+mutation crates/gw-store/src/templates.rs killed \
+  '/pub async fn create_page_for/,/^    }$/ s/if !is_template_path(t) {/if false {/' \
+  'templates: a page outside /vorlagen is not a template'
+mutation crates/gw-store/src/templates.rs killed \
+  '/pub async fn create_page_for/,/^    }$/ s/visibility: Visibility::Restricted,/visibility: Visibility::Public,/' \
+  'templates: a new page starts restricted whatever the template says'
+mutation crates/gw-store/src/templates.rs killed \
+  '/pub async fn create_page_for/,/^    }$/ s/slug == "history" ||/false ||/' \
+  'templates: history is reserved at every depth'
+mutation crates/gw-store/src/templates.rs killed \
+  '/pub async fn create_page_for/,/^    }$/ s/RESERVED_TOP_LEVEL.contains(&slug.as_str())/false/' \
+  'templates: the apps own top-level addresses are reserved'
+mutation crates/gw-store/src/templates.rs killed \
+  '/pub async fn create_page_for/,/^    }$/ s/title.chars().count() > MAX_TITLE_CHARS/false/' \
+  'templates: a title has a length limit'
+mutation crates/gw-store/src/templates.rs killed \
+  '/pub async fn create_page_for/,/^    }$/ s/if title.is_empty() {/if false {/' \
+  'templates: a page needs a title'
+mutation crates/gw-store/src/templates.rs killed \
+  's/out.push_str(title);/out.push_str("");/' \
+  'templates: {{titel}} is filled in'
+mutation crates/gw-store/src/templates.rs killed \
+  's/out.push_str(date);/out.push_str("");/' \
+  'templates: {{datum}} is filled in'
+mutation crates/gw-store/src/templates.rs killed \
+  's/let tree = self.tree_for(principal).await?;/let tree = self.tree().await?;/' \
+  'templates: the picker lists only templates the caller may read'
+mutation crates/gw-api/src/routes/templates.rs killed \
+  's/Err(ApiError::Forbidden) => false,/Err(ApiError::Forbidden) => true,/' \
+  'templates: the API hands the store the real top-level administration verdict'
+
 # HOW LONG THIS IS ALLOWED TO TAKE
 # --------------------------------
 # A gate too slow to run stops being run. This one got there: eighteen mutations, a whole
@@ -2162,6 +2213,7 @@ probe_for() {
     # Before the generic store entry: every search mutation is caught by the search module's
     # own tests, and the filter spares the rest of the crate's 400 unit tests.
     crates/gw-store/src/search.rs) echo "-p gw-store --lib search::" ;;
+    crates/gw-store/src/templates.rs) echo "-p gw-store --lib templates::" ;;
     crates/gw-store/*) echo "-p gw-store --lib" ;;
     crates/gw-auth/*) echo "-p gw-auth --lib" ;;
     crates/gw-core/*) echo "-p gw-core --lib" ;;
@@ -2187,6 +2239,7 @@ probe_for() {
     crates/gw-api/src/routes/tasks.rs) echo "-p gw-api --test tasks" ;;
     # The trash endpoints, including the purge gate. One integration binary covers all
     # four, so the probe is exact rather than a whole-crate build of seven binaries.
+    crates/gw-api/src/routes/templates.rs) echo "-p gw-api --test templates" ;;
     crates/gw-api/src/routes/trash.rs) echo "-p gw-api --test trash" ;;
     # The attachment endpoints, including the download authorisation and everything a
     # download tells the browser. One integration binary covers all four routes.

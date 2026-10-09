@@ -4488,6 +4488,72 @@ await check('T6 a passage comment made from a selection is anchored, and once th
   assert((await kept.locator('blockquote.quote').innerText()).includes(PASSAGE), 'the orphaned comment lost its quote');
 });
 
+// ---------------------------------------------------------------------------------------
+// Group V — templates: the create form, the picker, and what a new page starts as
+// ---------------------------------------------------------------------------------------
+//
+// ADR 0028. /vorlagen/besprechung (behaviour-extra) holds `{{titel}}` and `{{datum}}`; this
+// identity READS /vorlagen and WRITES /rundgang. V1 is the keyboard path with a script, V2 is
+// the same form with JavaScript switched off, V3 is a parent this identity may not write.
+
+async function createFrom(page, titel) {
+  await page.goto(BASE + '/neu?unter=%2Frundgang', { waitUntil: 'networkidle' });
+  await page.getByRole('textbox', { name: 'Titel' }).focus();
+  await page.keyboard.type(titel);
+  await page.keyboard.press('Tab');
+  await page.keyboard.press('Tab');
+  const focused = await page.evaluate(() => document.activeElement?.getAttribute('name'));
+  assert(focused === 'vorlage', `Tab did not reach the template picker (focus is on ${focused})`);
+  await page.getByRole('combobox', { name: 'Vorlage' }).selectOption('/vorlagen/besprechung');
+  await page.getByRole('textbox', { name: 'Titel' }).focus();
+  await page.keyboard.press('Enter');
+}
+
+async function assertFilled(page, path, titel) {
+  const html = await (await page.request.get(BASE + path)).text();
+  const article = html.match(/<article[^>]*class="prose[\s\S]*?<\/article>/)?.[0] ?? '';
+  assert(article.includes(`Protokoll: ${titel}`), `the title was not filled into the copy: ${article.slice(0, 300)}`);
+  assert(/Stand: \d{2}\.\d{2}\.\d{4}/.test(article), 'the date was not filled in as TT.MM.JJJJ');
+  assert(!article.includes('{{'), 'a placeholder survived into the new page');
+}
+
+await check('V1 the create form works from the keyboard and the new page is a filled copy of the template', async (page) => {
+  await createFrom(page, 'Montagsrunde');
+  await page.waitForURL((url) => url.pathname === '/rundgang/montagsrunde', { timeout: 10_000 });
+  await assertFilled(page, '/rundgang/montagsrunde', 'Montagsrunde');
+  // A copy, not a link: the template still holds its placeholders.
+  const tpl = await (await page.request.get(BASE + '/api/documents/vorlagen/besprechung')).text();
+  assert(tpl.includes('{{titel}}'), 'creating a page changed the template');
+});
+
+await check('V2 the create form works with JavaScript switched off', async () => {
+  const ctx = await browser.newContext({ javaScriptEnabled: false });
+  try {
+    const page = await ctx.newPage();
+    await page.goto(BASE + '/neu?unter=%2Frundgang');
+    await page.getByRole('textbox', { name: 'Titel' }).fill('Ohne Skript');
+    await page.getByRole('combobox', { name: 'Vorlage' }).selectOption('/vorlagen/besprechung');
+    await Promise.all([
+      page.waitForURL((url) => url.pathname === '/rundgang/ohne-skript', { timeout: 10_000 }),
+      page.getByRole('button', { name: 'Seite anlegen' }).click()
+    ]);
+    await assertFilled(page, '/rundgang/ohne-skript', 'Ohne Skript');
+  } finally {
+    await ctx.close();
+  }
+});
+
+await check('V3 a parent this identity may only read refuses, in words, and creates nothing', async (page) => {
+  await page.goto(BASE + '/neu?unter=%2Fvorlagen', { waitUntil: 'networkidle' });
+  await page.getByRole('textbox', { name: 'Titel' }).fill('Nicht erlaubt');
+  await page.keyboard.press('Enter');
+  const alert = page.locator('#neu-fehler');
+  await alert.waitFor({ state: 'visible', timeout: 10_000 });
+  assert((await alert.innerText()).includes('/vorlagen'), 'the refusal does not name the parent');
+  const made = await page.request.get(BASE + '/vorlagen/nicht-erlaubt', { maxRedirects: 0 });
+  assert(made.status() === 404, `a page appeared under a read-only parent (${made.status()})`);
+});
+
 await browser.close();
 
 // ---------------------------------------------------------------------------------------
