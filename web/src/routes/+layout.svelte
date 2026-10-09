@@ -302,6 +302,7 @@
            one in a tab of its own is the strip's »Neuer Reiter« and then this link. -->
       <nav class="brand-group" aria-label="Hauptbereiche">
         <a class="brand" href={gehZu('/')}>great&#8209;wiki</a>
+        <a class="section" href={gehZu('/neu')}>Neue Seite</a>
         <a class="section" href={gehZu('/aufgaben')}>Aufgaben</a>
         <a class="section" href={gehZu('/projekte')}>Projekte</a>
         <!-- Themen belongs here for the reason Projekte does, only more so. D-4 kept topics
