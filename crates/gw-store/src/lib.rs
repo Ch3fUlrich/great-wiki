@@ -12,6 +12,7 @@ pub mod moves;
 pub mod principals;
 pub mod reclaim;
 pub mod revisions;
+pub mod search;
 pub mod sessions;
 pub mod tasks;
 pub mod topics;
@@ -38,6 +39,7 @@ pub use principals::{
 };
 pub use reclaim::{Reclaim, ReclaimReport};
 pub use revisions::{Author, Revision, IMPORT_AUTHOR_ID, IMPORT_AUTHOR_NAME};
+pub use search::{PageHit, SearchResults, Segment, TaskHit, TopicHit, MAX_QUERY_CHARS};
 pub use sessions::SESSION_TTL_SECONDS;
 pub use tasks::{NewTask, Project, Task, TaskHome, TaskOutcome, TaskPage, TaskStatus, TaskUpdate};
 pub use topics::{
@@ -102,6 +104,9 @@ impl Store {
         // rules that can disagree about whether two addresses are one person. Idempotent
         // and bounded by the number of accounts, so it is cheap to run at every start.
         store.backfill_email_keys().await?;
+        // 0016 adds `body_text` NULL to rows that already exist; fill it and index them.
+        // See `search.rs`.
+        store.backfill_search_text().await?;
         Ok(store)
     }
 

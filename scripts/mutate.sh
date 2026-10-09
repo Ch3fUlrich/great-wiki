@@ -1249,6 +1249,70 @@ mutation crates/gw-store/migrations/0015_forwards.sql killed \
   '/forwards_end_when_a_page_arrives_update/,/^END;$/ s/    DELETE FROM forwards WHERE old_path = NEW.path;/    SELECT 1;/' \
   'move: moving a page back to an address ends the forward from it'
 
+# --- search: a retriever, so the filter is in it and not after it (ADR 0024) -------------
+#
+# The index returns candidates with no notion of who is asking; `search_for` is the only way
+# one becomes a hit, and each link of that chain is broken here. The fixtures hold a page and
+# a topic and a task that exist only behind a grant (`/geheim`), a caller with no grant
+# (`fremde`) and one who administers it (`chefin`), so every bypass below has somebody who
+# must still be refused and somebody who must still be served.
+#
+# The first is "the filter is simply not there": the candidate is read straight out of
+# `documents`. The second and third are the shapes it more often takes — the accessor is
+# asked, but as an administrator (the same forward `move:` mutates), or asked as the caller
+# with a baseline resolved for somebody else, which "reads like an optimisation".
+mutation crates/gw-store/src/search.rs killed \
+  '/async fn readable_candidate/,/^    }$/ s@        self.document_for_id_with_baseline(principal, document_id, Action::Read, baseline)@        async { sqlx::query_as::<_, StoredDocument>("SELECT id, path, parent_path, slug, doc_type, title, language, visibility, body, sort_key FROM documents WHERE id = ?1").bind(document_id).fetch_optional(\&self.pool).await.map_err(anyhow::Error::from) }@' \
+  'search: a candidate becomes a hit only by going through the permission-checked accessor'
+mutation crates/gw-store/src/search.rs killed \
+  '/async fn readable_candidate/,/^    }$/ s@        self.document_for_id_with_baseline(principal, document_id, Action::Read, baseline)@        self.document_for_id_with_baseline(\&Principal::test("x", \&["admins"], \&[]), document_id, Action::Read, Baseline::Admin)@' \
+  'search: the accessor is asked as the caller, not as an administrator'
+mutation crates/gw-store/src/search.rs killed \
+  '/pub async fn search_for/,/^    }$/ s@        let baseline = self.baseline_for(principal).await?;@        let baseline = self.baseline_for(\&Principal::test("x", \&["admins"], \&[])).await?;@' \
+  'search: the baseline hoisted out of the loop is the caller own'
+# The excerpt is content. The index copy is a ranking artefact: a drifted or poisoned index
+# must not be able to put words on the screen that the page no longer holds.
+mutation crates/gw-store/src/search.rs killed \
+  's@            let text = gw_core::body_plain_text(\&document.body);@            let text = candidate.snippet.clone();@' \
+  'search: the snippet is cut from the accessor document, never from the index row'
+# `deleted_at` is read live because the index holds no state. Dropped, the accessor would
+# still refuse a trashed page, so the visible answer is unchanged; the test that catches it is
+# the one that asks the index for its candidates directly, which is what ADR 0024 decision 2
+# promises (a trashed page is never a candidate, so it cannot use up the candidate cap).
+mutation crates/gw-store/src/search.rs killed \
+  's@MATCH ?1 AND d.deleted_at IS NULL@MATCH ?1@' \
+  'search: a page in the trash is dropped by the index query itself'
+mutation crates/gw-store/src/search.rs killed \
+  's@            .topics_for(principal)@            .topics_for(\&Principal::test("x", \&["admins"], \&[]))@' \
+  'search: topics are those the caller may see, whose name is the disclosure'
+mutation crates/gw-store/src/search.rs killed \
+  's@            .board_for(principal, None)@            .board_for(\&Principal::test("x", \&["admins"], \&[]), None)@' \
+  'search: tasks are those on boards the caller may read'
+mutation crates/gw-store/src/search.rs killed \
+  's@format!("\\"{w}\\"\*")@format!("{w}*")@; s@format!("\\"{w}\\"")@format!("{w}")@' \
+  'search: MATCH receives quoted words only, never what was typed'
+# The answer is cut to `limit` AFTER ranking, from visible hits only; and the order is the
+# caller's own score, because bm25 would carry how common a word is across pages the caller
+# may not read (ADR 0024, decision 5).
+mutation crates/gw-store/src/search.rs killed \
+  's@        visible.truncate(limit);@        visible.truncate(usize::MAX);@' \
+  'search: the answer is cut to the limit of VISIBLE hits'
+mutation crates/gw-store/src/search.rs killed \
+  's@        visible.sort_by(|a, b| b.0.cmp(\&a.0).then_with(|| a.1.path.cmp(\&b.1.path)));@        visible.sort_by(|_, _| std::cmp::Ordering::Equal);@' \
+  'search: visible hits are ranked by their own score, not by the index order'
+mutation crates/gw-store/src/search.rs killed \
+  's@        let limit = limit.min(MAX_LIMIT);@        let limit = limit;@' \
+  'search: no caller can ask for more than the maximum number of hits'
+mutation crates/gw-store/src/search.rs killed \
+  '/pub async fn search_for/,/^    }$/ s@        let baseline = self.baseline_for(principal).await?;@        let baseline = Baseline::Internal;@' \
+  'search: the baseline is the callers own, not a constant that lets internal pages through'
+mutation crates/gw-store/src/search.rs killed \
+  '/^fn text_matches/,/^}$/ s@        .all(|t| words.iter()@        .any(|t| words.iter()@' \
+  'search: every word of the query must match a topic or task title, not just one'
+mutation crates/gw-api/src/routes/search.rs killed \
+  's@        .search_for(\&principal, @        .search_for(\&gw_auth::Principal::test("x", \&["admins"], \&[]), @' \
+  'search: the endpoint searches as the caller it authenticated'
+
 # --- attachments: the one path that returns BYTES rather than a title -------------------
 #
 # Every other disclosure in this system reveals that a page exists or what it is called. This
@@ -1996,6 +2060,9 @@ note_drift() {
 # SOURCE file, which no amount of artefact separation separates.
 probe_for() {
   case "$1" in
+    # Before the generic store entry: every search mutation is caught by the search module's
+    # own tests, and the filter spares the rest of the crate's 400 unit tests.
+    crates/gw-store/src/search.rs) echo "-p gw-store --lib search::" ;;
     crates/gw-store/*) echo "-p gw-store --lib" ;;
     crates/gw-auth/*) echo "-p gw-auth --lib" ;;
     crates/gw-core/*) echo "-p gw-core --lib" ;;
@@ -2034,6 +2101,8 @@ probe_for() {
     # asserts a status code, so without it every ADR 0022 mutation would fall through to a
     # whole-workspace build.
     crates/gw-api/src/routes/docs.rs) echo "-p gw-api --test references --test embeds --test withheld" ;;
+    # Search: the policy is in the store's own tests; the endpoint is one binary.
+    crates/gw-api/src/routes/search.rs) echo "-p gw-api --test search" ;;
     *) echo "" ;;
   esac
 }

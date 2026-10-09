@@ -11,7 +11,7 @@ pub mod frontmatter;
 pub mod markdown;
 pub mod slug;
 
-pub use block::{Block, BlockKind, Heading, Mark, MarkKind, MARK_ORDER};
+pub use block::{body_plain_text, Block, BlockKind, Heading, Mark, MarkKind, MARK_ORDER};
 pub use diff::{
     diff_design, diff_prose, diff_structure, ChangeKind, DesignChange, ProseChange, StructureChange,
 };

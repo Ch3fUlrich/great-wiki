@@ -11,6 +11,7 @@ const PAGES = [
   ['home', '/'],
   ['doc', '/rundgang/was-schon-geht'],
   ['table', '/rundgang/tabellen-was-heute-passiert'],
+  ['suche', '/suche?q=Beweis'],
 ];
 const VIEWPORTS = [
   ['desktop', { width: 1440, height: 1000 }],

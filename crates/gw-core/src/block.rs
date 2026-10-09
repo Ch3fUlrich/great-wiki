@@ -619,9 +619,27 @@ fn push_collapsed(prose: &mut String, out: &mut Vec<String>) {
     }
 }
 
+/// The plain text of a stored body — the JSON a `documents.body` or `revisions.body` column
+/// holds — for the full-text index (ADR 0024).
+///
+/// **The one flattener.** The search index must read a page exactly as the reader's outline,
+/// the seeder and the diff do, which is [`Block::plain_text`]; a second walk over the tree
+/// written for search would be a second opinion about where one word ends and the next
+/// begins. This function only adds the step from a column to a tree.
+///
+/// **A body that does not parse is empty text, never an error.** Writing a revision must not
+/// fail because its index text could not be made: the body is the source of truth and the
+/// index is derived from it (ADR 0003). A page whose body cannot be read is merely not found
+/// by its words — its title still is.
+pub fn body_plain_text(body_json: &str) -> String {
+    serde_json::from_str::<Block>(body_json)
+        .map(|b| b.plain_text())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::block::{Block, BlockKind, Mark};
+    use crate::block::{body_plain_text, Block, BlockKind, Mark};
 
     fn sample() -> Block {
         serde_json::from_str(
@@ -1046,5 +1064,25 @@ mod tests {
             None,
             "an href must never be read as a document id"
         );
+    }
+
+    #[test]
+    fn a_stored_body_flattens_exactly_as_the_tree_does() {
+        let json = serde_json::to_string(&sample()).unwrap();
+        assert_eq!(body_plain_text(&json), sample().plain_text());
+    }
+
+    #[test]
+    fn a_body_that_does_not_parse_is_empty_text_rather_than_an_error() {
+        for bad in [
+            "",
+            "not json",
+            "{\"kind\":",
+            "[]",
+            "null",
+            "{\"kind\":\"nope\"}",
+        ] {
+            assert_eq!(body_plain_text(bad), "", "for {bad:?}");
+        }
     }
 }

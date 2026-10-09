@@ -61,6 +61,7 @@
   } from '$lib/topics';
   import { dropHref } from '$lib/moves';
   import { TRASH_PATH } from '$lib/trash';
+  import { SEARCH_PARAM, SEARCH_PATH, isTypingTarget } from '$lib/search';
 
   let { children, data } = $props();
 
@@ -141,6 +142,19 @@
    */
   function gehZuMit(target: string, wunsch: SidebarMode): string {
     return navigateHref(withSidebar(target, wunsch), hrefs, strip.active);
+  }
+
+  /** The header's search box, so `/` can focus it. */
+  let suchfeld = $state<HTMLInputElement | null>(null);
+
+  /** `/` focuses the search box — but never steals the key from something being typed in. */
+  function taste(event: KeyboardEvent) {
+    if (event.key !== '/' || event.ctrlKey || event.metaKey || event.altKey) return;
+    if (event.defaultPrevented || isTypingTarget(event.target)) return;
+    if (!suchfeld) return;
+    event.preventDefault();
+    suchfeld.focus();
+    suchfeld.select();
   }
 
   /** `localStorage` can throw on the property itself, not only on its methods. */
@@ -239,6 +253,8 @@
   <link rel="icon" href={favicon} />
 </svelte:head>
 
+<svelte:window onkeydown={taste} />
+
 {#if rahmen}
   <!-- The diagram frame (D-26) is a document, not a view: it is loaded into a hidden
        `<iframe>` by `$lib/blocks/mermaid`, it has no content, and nobody navigates to it.
@@ -303,6 +319,20 @@
         <a class="section" href={gehZu(TRASH_PATH)}>Papierkorb</a>
         <a class="section" href={gehZu('/graph')}>Graph</a>
       </nav>
+      <!-- A plain GET form: it works with no script at all, and the results are a page of
+           their own at an address that can be sent. `/` focuses it when a script is running. -->
+      <form class="suche" method="GET" action={SEARCH_PATH} role="search">
+        <input
+          bind:this={suchfeld}
+          type="search"
+          name={SEARCH_PARAM}
+          aria-label="Suche"
+          placeholder="Suchen ( / )"
+          autocomplete="off"
+          maxlength="200"
+        />
+        <button type="submit">Suchen</button>
+      </form>
       <!-- Two reading preferences, side by side, because they are the same kind of thing.
            They wrap under the brand on a narrow screen rather than squeezing it. -->
       <div class="prefs">
@@ -450,6 +480,43 @@
        --space-4 between them opens a gap wide enough to look like a divider. */
     gap: var(--space-1) var(--space-4);
     min-inline-size: 0;
+  }
+
+  .suche {
+    display: flex;
+    gap: var(--space-1);
+    flex: 1 1 12rem;
+    max-inline-size: 22rem;
+    min-inline-size: 0;
+  }
+
+  .suche input {
+    flex: 1 1 auto;
+    min-inline-size: 0;
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg);
+    color: var(--ink);
+    font: inherit;
+    font-size: var(--text-sm);
+  }
+
+  .suche button {
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-sunken);
+    color: var(--ink);
+    font: inherit;
+    font-size: var(--text-sm);
+    cursor: pointer;
+  }
+
+  .suche input:focus-visible,
+  .suche button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
 
   .brand {
