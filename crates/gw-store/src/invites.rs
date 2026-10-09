@@ -20,6 +20,7 @@
 //! principal that does not exist. Either everything committed, or the link is still live.
 
 use crate::acl::{permission_column, subject_columns};
+use crate::events::EventKind;
 use crate::principals::insert_local_principal;
 use crate::{Baseline, Store};
 use anyhow::Result;
@@ -681,6 +682,14 @@ impl Store {
         .await?;
 
         tx.commit().await?;
+
+        // After the commit, so the new grant is among what "who administers this" reads.
+        // Only a path-bearing invite concerns a path's administrators; one that merely
+        // adds a team member has no path to tell anyone about.
+        if let Some(path) = &path {
+            self.emit_admin_event(EventKind::InviteAccepted, &principal_id, path, None)
+                .await;
+        }
 
         self.principal_by_id(&principal_id)
             .await?
@@ -1356,5 +1365,71 @@ mod tests {
         assert_eq!(principal.id, oma.id);
         assert_eq!(principal.username, "oma");
         assert_eq!(principal.oidc_username.as_deref(), Some("erika.mueller"));
+    }
+
+    #[tokio::test]
+    async fn an_accepted_invite_reaches_the_path_admin_and_not_a_plain_reader() {
+        use crate::{Author, NewDocument};
+        use gw_core::{Block, BlockKind, DocumentType, Visibility};
+        let store = store().await;
+        let doc = store
+            .create_document(
+                Author::Import,
+                &NewDocument {
+                    parent_path: None,
+                    doc_type: DocumentType::Page,
+                    title: "Raum".into(),
+                    slug: None,
+                    language: "de".into(),
+                    visibility: Visibility::Restricted,
+                    body: Block {
+                        kind: BlockKind::Doc,
+                        attrs: Default::default(),
+                        content: Vec::new(),
+                        text: None,
+                        marks: Vec::new(),
+                    },
+                    sort_key: 0,
+                    topics: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let path = store.document_path_unchecked(&doc).await.unwrap().unwrap();
+        let boss = store
+            .create_local_principal("boss", "boss", None, "h")
+            .await
+            .unwrap();
+        let leser = store
+            .create_local_principal("leser", "leser", None, "h")
+            .await
+            .unwrap();
+        for (who, p) in [(&boss, Permission::Admin), (&leser, Permission::Read)] {
+            store
+                .add_grant(&path, Subject::Principal(who.id.clone()), p)
+                .await
+                .unwrap();
+        }
+        let mut invite = to_raum("oma");
+        invite.path = Some(path.as_str());
+        created(&store, "digest", invite).await;
+        let AcceptOutcome::Accepted(oma) = store
+            .accept_invite_audited("digest", "Oma", "hash", "sitzung", 3600)
+            .await
+            .unwrap()
+        else {
+            panic!("expected acceptance");
+        };
+        let list = store.notifications_for(&boss, 10).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].kind, crate::events::EventKind::InviteAccepted);
+        assert_eq!(list[0].actor_name.as_deref(), Some("Oma"));
+        assert!(store
+            .notifications_for(&leser, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store.notifications_for(&oma, 10).await.unwrap().is_empty());
     }
 }

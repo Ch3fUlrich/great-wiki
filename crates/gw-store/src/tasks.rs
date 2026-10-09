@@ -81,6 +81,7 @@
 //! the blocks were read out of.
 
 use crate::acl::Baseline;
+use crate::events::{EventKind, NewEvent};
 use crate::revisions::byline;
 use crate::{DocumentAccess, Store, StoredDocument};
 use anyhow::{bail, Result};
@@ -702,6 +703,7 @@ impl Store {
         let Some(row) = self.task_row_unchecked(&id).await? else {
             bail!("task {id} vanished immediately after being inserted");
         };
+        self.emit_task_assigned(principal, &row).await;
         // The page named on the card is the document that just authorised the write, not a
         // second lookup by the `doc_id` two lines above.
         let page = page_of(&new.home, &governing.document);
@@ -725,6 +727,78 @@ impl Store {
             governing.may_write,
             name,
         )?)))
+    }
+
+    /// Tell the assignee, if there is one and it is not the person who just assigned them.
+    ///
+    /// A candidate only (ADR 0025): the assignment gate already required Read on the
+    /// governing page, and delivery asks again. `doc_id` is the governing page — the anchor,
+    /// or a standalone card's project home — so delivery has a page to check the reader
+    /// against. Never fails the caller.
+    async fn emit_task_assigned(&self, actor: &Principal, row: &TaskRow) {
+        let Some(assignee) = &row.assignee else {
+            return;
+        };
+        let doc_id: Option<String> = match &row.doc_id {
+            Some(d) => Some(d.clone()),
+            None => sqlx::query_scalar("SELECT home_doc FROM projects WHERE id = ?1")
+                .bind(&row.project_id)
+                .fetch_optional(&self.pool)
+                .await
+                .unwrap_or(None),
+        };
+        self.emit_logged(&NewEvent {
+            kind: EventKind::TaskAssigned,
+            recipient: assignee.clone(),
+            actor: Some(actor.id.clone()),
+            doc_id,
+            path: None,
+            subject: Some(row.id.clone()),
+            dedupe_key: Some(format!("task-assigned:{}:{assignee}", row.id)),
+        })
+        .await;
+    }
+
+    /// The sweep a background tick calls: tell each assignee of a task falling due within
+    /// `window_hours` of `now`. Returns how many candidates it recorded.
+    ///
+    /// `now` is any timestamp SQLite's `datetime()` reads (`2026-10-08 06:00:00`, or
+    /// RFC 3339), passed in so the caller owns the clock and tests need not wait. A task's
+    /// `due_at` is often a bare date, so the window opens at the start of `now`'s day: a
+    /// task due today is due, not already missed. Done and detached cards are skipped.
+    ///
+    /// Idempotent: the key is `(task, due_at)`, so running the sweep every hour coalesces
+    /// into one row per task and date, while moving the due date makes it a new event.
+    /// "Your tasks" means the **assignee only** — a task has no creator column. Like every
+    /// producer this records candidates; delivery decides who may see it.
+    pub async fn emit_tasks_due(&self, now: &str, window_hours: i64) -> Result<usize> {
+        let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT t.id, t.assignee, t.due_at, COALESCE(t.doc_id, p.home_doc) \
+             FROM tasks t LEFT JOIN projects p ON p.id = t.project_id \
+             WHERE t.assignee IS NOT NULL AND t.due_at IS NOT NULL \
+               AND t.status <> 'Fertig' AND t.detached = 0 \
+               AND datetime(t.due_at) >= datetime(?1, 'start of day') \
+               AND datetime(t.due_at) <= datetime(?1, ?2)",
+        )
+        .bind(now)
+        .bind(format!("+{window_hours} hours"))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut emitted = 0;
+        for (id, assignee, due_at, doc_id) in rows {
+            self.emit_event(&NewEvent {
+                kind: EventKind::TaskDue,
+                recipient: assignee,
+                actor: None,
+                doc_id,
+                path: None,
+                subject: Some(id.clone()),
+                dedupe_key: Some(format!("task-due:{id}:{due_at}")),
+            })
+            .await?;
+            emitted += 1;
+        }
+        Ok(emitted)
     }
 
     /// One task, if the caller may Read its governing page.
@@ -785,6 +859,7 @@ impl Store {
             return Ok(TaskOutcome::Refused);
         };
         let home = home_of(&row)?;
+        let previous_assignee = row.assignee.clone();
         let baseline = self.baseline_for(principal).await?;
         let Some(governing) = self
             .governing_document(principal, &home, Action::Write, baseline)
@@ -876,6 +951,11 @@ impl Store {
         let Some(row) = self.task_row_unchecked(task_id).await? else {
             bail!("task {task_id} vanished immediately after being updated");
         };
+        // Only a CHANGE of assignee tells anyone: saving a card that already rests on
+        // someone (a new title, a drag to another column) must not re-announce it.
+        if row.assignee != previous_assignee {
+            self.emit_task_assigned(principal, &row).await;
+        }
         // Asked of the row as it now stands, not of `effective_assignee`. A change that
         // says nothing about the assignee leaves a name on the card that the gate above
         // never looked at — and that person may have lost their read since it was written.
@@ -4350,5 +4430,130 @@ mod tests {
             .expect("the card is not on its own board");
         assert_eq!(listed.page, None);
         assert!(listed.may_write, "the board dropped the bit the create set");
+    }
+
+    // --- bus producers (ADR 0025) -------------------------------------------------------
+
+    #[tokio::test]
+    async fn assigning_somebody_else_tells_them_and_assigning_yourself_does_not() {
+        let s = store().await;
+        let doc = page(&s, None, "Raum", Visibility::Restricted).await;
+        let path = s.document_path_unchecked(&doc).await.unwrap().unwrap();
+        let (anna, bert) = (account(&s, "anna").await, account(&s, "bert").await);
+        grant(&s, &path, &anna, Permission::Write).await;
+        grant(&s, &path, &bert, Permission::Read).await;
+        let new = |assignee: &Principal| NewTask {
+            home: anchored(&doc),
+            title: "Aufgabe".into(),
+            status: TaskStatus::Offen,
+            assignee: Some(assignee.id.clone()),
+            due_at: None,
+            position: 0,
+        };
+        assert!(matches!(
+            s.create_task(&anna, &new(&anna)).await.unwrap(),
+            TaskOutcome::Done(_)
+        ));
+        assert_eq!(s.unread_count_for(&anna).await.unwrap(), 0);
+        assert!(matches!(
+            s.create_task(&anna, &new(&bert)).await.unwrap(),
+            TaskOutcome::Done(_)
+        ));
+        let list = s.notifications_for(&bert, 10).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].kind, EventKind::TaskAssigned);
+        assert_eq!(list[0].page.path, path);
+    }
+
+    #[tokio::test]
+    async fn re_assigning_through_update_tells_the_new_assignee_once() {
+        let s = store().await;
+        let doc = page(&s, None, "Raum", Visibility::Restricted).await;
+        let path = s.document_path_unchecked(&doc).await.unwrap().unwrap();
+        let (anna, bert) = (account(&s, "anna").await, account(&s, "bert").await);
+        grant(&s, &path, &anna, Permission::Write).await;
+        grant(&s, &path, &bert, Permission::Read).await;
+        let TaskOutcome::Done(task) = s
+            .create_task(
+                &anna,
+                &NewTask {
+                    home: anchored(&doc),
+                    title: "Aufgabe".into(),
+                    status: TaskStatus::Offen,
+                    assignee: None,
+                    due_at: None,
+                    position: 0,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("create refused");
+        };
+        for _ in 0..2 {
+            s.update_task(
+                &anna,
+                &task.id,
+                &TaskUpdate {
+                    assignee: Some(Some(bert.id.clone())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(s.notifications_for(&bert, 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_due_sweep_is_idempotent_and_keeps_to_its_window() {
+        let s = store().await;
+        let doc = page(&s, None, "Raum", Visibility::Restricted).await;
+        let path = s.document_path_unchecked(&doc).await.unwrap().unwrap();
+        let (anna, bert) = (account(&s, "anna").await, account(&s, "bert").await);
+        grant(&s, &path, &anna, Permission::Write).await;
+        grant(&s, &path, &bert, Permission::Read).await;
+        for (title, due) in [
+            ("bald", "2026-10-09"),
+            ("heute", "2026-10-08"),
+            ("spaeter", "2026-12-01"),
+            ("vorbei", "2026-10-01"),
+        ] {
+            s.create_task(
+                &anna,
+                &NewTask {
+                    home: anchored(&doc),
+                    title: title.into(),
+                    status: TaskStatus::Offen,
+                    assignee: Some(bert.id.clone()),
+                    due_at: Some(due.into()),
+                    position: 0,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            s.emit_tasks_due("2026-10-08 12:00:00", 48).await.unwrap(),
+            2
+        );
+        assert_eq!(
+            s.emit_tasks_due("2026-10-08 13:00:00", 48).await.unwrap(),
+            2
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE kind = 'task_due'")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 2);
+        let kinds: Vec<_> = s
+            .notifications_for(&bert, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|n| n.kind)
+            .filter(|k| *k == EventKind::TaskDue)
+            .collect();
+        assert_eq!(kinds, vec![EventKind::TaskDue; 2]);
     }
 }

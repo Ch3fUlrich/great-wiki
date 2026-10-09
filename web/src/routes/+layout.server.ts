@@ -5,6 +5,7 @@ import {
   type TopicSummary,
   type TopicsResponse
 } from '$lib/topics';
+import { unreadCount } from '$lib/notificationsApi';
 import type { LayoutServerLoad } from './$types';
 
 /**
@@ -57,10 +58,25 @@ export const load: LayoutServerLoad = async ({ fetch, request }) => {
       .then((answer) =>
         answer.data
           ? { themen: answer.data.topics ?? [], themenFehler: null }
-          : { themen: [] as TopicSummary[], themenFehler: describeTopics(answer.status) }
+          : {
+              themen: [] as TopicSummary[],
+              themenFehler: describeTopics(answer.status)
+            }
       )
-      .catch(() => ({ themen: [] as TopicSummary[], themenFehler: describeTopics(0) }))
+      .catch(() => ({
+        themen: [] as TopicSummary[],
+        themenFehler: describeTopics(0)
+      }))
   ]);
 
-  return { me, tree, ...topics };
+  // Only for a signed-in reader, and soft: a failing count renders no badge and nothing else.
+  const ungelesen: number | null = me.authenticated
+    ? await unreadCount(fetch, cookie)
+        .then((answer) => answer.data?.count ?? null)
+        .catch(() => null)
+    : null;
+
+  // Absent rather than `null` when unknown, so pages and tests that build layout data by
+  // hand need not know about it.
+  return { me, tree, ...(ungelesen === null ? {} : { ungelesen }), ...topics };
 };

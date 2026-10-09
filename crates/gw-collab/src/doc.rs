@@ -158,6 +158,11 @@ impl CollabDoc {
         paragraph.push_back(&mut txn, XmlTextPrelim::new(text));
     }
 
+    /// The underlying `yrs` document, for sibling modules that build on it.
+    pub(crate) fn inner(&self) -> &Doc {
+        &self.doc
+    }
+
     /// This replica's client id, as Yjs uses it to break ties between concurrent inserts.
     pub fn client_id(&self) -> u64 {
         self.doc.client_id().get()

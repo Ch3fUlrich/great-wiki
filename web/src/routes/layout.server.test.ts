@@ -38,7 +38,12 @@ function spyFetch(byPath: Record<string, { status: number; body?: unknown }>) {
 
 const topics: TopicSummary[] = [
   { path: '/format', name: 'Format', display_path: 'Format', documents: 1 },
-  { path: '/rundgang', name: 'Rundgang', display_path: 'Rundgang', documents: 3 }
+  {
+    path: '/rundgang',
+    name: 'Rundgang',
+    display_path: 'Rundgang',
+    documents: 3
+  }
 ];
 
 const ok = {
@@ -63,7 +68,9 @@ async function run(fetchFn: typeof fetch): Promise<Loaded> {
 function event(fetchFn: typeof fetch): any {
   return {
     fetch: fetchFn,
-    request: new Request('http://wiki.test/rundgang', { headers: { cookie: 'gw_session=abc' } })
+    request: new Request('http://wiki.test/rundgang', {
+      headers: { cookie: 'gw_session=abc' }
+    })
   };
 }
 
@@ -90,7 +97,9 @@ describe('the one topic query', () => {
     const call = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls.find((args) =>
       String(args[0]).includes('/api/topics')
     );
-    expect((call?.[1] as RequestInit).headers).toMatchObject({ cookie: 'gw_session=abc' });
+    expect((call?.[1] as RequestInit).headers).toMatchObject({
+      cookie: 'gw_session=abc'
+    });
   });
 });
 
@@ -114,7 +123,10 @@ describe('when the topics cannot be fetched', () => {
   it('says so when the request got no answer at all', async () => {
     const fetchFn = vi.fn(async (url: string | URL) => {
       if (String(url).includes('/api/topics')) throw new TypeError('fetch failed');
-      return new Response('null', { status: 200, headers: { 'content-type': 'application/json' } });
+      return new Response('null', {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      });
     }) as unknown as typeof fetch;
     const data = await run(fetchFn);
     expect(data.themenFehler).toContain('antwortet nicht');

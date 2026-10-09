@@ -74,6 +74,7 @@ tower-http = { version = "0.6", features = ["trace", "limit"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = "2.5"
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls", "ring", "webpki-roots", "tokio1"] }
 
 [dev-dependencies]
 # A stand-in identity provider for the login tests: a real RSA key, generated per test

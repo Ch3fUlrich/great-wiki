@@ -1028,6 +1028,7 @@ async fn persist(state: &AppState, room: &Room, writer_id: &str) {
     {
         Ok(true) => {
             let bytes = encoded.len();
+            orphan_lost_anchors(state, document_id, room.doc()).await;
             state.collab.saved(document_id, encoded);
             tracing::debug!(
                 document_id,
@@ -1041,6 +1042,21 @@ async fn persist(state: &AppState, room: &Room, writer_id: &str) {
             "cannot save: the last editor may no longer write this page"
         ),
         Err(error) => tracing::error!(%error, document_id, "cannot save a collaboration room"),
+    }
+}
+
+/// After a save, flag comments whose anchored passage the edits have deleted. A failure is
+/// logged and never fails the save: the state is already stored, and the next save retries.
+async fn orphan_lost_anchors(state: &AppState, document_id: &str, doc: &gw_collab::CollabDoc) {
+    let survives = |start: &[u8], end: &[u8]| gw_collab::anchor::passage_survives(doc, start, end);
+    match state
+        .store
+        .orphan_lost_anchors(document_id, &survives)
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(document_id, n, "comment anchors lost their passage"),
+        Err(error) => tracing::warn!(%error, document_id, "cannot orphan lost comment anchors"),
     }
 }
 

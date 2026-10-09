@@ -167,6 +167,12 @@ behaviour-fixture:
       --subject group:editors --permission write --actor behaviour-fixture
     cargo run -q -p gw-api -- grant --path /verweisbeispiel/offener-hafen \
       --subject anyone --permission read --actor behaviour-fixture
+    # Group T (comments and notifications): /verweisbeispiel/gespraech is RESTRICTED (no
+    # visibility line), because a public page is readable by anyone whatever its grants say and
+    # so could never be withheld from the guest that T5 strips of access. Admin for the editors
+    # is what lets the harness invite people to it and revoke one of them again.
+    cargo run -q -p gw-api -- grant --path /verweisbeispiel/gespraech \
+      --subject group:editors --permission admin --actor behaviour-fixture
     echo "behaviour fixture ready:"
     echo "  GW_DATABASE_URL=$GW_DATABASE_URL"
     echo "  GW_MEDIA_DIR=$GW_MEDIA_DIR"
