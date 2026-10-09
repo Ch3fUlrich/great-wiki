@@ -165,6 +165,15 @@ impl Store {
                 .filter(|s| !s.is_empty())
                 .unwrap_or(title),
         );
+        // Cap slug at 100 characters to avoid overly long paths
+        let mut slug = slug;
+        if slug.len() > 100 {
+            // Truncate on a char boundary, then trim trailing '-'
+            slug.truncate(100);
+            while !slug.is_empty() && slug.ends_with('-') {
+                slug.pop();
+            }
+        }
         if slug.is_empty() {
             return Ok(CreateOutcome::Blocked(format!(
                 "«{title}» contains nothing an address can be made of"
@@ -571,5 +580,45 @@ mod tests {
             store.create_page_for(&anna, &rq, false, "d").await.unwrap(),
             CreateOutcome::Blocked(m) if m.contains("already")
         ));
+    }
+
+    #[tokio::test]
+    async fn a_slug_is_capulated_at_100_chars() {
+        let (store, anna) = world().await;
+        // Create a slug that would be > 100 chars after slugification
+        let long_title = "a".repeat(200); // 200 chars
+        let rq = req(Some("/raum"), &long_title, None);
+        let outcome = store.create_page_for(&anna, &rq, false, "d").await.unwrap();
+
+        let CreateOutcome::Created { path, .. } = outcome else {
+            panic!("Expected page creation to succeed for title length {} (expected <= 200)", long_title.len());
+        };
+
+        // Check that the slug segment (last part of path) is <= 100 chars
+        let slug_segment = path.split('/').next_back().unwrap();
+        assert!(
+            slug_segment.len() <= 100,
+            "Slug segment is {} chars: {}",
+            slug_segment.len(),
+            slug_segment
+        );
+
+        // The slug should have trailing '-' trimmed
+        assert!(
+            !slug_segment.ends_with('-'),
+            "Slug ends with dash: {}",
+            slug_segment
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slug_of_only_punctuation_is_refused() {
+        let (store, anna) = world().await;
+        let rq = req(Some("/raum"), "!!! ??? ???", None);
+        let outcome = store.create_page_for(&anna, &rq, false, "d").await.unwrap();
+
+        assert!(matches!(outcome, CreateOutcome::Blocked(_)), 
+            "Empty slug should be refused: {outcome:?}"
+        );
     }
 }

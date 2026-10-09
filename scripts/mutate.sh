@@ -2164,6 +2164,12 @@ mutation crates/gw-api/src/routes/templates.rs killed \
   's/Err(ApiError::Forbidden) => false,/Err(ApiError::Forbidden) => true,/' \
   'templates: the API hands the store the real top-level administration verdict'
 
+# Slug is now capped at 100 characters (truncate on char boundary, then trim trailing '-') and
+# a slug of only punctuation is refused, matching the title's rules. The trashed page still holds its address.
+mutation crates/gw-store/src/templates.rs killed \
+  '/pub async fn create_page_for/,/^    }$/ s/if slug.len() > 100 {/if false {/' \
+  'templates: a slug is capped at 100 characters, and the trash still holds its address'
+
 # HOW LONG THIS IS ALLOWED TO TAKE
 # --------------------------------
 # A gate too slow to run stops being run. This one got there: eighteen mutations, a whole
