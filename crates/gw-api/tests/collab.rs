@@ -1479,3 +1479,186 @@ async fn an_edit_sent_after_a_move_out_of_reach_is_refused_and_not_stored() {
         "an update sent after the page left her reach was stored"
     );
 }
+
+// -------------------------------------------------------------------------------------
+// Revocation is pushed, and an update is vetted before it is applied (ADR 0027).
+// -------------------------------------------------------------------------------------
+//
+// The policy below makes the periodic check unreachable (an hour), so the only thing that can
+// end a session or refuse an update here is the access epoch — the push for a socket that is
+// merely listening, the check before applying for one that is writing. `unpushed` switches the
+// push off so that the second can be proven alone: with both on, either hides the other.
+
+fn parked() -> CollabPolicy {
+    CollabPolicy {
+        reauth_interval: Duration::from_secs(3600),
+        idle_grace: Duration::ZERO,
+        ..CollabPolicy::default()
+    }
+}
+
+fn unpushed() -> CollabPolicy {
+    CollabPolicy {
+        push_revocation: false,
+        ..parked()
+    }
+}
+
+/// A listening socket for `autorin` under `policy`, and the state it is served from.
+async fn listening(
+    store: &Arc<Store>,
+    policy: CollabPolicy,
+    path: &str,
+) -> (AppState, Socket, CollabDoc) {
+    let state = under(state_as(store, "autorin").await, policy);
+    let addr = serve(state.clone()).await;
+    let mut ws = connect(&addr, path, None).await.unwrap();
+    let replica = sync(&mut ws).await;
+    (state, ws, replica)
+}
+
+#[tokio::test]
+async fn a_revoked_grant_ends_an_idle_session_at_once() {
+    let store = fixture().await;
+    let (_state, mut ws, _replica) = listening(&store, parked(), "handbuch").await;
+    revoke(&store, "autorin", Permission::Write).await;
+    assert_eq!(close_code(&mut ws).await, CloseCode::Policy);
+}
+
+#[tokio::test]
+async fn a_deactivation_ends_an_idle_session_at_once() {
+    let store = fixture().await;
+    let (_state, mut ws, _replica) = listening(&store, parked(), "handbuch").await;
+    let id = principal(&store, "autorin").await.id;
+    store.set_principal_active(&id, false).await.unwrap();
+    assert_eq!(close_code(&mut ws).await, CloseCode::Policy);
+}
+
+#[tokio::test]
+async fn a_move_out_of_reach_ends_an_idle_session_at_once() {
+    let store = fixture().await;
+    let (_state, mut ws, _replica) = listening(&store, parked(), "handbuch/onboarding").await;
+    move_onboarding_under(&store, "/oeffentlich").await;
+    assert_eq!(close_code(&mut ws).await, CloseCode::Policy);
+}
+
+#[tokio::test]
+async fn trashing_the_page_ends_an_idle_session_at_once() {
+    let store = fixture().await;
+    let (_state, mut ws, _replica) = listening(&store, parked(), "handbuch/onboarding").await;
+    grant(&store, "chef", Permission::Write).await;
+    let chef = principal(&store, "chef").await;
+    store
+        .trash_document(&chef, "/handbuch/onboarding")
+        .await
+        .unwrap();
+    assert_eq!(close_code(&mut ws).await, CloseCode::Policy);
+}
+
+#[tokio::test]
+async fn an_administrator_entering_view_as_ends_the_session_they_already_had_open() {
+    // The socket holds the cookies it was upgraded with, which cannot show the mode: it is
+    // ended because the registry says this person is now viewing as somebody, by identity.
+    let store = fixture().await;
+    grant(&store, "chef", Permission::Write).await;
+    let state = under(state_as(&store, "chef").await, parked());
+    let addr = serve(state.clone()).await;
+    let mut ws = connect(&addr, "handbuch", None).await.unwrap();
+    sync(&mut ws).await;
+
+    view_as_cookie(&state, &store, "autorin").await;
+
+    assert_eq!(close_code(&mut ws).await, CloseCode::Policy);
+}
+
+#[tokio::test]
+async fn a_change_that_does_not_touch_this_editor_leaves_the_session_open() {
+    // The control for the five above: a session that closed on EVERY epoch move would pass
+    // all of them. `leserin` losing her read grant is an access change, and not hers.
+    let store = fixture().await;
+    let (_state, mut ws, replica) = listening(&store, parked(), "handbuch").await;
+    let leserin = principal(&store, "leserin").await.id;
+    store
+        .remove_grant("/handbuch", &Subject::Principal(leserin), Permission::Read)
+        .await
+        .unwrap();
+
+    send_update(&mut ws, &edit(&replica, "unberührt")).await;
+    settle(&mut ws, &replica).await;
+}
+
+/// `autorin` and a second writer, `fremde`, in one room; the first has just lost her grant.
+/// Returns the observer's socket and replica, `autorin`'s socket and replica, and the state.
+async fn two_writers_then_a_revocation(
+    store: &Arc<Store>,
+    policy: CollabPolicy,
+) -> (AppState, Socket, CollabDoc, Socket, CollabDoc) {
+    grant(store, "fremde", Permission::Write).await;
+    let a = under(state_as(store, "autorin").await, policy);
+    let b = AppState {
+        collab: Arc::clone(&a.collab),
+        ..state_as(store, "fremde").await
+    };
+    let (addr_a, addr_b) = (serve(a.clone()).await, serve(b.clone()).await);
+    let mut lapsed = connect(&addr_a, "handbuch", None).await.unwrap();
+    let lapsed_replica = sync(&mut lapsed).await;
+    let mut observer = connect(&addr_b, "handbuch", None).await.unwrap();
+    let observer_replica = sync(&mut observer).await;
+    revoke(store, "autorin", Permission::Write).await;
+    (b, lapsed, lapsed_replica, observer, observer_replica)
+}
+
+#[tokio::test]
+async fn the_check_before_applying_refuses_an_update_the_push_has_not_yet_caught() {
+    // The push is off, the interval is an hour: nothing but the pre-write check can refuse
+    // this update. Deleting that check leaves the update applied and broadcast, and this fails.
+    let store = fixture().await;
+    let (_b, mut lapsed, lapsed_replica, mut observer, observer_replica) =
+        two_writers_then_a_revocation(&store, unpushed()).await;
+
+    send_update(&mut lapsed, &edit(&lapsed_replica, "nach dem Entzug")).await;
+    assert_eq!(close_code(&mut lapsed).await, CloseCode::Policy);
+
+    assert_eq!(
+        settle(&mut observer, &observer_replica).await,
+        0,
+        "an update from a revoked editor was broadcast to the others"
+    );
+    assert!(
+        !observer_replica.to_block().plain_text().contains("Entzug"),
+        "an update from a revoked editor is in the room"
+    );
+}
+
+#[tokio::test]
+async fn a_publish_by_another_writer_does_not_file_a_revoked_editors_update_in_the_history() {
+    // The laundering: she lost the grant, kept typing, and somebody who legitimately holds
+    // `write` pressed publish — which checks only the publisher.
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let store = fixture().await;
+    let (b, mut lapsed, lapsed_replica, mut observer, observer_replica) =
+        two_writers_then_a_revocation(&store, unpushed()).await;
+    send_update(&mut lapsed, &edit(&lapsed_replica, "nach dem Entzug")).await;
+    assert_eq!(close_code(&mut lapsed).await, CloseCode::Policy);
+    settle(&mut observer, &observer_replica).await;
+
+    let response = gw_api::build_router(b)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collab/handbuch")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        !history(&store).await.iter().any(|b| b.contains("Entzug")),
+        "a revoked editor's update was filed in the history by somebody else's publish"
+    );
+}

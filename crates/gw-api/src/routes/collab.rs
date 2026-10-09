@@ -181,6 +181,14 @@ pub struct CollabPolicy {
     /// keystroke as well as the memory a room holds. Thirty-two people editing one page at
     /// once is not this wiki; a client opening thirty-two sockets to one page is.
     pub max_connections_per_room: usize,
+    /// Whether an access change re-authorises every open socket AT ONCE (ADR 0027), including
+    /// one that is only listening, rather than at the next [`Self::reauth_interval`] tick.
+    ///
+    /// On in production, always. It is a value for the reason every interval here is: the
+    /// push and the check before an update is applied are two defences against the same
+    /// thing, and a test can only prove the second bites if the first can be switched off.
+    /// The pre-write check has no switch.
+    pub push_revocation: bool,
 }
 
 impl Default for CollabPolicy {
@@ -193,6 +201,7 @@ impl Default for CollabPolicy {
             max_messages_per_second: 240,
             max_bytes_per_second: 1024 * 1024,
             max_connections_per_room: 32,
+            push_revocation: true,
         }
     }
 }
@@ -424,7 +433,15 @@ async fn editor(state: &AppState, jar: &CookieJar, path: &str) -> Result<Princip
         );
         return Err(ApiError::Forbidden);
     }
-    Ok(state.principal(jar).await)
+    let principal = state.principal(jar).await;
+    // By identity as well as by cookie: an open socket holds the cookies it was upgraded with,
+    // which cannot show that its administrator has entered the mode since.
+    if state.view_as.is_viewing(&principal.id) {
+        tracing::warn!(path, viewer = %principal.username,
+            "refused: an editing session while viewing as somebody else");
+        return Err(ApiError::Forbidden);
+    }
+    Ok(principal)
 }
 
 /// [`authorise`], asked of a document by its id.
@@ -468,6 +485,11 @@ async fn join(
     Path(captured): Path<String>,
 ) -> Result<Response, ApiError> {
     let path = full_path(&captured);
+    // BEFORE the check, so an access change between the verdict and the first line of the
+    // socket task is reported rather than missed. Marked seen: only what happens from here on
+    // is news.
+    let mut epoch = state.store.access_epoch();
+    epoch.borrow_and_update();
     let (principal, document) = authorise(&state, &jar, &path).await?;
 
     let room = open_room(&state, &principal, &document).await?;
@@ -500,7 +522,14 @@ async fn join(
         .max_message_size(policy.transport_limit())
         .max_frame_size(policy.transport_limit())
         .on_upgrade(move |socket| async move {
-            run(socket, state, jar, path, room, subscription, writer_id).await;
+            let joined = Joined {
+                path,
+                room,
+                subscription,
+                writer_id,
+                epoch,
+            };
+            run(socket, state, jar, joined).await;
         }))
 }
 
@@ -651,16 +680,25 @@ async fn close(sink: &mut Sink, code: u16, reason: &str, denied: bool) {
     let _ = sink.close().await;
 }
 
-/// One connection, from the upgrade to the close.
-async fn run(
-    socket: WebSocket,
-    state: AppState,
-    jar: CookieJar,
+/// What the handshake hands to the socket task.
+struct Joined {
     path: String,
     room: Arc<Room>,
     subscription: gw_collab::Subscription,
-    mut writer_id: String,
-) {
+    writer_id: String,
+    /// Marked seen before the handshake's authorisation, so a change after it is reported.
+    epoch: tokio::sync::watch::Receiver<u64>,
+}
+
+/// One connection, from the upgrade to the close.
+async fn run(socket: WebSocket, state: AppState, jar: CookieJar, joined: Joined) {
+    let Joined {
+        path,
+        room,
+        subscription,
+        mut writer_id,
+        mut epoch,
+    } = joined;
     let policy = state.collab.policy;
     let connection = subscription.id;
     let mut inbox = subscription.updates;
@@ -745,27 +783,25 @@ async fn run(
                             .await.is_err() { break }
                     }
                     wire::Incoming::Update(update) => {
-                        // The write path, and the only one. Re-authorised first when the
-                        // interval has passed, so that the first thing a demoted client
-                        // tries to write is what discovers the demotion.
+                        // The write path, and the only one. Vetted BEFORE the update is
+                        // applied, never after: nothing a lapsed connection sends reaches the
+                        // room, so there is nothing lapsed for a later publish to snapshot
+                        // (ADR 0027).
                         //
-                        // No test distinguishes this from the timer above, and that is
-                        // stated rather than hidden: both are driven by one interval, so
-                        // deleting this line leaves the whole suite green (verified). It is
-                        // here because `select!` chooses at random between ready branches,
-                        // so the timer alone bounds the staleness of an authorisation only
-                        // in expectation — a client sending continuously could have a
-                        // handful of updates applied after its permission lapsed. With this
-                        // line the bound is exact for the case that matters, which is the
-                        // one where content changes.
-                        if checked.elapsed() >= policy.reauth_interval {
-                            match reauthorise(&state, &jar, room.document_id(), &path).await {
-                                Some(id) => { writer_id = id; checked = Instant::now(); }
-                                None => {
-                                    close(&mut sink, close_code::POLICY,
-                                          "you may no longer edit this page", true).await;
-                                    break;
-                                }
+                        // Two triggers, either sufficient. The store's access epoch moved
+                        // since this connection was last checked — a grant, a move, the
+                        // trash, a deactivation, view-as — which is exact; or the interval
+                        // has passed, which covers what raises no event (a session that
+                        // simply expires). The epoch is marked seen BEFORE the question is
+                        // asked, so a change landing during the check is still reported.
+                        //
+                        // The `select!` timer and the push branch alone would leave this to
+                        // chance, since `select!` picks at random between ready branches.
+                        let moved = epoch.has_changed().unwrap_or(true);
+                        if moved || checked.elapsed() >= policy.reauth_interval {
+                            epoch.borrow_and_update();
+                            if !vet(&state, &jar, &room, &path, &mut sink, &mut writer_id, &mut checked).await {
+                                break;
                             }
                         }
                         // Apply, THEN relay: a frame this replica rejected must never reach
@@ -816,17 +852,22 @@ async fn run(
                 }
             }
 
+            // Push revocation (ADR 0027): the store says access changed somewhere, and this
+            // connection asks its own question straight away instead of at the next tick. The
+            // receiver is marked seen by `changed()` itself, before the question is asked.
+            changed = epoch.changed(), if policy.push_revocation => {
+                if changed.is_err() { break }
+                if !vet(&state, &jar, &room, &path, &mut sink, &mut writer_id, &mut checked).await {
+                    break;
+                }
+            }
+
             _ = ticker.tick() => {
                 // The other end of the re-check: a connection that sends nothing is closed
                 // too. Without this, revoking somebody's access would leave them subscribed
                 // to every keystroke of a page they may no longer read.
-                match reauthorise(&state, &jar, room.document_id(), &path).await {
-                    Some(id) => { writer_id = id; checked = Instant::now(); }
-                    None => {
-                        close(&mut sink, close_code::POLICY,
-                              "you may no longer edit this page", true).await;
-                        break;
-                    }
+                if !vet(&state, &jar, &room, &path, &mut sink, &mut writer_id, &mut checked).await {
+                    break;
                 }
                 // And a heartbeat, because a room with a subscriber in it is never idle and
                 // therefore never evicted. A browser that vanishes without closing its
@@ -840,6 +881,37 @@ async fn run(
     }
 
     tracing::debug!(%path, %connection, "collaboration session ended");
+}
+
+/// Re-ask the handshake's question for an open session; on a refusal, say so and report that
+/// the session is over. Shared by the push, the pre-write check and the timer, so the three
+/// cannot drift apart on what "no longer authorised" means.
+async fn vet(
+    state: &AppState,
+    jar: &CookieJar,
+    room: &Room,
+    path: &str,
+    sink: &mut Sink,
+    writer_id: &mut String,
+    checked: &mut Instant,
+) -> bool {
+    match reauthorise(state, jar, room.document_id(), path).await {
+        Some(id) => {
+            *writer_id = id;
+            *checked = Instant::now();
+            true
+        }
+        None => {
+            close(
+                sink,
+                close_code::POLICY,
+                "you may no longer edit this page",
+                true,
+            )
+            .await;
+            false
+        }
+    }
 }
 
 /// May this session still write this page? The principal's id if so.

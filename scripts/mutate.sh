@@ -636,6 +636,38 @@ mutation crates/gw-api/src/routes/collab.rs killed \
   '/async fn authorise_id/,/^}$/ s/Action::Write/Action::Read/' \
   'collab: the open-session check asks for WRITE at the page'"'"'s new place, not read'
 
+# --- revocation is pushed, and an update is vetted before it is applied (ADR 0027) -------
+#
+# Three defences against one defect — a socket that keeps writing after it lost the page —
+# and the tests are built so that each can be removed alone. The interval is an hour in those
+# tests, so only the access epoch can act; `push_revocation: false` takes the listener branch
+# away so that the check before applying is the only thing standing between a lapsed editor
+# and the room. Before this existed, deleting that check left the whole suite green.
+#   - no check before applying: a revoked editor's next update is applied and broadcast;
+#   - no listener branch: a session that only listens is left open until the tick;
+#   - view-as by identity: an administrator who enters the mode keeps the socket they had;
+#   - view-as start not announced: the same, from the other end;
+#   - the store announcing every commit: caught in gw-store, not here — the epoch must not
+#     move for a publish or a login.
+mutation crates/gw-api/src/routes/collab.rs killed \
+  's/let moved = epoch.has_changed().unwrap_or(true);/let moved = false;/' \
+  'collab: the check before applying an update refuses a revoked editor — no push needed, no tick waited for'
+mutation crates/gw-api/src/routes/collab.rs killed \
+  's/changed = epoch.changed(), if policy.push_revocation => {/changed = epoch.changed(), if false => {/' \
+  'collab: an access change ends a session that is only listening, at once'
+mutation crates/gw-api/src/routes/collab.rs killed \
+  's/    if state.view_as.is_viewing(&principal.id) {/    if false {/' \
+  'collab: an administrator who enters view-as mode loses the editing socket they already had open'
+mutation crates/gw-api/src/view_as.rs killed \
+  's/    state.store.bump_access_epoch();/    let _ = ();/' \
+  'collab: entering view-as mode is announced as an access change'
+mutation crates/gw-store/src/access_epoch.rs killed \
+  's/if committing.swap(false, Ordering::SeqCst) {/if committing.swap(false, Ordering::SeqCst) || true {/' \
+  'access epoch: only a commit that touched an access table moves it'
+mutation crates/gw-store/src/access_epoch.rs killed \
+  's/handle.set_rollback_hook(move || dirty.store(false, Ordering::SeqCst));/handle.set_rollback_hook(move || ());/' \
+  'access epoch: a rolled-back change leaves no dirty mark to announce a later, unrelated commit'
+
 # --- links: the graph, and who is allowed to see an edge of it ------------------------
 #
 # A backlinks panel is an aggregate view, and an aggregate view is where filtering gets
