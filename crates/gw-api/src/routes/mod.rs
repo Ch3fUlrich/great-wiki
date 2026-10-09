@@ -9,6 +9,7 @@ pub mod notifications;
 pub mod revisions;
 pub mod search;
 pub mod tasks;
+pub mod templates;
 pub mod topics;
 pub mod trash;
 pub mod tree;
@@ -416,6 +417,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(revisions::routes())
         .merge(search::routes())
         .merge(tasks::routes())
+        .merge(templates::routes())
         .merge(notifications::routes())
         .merge(topics::routes())
         .merge(trash::routes())

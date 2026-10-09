@@ -19,6 +19,25 @@ use serde::Serialize;
 /// The reserved subtree whose pages are templates.
 pub const TEMPLATE_ROOT: &str = "/vorlagen";
 
+/// Top-level addresses the web app serves itself (`web/src/routes`, plus the create form).
+/// A page there would be unreachable, or would shadow the app.
+pub const RESERVED_TOP_LEVEL: [&str; 11] = [
+    "admin",
+    "api",
+    "aufgaben",
+    "benachrichtigungen",
+    "graph",
+    "neu",
+    "papierkorb",
+    "projekte",
+    "suche",
+    "themen",
+    "history",
+];
+
+/// Longest title a new page may have, in characters.
+pub const MAX_TITLE_CHARS: usize = 200;
+
 /// A template as the picker lists it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TemplateEntry {
@@ -40,7 +59,10 @@ pub struct CreateRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateOutcome {
-    Created { path: String, id: String },
+    Created {
+        path: String,
+        id: String,
+    },
     /// Nothing was created; the reason is safe to show this caller.
     Blocked(String),
     /// Not a signed-in, active account.
@@ -99,7 +121,7 @@ impl Store {
     /// retriever every listing uses, so an unreadable template is not listed rather than
     /// listed and hidden. The root page itself is a container, not an offer.
     pub async fn templates_for(&self, principal: &Principal) -> Result<Vec<TemplateEntry>> {
-        fn find<'a>(nodes: &'a [TreeNode]) -> Option<&'a TreeNode> {
+        fn find(nodes: &[TreeNode]) -> Option<&TreeNode> {
             nodes.iter().find(|n| n.path == TEMPLATE_ROOT)
         }
         let tree = self.tree_for(principal).await?;
@@ -130,6 +152,11 @@ impl Store {
         if title.is_empty() {
             return Ok(CreateOutcome::Blocked("a page needs a title".into()));
         }
+        if title.chars().count() > MAX_TITLE_CHARS {
+            return Ok(CreateOutcome::Blocked(format!(
+                "a title may have at most {MAX_TITLE_CHARS} characters"
+            )));
+        }
         let slug = slugify(
             request
                 .slug
@@ -150,6 +177,13 @@ impl Store {
             .map(|p| p.trim().trim_matches('/'))
             .filter(|p| !p.is_empty())
             .map(|p| format!("/{p}"));
+        // `history` is a route under every page, so a page called that is unreachable at
+        // any depth; the rest shadow the app only at the top.
+        if slug == "history" || (parent.is_none() && RESERVED_TOP_LEVEL.contains(&slug.as_str())) {
+            return Ok(CreateOutcome::Blocked(format!(
+                "«{slug}» is reserved: choose another address"
+            )));
+        }
         match &parent {
             Some(p) => {
                 if self
@@ -179,11 +213,10 @@ impl Store {
         }
 
         let path = format!("{}/{slug}", parent.as_deref().unwrap_or(""));
-        let taken: Option<(String,)> =
-            sqlx::query_as("SELECT path FROM documents WHERE path = ?1")
-                .bind(&path)
-                .fetch_optional(&self.pool)
-                .await?;
+        let taken: Option<(String,)> = sqlx::query_as("SELECT path FROM documents WHERE path = ?1")
+            .bind(&path)
+            .fetch_optional(&self.pool)
+            .await?;
         if taken.is_some() {
             return Ok(CreateOutcome::Blocked(format!(
                 "there is already a page at {path}"
@@ -435,10 +468,13 @@ mod tests {
         let r = |p: Option<&str>, a: bool| {
             let store = &store;
             let anna = &anna;
-            let rq = req(p, "Neu", None);
+            let rq = req(p, "Oben", None);
             async move { store.create_page_for(anna, &rq, a, "d").await.unwrap() }
         };
-        assert!(matches!(r(Some("/raum"), false).await, CreateOutcome::Created { .. }));
+        assert!(matches!(
+            r(Some("/raum"), false).await,
+            CreateOutcome::Created { .. }
+        ));
         // Read-only parent: told why, because she can see it.
         assert_eq!(
             r(Some("/vorlagen"), false).await,
@@ -456,6 +492,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(anon, CreateOutcome::Refused);
+    }
+
+    #[tokio::test]
+    async fn reserved_addresses_and_overlong_titles_are_refused() {
+        let (store, anna) = world().await;
+        let go = |parent: Option<&str>, title: String| {
+            let store = &store;
+            let anna = &anna;
+            let rq = req(parent, &title, None);
+            async move { store.create_page_for(anna, &rq, true, "d").await.unwrap() }
+        };
+        assert!(
+            matches!(go(None, "Admin".into()).await, CreateOutcome::Blocked(m) if m.contains("reserved"))
+        );
+        assert!(
+            matches!(go(Some("/raum"), "History".into()).await, CreateOutcome::Blocked(m) if m.contains("reserved"))
+        );
+        // Reserved only at the top: /raum/admin is fine.
+        assert!(matches!(
+            go(Some("/raum"), "Admin".into()).await,
+            CreateOutcome::Created { .. }
+        ));
+        assert!(
+            matches!(go(Some("/raum"), "x".repeat(201)).await, CreateOutcome::Blocked(m) if m.contains("at most"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_traversing_parent_names_no_page() {
+        let (store, anna) = world().await;
+        for parent in ["/raum/../vorlagen", "/raum/%2e%2e", "/raum//x", "raum/./"] {
+            let out = store
+                .create_page_for(&anna, &req(Some(parent), "T", None), false, "d")
+                .await
+                .unwrap();
+            assert!(
+                matches!(out, CreateOutcome::Blocked(_)),
+                "{parent}: {out:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_page_made_where_a_moved_page_used_to_be_ends_its_forward() {
+        let (store, anna) = world().await;
+        sqlx::query("INSERT INTO forwards (old_path, document_id) SELECT '/raum/alt', id FROM documents WHERE path = '/raum'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        store
+            .create_page_for(&anna, &req(Some("/raum"), "Alt", None), false, "d")
+            .await
+            .unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM forwards")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[tokio::test]
