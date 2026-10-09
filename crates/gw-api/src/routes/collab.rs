@@ -201,6 +201,9 @@ pub struct CollabPolicy {
     /// is never applied unvetted, so the cost of churn falls on the socket's latency and
     /// not on safety. Per-document epochs were rejected, see ADR 0027.
     pub vet_gap: Duration,
+    /// Frames a room buffers for a connection that is not reading before it is told it lagged
+    /// and resent the whole state. Only a test has a reason to change it.
+    pub update_buffer: usize,
 }
 
 impl Default for CollabPolicy {
@@ -215,6 +218,7 @@ impl Default for CollabPolicy {
             max_connections_per_room: 32,
             push_revocation: true,
             vet_gap: Duration::from_millis(250),
+            update_buffer: gw_collab::room::UPDATE_BUFFER,
         }
     }
 }
@@ -284,6 +288,28 @@ pub struct CollabState {
     /// How many times an open session has been re-authorised. A counter and not a metric
     /// system: tests assert that churn is bounded, and an operator can read it.
     vets: std::sync::atomic::AtomicU64,
+    /// Test seam: holds a session task at a named point. Never set outside tests, and one
+    /// atomic-cheap check when it is not. See [`Hold`].
+    holds: tokio::sync::watch::Sender<u8>,
+}
+
+/// Where a test can park a session task to land an access change in a window the code cannot
+/// otherwise be made to stand in (see [`CollabState::hold`]).
+#[derive(Debug, Clone, Copy)]
+pub enum Hold {
+    /// After the upgrade, before anything is sent: the connect snapshot.
+    Connect,
+    /// After the connect snapshot, before the first frame is read: lets a connection lag.
+    Loop,
+}
+
+impl Hold {
+    fn bit(self) -> u8 {
+        match self {
+            Hold::Connect => 1,
+            Hold::Loop => 2,
+        }
+    }
 }
 
 impl Default for CollabState {
@@ -295,16 +321,38 @@ impl Default for CollabState {
 impl CollabState {
     pub fn with_policy(policy: CollabPolicy) -> Self {
         Self {
-            rooms: gw_collab::Rooms::new(),
+            rooms: gw_collab::Rooms::with_buffer(policy.update_buffer),
             open: Mutex::new(HashMap::new()),
             building: tokio::sync::Mutex::new(()),
             policy,
             vets: std::sync::atomic::AtomicU64::new(0),
+            holds: tokio::sync::watch::channel(0).0,
         }
     }
 
     pub fn policy(&self) -> &CollabPolicy {
         &self.policy
+    }
+
+    /// Park (or release) every session task at `point`. A test seam for the two windows —
+    /// the connect snapshot and the resync after lag — that no ordinary sequence of requests
+    /// can place an access change inside. Nothing in the server calls it.
+    pub fn hold(&self, point: Hold, on: bool) {
+        self.holds.send_modify(|bits| {
+            if on {
+                *bits |= point.bit();
+            } else {
+                *bits &= !point.bit();
+            }
+        });
+    }
+
+    async fn held(&self, point: Hold) {
+        let _ = self
+            .holds
+            .subscribe()
+            .wait_for(|bits| bits & point.bit() == 0)
+            .await;
     }
 
     /// Re-authorisations of open sessions so far.
@@ -760,6 +808,7 @@ async fn run(socket: WebSocket, state: AppState, jar: CookieJar, joined: Joined)
 
     // Step 1 on connect: this replica's state vector, so the client can send what we lack.
     // The client answers with step 2, and asks its own step 1, which is answered below.
+    state.collab.held(Hold::Connect).await;
     if !settled!(connect) {
         return;
     }
@@ -778,6 +827,7 @@ async fn run(socket: WebSocket, state: AppState, jar: CookieJar, joined: Joined)
         policy.reauth_interval,
     );
 
+    state.collab.held(Hold::Loop).await;
     loop {
         tokio::select! {
                    incoming = stream.next() => {

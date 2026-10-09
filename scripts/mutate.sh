@@ -692,6 +692,16 @@ mutation crates/gw-api/src/routes/collab.rs killed \
   's/if !settled!(awareness) { break }/if false { break }/' \
   'collab: presence from a socket whose access may have changed is not relayed before it is re-checked'
 
+# The two windows no ordinary request sequence can reach: a connection that loses access after
+# the handshake passed but before its snapshot is sent, and one that lags and is about to be
+# resent the whole document. `CollabState::hold` parks the session task there.
+mutation crates/gw-api/src/routes/collab.rs killed \
+  's/if !settled!(connect) {/if false {/' \
+  'collab: the connect snapshot is not sent to a socket whose access was revoked after the handshake'
+mutation crates/gw-api/src/routes/collab.rs killed \
+  's/if !settled!(resync) { break }/if false { break }/' \
+  'collab: the resync after lag is not sent to a socket whose access was revoked meanwhile'
+
 # --- links: the graph, and who is allowed to see an edge of it ------------------------
 #
 # A backlinks panel is an aggregate view, and an aggregate view is where filtering gets

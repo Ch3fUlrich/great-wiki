@@ -42,8 +42,12 @@ failed without it (its own comment said so).
    last answer nothing leaves or enters until the answer is in; on a no the session closes with
    none sent. Frames already queued for the socket before a revocation are held at the same
    gate. Cost: during the `vet_gap` wait the socket's outbound frames wait too (they are not
-   dropped; a yes delivers them in order). Not tested: the connect and resync sites (no way to
-   land a change in those windows without a test seam) — they are the same call.
+   dropped; a yes delivers them in order). The connect and resync sites are the likeliest read leak (a client reconnecting right after
+   losing access), so they are tested too, through `CollabState::hold`: a test seam that parks
+   the session task after the handshake or after the connect snapshot, so that a revocation can
+   land in a window no request sequence reaches (and `CollabPolicy::update_buffer` makes a
+   connection lag with a few frames). The seam is one cheap check when unset and nothing in the
+   server sets it.
 5. **No laundering, by prevention.** An update from a connection whose authorisation is older
    than the current epoch is never applied, so nothing lapsed is in the room for a publish (or
    a sweep) to snapshot. No publish-side rule is needed for committed revocations.

@@ -21,7 +21,7 @@
 
 use axum::http::{header, HeaderValue, StatusCode};
 use futures_util::{SinkExt, StreamExt};
-use gw_api::routes::collab::{sweep, CollabPolicy, CollabState};
+use gw_api::routes::collab::{sweep, CollabPolicy, CollabState, Hold};
 use gw_api::AppState;
 use gw_auth::{Permission, Principal, Subject};
 use gw_collab::CollabDoc;
@@ -1777,4 +1777,64 @@ async fn presence_sent_by_a_revoked_socket_is_not_relayed_to_the_others() {
     // `settle` fails on any frame that is not a sync reply, so an awareness frame relayed
     // from the revoked socket makes this panic.
     assert_eq!(settle(&mut observer, &observer_replica).await, 0);
+}
+
+#[tokio::test]
+async fn a_connection_that_loses_access_between_the_handshake_and_its_first_frame_is_sent_nothing()
+{
+    // The reconnect that races the revocation. The handshake itself is already refused for
+    // somebody without access; this is the window after it passed, before the task sends the
+    // snapshot. The task is parked there, the grant revoked, and the task released.
+    let store = fixture().await;
+    let state = under(state_as(&store, "autorin").await, unpushed());
+    let addr = serve(state.clone()).await;
+    state.collab.hold(Hold::Connect, true);
+    let mut ws = connect(&addr, "handbuch", None).await.unwrap();
+
+    revoke(&store, "autorin", Permission::Write).await;
+    state.collab.hold(Hold::Connect, false);
+
+    assert_eq!(room_frames_before_close(&mut ws).await, vec![]);
+}
+
+#[tokio::test]
+async fn a_resync_after_lag_is_not_sent_to_a_socket_whose_access_was_revoked_meanwhile() {
+    // A connection that fell behind is resent the whole document. Parked after the connect
+    // snapshot while the others type (the room buffers two frames, so it lags), then revoked,
+    // then released: its first act is the resync, and nothing of the document may be in it.
+    let store = fixture().await;
+    grant(&store, "fremde", Permission::Write).await;
+    let a = under(
+        state_as(&store, "autorin").await,
+        CollabPolicy {
+            update_buffer: 2,
+            ..unpushed()
+        },
+    );
+    let b = AppState {
+        collab: Arc::clone(&a.collab),
+        ..state_as(&store, "fremde").await
+    };
+    let (addr_a, addr_b) = (serve(a.clone()).await, serve(b).await);
+    let mut observer = connect(&addr_b, "handbuch", None).await.unwrap();
+    let observer_replica = sync(&mut observer).await;
+
+    a.collab.hold(Hold::Loop, true);
+    let mut lapsed = connect(&addr_a, "handbuch", None).await.unwrap();
+    for n in 0..6 {
+        send_update(
+            &mut observer,
+            &edit(&observer_replica, &format!("Tipp {n}")),
+        )
+        .await;
+    }
+    settle(&mut observer, &observer_replica).await;
+    revoke(&store, "autorin", Permission::Write).await;
+    a.collab.hold(Hold::Loop, false);
+
+    // Only the connect-time state vector, which was sent while she still had access.
+    assert_eq!(
+        room_frames_before_close(&mut lapsed).await,
+        vec![(0, Some(SYNC_STEP1))]
+    );
 }
