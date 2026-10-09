@@ -1,0 +1,5 @@
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "rsa: verify-only, see docs/operations/running-in-production.md section 'Known advisories'" },
+    { id = "RUSTSEC-2026-0215", reason = "smallstr: unmaintained, via yrs, see docs/operations/running-in-production.md section 'Known advisories'" },
+]

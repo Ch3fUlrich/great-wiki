@@ -93,3 +93,12 @@ jobs:
 
       - name: Fail if stored content could reach the DOM as markup
         run: ./scripts/check-html-sinks.sh scan
+
+  advisories:
+    runs-on: ubuntu-latest
+    if: ${{ github.server_url == 'https://github.com' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories

@@ -175,3 +175,26 @@ jobs:
 
       - name: Fail if stored content could reach the DOM as markup
         run: ./scripts/check-html-sinks.sh scan
+
+  advisories:
+    runs-on: docker
+    container:
+      image: node:24-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-deny (pinned release binary; this image has nothing)
+        run: |
+          VERSION=0.20.2
+          URL="https://github.com/EmbarkStudios/cargo-deny/releases/download/${VERSION}/cargo-deny-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -sSfL "$URL" | tar -xz -C /tmp
+          install -m 755 "/tmp/cargo-deny-${VERSION}-x86_64-unknown-linux-musl/cargo-deny" /usr/local/bin/
+          cargo-deny --version
+      # cargo-deny reads `cargo metadata`, so cargo must be on PATH; rust-toolchain.toml
+      # picks the version on first use, as in the rust job.
+      - name: Rust toolchain, as pinned by rust-toolchain.toml
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Run cargo-deny check advisories
+        run: cargo-deny check advisories

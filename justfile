@@ -460,6 +460,12 @@ agent-ci:
     just test
     just build
 
+# Known dependency advisories fail the build unless deny.toml names them with a reason.
+# CI mirrors this in BOTH workflow files (cargo-deny-action on GitHub, a pinned release
+# binary on Forgejo).
+advisories:
+    cargo deny check advisories
+
 # Rebuild the Graphify CODE graph. Seconds, no key, no network.
 # --user is REQUIRED: without it the container writes root-owned files that the next
 # rebuild cannot overwrite.
