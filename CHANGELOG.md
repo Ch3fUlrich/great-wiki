@@ -8,6 +8,14 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Added
 
+- **A signed-in smoke test for a deployed wiki** (`scripts/smoke-signed-in.py`). As one
+  dedicated local account it signs in, creates a page from a template in a test space,
+  finds it through search, comments on it, reads the notification count, trashes the page
+  and signs out, and prints one `ok`/`FAIL`/`SKIP` line per step. It can also redeem the
+  account's invite, so the password comes from a secret store rather than a browser. It
+  never prints a secret, and it makes one sign-in attempt per run so it cannot lock the
+  account out.
+
 - **Aufgaben**, at `/aufgaben` and in the header beside »Projekte« and »Graph«: every to-do
   you may see, in three columns — **Offen, Läuft, Fertig** — narrowable to one project. The
   columns are fixed and the same everywhere, so a card's column means the same thing on
