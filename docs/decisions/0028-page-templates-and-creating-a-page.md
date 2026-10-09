@@ -31,6 +31,13 @@ not in the web. So this change builds the create door and the templates together
   Rejected: inheriting the template's visibility — a public template would publish every page
   made from it.
 
+- **An occupied address is refused, and the refusal says so.** Creating at an address a page
+  already holds — live, withheld from the caller, or in the trash — answers "taken". That tells
+  a writer of the parent one bit about an address under it, the rule ADR 0023 states for a
+  move's destination and `crate::trash` for a restore; a prober without write on the parent
+  never gets that far. The address segment is capped at 100 characters, like a title at 200,
+  so a long `slug` cannot make a path of any length.
+
 ## Not built (later)
 
 Default template per content type (D14): needs a per-type pointer to a template path; the
