@@ -197,12 +197,21 @@ const ORDER: [EventKind; 7] = [
     EventKind::GrantChanged,
 ];
 
-/// One line of a plain-text mail: every control character and Unicode line or paragraph
-/// separator becomes a space, so a title, path or name cannot start a line of its own.
+/// One line of a plain-text mail: every control character, Unicode line or paragraph
+/// separator, and invisible format character that could reorder or hide text becomes a
+/// space, so a title, path or name cannot start a line of its own.
 fn one_line(s: &str) -> String {
     s.chars()
         .map(|c| {
-            if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
+            if c.is_control()
+                || c == '\u{2028}'
+                || c == '\u{2029}'
+                || ('\u{200B}'..='\u{200F}').contains(&c)
+                || ('\u{202A}'..='\u{202E}').contains(&c)
+                || ('\u{2060}'..='\u{2064}').contains(&c)
+                || ('\u{2066}'..='\u{2069}').contains(&c)
+                || c == '\u{FEFF}'
+            {
                 ' '
             } else {
                 c
@@ -615,5 +624,27 @@ mod tests {
     fn an_ordinary_title_is_unchanged() {
         let body = build_body(&[note(Some("Geheimseite"), "/geheimseite", Some("anna"))]);
         assert!(body.contains("- anna: Geheimseite (/geheimseite)"));
+    }
+
+    #[test]
+    fn right_to_left_override_in_title_becomes_space() {
+        let body = build_body(&[note(Some("X\u{202E}Y"), "/seite", Some("anna"))]);
+        assert!(body.contains("- anna: X Y (/seite)"));
+        assert!(!body.contains('\u{202E}'));
+        assert_eq!(body.lines().count(), 6);
+    }
+
+    #[test]
+    fn zero_width_space_in_title_becomes_space() {
+        let body = build_body(&[note(Some("X\u{200B}Y"), "/seite", Some("anna"))]);
+        assert!(body.contains("- anna: X Y (/seite)"));
+        assert!(!body.contains('\u{200B}'));
+        assert_eq!(body.lines().count(), 6);
+    }
+
+    #[test]
+    fn accented_german_title_is_unchanged() {
+        let body = build_body(&[note(Some("Übersicht für Ärzte"), "/seite", Some("anna"))]);
+        assert!(body.contains("- anna: Übersicht für Ärzte (/seite)"));
     }
 }
