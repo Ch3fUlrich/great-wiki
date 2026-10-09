@@ -650,10 +650,10 @@ mutation crates/gw-api/src/routes/collab.rs killed \
 #   - the store announcing every commit: caught in gw-store, not here — the epoch must not
 #     move for a publish or a login.
 mutation crates/gw-api/src/routes/collab.rs killed \
-  's/let moved = epoch.has_changed().unwrap_or(true);/let moved = false;/' \
+  's/let moved = told || gate.epoch.has_changed().unwrap_or(true);/let moved = told;/' \
   'collab: the check before applying an update refuses a revoked editor — no push needed, no tick waited for'
 mutation crates/gw-api/src/routes/collab.rs killed \
-  's/changed = epoch.changed(), if policy.push_revocation => {/changed = epoch.changed(), if false => {/' \
+  's/changed = gate.epoch.changed(), if policy.push_revocation => {/changed = gate.epoch.changed(), if false => {/' \
   'collab: an access change ends a session that is only listening, at once'
 mutation crates/gw-api/src/routes/collab.rs killed \
   's/    if state.view_as.is_viewing(&principal.id) {/    if false {/' \
@@ -676,7 +676,7 @@ mutation crates/gw-api/src/routes/collab.rs killed \
   's/        gate.last_vet = Instant::now();/        gate.last_vet = Instant::now(); if allowed { return true; }/' \
   'collab: a change landing during the answer is vetted again before the update applies'
 mutation crates/gw-api/src/routes/collab.rs killed \
-  's/tokio::time::sleep_until((gate.last_vet + gate.policy.vet_gap).into()).await;/();/' \
+  's/tokio::time::sleep_until((gate.last_vet + gate.policy.vet_gap).into()).await;/let _ = gate.policy.vet_gap;/' \
   'collab: churn in the access epoch is bounded to one re-authorisation per gap per socket'
 
 # --- links: the graph, and who is allowed to see an edge of it ------------------------
