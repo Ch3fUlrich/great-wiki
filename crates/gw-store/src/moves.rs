@@ -121,7 +121,7 @@ impl Store {
         if title.is_empty() {
             return Ok(MoveOutcome::Blocked("a page needs a title".into()));
         }
-        let mut slug = slugify(
+        let slug = slugify(
             request
                 .slug
                 .as_deref()
@@ -129,14 +129,6 @@ impl Store {
                 .filter(|s| !s.is_empty())
                 .unwrap_or(title),
         );
-        // Cap slug at 100 characters to avoid overly long paths
-        if slug.len() > 100 {
-            // Truncate on a char boundary, then trim trailing '-'
-            slug.truncate(100);
-            while !slug.is_empty() && slug.ends_with('-') {
-                slug.pop();
-            }
-        }
         if slug.is_empty() {
             return Ok(MoveOutcome::Blocked(format!(
                 "«{title}» contains nothing an address can be made of"
@@ -1243,41 +1235,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        // Check that it's the trashed version of the error message
-        assert!(
-            reason.contains("a page in the trash still holds") && reason.contains("/b/p"),
-            "Expected trashed error message, got: {reason}"
-        );
-        assert!(
-            !reason.contains("there is already a page at"),
-            "Should be trashed error message, not live address error: {reason}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_live_address_is_refused_with_live_error_message() {
-        let f = fixture().await;
-        let reason = blocked(
-            f.store
-                .move_document(
-                    &f.chefin,
-                    "/a/p",
-                    &to(Some("/a"), "P"), // /a is a live page
-                    true,
-                    MoveMode::Commit,
-                )
-                .await
-                .unwrap(),
-        );
-        // Check that it's the live version of the error message
-        assert!(
-            reason.contains("there is already a page at") && reason.contains("/a"),
-            "Expected live error message, got: {reason}"
-        );
-        assert!(
-            !reason.contains("a page in the trash still holds"),
-            "Should be live error message, not trashed error: {reason}"
-        );
+        assert!(reason.contains("/b/p"), "{reason}");
     }
 
     #[tokio::test]

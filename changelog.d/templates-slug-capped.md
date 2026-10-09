@@ -1,4 +1,7 @@
+<!-- Fold into CHANGELOG.md under [Unreleased], in the sections named below. -->
+
 ### Fixed
 
-- Page creation: a slug is capped at 100 characters (truncate on char boundary, then trim trailing '-') and a slug of only punctuation is refused, matching the title's length and empty-content rules.
-- Move operation: a page in the trash still holds its address, so moving to an occupied address that is trashed says "a page in the trash still holds {path}: restore or purge it first" rather than "there is already a page at {path}".
+- **A new page's address segment is capped at 100 characters**, as its title is at 200. A
+  long `slug` could otherwise make a path of any length; a slug of only punctuation is
+  refused like an empty title.

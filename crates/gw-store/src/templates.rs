@@ -591,7 +591,10 @@ mod tests {
         let outcome = store.create_page_for(&anna, &rq, false, "d").await.unwrap();
 
         let CreateOutcome::Created { path, .. } = outcome else {
-            panic!("Expected page creation to succeed for title length {} (expected <= 200)", long_title.len());
+            panic!(
+                "Expected page creation to succeed for title length {} (expected <= 200)",
+                long_title.len()
+            );
         };
 
         // Check that the slug segment (last part of path) is <= 100 chars
@@ -617,7 +620,8 @@ mod tests {
         let rq = req(Some("/raum"), "!!! ??? ???", None);
         let outcome = store.create_page_for(&anna, &rq, false, "d").await.unwrap();
 
-        assert!(matches!(outcome, CreateOutcome::Blocked(_)), 
+        assert!(
+            matches!(outcome, CreateOutcome::Blocked(_)),
             "Empty slug should be refused: {outcome:?}"
         );
     }
