@@ -158,3 +158,16 @@ default 7) picks the hour. Nothing is read from these variables while it is disa
 operator: the credential lives in the deployment environment, not in this repository, and
 no test ever touches a real mail server. Rows are marked digested only after a send
 succeeds, so a failed first attempt is retried the next day rather than lost.
+
+## Known advisories
+
+`cargo audit` reports two that are left in place on purpose:
+
+- **rsa 0.9.10** (RUSTSEC-2023-0071, no fixed release) arrives through `jsonwebtoken`.
+  Production only *verifies* OIDC id_token signatures with the provider's public key
+  (`crates/gw-api/src/auth/oidc.rs`: `DecodingKey::from_jwk`, `decode`). Private-key
+  operations (`EncodingKey`, signing) happen only in `crates/gw-api/tests/auth.rs`. The
+  Marvin timing attack needs this process to decrypt or sign with a private RSA key, so it
+  has no target here. Revisit the day the wiki signs or decrypts anything with RSA.
+- **smallstr 0.3.1** (RUSTSEC-2026-0215, unmaintained) comes in through `yrs`, the CRDT
+  under `gw-collab`.
