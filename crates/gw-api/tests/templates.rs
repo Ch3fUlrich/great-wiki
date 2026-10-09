@@ -193,3 +193,27 @@ async fn the_gates_answer_with_the_right_status() {
         "a non-template page is not a template"
     );
 }
+
+#[tokio::test]
+async fn the_top_level_needs_administration_of_the_whole_wiki() {
+    let store = fixture().await;
+    let top = serde_json::json!({ "title": "Oben" });
+    // `schreiber` writes /raum and administers nothing: refused, and told why.
+    let (s, b) = send(
+        &store,
+        Some("schreiber"),
+        "POST",
+        "/api/pages",
+        Some(top.clone()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{b}");
+    assert!(b.contains("top level"), "{b}");
+    // An instance admin (the `admins` group) may.
+    store
+        .upsert_oidc_principal("chefin", "Chefin", None, &["admins".into()])
+        .await
+        .unwrap();
+    let (s, b) = send(&store, Some("chefin"), "POST", "/api/pages", Some(top)).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+}

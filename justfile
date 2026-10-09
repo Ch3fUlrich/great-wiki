@@ -173,6 +173,11 @@ behaviour-fixture:
     # is what lets the harness invite people to it and revoke one of them again.
     cargo run -q -p gw-api -- grant --path /verweisbeispiel/gespraech \
       --subject group:editors --permission admin --actor behaviour-fixture
+    # Group V (templates): /vorlagen is restricted and the editors may only READ it, so the
+    # picker offers its template while a page cannot be created under it. New pages go under
+    # /rundgang, where the editors write.
+    cargo run -q -p gw-api -- grant --path /vorlagen \
+      --subject group:editors --permission read --actor behaviour-fixture
     echo "behaviour fixture ready:"
     echo "  GW_DATABASE_URL=$GW_DATABASE_URL"
     echo "  GW_MEDIA_DIR=$GW_MEDIA_DIR"

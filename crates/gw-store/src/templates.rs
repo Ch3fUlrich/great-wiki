@@ -520,6 +520,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_blank_title_is_refused_as_a_missing_title() {
+        let (store, anna) = world().await;
+        let out = store
+            .create_page_for(&anna, &req(Some("/raum"), "   ", None), false, "d")
+            .await
+            .unwrap();
+        assert_eq!(out, CreateOutcome::Blocked("a page needs a title".into()));
+    }
+
+    #[tokio::test]
     async fn a_traversing_parent_names_no_page() {
         let (store, anna) = world().await;
         for parent in ["/raum/../vorlagen", "/raum/%2e%2e", "/raum//x", "raum/./"] {
