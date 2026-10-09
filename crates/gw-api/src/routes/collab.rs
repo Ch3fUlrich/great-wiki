@@ -29,7 +29,10 @@
 //! **Authorisation is re-checked during the session**, not only at the handshake. A grant
 //! can be revoked, an account deactivated and a session ended while a socket is open, and
 //! an editing session that outlives the permission behind it is a permission that was never
-//! really revoked. See [`CollabPolicy::reauth_interval`].
+//! really revoked. A change is **pushed** (ADR 0027): the store's access epoch re-authorises
+//! every open socket at once, and an update is vetted before it is applied, so nothing a
+//! revoked editor sends reaches the room, a publish or a sweep. The timer
+//! ([`CollabPolicy::reauth_interval`]) remains for what raises no event, such as an expiry.
 //!
 //! # DEVIATIONS from the M3 plan, and why
 //!
@@ -144,9 +147,8 @@ pub struct CollabPolicy {
     /// same order as `view_as`'s "next click" and bounds how long a demotion can be
     /// outlived.
     ///
-    /// It is enforced from both ends: a timer, so an idle listener is closed too, and a
-    /// check before applying an update, so the first thing a demoted client tries to write
-    /// is refused rather than merely reported late.
+    /// It is the backstop since ADR 0027: the access epoch re-checks at once on any change
+    /// the store sees, and this interval bounds only what raises no event.
     pub reauth_interval: Duration,
     /// How often [`sweep`] runs. Also the window a crash can lose, which is why it is a
     /// short interval and not an hour.
