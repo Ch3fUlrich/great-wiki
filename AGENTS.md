@@ -4,6 +4,8 @@ Self-hosted collaborative knowledge platform. Rust (Axum) backend + SvelteKit fr
 SQLite, collaborative rich-text editing, permissioned search/RAG, and a derived knowledge
 graph. **Keep this file a thin pointer — a skill's `SKILL.md` is the source of truth.**
 
+**Orchestration:** follow the `unattended-orchestration` skill (canonical: AutoOS `.agents/skills/unattended-orchestration`, linked on hosts at ~/.claude/skills/) and the AutoOS rules (AutoOS `AGENTS.md`).
+
 ## Start at the router
 
 **Read `agent-skills/skills/repository-index/SKILL.md` first** (`~/code/agent-skills/…` on

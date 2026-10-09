@@ -5,25 +5,21 @@ Written for the next Claude Code session. Read this, then
 
 ## Where the project actually is
 
-**Production runs `3128ece`** (Semaphore task 112569) at <https://wiki.ohje.ooguy.com>:
-identity merge (ADR 0021), withheld pages read as absent (ADR 0022) and the `/admin` gate.
-**`main` is far ahead and not deployed.** Since `3128ece` it gained rename and move
-(ADR 0023, migration 0015), permission-aware full-text search (M7, ADR 0024, migration
-0016), the event bus, comments, notifications and the daily digest (M6, ADRs 0025/0026,
-migrations 0017/0018), the »Sie« register with a guard test, and a dependency-advisory
-gate (`deny.toml`, `just advisories`, a CI job on both forges). About 1340 Rust tests,
-1238 web tests and 122 behaviour checks, all green.
+**Production runs `64d21f2`** (prox app-deploy 144841, 2026-10-09; migrations through 19)
+at <https://wiki.ohje.ooguy.com>. Everything on `main` up to that commit is live: rename
+and move, permission-aware full-text search, the event bus, comments, notifications, the
+daily digest, access-epoch revocation (ADR 0027) and page templates (ADR 0028). The
+pre-deploy backup is `_backups/great-wiki/great-wiki-pre-64d21f2-20261009T092419Z.db` on
+cloud.vm.
 
-**Deploying needs the operator's own OK** — every release since `3128ece` carries forward
-migrations — and runs through the `prox` session, because `scripts/build-images.sh` needs
+**Deploying needs the operator's own OK**, naming the sha. Deploys run through the `prox`
+session, because `scripts/build-images.sh` needs
 `../Server/secrets-generated/server__cloud__harbor__.env`, which is not on coding.vm.
-**Mail is a second, separate decision:** the digest sends nothing unless
+Rolling back an image cannot undo forward migrations. app-deploy has a guarded DB-restore
+rollback that refuses when user data has changed since the backup.
+**Mail stays off** (operator decision, 2026-10-09): the digest sends nothing unless
 `GW_DIGEST_ENABLED=1`, and uses the homelab's shared `SMTP_*` settings, never a credential
 of the wiki's own.
-
-**In flight** on branches, not merged: access-epoch revocation for open editing sockets
-(`l2/collab-revoke`, ADR 0027) and page templates, which also brings the first way to
-create a page from the interface (`l2/templates`, ADR 0028).
 
 **Forgejo is the primary forge** — <https://forgejo.ohje.ooguy.com/Ch3fUlrich/great-wiki>
 (private). GitHub is a public mirror and both carry CI; push to both. The Forgejo
