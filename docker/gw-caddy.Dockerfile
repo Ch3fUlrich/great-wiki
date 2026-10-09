@@ -24,7 +24,13 @@
 # routing config with no plugins.
 FROM caddy:2.10-alpine
 
-COPY docker/Caddyfile /etc/caddy/Caddyfile
+# `--chmod`, because COPY keeps the build context's file mode, and the container reads
+# this file as uid 1000, not as the root that owns it. A checkout made under umask 077
+# leaves the file 0600; Caddy then dies with "open /etc/caddy/Caddyfile: permission
+# denied", the deploy's HTTP gate gets connection refused, and `caddy validate` below
+# passes anyway because it runs as root. That is how the 65d7ace deploy failed
+# (2026-10-09): the image built from 3128ece had 0664, the one from 65d7ace had 0600.
+COPY --chmod=0644 docker/Caddyfile /etc/caddy/Caddyfile
 
 # Parse and PROVISION the config at build time. `caddy validate` loads every
 # module the file names, so a misspelled directive, an unknown matcher or a
