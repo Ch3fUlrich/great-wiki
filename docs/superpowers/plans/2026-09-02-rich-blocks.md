@@ -532,6 +532,12 @@ mode this plan names as disqualifying for inline maths.
 begins `dok:`. If any exist, they are migrated to `doc` before the importer changes, in the same
 change.
 
+**Result, 2026-10-09** (prox, count-only on an online-backup copy of the production database,
+copy deleted afterwards): `documents` link marks with `href` beginning `dok:` — **0**;
+revisions with such an `href` — **0**; document marks (`"doc":`) — **0**. No migration was
+owed. The scheme had already shipped (`a1466c9`, in production since `3128ece`), so the check
+ran after the fact; the zero means no page was made unexportable by it.
+
 #### D-21h: What identity buys and what it costs
 
 **Consequence, stated because it is the asymmetry somebody will trip over:** an export re-seeded
