@@ -2194,6 +2194,7 @@ probe_for() {
     # Before the generic store entry: every search mutation is caught by the search module's
     # own tests, and the filter spares the rest of the crate's 400 unit tests.
     crates/gw-store/src/search.rs) echo "-p gw-store --lib search::" ;;
+    crates/gw-store/src/access_epoch.rs) echo "-p gw-store --lib access_epoch::" ;;
     crates/gw-store/*) echo "-p gw-store --lib" ;;
     crates/gw-auth/*) echo "-p gw-auth --lib" ;;
     crates/gw-core/*) echo "-p gw-core --lib" ;;
