@@ -13,7 +13,7 @@ use crate::acl::Baseline;
 use crate::{Author, NewDocument, Store, TreeNode};
 use anyhow::Result;
 use gw_auth::{Action, Principal};
-use gw_core::{slugify, Block, Visibility};
+use gw_core::{slugify, Block, Visibility, title_problem};
 use serde::Serialize;
 
 /// The reserved subtree whose pages are templates.
@@ -156,6 +156,9 @@ impl Store {
             return Ok(CreateOutcome::Blocked(format!(
                 "a title may have at most {MAX_TITLE_CHARS} characters"
             )));
+        }
+        if let Some(reason) = title_problem(title) {
+            return Ok(CreateOutcome::Blocked(reason.to_string()));
         }
         let slug = slugify(
             request

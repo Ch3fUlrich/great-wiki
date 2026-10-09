@@ -2236,6 +2236,14 @@ mutation crates/gw-store/src/templates.rs killed \
   '/pub async fn create_page_for/,/^    }$/ s/if slug.len() > 100 {/if false {/' \
   'templates: a slug is capped at 100 characters, and the trash still holds its address'
 
+# Title validation against control characters and invisible formatting
+mutation crates/gw-store/src/templates.rs killed \
+  '/pub async fn create_page_for/,/^    }$/ s/if let Some(reason) = crate::gw_core::title_problem(title) {/if false {/' \
+  'templates: a title may not contain control or invisible formatting characters'
+mutation crates/gw-store/src/moves.rs killed \
+  '/pub async fn move_document/,/^    }$/ s/if let Some(reason) = crate::gw_core::title_problem(title) {/if false {/' \
+  'move: a title may not contain control or invisible formatting characters'
+
 # HOW LONG THIS IS ALLOWED TO TAKE
 # --------------------------------
 # A gate too slow to run stops being run. This one got there: eighteen mutations, a whole

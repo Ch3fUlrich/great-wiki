@@ -7,7 +7,7 @@ use crate::trash::{refuse_a_hole_in_the_tree, SUBTREE};
 use crate::Store;
 use anyhow::Result;
 use gw_auth::{Action, Principal};
-use gw_core::{slugify, Visibility};
+use gw_core::{slugify, Visibility, title_problem};
 use serde::Serialize;
 use serde_json::json;
 use std::str::FromStr;
@@ -120,6 +120,9 @@ impl Store {
         let title = request.title.trim();
         if title.is_empty() {
             return Ok(MoveOutcome::Blocked("a page needs a title".into()));
+        }
+        if let Some(reason) = title_problem(title) {
+            return Ok(MoveOutcome::Blocked(reason.to_string()));
         }
         let slug = slugify(
             request

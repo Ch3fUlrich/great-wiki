@@ -10,6 +10,7 @@ pub mod document;
 pub mod frontmatter;
 pub mod markdown;
 pub mod slug;
+pub mod title;
 
 pub use block::{body_plain_text, Block, BlockKind, Heading, Mark, MarkKind, MARK_ORDER};
 pub use diff::{
@@ -19,3 +20,4 @@ pub use document::{DocumentType, Visibility};
 pub use frontmatter::{split_frontmatter, FrontmatterError, SeedMeta};
 pub use markdown::{markdown_to_blocks, Conversion, Note, Unsupported};
 pub use slug::slugify;
+pub use title::title_problem;
