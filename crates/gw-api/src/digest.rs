@@ -197,6 +197,20 @@ const ORDER: [EventKind; 7] = [
     EventKind::GrantChanged,
 ];
 
+/// One line of a plain-text mail: every control character and Unicode line or paragraph
+/// separator becomes a space, so a title, path or name cannot start a line of its own.
+fn one_line(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// German plain text, one section per kind; a line is the actor and the page, nothing else.
 pub fn build_body(items: &[Notification]) -> String {
     let mut out =
@@ -209,11 +223,11 @@ pub fn build_body(items: &[Notification]) -> String {
         out.push_str(&format!("\n{}\n", heading(kind)));
         for n in rows {
             let page = match &n.page.title {
-                Some(t) => format!("{t} ({})", n.page.path),
-                None => n.page.path.clone(),
+                Some(t) => format!("{} ({})", one_line(t), one_line(&n.page.path)),
+                None => one_line(&n.page.path),
             };
             match &n.actor_name {
-                Some(who) => out.push_str(&format!("- {who}: {page}\n")),
+                Some(who) => out.push_str(&format!("- {}: {page}\n", one_line(who))),
                 None => out.push_str(&format!("- {page}\n")),
             }
         }
@@ -548,5 +562,58 @@ mod tests {
         assert!(seen.contains("RCPT TO:<BERT@EXAMPLE.ORG>"));
         assert!(data.contains("Subject:"));
         assert!(data.contains("anna: Seite"));
+    }
+
+    fn note(title: Option<&str>, path: &str, actor: Option<&str>) -> Notification {
+        Notification {
+            id: "n1".into(),
+            kind: EventKind::Mention,
+            created_at: "2026-01-01 00:00:00".into(),
+            read: false,
+            actor_name: actor.map(|a| a.to_string()),
+            page: gw_store::events::NotificationPage {
+                path: path.into(),
+                title: title.map(|t| t.to_string()),
+            },
+            subject: None,
+        }
+    }
+
+    #[test]
+    fn a_newline_in_the_title_cannot_add_a_line() {
+        let body = build_body(&[note(Some("X\n- admin: forged"), "/seite", Some("anna"))]);
+        assert!(body.contains("- anna: X - admin: forged (/seite)"));
+        assert!(!body.contains("X\n- admin"));
+        assert_eq!(body.lines().count(), 6);
+    }
+
+    #[test]
+    fn a_crlf_in_the_actor_name_cannot_add_a_line() {
+        let body = build_body(&[note(
+            Some("Seite"),
+            "/seite",
+            Some("bob\r\n- admin: forged"),
+        )]);
+        assert!(body.contains("- bob  - admin: forged: Seite (/seite)"));
+        assert!(!body.contains("bob\r\n- admin"));
+        assert_eq!(body.lines().count(), 6);
+    }
+
+    #[test]
+    fn a_unicode_line_separator_in_the_path_cannot_add_a_line() {
+        let body = build_body(&[note(
+            Some("Seite"),
+            "/a\u{2028}- admin: forged",
+            Some("anna"),
+        )]);
+        assert!(body.contains("- anna: Seite (/a - admin: forged)"));
+        assert!(!body.contains("\u{2028}"));
+        assert_eq!(body.lines().count(), 6);
+    }
+
+    #[test]
+    fn an_ordinary_title_is_unchanged() {
+        let body = build_body(&[note(Some("Geheimseite"), "/geheimseite", Some("anna"))]);
+        assert!(body.contains("- anna: Geheimseite (/geheimseite)"));
     }
 }
