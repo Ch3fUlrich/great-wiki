@@ -7,7 +7,7 @@ use crate::trash::{refuse_a_hole_in_the_tree, SUBTREE};
 use crate::Store;
 use anyhow::Result;
 use gw_auth::{Action, Principal};
-use gw_core::{slugify, Visibility, title_problem};
+use gw_core::{slugify, title_problem, Visibility};
 use serde::Serialize;
 use serde_json::json;
 use std::str::FromStr;
@@ -1347,5 +1347,23 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(parent, None);
+    }
+
+    #[tokio::test]
+    async fn a_rename_to_a_title_with_a_line_break_is_refused() {
+        let f = fixture().await;
+        let reason = blocked(
+            f.store
+                .move_document(
+                    &f.chefin,
+                    "/a/p",
+                    &to(Some("/a"), "P\u{202E}gefälscht"),
+                    true,
+                    MoveMode::Commit,
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(reason.contains("control or invisible"), "{reason}");
     }
 }

@@ -13,7 +13,7 @@ use crate::acl::Baseline;
 use crate::{Author, NewDocument, Store, TreeNode};
 use anyhow::Result;
 use gw_auth::{Action, Principal};
-use gw_core::{slugify, Block, Visibility, title_problem};
+use gw_core::{slugify, title_problem, Block, Visibility};
 use serde::Serialize;
 
 /// The reserved subtree whose pages are templates.
@@ -627,5 +627,22 @@ mod tests {
             matches!(outcome, CreateOutcome::Blocked(_)),
             "Empty slug should be refused: {outcome:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_title_with_a_line_break_is_refused_and_nothing_is_created() {
+        let (store, anna) = world().await;
+        let rq = req(Some("/raum"), "Seite\n- admin: gefälscht", None);
+        let outcome = store.create_page_for(&anna, &rq, false, "d").await.unwrap();
+        assert!(
+            matches!(outcome, CreateOutcome::Blocked(_)),
+            "a control character in a title must be refused: {outcome:?}"
+        );
+        let made: Option<(String,)> =
+            sqlx::query_as("SELECT path FROM documents WHERE path LIKE '/raum/seite%'")
+                .fetch_optional(&store.pool)
+                .await
+                .unwrap();
+        assert!(made.is_none(), "a refused title still created {made:?}");
     }
 }

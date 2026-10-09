@@ -2238,10 +2238,10 @@ mutation crates/gw-store/src/templates.rs killed \
 
 # Title validation against control characters and invisible formatting
 mutation crates/gw-store/src/templates.rs killed \
-  '/pub async fn create_page_for/,/^    }$/ s/if let Some(reason) = crate::gw_core::title_problem(title) {/if false {/' \
+  '/pub async fn create_page_for/,/^    }$/ s/if let Some(reason) = title_problem(title) {/if let Some(reason) = None::<\&str> {/' \
   'templates: a title may not contain control or invisible formatting characters'
 mutation crates/gw-store/src/moves.rs killed \
-  '/pub async fn move_document/,/^    }$/ s/if let Some(reason) = crate::gw_core::title_problem(title) {/if false {/' \
+  '/pub async fn move_document/,/^    }$/ s/if let Some(reason) = title_problem(title) {/if let Some(reason) = None::<\&str> {/' \
   'move: a title may not contain control or invisible formatting characters'
 
 # HOW LONG THIS IS ALLOWED TO TAKE
