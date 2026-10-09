@@ -1,3 +1,4 @@
+mod access_epoch;
 pub mod acl;
 pub mod admin;
 pub mod attachments;
@@ -74,6 +75,8 @@ pub struct Store {
     /// `open` argument or an environment read in this crate — this is a library, and both
     /// of those are the application's job.
     pub(crate) public_origin: Option<Url>,
+    /// Moves whenever who-may-do-what may have changed. See [`Store::access_epoch`].
+    pub(crate) epoch: access_epoch::AccessEpoch,
 }
 
 impl Store {
@@ -91,8 +94,14 @@ impl Store {
             .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
             .foreign_keys(true);
 
+        let epoch = access_epoch::AccessEpoch::new();
+        let hooked = epoch.clone();
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
+            .after_connect(move |connection, _| {
+                let epoch = hooked.clone();
+                Box::pin(async move { epoch.attach(connection).await })
+            })
             .connect_with(opts)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
@@ -100,6 +109,7 @@ impl Store {
         let store = Self {
             pool,
             public_origin: None,
+            epoch,
         };
         // The one part of 0014 that is not SQL. The merge key has exactly one definition
         // — `canonical_email` — and writing a second one in a migration would be two
@@ -110,6 +120,21 @@ impl Store {
         // See `search.rs`.
         store.backfill_search_text().await?;
         Ok(store)
+    }
+
+    /// A receiver that is told, at commit, whenever a write may have changed who may do what
+    /// to which page: a grant, a membership, an account's state, a session ending, a page
+    /// moving, changing visibility or entering the trash. The value is only a counter; what
+    /// matters is that it changed. Subscribe BEFORE the check being protected, mark it seen,
+    /// then check — a change in between is then reported rather than missed (ADR 0027).
+    pub fn access_epoch(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.epoch.subscribe()
+    }
+
+    /// Announce an access change this crate cannot see: one held in the server's memory,
+    /// such as an administrator entering view-as mode.
+    pub fn bump_access_epoch(&self) {
+        self.epoch.bump();
     }
 
     /// Configure the origin this deployment is publicly reachable at, so that an absolute
