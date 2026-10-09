@@ -726,8 +726,43 @@ async fn run(socket: WebSocket, state: AppState, jar: CookieJar, joined: Joined)
     let mut inbox = subscription.updates;
     let (mut sink, mut stream) = socket.split();
 
+    let mut budget = Budget::new();
+    let mut gate = VetGate::new(epoch, policy);
+
+    // The outbound gate (ADR 0027), at every send of room data to the client — the snapshot on
+    // connect, sync diffs, relayed updates and awareness, a resync — and not only at the tick.
+    // Frames already queued for this socket before a revocation are held at this gate too and
+    // are delivered only if the answer is yes; on a no the session closes with none sent.
+    // Reads are not exempt: a socket whose access may have
+    // changed is sent nothing, relays nothing and answers no sync request until the question
+    // has been asked again and the answer is yes — on a no, the session is closed with
+    // nothing room-derived sent first. Returns immediately when nothing has changed, so the
+    // ordinary frame pays one atomic load. The tag only names the call site, so that a
+    // mutation can disable one site at a time.
+    macro_rules! settled {
+        ($site:ident) => {
+            vet_until_stable(
+                &mut gate,
+                false,
+                false,
+                &mut SessionVetter {
+                    state: &state,
+                    jar: &jar,
+                    room: &room,
+                    path: &path,
+                    sink: &mut sink,
+                    writer_id: &mut writer_id,
+                },
+            )
+            .await
+        };
+    }
+
     // Step 1 on connect: this replica's state vector, so the client can send what we lack.
     // The client answers with step 2, and asks its own step 1, which is answered below.
+    if !settled!(connect) {
+        return;
+    }
     if sink
         .send(Message::Binary(
             wire::sync_step1(&room.doc().state_vector()).into(),
@@ -738,8 +773,6 @@ async fn run(socket: WebSocket, state: AppState, jar: CookieJar, joined: Joined)
         return;
     }
 
-    let mut budget = Budget::new();
-    let mut gate = VetGate::new(epoch, policy);
     let mut ticker = tokio::time::interval_at(
         tokio::time::Instant::now() + policy.reauth_interval,
         policy.reauth_interval,
@@ -796,6 +829,7 @@ async fn run(socket: WebSocket, state: AppState, jar: CookieJar, joined: Joined)
 
                        match decoded {
                            wire::Incoming::StateVector(vector) => {
+                               if !settled!(state_vector) { break }
                                let Ok(diff) = room.doc().encode_diff(vector) else {
                                    close(&mut sink, close_code::UNSUPPORTED,
                                          "malformed state vector", false).await;
@@ -845,7 +879,10 @@ async fn run(socket: WebSocket, state: AppState, jar: CookieJar, joined: Joined)
                            }
                            // Presence. Relayed verbatim and never applied to the document — it is
                            // not content, and the room does not interpret it either.
-                           wire::Incoming::Relay => room.broadcast(connection, &bytes),
+                           wire::Incoming::Relay => {
+                        if !settled!(awareness) { break }
+                        room.broadcast(connection, &bytes)
+                    }
                            // A well-formed message of a type this server has no use for. Ignored
                            // rather than refused: it cannot become content, and closing on it
                            // would make any future addition to the client protocol an outage.
@@ -859,6 +896,7 @@ async fn run(socket: WebSocket, state: AppState, jar: CookieJar, joined: Joined)
                        match frame {
                            Ok(frame) if frame.is_from(connection) => {}
                            Ok(frame) => {
+                               if !settled!(relayed) { break }
                                if sink.send(Message::Binary(frame.bytes.to_vec().into()))
                                    .await.is_err() { break }
                            }
@@ -867,6 +905,7 @@ async fn run(socket: WebSocket, state: AppState, jar: CookieJar, joined: Joined)
                            // because the frames it missed are gone.
                            Err(RecvError::Lagged(missed)) => {
                                tracing::warn!(missed, %path, "a connection lagged; resending the state");
+                        if !settled!(resync) { break }
                                if sink.send(Message::Binary(
                                        wire::sync_step2(&room.doc().encode_state()).into()))
                                    .await.is_err() { break }

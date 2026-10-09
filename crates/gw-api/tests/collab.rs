@@ -1604,6 +1604,12 @@ async fn two_writers_then_a_revocation(
     let lapsed_replica = sync(&mut lapsed).await;
     let mut observer = connect(&addr_b, "handbuch", None).await.unwrap();
     let observer_replica = sync(&mut observer).await;
+    // What the observer's own join sent has already reached `autorin`, legitimately: it was
+    // before the revocation. Read it off the socket so that a test looking for frames that
+    // arrive AFTER the revocation is not looking at those.
+    while let Ok(Some(Ok(_))) =
+        tokio::time::timeout(Duration::from_millis(150), lapsed.next()).await
+    {}
     revoke(store, "autorin", Permission::Write).await;
     (b, lapsed, lapsed_replica, observer, observer_replica)
 }
@@ -1687,4 +1693,88 @@ async fn churn_in_the_epoch_costs_a_socket_a_bounded_number_of_re_authorisations
     // And it is still a working session: the answers were all yes.
     send_update(&mut ws, &edit(&replica, "trotz Unruhe")).await;
     settle(&mut ws, &replica).await;
+}
+
+// -------------------------------------------------------------------------------------
+// Reads are gated too (ADR 0027): once access may have changed, nothing leaves the room for
+// the socket, and nothing it sends reaches the room, until the question has been answered.
+// -------------------------------------------------------------------------------------
+
+/// The room-derived frames — sync (0) and awareness (1) — that arrived before the close. The
+/// `permissionDenied` notice (2) is the refusal itself, not room data.
+async fn room_frames_before_close(socket: &mut Socket) -> Vec<(u8, Option<u8>)> {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let mut seen = Vec::new();
+    loop {
+        let next = tokio::time::timeout_at(deadline, socket.next())
+            .await
+            .expect("the session was not closed before the deadline");
+        match next {
+            Some(Ok(Message::Close(_))) | None => return seen,
+            Some(Ok(Message::Binary(bytes))) => match bytes[0] {
+                0 => seen.push((0, Some(bytes[1]))),
+                1 => seen.push((1, None)),
+                _ => {}
+            },
+            Some(Ok(_)) => {}
+            // A reset after the server's close counts as closed.
+            Some(Err(_)) => return seen,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_sync_request_after_a_revocation_is_not_answered_with_the_document() {
+    // The push is off, so nothing but the gate stands between a revoked socket and the diff.
+    let store = fixture().await;
+    let (_state, mut ws, replica) = listening(&store, unpushed(), "handbuch").await;
+    revoke(&store, "autorin", Permission::Write).await;
+
+    ws.send(message(MSG_SYNC, Some(SYNC_STEP1), &replica.state_vector()))
+        .await
+        .unwrap();
+
+    assert_eq!(room_frames_before_close(&mut ws).await, vec![]);
+}
+
+#[tokio::test]
+async fn an_update_broadcast_after_a_revocation_is_not_delivered_to_the_revoked_socket() {
+    let store = fixture().await;
+    let (_b, mut lapsed, _lr, mut observer, observer_replica) =
+        two_writers_then_a_revocation(&store, unpushed()).await;
+
+    send_update(&mut observer, &edit(&observer_replica, "Tastendruck")).await;
+
+    assert_eq!(room_frames_before_close(&mut lapsed).await, vec![]);
+}
+
+#[tokio::test]
+async fn presence_broadcast_after_a_revocation_is_not_delivered_to_the_revoked_socket() {
+    let store = fixture().await;
+    let (_b, mut lapsed, _lr, mut observer, _or) =
+        two_writers_then_a_revocation(&store, unpushed()).await;
+
+    observer
+        .send(message(MSG_AWARENESS, None, b"Cursor"))
+        .await
+        .unwrap();
+
+    assert_eq!(room_frames_before_close(&mut lapsed).await, vec![]);
+}
+
+#[tokio::test]
+async fn presence_sent_by_a_revoked_socket_is_not_relayed_to_the_others() {
+    let store = fixture().await;
+    let (_b, mut lapsed, _lr, mut observer, observer_replica) =
+        two_writers_then_a_revocation(&store, unpushed()).await;
+
+    lapsed
+        .send(message(MSG_AWARENESS, None, b"Cursor"))
+        .await
+        .unwrap();
+    assert_eq!(close_code(&mut lapsed).await, CloseCode::Policy);
+
+    // `settle` fails on any frame that is not a sync reply, so an awareness frame relayed
+    // from the revoked socket makes this panic.
+    assert_eq!(settle(&mut observer, &observer_replica).await, 0);
 }

@@ -679,6 +679,19 @@ mutation crates/gw-api/src/routes/collab.rs killed \
   's/tokio::time::sleep_until((gate.last_vet + gate.policy.vet_gap).into()).await;/let _ = gate.policy.vet_gap;/' \
   'collab: churn in the access epoch is bounded to one re-authorisation per gap per socket'
 
+# The outbound gate (ADR 0027): reads are gated like writes. With the push off, nothing but the
+# gate at each send stands between a revoked socket and the document, the keystrokes of the
+# people still in the room, their cursors — or between its own cursor and them.
+mutation crates/gw-api/src/routes/collab.rs killed \
+  's/if !settled!(state_vector) { break }/if false { break }/' \
+  'collab: a sync request from a socket whose access may have changed is not answered before it is re-checked'
+mutation crates/gw-api/src/routes/collab.rs killed \
+  's/if !settled!(relayed) { break }/if false { break }/' \
+  'collab: a broadcast is not delivered to a socket whose access may have changed before it is re-checked'
+mutation crates/gw-api/src/routes/collab.rs killed \
+  's/if !settled!(awareness) { break }/if false { break }/' \
+  'collab: presence from a socket whose access may have changed is not relayed before it is re-checked'
+
 # --- links: the graph, and who is allowed to see an edge of it ------------------------
 #
 # A backlinks panel is an aggregate view, and an aggregate view is where filtering gets

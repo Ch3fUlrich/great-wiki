@@ -36,10 +36,18 @@ failed without it (its own comment said so).
    instance admin reaches documents the writer does not name, so the store would have to
    compute the affected set at write time, which is the check itself; and a wrong set is a
    silent hole. Revisit if a deployment has thousands of sockets.
-4. **No laundering, by prevention.** An update from a connection whose authorisation is older
+4. **Reads are gated too.** Every send of room data to the socket (the snapshot on connect,
+   sync diffs, relayed updates, presence, a resync) and every relay of the socket's presence to
+   the room goes through the same `vet_until_stable` first. Once the epoch has moved since the
+   last answer nothing leaves or enters until the answer is in; on a no the session closes with
+   none sent. Frames already queued for the socket before a revocation are held at the same
+   gate. Cost: during the `vet_gap` wait the socket's outbound frames wait too (they are not
+   dropped; a yes delivers them in order). Not tested: the connect and resync sites (no way to
+   land a change in those windows without a test seam) — they are the same call.
+5. **No laundering, by prevention.** An update from a connection whose authorisation is older
    than the current epoch is never applied, so nothing lapsed is in the room for a publish (or
    a sweep) to snapshot. No publish-side rule is needed for committed revocations.
-5. **View-as is asked by identity** (`Registry::is_viewing`): an open socket's cookies are
+6. **View-as is asked by identity** (`Registry::is_viewing`): an open socket's cookies are
    frozen at the upgrade and cannot show that its administrator entered the mode since.
 
 ## Alternatives rejected

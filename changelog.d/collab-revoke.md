@@ -7,3 +7,5 @@
   before it is applied, so nothing from a revoked editor reaches the room or a later publish.
 - An administrator who starts viewing as someone else no longer keeps an editing session they
   had open before (it is closed at once).
+- A session whose access may just have changed is also sent nothing and relays nothing — no
+  document diff, no other editors' keystrokes or cursors — until its access has been re-checked.
