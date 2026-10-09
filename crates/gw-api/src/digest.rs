@@ -180,7 +180,7 @@ fn heading(kind: EventKind) -> &'static str {
         EventKind::CommentReply => "Antworten auf Ihre Kommentare",
         EventKind::Mention => "Erwähnungen",
         EventKind::PageEdited => "Geänderte Seiten",
-        EventKind::TaskAssigned => "Dir zugewiesene Aufgaben",
+        EventKind::TaskAssigned => "Ihnen zugewiesene Aufgaben",
         EventKind::TaskDue => "Fällige Aufgaben",
         EventKind::InviteAccepted => "Angenommene Einladungen",
         EventKind::GrantChanged => "Geänderte Berechtigungen",
