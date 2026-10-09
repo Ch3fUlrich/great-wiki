@@ -29,7 +29,10 @@
 //! **Authorisation is re-checked during the session**, not only at the handshake. A grant
 //! can be revoked, an account deactivated and a session ended while a socket is open, and
 //! an editing session that outlives the permission behind it is a permission that was never
-//! really revoked. See [`CollabPolicy::reauth_interval`].
+//! really revoked. A change is **pushed** (ADR 0027): the store's access epoch re-authorises
+//! every open socket at once, and an update is vetted before it is applied, so nothing a
+//! revoked editor sends reaches the room, a publish or a sweep. The timer
+//! ([`CollabPolicy::reauth_interval`]) remains for what raises no event, such as an expiry.
 //!
 //! # DEVIATIONS from the M3 plan, and why
 //!
@@ -144,9 +147,8 @@ pub struct CollabPolicy {
     /// same order as `view_as`'s "next click" and bounds how long a demotion can be
     /// outlived.
     ///
-    /// It is enforced from both ends: a timer, so an idle listener is closed too, and a
-    /// check before applying an update, so the first thing a demoted client tries to write
-    /// is refused rather than merely reported late.
+    /// It is the backstop since ADR 0027: the access epoch re-checks at once on any change
+    /// the store sees, and this interval bounds only what raises no event.
     pub reauth_interval: Duration,
     /// How often [`sweep`] runs. Also the window a crash can lose, which is why it is a
     /// short interval and not an hour.
@@ -181,6 +183,27 @@ pub struct CollabPolicy {
     /// keystroke as well as the memory a room holds. Thirty-two people editing one page at
     /// once is not this wiki; a client opening thirty-two sockets to one page is.
     pub max_connections_per_room: usize,
+    /// Whether an access change re-authorises every open socket AT ONCE (ADR 0027), including
+    /// one that is only listening, rather than at the next [`Self::reauth_interval`] tick.
+    ///
+    /// On in production, always. It is a value for the reason every interval here is: the
+    /// push and the check before an update is applied are two defences against the same
+    /// thing, and a test can only prove the second bites if the first can be switched off.
+    /// The pre-write check has no switch.
+    pub push_revocation: bool,
+    /// The least time between two epoch-driven re-authorisations of ONE socket.
+    ///
+    /// The epoch is global, so anyone who can make a write that moves it (logging out, moving
+    /// a page) would otherwise make every open socket re-ask three queries on the one
+    /// SQLite connection, as often as they can write. Bursts are already collapsed (a
+    /// watch holds "changed", not a count); this bounds the rate: the first change after
+    /// quiet is acted on at once, further ones wait out the gap. An update waits too — it
+    /// is never applied unvetted, so the cost of churn falls on the socket's latency and
+    /// not on safety. Per-document epochs were rejected, see ADR 0027.
+    pub vet_gap: Duration,
+    /// Frames a room buffers for a connection that is not reading before it is told it lagged
+    /// and resent the whole state. Only a test has a reason to change it.
+    pub update_buffer: usize,
 }
 
 impl Default for CollabPolicy {
@@ -193,6 +216,9 @@ impl Default for CollabPolicy {
             max_messages_per_second: 240,
             max_bytes_per_second: 1024 * 1024,
             max_connections_per_room: 32,
+            push_revocation: true,
+            vet_gap: Duration::from_millis(250),
+            update_buffer: gw_collab::room::UPDATE_BUFFER,
         }
     }
 }
@@ -259,6 +285,31 @@ pub struct CollabState {
     /// correctness of what a room is built from is.
     building: tokio::sync::Mutex<()>,
     policy: CollabPolicy,
+    /// How many times an open session has been re-authorised. A counter and not a metric
+    /// system: tests assert that churn is bounded, and an operator can read it.
+    vets: std::sync::atomic::AtomicU64,
+    /// Test seam: holds a session task at a named point. Never set outside tests, and one
+    /// atomic-cheap check when it is not. See [`Hold`].
+    holds: tokio::sync::watch::Sender<u8>,
+}
+
+/// Where a test can park a session task to land an access change in a window the code cannot
+/// otherwise be made to stand in (see [`CollabState::hold`]).
+#[derive(Debug, Clone, Copy)]
+pub enum Hold {
+    /// After the upgrade, before anything is sent: the connect snapshot.
+    Connect,
+    /// After the connect snapshot, before the first frame is read: lets a connection lag.
+    Loop,
+}
+
+impl Hold {
+    fn bit(self) -> u8 {
+        match self {
+            Hold::Connect => 1,
+            Hold::Loop => 2,
+        }
+    }
 }
 
 impl Default for CollabState {
@@ -270,15 +321,43 @@ impl Default for CollabState {
 impl CollabState {
     pub fn with_policy(policy: CollabPolicy) -> Self {
         Self {
-            rooms: gw_collab::Rooms::new(),
+            rooms: gw_collab::Rooms::with_buffer(policy.update_buffer),
             open: Mutex::new(HashMap::new()),
             building: tokio::sync::Mutex::new(()),
             policy,
+            vets: std::sync::atomic::AtomicU64::new(0),
+            holds: tokio::sync::watch::channel(0).0,
         }
     }
 
     pub fn policy(&self) -> &CollabPolicy {
         &self.policy
+    }
+
+    /// Park (or release) every session task at `point`. A test seam for the two windows —
+    /// the connect snapshot and the resync after lag — that no ordinary sequence of requests
+    /// can place an access change inside. Nothing in the server calls it.
+    pub fn hold(&self, point: Hold, on: bool) {
+        self.holds.send_modify(|bits| {
+            if on {
+                *bits |= point.bit();
+            } else {
+                *bits &= !point.bit();
+            }
+        });
+    }
+
+    async fn held(&self, point: Hold) {
+        let _ = self
+            .holds
+            .subscribe()
+            .wait_for(|bits| bits & point.bit() == 0)
+            .await;
+    }
+
+    /// Re-authorisations of open sessions so far.
+    pub fn vets(&self) -> u64 {
+        self.vets.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// How many rooms are open. For tests and for a future health endpoint.
@@ -424,7 +503,15 @@ async fn editor(state: &AppState, jar: &CookieJar, path: &str) -> Result<Princip
         );
         return Err(ApiError::Forbidden);
     }
-    Ok(state.principal(jar).await)
+    let principal = state.principal(jar).await;
+    // By identity as well as by cookie: an open socket holds the cookies it was upgraded with,
+    // which cannot show that its administrator has entered the mode since.
+    if state.view_as.is_viewing(&principal.id) {
+        tracing::warn!(path, viewer = %principal.username,
+            "refused: an editing session while viewing as somebody else");
+        return Err(ApiError::Forbidden);
+    }
+    Ok(principal)
 }
 
 /// [`authorise`], asked of a document by its id.
@@ -468,6 +555,11 @@ async fn join(
     Path(captured): Path<String>,
 ) -> Result<Response, ApiError> {
     let path = full_path(&captured);
+    // BEFORE the check, so an access change between the verdict and the first line of the
+    // socket task is reported rather than missed. Marked seen: only what happens from here on
+    // is news.
+    let mut epoch = state.store.access_epoch();
+    epoch.borrow_and_update();
     let (principal, document) = authorise(&state, &jar, &path).await?;
 
     let room = open_room(&state, &principal, &document).await?;
@@ -500,7 +592,14 @@ async fn join(
         .max_message_size(policy.transport_limit())
         .max_frame_size(policy.transport_limit())
         .on_upgrade(move |socket| async move {
-            run(socket, state, jar, path, room, subscription, writer_id).await;
+            let joined = Joined {
+                path,
+                room,
+                subscription,
+                writer_id,
+                epoch,
+            };
+            run(socket, state, jar, joined).await;
         }))
 }
 
@@ -651,23 +750,68 @@ async fn close(sink: &mut Sink, code: u16, reason: &str, denied: bool) {
     let _ = sink.close().await;
 }
 
-/// One connection, from the upgrade to the close.
-async fn run(
-    socket: WebSocket,
-    state: AppState,
-    jar: CookieJar,
+/// What the handshake hands to the socket task.
+struct Joined {
     path: String,
     room: Arc<Room>,
     subscription: gw_collab::Subscription,
-    mut writer_id: String,
-) {
+    writer_id: String,
+    /// Marked seen before the handshake's authorisation, so a change after it is reported.
+    epoch: tokio::sync::watch::Receiver<u64>,
+}
+
+/// One connection, from the upgrade to the close.
+async fn run(socket: WebSocket, state: AppState, jar: CookieJar, joined: Joined) {
+    let Joined {
+        path,
+        room,
+        subscription,
+        mut writer_id,
+        epoch,
+    } = joined;
     let policy = state.collab.policy;
     let connection = subscription.id;
     let mut inbox = subscription.updates;
     let (mut sink, mut stream) = socket.split();
 
+    let mut budget = Budget::new();
+    let mut gate = VetGate::new(epoch, policy);
+
+    // The outbound gate (ADR 0027), at every send of room data to the client — the snapshot on
+    // connect, sync diffs, relayed updates and awareness, a resync — and not only at the tick.
+    // Frames already queued for this socket before a revocation are held at this gate too and
+    // are delivered only if the answer is yes; on a no the session closes with none sent.
+    // Reads are not exempt: a socket whose access may have
+    // changed is sent nothing, relays nothing and answers no sync request until the question
+    // has been asked again and the answer is yes — on a no, the session is closed with
+    // nothing room-derived sent first. Returns immediately when nothing has changed, so the
+    // ordinary frame pays one atomic load. The tag only names the call site, so that a
+    // mutation can disable one site at a time.
+    macro_rules! settled {
+        ($site:ident) => {
+            vet_until_stable(
+                &mut gate,
+                false,
+                false,
+                &mut SessionVetter {
+                    state: &state,
+                    jar: &jar,
+                    room: &room,
+                    path: &path,
+                    sink: &mut sink,
+                    writer_id: &mut writer_id,
+                },
+            )
+            .await
+        };
+    }
+
     // Step 1 on connect: this replica's state vector, so the client can send what we lack.
     // The client answers with step 2, and asks its own step 1, which is answered below.
+    state.collab.held(Hold::Connect).await;
+    if !settled!(connect) {
+        return;
+    }
     if sink
         .send(Message::Binary(
             wire::sync_step1(&room.doc().state_vector()).into(),
@@ -678,168 +822,293 @@ async fn run(
         return;
     }
 
-    let mut budget = Budget::new();
-    let mut checked = Instant::now();
     let mut ticker = tokio::time::interval_at(
         tokio::time::Instant::now() + policy.reauth_interval,
         policy.reauth_interval,
     );
 
+    state.collab.held(Hold::Loop).await;
     loop {
         tokio::select! {
-            incoming = stream.next() => {
-                let Some(Ok(message)) = incoming else { break };
+                   incoming = stream.next() => {
+                       let Some(Ok(message)) = incoming else { break };
 
-                // Every frame is counted, including the ones this loop then ignores. A ping
-                // is answered by the transport whether or not this handler looks at it, so
-                // exempting pings from the budget would leave one message type that a client
-                // may send without limit and be answered every time.
-                let size = match &message {
-                    Message::Binary(bytes) => bytes.len(),
-                    Message::Text(text) => text.len(),
-                    Message::Ping(bytes) | Message::Pong(bytes) => bytes.len(),
-                    Message::Close(_) => 0,
-                };
-                if size > policy.max_message_bytes {
-                    tracing::warn!(bytes = size, "refused: an oversized frame");
-                    close(&mut sink, close_code::SIZE, "frame too large", false).await;
-                    break;
-                }
-                if !budget.admit(size, &policy) {
-                    tracing::warn!(%path, "refused: a connection exceeded its rate budget");
-                    close(&mut sink, close_code::POLICY, "too many updates", false).await;
-                    break;
-                }
+                       // Every frame is counted, including the ones this loop then ignores. A ping
+                       // is answered by the transport whether or not this handler looks at it, so
+                       // exempting pings from the budget would leave one message type that a client
+                       // may send without limit and be answered every time.
+                       let size = match &message {
+                           Message::Binary(bytes) => bytes.len(),
+                           Message::Text(text) => text.len(),
+                           Message::Ping(bytes) | Message::Pong(bytes) => bytes.len(),
+                           Message::Close(_) => 0,
+                       };
+                       if size > policy.max_message_bytes {
+                           tracing::warn!(bytes = size, "refused: an oversized frame");
+                           close(&mut sink, close_code::SIZE, "frame too large", false).await;
+                           break;
+                       }
+                       if !budget.admit(size, &policy) {
+                           tracing::warn!(%path, "refused: a connection exceeded its rate budget");
+                           close(&mut sink, close_code::POLICY, "too many updates", false).await;
+                           break;
+                       }
 
-                let bytes = match message {
-                    Message::Binary(bytes) => bytes,
-                    // Text is not part of this protocol. Refused rather than ignored: a
-                    // client sending it has misunderstood something, and finding that out
-                    // now is cheaper than finding it out when nothing saves.
-                    Message::Text(_) => {
-                        close(&mut sink, close_code::UNSUPPORTED,
-                              "this session speaks binary y-protocol frames only", false).await;
-                        break;
-                    }
-                    Message::Close(_) => break,
-                    // Ping and Pong are answered by the transport.
-                    Message::Ping(_) | Message::Pong(_) => continue,
-                };
+                       let bytes = match message {
+                           Message::Binary(bytes) => bytes,
+                           // Text is not part of this protocol. Refused rather than ignored: a
+                           // client sending it has misunderstood something, and finding that out
+                           // now is cheaper than finding it out when nothing saves.
+                           Message::Text(_) => {
+                               close(&mut sink, close_code::UNSUPPORTED,
+                                     "this session speaks binary y-protocol frames only", false).await;
+                               break;
+                           }
+                           Message::Close(_) => break,
+                           // Ping and Pong are answered by the transport.
+                           Message::Ping(_) | Message::Pong(_) => continue,
+                       };
 
-                let Some(decoded) = wire::decode(&bytes) else {
-                    // Malformed framing, as against a well-formed message this server has
-                    // no handler for. The bytes came off a socket, so this is a close and
-                    // never a panic.
-                    close(&mut sink, close_code::UNSUPPORTED, "malformed frame", false).await;
-                    break;
-                };
+                       let Some(decoded) = wire::decode(&bytes) else {
+                           // Malformed framing, as against a well-formed message this server has
+                           // no handler for. The bytes came off a socket, so this is a close and
+                           // never a panic.
+                           close(&mut sink, close_code::UNSUPPORTED, "malformed frame", false).await;
+                           break;
+                       };
 
-                match decoded {
-                    wire::Incoming::StateVector(vector) => {
-                        let Ok(diff) = room.doc().encode_diff(vector) else {
-                            close(&mut sink, close_code::UNSUPPORTED,
-                                  "malformed state vector", false).await;
-                            break;
-                        };
-                        if sink.send(Message::Binary(wire::sync_step2(&diff).into()))
-                            .await.is_err() { break }
+                       match decoded {
+                           wire::Incoming::StateVector(vector) => {
+                               if !settled!(state_vector) { break }
+                               let Ok(diff) = room.doc().encode_diff(vector) else {
+                                   close(&mut sink, close_code::UNSUPPORTED,
+                                         "malformed state vector", false).await;
+                                   break;
+                               };
+                               if sink.send(Message::Binary(wire::sync_step2(&diff).into()))
+                                   .await.is_err() { break }
+                           }
+                           wire::Incoming::Update(update) => {
+                               // The write path, and the only one. Vetted BEFORE the update is
+                               // applied, never after: nothing a lapsed connection sends reaches the
+                               // room, so there is nothing lapsed for a later publish to snapshot
+                               // (ADR 0027).
+                               //
+                               // Two triggers, either sufficient. The store's access epoch moved
+                               // since this connection was last checked — a grant, a move, the
+                               // trash, a deactivation, view-as — which is exact; or the interval
+                               // has passed, which covers what raises no event (a session that
+                               // simply expires). The epoch is marked seen BEFORE the question is
+                               // asked, so a change landing during the check is still reported.
+                               //
+                               // The `select!` timer and the push branch alone would leave this to
+                               // chance, since `select!` picks at random between ready branches.
+                               //
+                               // Until STABLE: the questions are async, and a change landing
+                               // between the last answer and the apply below would let one lapsed
+                               // update in. So the epoch is looked at again once the answer is in,
+                               // and the question is asked again if it moved. The look and the apply
+                               // have no await between them.
+                               if !vet_until_stable(
+        &mut gate, false, false, &mut SessionVetter { state: &state, jar: &jar, room: &room, path: &path, sink: &mut sink, writer_id: &mut writer_id }).await {
+                                   break;
+                               }
+                               // Apply, THEN relay: a frame this replica rejected must never reach
+                               // the other editors. `Room::apply_update` enforces that ordering for
+                               // callers whose frames are bare updates; the frames here are encoded
+                               // protocol messages, so that a receiving connection can write one to
+                               // its socket without knowing what it is.
+                               if room.doc().apply_update(update).is_err() {
+                                   tracing::warn!(%path, "refused: an update that could not be applied");
+                                   close(&mut sink, close_code::UNSUPPORTED,
+                                         "this update could not be applied", false).await;
+                                   break;
+                               }
+                               room.broadcast(connection, &wire::sync_update(update));
+                               state.collab.wrote(room.document_id(), &writer_id);
+                           }
+                           // Presence. Relayed verbatim and never applied to the document — it is
+                           // not content, and the room does not interpret it either.
+                           wire::Incoming::Relay => {
+                        if !settled!(awareness) { break }
+                        room.broadcast(connection, &bytes)
                     }
-                    wire::Incoming::Update(update) => {
-                        // The write path, and the only one. Re-authorised first when the
-                        // interval has passed, so that the first thing a demoted client
-                        // tries to write is what discovers the demotion.
-                        //
-                        // No test distinguishes this from the timer above, and that is
-                        // stated rather than hidden: both are driven by one interval, so
-                        // deleting this line leaves the whole suite green (verified). It is
-                        // here because `select!` chooses at random between ready branches,
-                        // so the timer alone bounds the staleness of an authorisation only
-                        // in expectation — a client sending continuously could have a
-                        // handful of updates applied after its permission lapsed. With this
-                        // line the bound is exact for the case that matters, which is the
-                        // one where content changes.
-                        if checked.elapsed() >= policy.reauth_interval {
-                            match reauthorise(&state, &jar, room.document_id(), &path).await {
-                                Some(id) => { writer_id = id; checked = Instant::now(); }
-                                None => {
-                                    close(&mut sink, close_code::POLICY,
-                                          "you may no longer edit this page", true).await;
-                                    break;
-                                }
-                            }
-                        }
-                        // Apply, THEN relay: a frame this replica rejected must never reach
-                        // the other editors. `Room::apply_update` enforces that ordering for
-                        // callers whose frames are bare updates; the frames here are encoded
-                        // protocol messages, so that a receiving connection can write one to
-                        // its socket without knowing what it is.
-                        if room.doc().apply_update(update).is_err() {
-                            tracing::warn!(%path, "refused: an update that could not be applied");
-                            close(&mut sink, close_code::UNSUPPORTED,
-                                  "this update could not be applied", false).await;
-                            break;
-                        }
-                        room.broadcast(connection, &wire::sync_update(update));
-                        state.collab.wrote(room.document_id(), &writer_id);
-                    }
-                    // Presence. Relayed verbatim and never applied to the document — it is
-                    // not content, and the room does not interpret it either.
-                    wire::Incoming::Relay => room.broadcast(connection, &bytes),
-                    // A well-formed message of a type this server has no use for. Ignored
-                    // rather than refused: it cannot become content, and closing on it
-                    // would make any future addition to the client protocol an outage.
-                    wire::Incoming::Ignored(kind) => {
-                        tracing::debug!(kind, "ignoring an unhandled protocol message");
-                    }
-                }
-            }
+                           // A well-formed message of a type this server has no use for. Ignored
+                           // rather than refused: it cannot become content, and closing on it
+                           // would make any future addition to the client protocol an outage.
+                           wire::Incoming::Ignored(kind) => {
+                               tracing::debug!(kind, "ignoring an unhandled protocol message");
+                           }
+                       }
+                   }
 
-            frame = inbox.recv() => {
-                match frame {
-                    Ok(frame) if frame.is_from(connection) => {}
-                    Ok(frame) => {
-                        if sink.send(Message::Binary(frame.bytes.to_vec().into()))
-                            .await.is_err() { break }
-                    }
-                    // This connection fell behind. Not data loss — the whole state is sent
-                    // and Yjs applies it idempotently — but it must be repaired here,
-                    // because the frames it missed are gone.
-                    Err(RecvError::Lagged(missed)) => {
-                        tracing::warn!(missed, %path, "a connection lagged; resending the state");
-                        if sink.send(Message::Binary(
-                                wire::sync_step2(&room.doc().encode_state()).into()))
-                            .await.is_err() { break }
-                    }
-                    // The room was evicted from under us. Ending the session is right: the
-                    // client reconnects and is given a room built from the database.
-                    Err(RecvError::Closed) => break,
-                }
-            }
+                   frame = inbox.recv() => {
+                       match frame {
+                           Ok(frame) if frame.is_from(connection) => {}
+                           Ok(frame) => {
+                               if !settled!(relayed) { break }
+                               if sink.send(Message::Binary(frame.bytes.to_vec().into()))
+                                   .await.is_err() { break }
+                           }
+                           // This connection fell behind. Not data loss — the whole state is sent
+                           // and Yjs applies it idempotently — but it must be repaired here,
+                           // because the frames it missed are gone.
+                           Err(RecvError::Lagged(missed)) => {
+                               tracing::warn!(missed, %path, "a connection lagged; resending the state");
+                        if !settled!(resync) { break }
+                               if sink.send(Message::Binary(
+                                       wire::sync_step2(&room.doc().encode_state()).into()))
+                                   .await.is_err() { break }
+                           }
+                           // The room was evicted from under us. Ending the session is right: the
+                           // client reconnects and is given a room built from the database.
+                           Err(RecvError::Closed) => break,
+                       }
+                   }
 
-            _ = ticker.tick() => {
-                // The other end of the re-check: a connection that sends nothing is closed
-                // too. Without this, revoking somebody's access would leave them subscribed
-                // to every keystroke of a page they may no longer read.
-                match reauthorise(&state, &jar, room.document_id(), &path).await {
-                    Some(id) => { writer_id = id; checked = Instant::now(); }
-                    None => {
-                        close(&mut sink, close_code::POLICY,
-                              "you may no longer edit this page", true).await;
-                        break;
-                    }
-                }
-                // And a heartbeat, because a room with a subscriber in it is never idle and
-                // therefore never evicted. A browser that vanishes without closing its
-                // socket — a laptop lid, a lost network — would otherwise hold a document in
-                // memory for as long as the process lives. Every conforming peer answers a
-                // ping automatically, and a peer that is gone makes this write fail once the
-                // kernel gives up retransmitting, which ends the session and frees the room.
-                if sink.send(Message::Ping(Default::default())).await.is_err() { break }
-            }
-        }
+                   // Push revocation (ADR 0027): the store says access changed somewhere, and this
+                   // connection asks its own question straight away instead of at the next tick. The
+                   // receiver is marked seen by `changed()` itself, before the question is asked.
+                   changed = gate.epoch.changed(), if policy.push_revocation => {
+                       if changed.is_err() { break }
+                       if !vet_until_stable(&mut gate, true, false, &mut SessionVetter { state: &state, jar: &jar, room: &room, path: &path, sink: &mut sink, writer_id: &mut writer_id }).await {
+                           break;
+                       }
+                   }
+
+                   _ = ticker.tick() => {
+                       // The other end of the re-check: a connection that sends nothing is closed
+                       // too. Without this, revoking somebody's access would leave them subscribed
+                       // to every keystroke of a page they may no longer read.
+                       if !vet_until_stable(&mut gate, false, true, &mut SessionVetter { state: &state, jar: &jar, room: &room, path: &path, sink: &mut sink, writer_id: &mut writer_id }).await {
+                           break;
+                       }
+                       // And a heartbeat, because a room with a subscriber in it is never idle and
+                       // therefore never evicted. A browser that vanishes without closing its
+                       // socket — a laptop lid, a lost network — would otherwise hold a document in
+                       // memory for as long as the process lives. Every conforming peer answers a
+                       // ping automatically, and a peer that is gone makes this write fail once the
+                       // kernel gives up retransmitting, which ends the session and frees the room.
+                       if sink.send(Message::Ping(Default::default())).await.is_err() { break }
+                   }
+               }
     }
 
     tracing::debug!(%path, %connection, "collaboration session ended");
+}
+
+/// When a socket last had its authorisation answered, and what the store's epoch looked like
+/// then. See [`vet_until_stable`].
+struct VetGate {
+    epoch: tokio::sync::watch::Receiver<u64>,
+    last_vet: Instant,
+    policy: CollabPolicy,
+}
+
+impl VetGate {
+    fn new(epoch: tokio::sync::watch::Receiver<u64>, policy: CollabPolicy) -> Self {
+        Self {
+            epoch,
+            // Backdated by the gap so that the first change after connecting is acted on at once.
+            last_vet: Instant::now()
+                .checked_sub(policy.vet_gap)
+                .unwrap_or_else(Instant::now),
+            policy,
+        }
+    }
+}
+
+/// The question [`vet_until_stable`] asks. A trait with a boxed future rather than a closure
+/// because the real one borrows the socket's sink mutably, which a closure cannot lend.
+trait Vetter {
+    fn vet(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>;
+}
+
+/// [`vet`], with everything it borrows.
+struct SessionVetter<'a> {
+    state: &'a AppState,
+    jar: &'a CookieJar,
+    room: &'a Room,
+    path: &'a str,
+    sink: &'a mut Sink,
+    writer_id: &'a mut String,
+}
+
+impl Vetter for SessionVetter<'_> {
+    fn vet(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(vet(
+            self.state,
+            self.jar,
+            self.room,
+            self.path,
+            self.sink,
+            self.writer_id,
+        ))
+    }
+}
+
+/// Vet, and keep vetting until the access epoch holds still across an answer. `true` if the
+/// session may go on.
+///
+/// Asked when `changed` (the push already consumed the notification), `forced` (the tick) or when the interval has passed or the epoch has
+/// moved. A moved epoch waits out [`CollabPolicy::vet_gap`] since the last answer first, which
+/// is what bounds the rate churn can impose; the epoch is marked seen BEFORE the question so a
+/// change landing during it is reported by the check that follows. The answer is async, so
+/// without that second look a change between the answer and the caller's next statement
+/// would let one lapsed update in; the look has no await between it and that statement.
+async fn vet_until_stable(
+    gate: &mut VetGate,
+    changed: bool,
+    mut forced: bool,
+    vetter: &mut impl Vetter,
+) -> bool {
+    let mut told = changed;
+    loop {
+        let moved = told || gate.epoch.has_changed().unwrap_or(true);
+        if !(moved || forced || gate.last_vet.elapsed() >= gate.policy.reauth_interval) {
+            return true;
+        }
+        if moved {
+            tokio::time::sleep_until((gate.last_vet + gate.policy.vet_gap).into()).await;
+        }
+        told = false;
+        forced = false;
+        gate.epoch.borrow_and_update();
+        let allowed = vetter.vet().await;
+        gate.last_vet = Instant::now();
+        if !allowed {
+            return false;
+        }
+    }
+}
+
+/// Re-ask the handshake's question for an open session; on a refusal, say so and report that
+/// the session is over. Shared by the push, the pre-write check and the timer, so the three
+/// cannot drift apart on what "no longer authorised" means.
+async fn vet(
+    state: &AppState,
+    jar: &CookieJar,
+    room: &Room,
+    path: &str,
+    sink: &mut Sink,
+    writer_id: &mut String,
+) -> bool {
+    match reauthorise(state, jar, room.document_id(), path).await {
+        Some(id) => {
+            *writer_id = id;
+            true
+        }
+        None => {
+            close(
+                sink,
+                close_code::POLICY,
+                "you may no longer edit this page",
+                true,
+            )
+            .await;
+            false
+        }
+    }
 }
 
 /// May this session still write this page? The principal's id if so.
@@ -856,6 +1125,10 @@ async fn reauthorise(
     document_id: &str,
     joined_at: &str,
 ) -> Option<String> {
+    state
+        .collab
+        .vets
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     match authorise_id(state, jar, document_id, joined_at).await {
         Ok(principal) => Some(principal.id),
         Err(error) => {
@@ -1310,8 +1583,74 @@ mod wire {
 
 #[cfg(test)]
 mod tests {
-    use super::{full_path, Budget, CollabPolicy};
+    use super::{full_path, vet_until_stable, Budget, CollabPolicy, VetGate, Vetter};
+    use std::future::Future;
+    use std::pin::Pin;
     use std::time::Duration;
+    use tokio::sync::watch;
+
+    fn gapless() -> CollabPolicy {
+        CollabPolicy {
+            vet_gap: Duration::ZERO,
+            reauth_interval: Duration::from_secs(3600),
+            ..CollabPolicy::default()
+        }
+    }
+
+    /// Answers `allowed` for each call in turn, bumping the epoch during the first.
+    struct Scripted {
+        sender: watch::Sender<u64>,
+        asked: usize,
+        answers: Vec<bool>,
+        bump_during_first: bool,
+    }
+
+    impl Vetter for Scripted {
+        fn vet(&mut self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+            Box::pin(async move {
+                self.asked += 1;
+                if self.asked == 1 && self.bump_during_first {
+                    self.sender.send_modify(|n| *n += 1);
+                }
+                self.answers.get(self.asked - 1).copied().unwrap_or(true)
+            })
+        }
+    }
+
+    fn scripted(answers: Vec<bool>, bump_during_first: bool) -> (Scripted, VetGate) {
+        let (sender, receiver) = watch::channel(0u64);
+        let vetter = Scripted {
+            sender,
+            asked: 0,
+            answers,
+            bump_during_first,
+        };
+        (vetter, VetGate::new(receiver, gapless()))
+    }
+
+    #[tokio::test]
+    async fn a_change_landing_during_the_answer_is_vetted_again_before_the_update_applies() {
+        // The window between "vetted" and "applied": the answer is async, so the epoch can
+        // move during it. One bump is injected inside the first answer (which says yes); the
+        // loop must ask again and act on the refusal, not return on a verdict that predates
+        // the change.
+        let (mut vetter, mut gate) = scripted(vec![true, false], true);
+        let allowed = vet_until_stable(&mut gate, false, true, &mut vetter).await;
+        assert_eq!(vetter.asked, 2, "the stale verdict was acted on");
+        assert!(!allowed, "the refusal that followed the change was lost");
+    }
+
+    #[tokio::test]
+    async fn a_hundred_changes_cost_one_answer_and_a_steady_epoch_none() {
+        let (mut vetter, mut gate) = scripted(vec![], false);
+        for _ in 0..100 {
+            vetter.sender.send_modify(|n| *n += 1);
+        }
+        assert!(vet_until_stable(&mut gate, false, false, &mut vetter).await);
+        assert_eq!(vetter.asked, 1, "a burst was answered once per change");
+        assert!(vet_until_stable(&mut gate, false, false, &mut vetter).await);
+        assert_eq!(vetter.asked, 1, "an unchanged epoch was re-asked");
+    }
 
     #[test]
     fn a_captured_path_is_given_back_the_leading_slash_exactly_once() {
