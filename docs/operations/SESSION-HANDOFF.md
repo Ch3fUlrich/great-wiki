@@ -1,28 +1,43 @@
-# Session handoff — 2026-08-08
+# Session handoff — 2026-10-09
 
 Written for the next Claude Code session. Read this, then
 [`AGENTS.md`](../../AGENTS.md), then the milestone plan you are working on.
 
 ## Where the project actually is
 
-**Live and working:** <https://wiki-dev.ohje.ooguy.com> — public pages readable with no
-login, sign-in through Authelia OIDC, restricted content gated by the real permission
-engine. **243 Rust tests, 31 web tests**, all gates green.
+**Production runs `3128ece`** (Semaphore task 112569) at <https://wiki.ohje.ooguy.com>:
+identity merge (ADR 0021), withheld pages read as absent (ADR 0022) and the `/admin` gate.
+**`main` is far ahead and not deployed.** Since `3128ece` it gained rename and move
+(ADR 0023, migration 0015), permission-aware full-text search (M7, ADR 0024, migration
+0016), the event bus, comments, notifications and the daily digest (M6, ADRs 0025/0026,
+migrations 0017/0018), the »Sie« register with a guard test, and a dependency-advisory
+gate (`deny.toml`, `just advisories`, a CI job on both forges). About 1340 Rust tests,
+1238 web tests and 122 behaviour checks, all green.
+
+**Deploying needs the operator's own OK** — every release since `3128ece` carries forward
+migrations — and runs through the `prox` session, because `scripts/build-images.sh` needs
+`../Server/secrets-generated/server__cloud__harbor__.env`, which is not on coding.vm.
+**Mail is a second, separate decision:** the digest sends nothing unless
+`GW_DIGEST_ENABLED=1`, and uses the homelab's shared `SMTP_*` settings, never a credential
+of the wiki's own.
+
+**In flight** on branches, not merged: access-epoch revocation for open editing sockets
+(`l2/collab-revoke`, ADR 0027) and page templates, which also brings the first way to
+create a page from the interface (`l2/templates`, ADR 0028).
 
 **Forgejo is the primary forge** — <https://forgejo.ohje.ooguy.com/Ch3fUlrich/great-wiki>
 (private). GitHub is a public mirror and both carry CI; push to both. The Forgejo
-pipeline is `.forgejo/workflows/ci.yml` and is shaped by one fact: the runner's only
-label is `docker` → `node:22-bookworm`, with nothing preinstalled. **`ubuntu-latest`
-matches no runner and queues forever rather than failing** — never use it there. Full
-detail, including the on-disk job-log path (there is no log API) and ci.vm's real 1.7 GiB
-memory ceiling, is in `Server/docs/operations/ci-runner-vm.md`.
+pipeline is `.forgejo/workflows/ci.yml` and is shaped by one fact: the runner has nothing
+preinstalled and runs `node:24-bookworm`. **`ubuntu-latest` matches no runner there and
+queues forever rather than failing** — never use it in that file. Detail, including the
+on-disk job-log path (there is no log API), is in `Server/docs/operations/ci-runner-vm.md`.
 
 | Milestone | State |
 |---|---|
-| **M0** Foundations | Complete |
-| **M1** Vertical slice | Complete |
-| **M2** Identity & access | Tasks 1–4 and 6 done. Task 5's store layer done (scoped audit log, team and grant operations). **Remaining: Task 5 API + console, Task 7 (invites), Task 8 (view-as)** |
-| **M3+** | Planned, not started |
+| **M0–M5** Foundations, vertical slice, identity & access, editing core, blocks, media | Complete |
+| **M6** Comments & notifications | Built on `main`; digest mail off |
+| **M7** Search (no assistant — a separate decision) | Built on `main` |
+| **M8+** | Outlined in the roadmap |
 
 ## Start the dev servers
 
@@ -107,6 +122,15 @@ deploy of `10-services.conf` must assert that *zero* value-carrying placeholders
 not that its own got replaced. That assertion caught a third secret and prevented breaking
 a service.
 
+**Spawned review sandboxes hold one commit and no history.** A reviewer told to read
+`git diff A B` sees nothing and may answer "no findings". Paste the diff into the prompt,
+or name the files to read at HEAD.
+
+**Parallel worktrees share one build directory.** Set `CARGO_TARGET_DIR` to the main
+checkout's `target/` and `CARGO_INCREMENTAL=0` in every worktree — coding.vm's disk has
+filled more than once — and expect the occasional phantom "no field" error from a stale
+artifact, cured by `cargo clean -p <crate>`.
+
 ## Owner decisions already settled — do not re-litigate
 
 Recorded in the specification (§2) and ADRs 0001–0005. In short: database is the source of
@@ -122,13 +146,12 @@ ends sessions.
 
 ## Open items
 
-- **Rotate the Cloudflare token** (`CF_TOKEN_KINDERTAGESPFLEGE`). It reached a transcript
-  because the deploy substitutes it into an explanatory *comment* as well as the directive.
-  The same pattern exists at `10-services.conf:631` for another service.
-- **Server repo has unpushed commits** — the owner is handling those.
-- **Production deployment is untried.** `wiki.ohje.ooguy.com` points at `cloud.vm:8100`,
-  which serves nothing. Whatever routes `/api/*` there must also route **`/auth/*`**, or
-  sign-in breaks.
-- **Ark UI has never been used here.** ADR 0005 chose it; the current interface is
-  hand-written CSS. Spike it before building the admin console on it.
-- The owner has not seen a side-by-side visual comparison yet, and asked for one.
+- **Deploy `main`** — waits for the operator's OK, then `prox` builds and deploys
+  (`docs/operations/running-in-production.md`, "Deploying a new version").
+- **Enable the digest** (`GW_MAIL_ENABLE`) — waits for the operator; the control-character
+  fix it depended on is merged.
+- **The `dok:` SELECT on the production database** — read-only, needs production access.
+- **Rotate the Cloudflare token** (`CF_TOKEN_KINDERTAGESPFLEGE`) — recorded 2026-08-08,
+  not re-checked since; it belongs to the Server repository.
+- Left for later from rename and move: sidebar dragging is built; forwarding of further
+  sub-routes and a default template per content type are not.
