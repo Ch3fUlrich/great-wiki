@@ -332,6 +332,13 @@ Entries describe the *effect* of a change, not the diff.
 
 ### Fixed
 
+- **The proxy image no longer depends on how the build machine checked out the code.** The
+  Caddy config was copied into the image with whatever file mode the checkout had; built from
+  a checkout readable only by its owner, the proxy (which runs unprivileged) could not read
+  its own config and never started, so the whole site was unreachable while the API and web
+  containers reported healthy. That is how the 65d7ace deploy failed on 2026-10-09. The file
+  is now always world-readable in the image.
+
 - **Opening a page that contains a checkbox no longer destroys it.** This was the serious
   one. The editor builds the document by looking each block up by name, and a name it did not
   know was not skipped — it was **deleted from the shared document**, sent to everyone else
