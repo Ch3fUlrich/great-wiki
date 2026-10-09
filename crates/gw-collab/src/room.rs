@@ -83,8 +83,8 @@ pub struct Room {
 }
 
 impl Room {
-    fn new(document_id: &str, initial: &Block) -> Self {
-        let (updates, _) = broadcast::channel(UPDATE_BUFFER);
+    fn new(document_id: &str, initial: &Block, buffer: usize) -> Self {
+        let (updates, _) = broadcast::channel(buffer.max(1));
         Self {
             document_id: document_id.to_string(),
             doc: CollabDoc::from_block(initial),
@@ -177,14 +177,31 @@ impl std::fmt::Debug for Room {
 }
 
 /// Every live room, keyed by document id.
-#[derive(Default)]
 pub struct Rooms {
     rooms: Mutex<HashMap<String, Arc<Room>>>,
+    /// How many frames a room buffers per slow connection; see [`UPDATE_BUFFER`].
+    buffer: usize,
+}
+
+impl Default for Rooms {
+    fn default() -> Self {
+        Self::with_buffer(UPDATE_BUFFER)
+    }
 }
 
 impl Rooms {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Rooms that buffer `buffer` frames per connection instead of [`UPDATE_BUFFER`]. A
+    /// policy value so that a test can make a connection lag with a handful of frames
+    /// instead of stalling a socket for megabytes.
+    pub fn with_buffer(buffer: usize) -> Self {
+        Self {
+            rooms: Mutex::new(HashMap::new()),
+            buffer,
+        }
     }
 
     /// The room for a document, creating it from `initial` if there is not one already.
@@ -207,7 +224,7 @@ impl Rooms {
             .entry(document_id.to_string())
             .or_insert_with(|| {
                 tracing::debug!(document_id, "opening a collaboration room");
-                Arc::new(Room::new(document_id, initial))
+                Arc::new(Room::new(document_id, initial, self.buffer))
             })
             .clone();
         room.touch();

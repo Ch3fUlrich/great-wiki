@@ -177,6 +177,18 @@ impl Registry {
         token
     }
 
+    /// Whether `viewer_id` is, right now, viewing as somebody.
+    ///
+    /// Asked by identity and not by cookie, for the caller that holds an OLD cookie jar: an
+    /// editing socket captured its cookies at the upgrade, so an administrator who enters the
+    /// mode afterwards is invisible to a check made with those cookies. See
+    /// [`crate::routes::collab`].
+    pub(crate) fn is_viewing(&self, viewer_id: &str) -> bool {
+        self.live()
+            .values()
+            .any(|record| record.viewer_id == viewer_id && record.expires_at > Instant::now())
+    }
+
     /// The record a token names, if it is still live.
     ///
     /// Expiry is enforced here rather than by a sweeper, exactly as session expiry is: a
@@ -479,6 +491,8 @@ pub async fn start(
         .map_err(ApiError::Internal)?;
 
     let token = state.view_as.begin(&actor.id, &target.id);
+    // An editing socket this administrator already has open must end now (ADR 0027).
+    state.store.bump_access_epoch();
     let jar = jar.add(flow_cookie(
         VIEW_AS_COOKIE,
         token,

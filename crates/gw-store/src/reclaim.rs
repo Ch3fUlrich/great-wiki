@@ -716,6 +716,7 @@ mod tests {
         let loose = Store {
             pool,
             public_origin: None,
+            epoch: Default::default(),
         };
         let (_media, blobs) = media();
 
