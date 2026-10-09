@@ -173,11 +173,11 @@ impl Mailer for SmtpMailer {
     }
 }
 
-const SUBJECT: &str = "Deine Zusammenfassung aus dem Wiki";
+const SUBJECT: &str = "Ihre Zusammenfassung aus dem Wiki";
 
 fn heading(kind: EventKind) -> &'static str {
     match kind {
-        EventKind::CommentReply => "Antworten auf deine Kommentare",
+        EventKind::CommentReply => "Antworten auf Ihre Kommentare",
         EventKind::Mention => "Erwähnungen",
         EventKind::PageEdited => "Geänderte Seiten",
         EventKind::TaskAssigned => "Dir zugewiesene Aufgaben",

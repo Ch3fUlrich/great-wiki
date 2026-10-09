@@ -128,14 +128,14 @@ export function describeSession(state: SessionState): SessionDescription {
         tone: 'warn',
         headline: 'Keine Verbindung — noch nicht gespeichert',
         detail:
-          'Du kannst weiterschreiben. Sobald die Verbindung zurück ist, wird alles übertragen ' +
-          'und zusammengeführt. Schließe diesen Tab bis dahin nicht.',
+          'Sie können weiterschreiben. Sobald die Verbindung zurück ist, wird alles übertragen ' +
+          'und zusammengeführt. Schließen Sie diesen Tab bis dahin nicht.',
         safe: false
       };
     case 'refused':
       return {
         tone: 'fail',
-        headline: 'Du darfst diese Seite nicht bearbeiten',
+        headline: 'Sie dürfen diese Seite nicht bearbeiten',
         detail:
           'Schreiben ist eine eigene Berechtigung; sie zu lesen schließt sie nicht ein. ' +
           'Bitte eine Administratorin oder einen Administrator um Schreibrechte für diese Seite.',
@@ -147,7 +147,7 @@ export function describeSession(state: SessionState): SessionDescription {
         headline: 'Die Sitzung wurde beendet: keine Schreibrechte mehr',
         detail:
           'Was seit der letzten automatischen Sicherung geschrieben wurde, ist nicht gespeichert. ' +
-          'Kopiere den Text, bevor du die Seite verlässt.',
+          'Kopieren Sie den Text, bevor Sie die Seite verlassen.',
         safe: false
       };
     case 'unreachable':
@@ -155,7 +155,7 @@ export function describeSession(state: SessionState): SessionDescription {
         tone: 'fail',
         headline: 'Der Server antwortet nicht',
         detail:
-          'Es wurde nichts übertragen und nichts verändert. Lade die Seite später noch einmal.',
+          'Es wurde nichts übertragen und nichts verändert. Laden Sie die Seite später noch einmal.',
         safe: false
       };
     case 'ended':
@@ -164,7 +164,7 @@ export function describeSession(state: SessionState): SessionDescription {
         headline: 'Der Server hat die Sitzung beendet',
         detail:
           'Was seit der letzten automatischen Sicherung geschrieben wurde, ist nicht gespeichert. ' +
-          'Kopiere den Text und lade die Seite neu.',
+          'Kopieren Sie den Text und laden Sie die Seite neu.',
         safe: false
       };
   }
@@ -278,7 +278,7 @@ export function describePublish(status: number): PublishDescription {
     case 403:
       return {
         tone: 'fail',
-        text: 'Abgelehnt: du darfst diese Seite nicht schreiben. Es wurde nichts veröffentlicht.'
+        text: 'Abgelehnt: Sie dürfen diese Seite nicht schreiben. Es wurde nichts veröffentlicht.'
       };
     case 404:
       return { tone: 'fail', text: 'Diese Seite gibt es nicht mehr. Es wurde nichts veröffentlicht.' };
@@ -286,7 +286,7 @@ export function describePublish(status: number): PublishDescription {
       return {
         tone: 'fail',
         text:
-          'Die Sitzung ist auf dem Server nicht mehr offen. Lade die Seite neu — der zuletzt ' +
+          'Die Sitzung ist auf dem Server nicht mehr offen. Laden Sie die Seite neu — der zuletzt ' +
           'gesicherte Stand ist erhalten, spätere Änderungen sind es nicht.'
       };
     default:

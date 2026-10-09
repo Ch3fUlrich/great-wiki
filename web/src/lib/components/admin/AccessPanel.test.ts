@@ -171,7 +171,7 @@ describe('AccessPanel', () => {
 
   it('says what to do when no path has been chosen', () => {
     const out = html(props({ path: null, acl: null }));
-    expect(out).toContain('Wähle links eine Seite aus');
+    expect(out).toContain('Wählen Sie links eine Seite aus');
     expect(out).not.toContain('<table');
   });
 

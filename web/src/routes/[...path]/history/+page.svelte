@@ -83,7 +83,7 @@
   function refused(status: number): string {
     if (status === 403) return 'Dafür fehlen die Rechte: Wiederherstellen setzt Schreibrecht auf dieser Seite voraus.';
     if (status === 404) return 'Diese Fassung gibt es nicht (mehr).';
-    if (status === 401) return 'Nicht angemeldet. Bitte melde dich erneut an.';
+    if (status === 401) return 'Nicht angemeldet. Bitte melden Sie sich erneut an.';
     return `Das Wiederherstellen ist fehlgeschlagen (Fehler ${status}).`;
   }
 

@@ -302,7 +302,7 @@
 
 <div class="gw-adm-section">
   {#if !path}
-    <Notice text="Wähle links eine Seite aus, um zu sehen, wer sie erreicht." />
+    <Notice text="Wählen Sie links eine Seite aus, um zu sehen, wer sie erreicht." />
   {:else if error}
     <!-- The failure, in words. Never an empty panel: this endpoint may not exist yet. -->
     <Notice tone="fail" title="Zugriffsrechte nicht geladen." text={error} />
