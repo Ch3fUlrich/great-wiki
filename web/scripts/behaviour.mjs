@@ -4607,13 +4607,50 @@ await check('W1 an editor sees the typed table, sorts it by number, filters it a
 
   // Add a row, then reload: it is stored, not just drawn.
   await page.goto(BASE + TABELLE, { waitUntil: 'networkidle' });
-  const form = page.locator('form.neu-zeile');
+  const form = page.locator('form.zeile-editor[aria-label="Zeile hinzufügen"]');
   await form.getByLabel('Name').fill('Doris');
   await form.getByLabel('Alter').fill('41');
   await form.getByRole('button', { name: 'Speichern' }).click();
   await page.locator('section.datensatz td', { hasText: 'Doris' }).waitFor({ state: 'visible', timeout: 10_000 });
   await page.reload({ waitUntil: 'networkidle' });
   assert((await tabelleNamen(page)).includes('Doris'), 'the added row is gone after a reload');
+});
+
+await check('W3 an editor edits a cell in place; a concurrent change shows the current row and keeps the draft (409)', async (page) => {
+  await tabelleSetup(page);
+  await page.goto(BASE + TABELLE, { waitUntil: 'networkidle' });
+  const rowOf = (name) => page.locator('section.datensatz tbody tr', { has: page.locator('td', { hasText: name }) });
+  const editor = page.locator('form.zeile-editor[aria-label="Zeile bearbeiten"]');
+
+  // Plain edit: change a number, reload, it is stored.
+  await rowOf('Clara').getByRole('button', { name: 'Bearbeiten' }).click();
+  await editor.getByLabel('Alter').fill('31');
+  await editor.getByRole('button', { name: 'Speichern' }).click();
+  await editor.waitFor({ state: 'detached', timeout: 10_000 });
+  await page.reload({ waitUntil: 'networkidle' });
+  assert((await rowOf('Clara').innerText()).includes('31'), 'the edited number is not stored');
+
+  // Conflict: the row moves on behind the editor's back.
+  await rowOf('Anton').getByRole('button', { name: 'Bearbeiten' }).click();
+  await editor.getByLabel('Name').fill('Anton Neu');
+  const list = await (await page.request.get(BASE + '/api/datasets/rows' + TABELLE)).json();
+  const anton = list.rows.find((r) => r.values.name === 'Anton');
+  assert(anton, 'Anton is not in the rows');
+  const bump = await page.request.patch(BASE + '/api/datasets/rows' + TABELLE, {
+    data: { id: anton.id, version: anton.version, values: { alter: 10 } }
+  });
+  assert(bump.status() === 200, `the concurrent change answered ${bump.status()}`);
+  await editor.getByRole('button', { name: 'Speichern' }).click();
+  await editor.getByRole('alert').filter({ hasText: 'inzwischen' }).waitFor({ state: 'visible', timeout: 10_000 });
+  assert((await editor.getByLabel('Name').inputValue()) === 'Anton Neu', 'the draft was lost on a conflict');
+  assert((await editor.locator('.konflikt').innerText()).includes('10'), 'the current row is not shown');
+
+  // Adopting the current version lets the same draft save.
+  await editor.getByRole('button', { name: 'Aktuelle Version übernehmen' }).click();
+  await editor.getByRole('button', { name: 'Speichern' }).click();
+  await editor.waitFor({ state: 'detached', timeout: 10_000 });
+  await page.reload({ waitUntil: 'networkidle' });
+  assert((await tabelleNamen(page)).includes('Anton Neu'), 'the draft did not save after adopting');
 });
 
 await check('W2 a guest gets the same 404 for the dataset page and its rows as for a page that is not there', async (page) => {
