@@ -4,6 +4,7 @@
   import Backlinks from '$lib/components/Backlinks.svelte';
   import BlockView from '$lib/components/BlockView.svelte';
   import Board from '$lib/components/Board.svelte';
+  import TableView from '$lib/datasets/TableView.svelte';
   import Breadcrumb from '$lib/components/Breadcrumb.svelte';
   import PageAttachments from '$lib/components/PageAttachments.svelte';
   import PageMeta from '$lib/components/PageMeta.svelte';
@@ -389,6 +390,20 @@
           einbettungen={data.einbettungen ?? {}}
         />
       </article>
+    {/if}
+
+    <!-- A dataset page (ADR 0029) is its description above and its table here. The load
+         states a failed read in `dataset.error`; the table is never drawn empty for one. -->
+    {#if data.dataset}
+      <TableView
+        path={data.doc.path}
+        fields={data.dataset.fields}
+        page={data.dataset.page}
+        error={data.dataset.error}
+        sort={data.dataset.sort}
+        filter={data.dataset.filter}
+        mayWrite={data.doc.may_write === true}
+      />
     {/if}
 
     <!-- D-12's second placement: this page's own board, when this page is a project's home.

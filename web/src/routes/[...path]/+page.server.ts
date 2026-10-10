@@ -42,6 +42,7 @@ import {
   MOVE_PARAM,
   type MovePlan
 } from '$lib/moves';
+import { loadDataset } from '$lib/datasets/load';
 import type { Actions, PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
@@ -352,6 +353,12 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
     vorschauFehler,
     board,
     boardFehler,
+    // A dataset page's table: schema and first page, read for the caller and for the sort and
+    // filter in the address. `null` for every other kind of page.
+    dataset:
+      data.doc_type === 'dataset'
+        ? await loadDataset(fetch, data.path, url.searchParams, cookie)
+        : null,
     // What just happened on the board, checked against the board itself — the same function
     // `/aufgaben` calls, so the two placements cannot say different things about one move.
     hinweis: board ? noticeFor(url.searchParams, board) : null,
