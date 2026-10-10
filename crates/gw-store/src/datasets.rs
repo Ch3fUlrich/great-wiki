@@ -13,7 +13,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 mod query;
+mod views;
 pub use query::{Cursor, Filter, RowQuery, Sort, SortKind};
+pub use views::{DatasetView, MAX_VIEWS};
 
 /// What the caller asks of a row list beyond paging. `sort` is the field and whether it
 /// runs descending; `after` is a cursor from a previous page's `next`.

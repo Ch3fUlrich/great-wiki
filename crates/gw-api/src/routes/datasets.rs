@@ -11,6 +11,11 @@
 //!   `{error, current}`), delete (`{id}`). Reading needs read; every change needs write.
 //!   An unreadable dataset is the same bare 404 as an absent one.
 //!
+//! - `GET|POST|PATCH|DELETE /api/datasets/views/{path}` - saved table views: list (`{views}`),
+//!   save (`{name, kind, config}`, 201), change (`{id, name?, config?}`), delete (`{id}`).
+//!   Reading needs read; every change needs write. A config naming a field the dataset does
+//!   not have is a 400.
+//!
 //! The same door as `POST /api/pages` ([`gw_store::Store::create_dataset_for`]): the store
 //! decides, this file supplies the `path_admin` gate and the server's date.
 
@@ -27,7 +32,7 @@ use axum_extra::extract::CookieJar;
 use gw_core::dataset::FieldKey;
 use gw_core::FieldKind;
 use gw_store::datasets::{
-    DatasetField, DatasetRow, NewField, RowOutcome, RowSelect, SchemaOutcome,
+    DatasetField, DatasetRow, DatasetView, NewField, RowOutcome, RowSelect, SchemaOutcome,
 };
 use gw_store::{CreateOutcome, CreateRequest};
 use serde::{Deserialize, Serialize};
@@ -42,6 +47,13 @@ pub fn routes() -> Router<AppState> {
                 .patch(rename_field)
                 .put(reorder_fields)
                 .delete(delete_field),
+        )
+        .route(
+            "/api/datasets/views/{*path}",
+            get(views)
+                .post(add_view)
+                .patch(update_view)
+                .delete(delete_view),
         )
         .route(
             "/api/datasets/rows/{*path}",
@@ -440,4 +452,103 @@ pub async fn create(
         CreateOutcome::Blocked(reason) => Err(ApiError::Conflict(reason)),
         CreateOutcome::Refused => Err(ApiError::Unauthorized),
     }
+}
+
+#[derive(Debug, Serialize)]
+pub struct Views {
+    pub views: Vec<DatasetView>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewView {
+    pub name: String,
+    pub kind: String,
+    #[serde(default = "empty_config")]
+    pub config: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewPatch {
+    pub id: String,
+    pub name: Option<String>,
+    pub config: Option<serde_json::Value>,
+}
+
+async fn views(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(path): Path<String>,
+) -> Result<Json<Views>, ApiError> {
+    let principal = state.principal(&jar).await;
+    let out = state
+        .store
+        .dataset_views(&principal, &full(&path))
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(Views {
+        views: answer(out, principal.is_authenticated())?,
+    }))
+}
+
+async fn add_view(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(path): Path<String>,
+    Json(body): Json<NewView>,
+) -> Result<(StatusCode, Json<DatasetView>), ApiError> {
+    let principal = state.principal(&jar).await;
+    let out = state
+        .store
+        .create_dataset_view(
+            &principal,
+            &full(&path),
+            &body.name,
+            &body.kind,
+            &body.config,
+        )
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(answer(out, principal.is_authenticated())?),
+    ))
+}
+
+async fn update_view(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(path): Path<String>,
+    Json(body): Json<ViewPatch>,
+) -> Result<Json<DatasetView>, ApiError> {
+    let principal = state.principal(&jar).await;
+    let out = state
+        .store
+        .update_dataset_view(
+            &principal,
+            &full(&path),
+            &body.id,
+            body.name.as_deref(),
+            body.config.as_ref(),
+        )
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(answer(out, principal.is_authenticated())?))
+}
+
+async fn delete_view(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(path): Path<String>,
+    Json(body): Json<RowId>,
+) -> Result<StatusCode, ApiError> {
+    let principal = state.principal(&jar).await;
+    let out = state
+        .store
+        .delete_dataset_view(&principal, &full(&path), &body.id)
+        .await
+        .map_err(ApiError::Internal)?;
+    answer(out, principal.is_authenticated())?;
+    Ok(StatusCode::OK)
 }

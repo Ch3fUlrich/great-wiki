@@ -722,3 +722,117 @@ async fn a_filtered_list_of_an_unreadable_dataset_is_byte_identical_to_an_absent
     let got = send(&store, None, "GET", &format!("{ROWS}?{q}"), None).await;
     assert_eq!(got, want);
 }
+
+// --- saved views (M8 A9) ----------------------------------------------------------------
+
+const VIEWS: &str = "/api/datasets/views/raum/tabelle";
+
+fn view_body() -> serde_json::Value {
+    serde_json::json!({"name": "Alle", "kind": "table",
+        "config": {"fields": ["name", "alter"], "sort": {"key": "alter", "desc": true}}})
+}
+
+async fn view_ids(store: &Arc<Store>, who: &str) -> (StatusCode, Vec<String>, String) {
+    let (s, b) = send(store, Some(who), "GET", VIEWS, None).await;
+    let ids = serde_json::from_str::<serde_json::Value>(&b)
+        .ok()
+        .and_then(|v| {
+            v["views"].as_array().map(|a| {
+                a.iter()
+                    .map(|x| x["id"].as_str().unwrap().to_string())
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    (s, ids, b)
+}
+
+fn id_of(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_writer_saves_lists_changes_and_deletes_a_view() {
+    let store = with_columns().await;
+    let (s, b) = send(&store, Some("schreiber"), "POST", VIEWS, Some(view_body())).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let id = id_of(&b);
+    let (s, ids, _) = view_ids(&store, "leser").await;
+    assert_eq!((s, ids), (StatusCode::OK, vec![id.clone()]));
+    let (s, b) = send(
+        &store,
+        Some("schreiber"),
+        "PATCH",
+        VIEWS,
+        Some(serde_json::json!({"id": id, "name": "Neu"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(b.contains("Neu"));
+    let (s, _) = send(
+        &store,
+        Some("schreiber"),
+        "DELETE",
+        VIEWS,
+        Some(serde_json::json!({"id": id})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, ids, _) = view_ids(&store, "schreiber").await;
+    assert!(ids.is_empty());
+}
+
+#[tokio::test]
+async fn view_changes_need_write_and_an_unreadable_dataset_is_a_bare_404() {
+    let store = with_columns().await;
+    let (_, b) = send(&store, Some("schreiber"), "POST", VIEWS, Some(view_body())).await;
+    let id = id_of(&b);
+    for (m, body) in [
+        ("POST", view_body()),
+        ("PATCH", serde_json::json!({"id": id, "name": "X"})),
+        ("DELETE", serde_json::json!({"id": id})),
+    ] {
+        let (s, _) = send(&store, Some("leser"), m, VIEWS, Some(body.clone())).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{m}");
+        let (s, _) = send(&store, None, m, VIEWS, Some(body)).await;
+        assert_eq!(
+            s,
+            StatusCode::NOT_FOUND,
+            "{m} guest reads nothing: bare 404"
+        );
+    }
+    let (_, ids, _) = view_ids(&store, "schreiber").await;
+    assert_eq!(ids, vec![id.clone()]);
+    // A stranger sees the same bytes as for a path that does not exist.
+    let gone = "/api/datasets/views/raum/nirgends";
+    for (m, body) in [
+        ("GET", None),
+        ("POST", Some(view_body())),
+        ("PATCH", Some(serde_json::json!({"id": id, "name": "X"}))),
+        ("DELETE", Some(serde_json::json!({"id": id}))),
+    ] {
+        let a = send(&store, Some("fremde"), m, VIEWS, body.clone()).await;
+        let b = send(&store, Some("fremde"), m, gone, body).await;
+        assert_eq!(a, b, "{m}");
+        assert_eq!(a.0, StatusCode::NOT_FOUND, "{m}");
+    }
+}
+
+#[tokio::test]
+async fn a_view_naming_a_missing_field_or_a_hostile_key_is_a_400() {
+    let store = with_columns().await;
+    for cfg in [
+        serde_json::json!({"fields": ["gibtsnicht"]}),
+        serde_json::json!({"filters": [{"op": "is_empty", "key": "x'; --"}]}),
+        serde_json::json!({"sort": {"key": "gibtsnicht"}}),
+    ] {
+        let body = serde_json::json!({"name": "V", "kind": "table", "config": cfg});
+        let (s, b) = send(&store, Some("schreiber"), "POST", VIEWS, Some(body)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{cfg}: {b}");
+    }
+    let (_, ids, _) = view_ids(&store, "schreiber").await;
+    assert!(ids.is_empty());
+}

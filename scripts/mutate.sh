@@ -2318,6 +2318,28 @@ mutation crates/gw-store/src/datasets.rs killed \
   '/pub async fn dataset_rows_query/,/^    }$/ s/self.readable_dataset(principal, path).await?/self.document_by_path_unchecked(path).await?/' \
   'datasets: the filtered row list skips the access check and lists a stranger the rows'
 
+# --- datasets: saved views (ADR 0029, M8 A9) -------------------------------------------------
+#
+# A view is config, saved by whoever may WRITE the page; listing is for readers.
+# (1)-(2) turn the write gate of save / delete into a plain read check, so a reader could
+# save and delete views. (3) accepts a config naming a field the dataset lacks. (4) is the
+# list door skipping the read seam. (5) lets a delete reach another dataset's view.
+mutation crates/gw-store/src/datasets/views.rs killed \
+  '/pub async fn create_dataset_view/,/^    }$/ s/let doc_id = match self.writable_dataset(principal, path).await? {/let doc_id = match self.readable_dataset(principal, path).await?.map_or(Gate::NoDataset, |d| Gate::Open(d.id)) {/' \
+  'datasets: a view save without a write check - a reader may not save views'
+mutation crates/gw-store/src/datasets/views.rs killed \
+  '/pub async fn delete_dataset_view/,/^    }$/ s/let doc_id = match self.writable_dataset(principal, path).await? {/let doc_id = match self.readable_dataset(principal, path).await?.map_or(Gate::NoDataset, |d| Gate::Open(d.id)) {/' \
+  'datasets: a view delete without a write check - a reader may not delete views'
+mutation crates/gw-store/src/datasets/views.rs killed \
+  's/if !known.contains(&key) {/if false \&\& !known.contains(\&key) {/' \
+  'datasets: a view config naming a missing field is accepted'
+mutation crates/gw-store/src/datasets/views.rs killed \
+  '/pub async fn dataset_views/,/^    }$/ s/self.readable_dataset(principal, path).await?/self.document_by_path_unchecked(path).await?/' \
+  'datasets: the view list skips the access check and lists a stranger the views'
+mutation crates/gw-store/src/datasets/views.rs killed \
+  's/DELETE FROM dataset_view WHERE id = ? AND doc_id = ?/DELETE FROM dataset_view WHERE id = ?/' \
+  'datasets: a view delete is scoped to its own dataset'
+
 # HOW LONG THIS IS ALLOWED TO TAKE
 # --------------------------------
 # A gate too slow to run stops being run. This one got there: eighteen mutations, a whole
