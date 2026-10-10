@@ -12,6 +12,19 @@ use gw_core::DocumentType;
 use serde::Serialize;
 use serde_json::Value;
 
+mod query;
+pub use query::{Cursor, Filter, RowQuery, Sort, SortKind};
+
+/// What the caller asks of a row list beyond paging. `sort` is the field and whether it
+/// runs descending; `after` is a cursor from a previous page's `next`.
+#[derive(Debug, Clone, Default)]
+pub struct RowSelect {
+    pub filters: Vec<Filter>,
+    pub sort: Option<(FieldKey, bool)>,
+    pub after: Option<String>,
+    pub limit: i64,
+}
+
 /// Most fields one dataset may carry (spec: bounded schema).
 pub const MAX_FIELDS: usize = 100;
 /// Longest field label, in characters.
@@ -357,7 +370,11 @@ pub const MAX_PAGE: i64 = 200;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RowPage {
     pub rows: Vec<DatasetRow>,
+    /// Rows matching the filters (all rows when there are none), counted after the access gate.
     pub total: i64,
+    /// Cursor for the next page; absent on the last one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }
 
 /// How a row call ended. `NoDataset` is the same uniform refusal as [`SchemaOutcome`].
@@ -473,6 +490,118 @@ impl Store {
         Ok(RowOutcome::Done(RowPage {
             rows: tuples.into_iter().map(row_from).collect(),
             total,
+            next: None,
+        }))
+    }
+
+    /// Filtered, sorted, cursor-paged rows. Same access seam and count-after-gate as
+    /// [`Store::dataset_rows`]; see `query.rs` for how the SQL is kept free of caller text.
+    pub async fn dataset_rows_query(
+        &self,
+        principal: &Principal,
+        path: &str,
+        select: &RowSelect,
+    ) -> Result<RowOutcome<RowPage>> {
+        let Some(doc) = self.readable_dataset(principal, path).await? else {
+            return Ok(RowOutcome::NoDataset);
+        };
+        // Every named field must exist in this dataset's schema; the sort kind comes from it.
+        let fields = self.fields_of(&doc.id).await?;
+        let kind_of = |key: &FieldKey| fields.iter().find(|f| f.key == key.as_str());
+        for f in &select.filters {
+            let (Filter::Eq { key, .. }
+            | Filter::Contains { key, .. }
+            | Filter::IsEmpty { key }
+            | Filter::In { key, .. }) = f;
+            if kind_of(key).is_none() {
+                return Ok(RowOutcome::Invalid(format!("no field `{}`", key.as_str())));
+            }
+        }
+        let sort = match &select.sort {
+            None => None,
+            Some((key, desc)) => {
+                let Some(field) = kind_of(key) else {
+                    return Ok(RowOutcome::Invalid(format!("no field `{}`", key.as_str())));
+                };
+                Some(Sort {
+                    key: key.clone(),
+                    kind: if field.kind == FieldKind::Number.as_str() {
+                        SortKind::Number
+                    } else {
+                        SortKind::Text
+                    },
+                    desc: *desc,
+                })
+            }
+        };
+        let after = match select.after.as_deref().map(Cursor::decode) {
+            None => None,
+            Some(Ok(c)) => Some(c),
+            Some(Err(m)) => return Ok(RowOutcome::Invalid(m)),
+        };
+        let limit = select.limit.clamp(1, MAX_PAGE);
+        let query = RowQuery {
+            filters: select.filters.clone(),
+            sort,
+            after,
+            limit,
+        };
+        let built = match query.build(&doc.id) {
+            Ok(b) => b,
+            Err(m) => return Ok(RowOutcome::Invalid(m)),
+        };
+        let sql = format!(
+            "SELECT {ROW_COLS}{} FROM dataset_row WHERE {}{}",
+            built.sort_cols_sql, built.where_sql, built.page_sql
+        );
+        let mut q = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                i64,
+                String,
+                String,
+                Option<f64>,
+                Option<String>,
+            ),
+        >(&sql);
+        for b in built
+            .sort_cols_binds
+            .iter()
+            .chain(&built.where_binds)
+            .chain(&built.page_binds)
+        {
+            q = match b {
+                query::Bind::Text(s) => q.bind(s),
+                query::Bind::Real(r) => q.bind(*r),
+                query::Bind::Int(i) => q.bind(*i),
+            };
+        }
+        let mut fetched = q.fetch_all(&self.pool).await?;
+        let more = fetched.len() as i64 > limit;
+        fetched.truncate(limit as usize);
+        let next = match (more, fetched.last()) {
+            (true, Some(last)) => Some(Cursor::of(last.5, last.6.clone(), last.0.clone()).encode()),
+            _ => None,
+        };
+        let count_sql = format!("SELECT COUNT(*) FROM dataset_row WHERE {}", built.where_sql);
+        let mut c = sqlx::query_scalar::<_, i64>(&count_sql);
+        for b in &built.where_binds {
+            c = match b {
+                query::Bind::Text(s) => c.bind(s),
+                query::Bind::Real(r) => c.bind(*r),
+                query::Bind::Int(i) => c.bind(*i),
+            };
+        }
+        let total = c.fetch_one(&self.pool).await?;
+        Ok(RowOutcome::Done(RowPage {
+            rows: fetched
+                .into_iter()
+                .map(|t| row_from((t.0, t.1, t.2, t.3, t.4)))
+                .collect(),
+            total,
+            next,
         }))
     }
 
@@ -1561,5 +1690,270 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(to_actor, 0);
+    }
+
+    use super::{Filter, RowPage, RowSelect};
+
+    async fn select_fixture() -> (Store, Principal, Principal, String) {
+        let (store, anna, _bea, cleo, path) = schema_fixture().await;
+        for (k, kind) in [
+            ("title", FieldKind::Text),
+            ("code", FieldKind::Text),
+            ("amount", FieldKind::Number),
+        ] {
+            store
+                .add_dataset_field(&anna, &path, &nf(k, kind))
+                .await
+                .unwrap();
+        }
+        for (t, c, a) in [
+            ("Apple pie", "9", 9),
+            ("banana", "10", 10),
+            ("Cherry", "100", 100),
+            ("", "7", 50),
+            ("apple tart", "8", 2),
+        ] {
+            let mut v = json!({"code": c, "amount": a});
+            if !t.is_empty() {
+                v["title"] = json!(t);
+            }
+            store
+                .create_dataset_row(&anna, &path, v.as_object().unwrap())
+                .await
+                .unwrap();
+        }
+        (store, anna, cleo, path)
+    }
+
+    fn k(s: &str) -> gw_core::dataset::FieldKey {
+        gw_core::dataset::FieldKey::parse(s).unwrap()
+    }
+
+    async fn select(
+        store: &Store,
+        who: &Principal,
+        path: &str,
+        sel: RowSelect,
+    ) -> RowOutcome<RowPage> {
+        store.dataset_rows_query(who, path, &sel).await.unwrap()
+    }
+
+    fn done(o: RowOutcome<RowPage>) -> RowPage {
+        let RowOutcome::Done(p) = o else {
+            panic!("{o:?}")
+        };
+        p
+    }
+
+    fn col(p: &RowPage, key: &str) -> Vec<String> {
+        p.rows
+            .iter()
+            .map(|r| r.values.get(key).map(|v| v.to_string()).unwrap_or_default())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn filters_match_eq_contains_is_empty_and_in() {
+        let (store, anna, _cleo, path) = select_fixture().await;
+        let run = |f: Filter| {
+            let (store, anna, path) = (&store, &anna, &path);
+            async move {
+                done(
+                    select(
+                        store,
+                        anna,
+                        path,
+                        RowSelect {
+                            filters: vec![f],
+                            limit: 50,
+                            sort: Some((k("amount"), false)),
+                            ..Default::default()
+                        },
+                    )
+                    .await,
+                )
+            }
+        };
+        let p = run(Filter::Eq {
+            key: k("amount"),
+            value: json!(10),
+        })
+        .await;
+        assert_eq!((col(&p, "amount"), p.total), (vec!["10".into()], 1));
+        let p = run(Filter::Eq {
+            key: k("code"),
+            value: json!("9"),
+        })
+        .await;
+        assert_eq!(col(&p, "amount"), vec!["9"]);
+        // Case-insensitive substring; `%` is not a wildcard.
+        let p = run(Filter::Contains {
+            key: k("title"),
+            value: "APPLE".into(),
+        })
+        .await;
+        assert_eq!(col(&p, "amount"), vec!["2", "9"]);
+        let p = run(Filter::Contains {
+            key: k("title"),
+            value: "%".into(),
+        })
+        .await;
+        assert_eq!(p.rows.len(), 0);
+        let p = run(Filter::IsEmpty { key: k("title") }).await;
+        assert_eq!((col(&p, "amount"), p.total), (vec!["50".into()], 1));
+        let p = run(Filter::In {
+            key: k("amount"),
+            values: vec![json!(100), json!(2), json!(3)],
+        })
+        .await;
+        assert_eq!(
+            (col(&p, "amount"), p.total),
+            (vec!["2".into(), "100".into()], 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn sort_is_typed_ten_follows_nine_for_numbers_and_precedes_it_as_text() {
+        let (store, anna, _cleo, path) = select_fixture().await;
+        let sorted = |key: &str, desc: bool| {
+            let (store, anna, path, key) = (&store, &anna, &path, k(key));
+            async move {
+                done(
+                    select(
+                        store,
+                        anna,
+                        path,
+                        RowSelect {
+                            sort: Some((key, desc)),
+                            limit: 50,
+                            ..Default::default()
+                        },
+                    )
+                    .await,
+                )
+            }
+        };
+        assert_eq!(
+            col(&sorted("amount", false).await, "amount"),
+            ["2", "9", "10", "50", "100"]
+        );
+        assert_eq!(
+            col(&sorted("amount", true).await, "amount"),
+            ["100", "50", "10", "9", "2"]
+        );
+        // The same digits in a text field compare as text.
+        assert_eq!(
+            col(&sorted("code", false).await, "code"),
+            ["\"10\"", "\"100\"", "\"7\"", "\"8\"", "\"9\""]
+        );
+        // A row without a value sorts last either way.
+        assert_eq!(
+            sorted("title", false).await.rows[4].values.get("title"),
+            None
+        );
+        assert_eq!(
+            sorted("title", true).await.rows[4].values.get("title"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cursor_pages_without_repeats_or_gaps_while_rows_are_inserted() {
+        let (store, anna, _cleo, path) = select_fixture().await;
+        for (key, desc) in [("amount", false), ("amount", true), ("title", false)] {
+            let mut seen: Vec<String> = Vec::new();
+            let mut after = None;
+            let mut inserted = false;
+            loop {
+                let p = done(
+                    select(
+                        &store,
+                        &anna,
+                        &path,
+                        RowSelect {
+                            sort: Some((k(key), desc)),
+                            limit: 2,
+                            after,
+                            ..Default::default()
+                        },
+                    )
+                    .await,
+                );
+                seen.extend(p.rows.iter().map(|r| r.id.clone()));
+                if !inserted {
+                    // Between pages a row arrives that sorts before the cursor.
+                    let v = json!({"amount": if desc { 1000 } else { -5 }, "title": "!!"});
+                    store
+                        .create_dataset_row(&anna, &path, v.as_object().unwrap())
+                        .await
+                        .unwrap();
+                    inserted = true;
+                }
+                match p.next {
+                    Some(n) => after = Some(n),
+                    None => break,
+                }
+            }
+            let unique: std::collections::HashSet<_> = seen.iter().collect();
+            assert_eq!(unique.len(), seen.len(), "{key} {desc}: a row repeated");
+            // Five original rows seen; the newcomer, behind the cursor, was not (title
+            // sort: "!!" sorts before every letter, so also behind it).
+            assert_eq!(seen.len(), 5, "{key} {desc}: {seen:?}");
+            let all = done(
+                select(
+                    &store,
+                    &anna,
+                    &path,
+                    RowSelect {
+                        limit: 200,
+                        ..Default::default()
+                    },
+                )
+                .await,
+            );
+            for r in all
+                .rows
+                .iter()
+                .filter(|r| r.values.get("title") == Some(&json!("!!")))
+            {
+                store.delete_dataset_row(&anna, &path, &r.id).await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_fields_bad_cursors_and_unreadable_datasets_are_refused() {
+        let (store, anna, cleo, path) = select_fixture().await;
+        let sel = |s: RowSelect| select(&store, &anna, &path, s);
+        let unknown = sel(RowSelect {
+            filters: vec![Filter::IsEmpty { key: k("nope") }],
+            limit: 5,
+            ..Default::default()
+        })
+        .await;
+        assert!(matches!(unknown, RowOutcome::Invalid(_)), "{unknown:?}");
+        let unknown = sel(RowSelect {
+            sort: Some((k("nope"), false)),
+            limit: 5,
+            ..Default::default()
+        })
+        .await;
+        assert!(matches!(unknown, RowOutcome::Invalid(_)));
+        let forged = sel(RowSelect {
+            after: Some("zz".into()),
+            limit: 5,
+            ..Default::default()
+        })
+        .await;
+        assert!(matches!(forged, RowOutcome::Invalid(_)));
+        // A stranger gets the uniform nothing, the same as for an absent path.
+        let want = RowSelect {
+            limit: 5,
+            ..Default::default()
+        };
+        let gone = select(&store, &cleo, &path, want.clone()).await;
+        assert_eq!(gone, RowOutcome::NoDataset);
+        let gone = select(&store, &cleo, "/raum/absent", want).await;
+        assert_eq!(gone, RowOutcome::NoDataset);
     }
 }

@@ -1,0 +1,2 @@
+### Added
+- A dataset's row list can be filtered, sorted and paged by cursor: `filter` (a JSON list of `eq`, `contains`, `is_empty` and `in` conditions), `sort` with `desc`, and `after` with the `next` cursor each page returns. Number fields sort as numbers (10 follows 9), everything else as text; rows without a value come last. The count is of the matching rows. A field named in a query must be a valid key of the dataset, and field names and values are never part of the SQL text. An unreadable dataset still answers exactly as a missing one.

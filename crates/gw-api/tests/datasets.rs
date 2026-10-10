@@ -644,3 +644,81 @@ async fn the_count_is_this_datasets_own_and_follows_the_page() {
     assert_eq!(v["total"], 2, "{b}");
     assert_eq!(v["rows"].as_array().unwrap().len(), 1, "{b}");
 }
+
+fn enc(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+fn amounts(body: &str) -> Vec<i64> {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    v["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["values"]["alter"].as_i64().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn the_row_list_filters_sorts_and_pages_by_cursor_and_refuses_hostile_keys() {
+    let store = with_columns().await;
+    for (n, a) in [("anna", 9), ("Anton", 10), ("berta", 100)] {
+        new_row(&store, json!({ "name": n, "alter": a })).await;
+    }
+    let get = |q: String| {
+        let store = Arc::clone(&store);
+        async move { send(&store, Some("leser"), "GET", &format!("{ROWS}?{q}"), None).await }
+    };
+    // Numbers sort as numbers: 10 follows 9.
+    let (s, b) = get("sort=alter".into()).await;
+    assert_eq!((s, amounts(&b)), (StatusCode::OK, vec![9, 10, 100]), "{b}");
+    let (_, b) = get("sort=alter&desc=true".into()).await;
+    assert_eq!(amounts(&b), vec![100, 10, 9]);
+    // A filter; the total is the matching count.
+    let f = json!([{ "op": "contains", "key": "name", "value": "AN" }]).to_string();
+    let (s, b) = get(format!("sort=alter&filter={}", enc(&f))).await;
+    assert_eq!((s, amounts(&b)), (StatusCode::OK, vec![9, 10]), "{b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(v["total"], 2, "{b}");
+    // Cursor paging.
+    let (_, b) = get("sort=alter&limit=2".into()).await;
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    let next = v["next"].as_str().expect("a next cursor").to_string();
+    let (_, b) = get(format!("sort=alter&limit=2&after={next}")).await;
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!((amounts(&b), v.get("next")), (vec![100], None), "{b}");
+    // Hostile keys never reach SQL: a plain 400.
+    let hostile = "a') OR 1=1 --";
+    let (s, _) = get(format!("sort={}", enc(hostile))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let f = json!([{ "op": "eq", "key": hostile, "value": 1 }]).to_string();
+    let (s, _) = get(format!("filter={}", enc(&f))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    // A well-formed key the schema lacks is a 400 too; a forged cursor as well.
+    let (s, _) = get("sort=nope".into()).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = get("sort=alter&after=zz".into()).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn a_filtered_list_of_an_unreadable_dataset_is_byte_identical_to_an_absent_one() {
+    let store = with_columns().await;
+    new_row(&store, json!({ "name": "x", "alter": 1 })).await;
+    let f = json!([{ "op": "is_empty", "key": "name" }]).to_string();
+    let q = format!("sort=alter&filter={}", enc(&f));
+    let absent = ROWS.replace("tabelle", "gibtsnicht");
+    assert_ne!(absent, ROWS, "fixture: the dataset path changed");
+    let want = send(&store, None, "GET", &format!("{absent}?{q}"), None).await;
+    assert_eq!(want.0, StatusCode::NOT_FOUND);
+    let got = send(&store, None, "GET", &format!("{ROWS}?{q}"), None).await;
+    assert_eq!(got, want);
+}

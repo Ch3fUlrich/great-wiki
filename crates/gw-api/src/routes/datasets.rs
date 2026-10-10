@@ -24,8 +24,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
+use gw_core::dataset::FieldKey;
 use gw_core::FieldKind;
-use gw_store::datasets::{DatasetField, DatasetRow, NewField, RowOutcome, SchemaOutcome};
+use gw_store::datasets::{
+    DatasetField, DatasetRow, NewField, RowOutcome, RowSelect, SchemaOutcome,
+};
 use gw_store::{CreateOutcome, CreateRequest};
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +81,40 @@ pub struct RowQuery {
     pub id: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    /// JSON array of filters: `[{"op":"eq","key":"k","value":1}, ...]`.
+    pub filter: Option<String>,
+    /// A field key to sort by; `desc=true` reverses it.
+    pub sort: Option<String>,
+    pub desc: Option<bool>,
+    /// A `next` cursor from the previous page.
+    pub after: Option<String>,
+}
+
+/// The filter/sort/cursor parameters as a store request; `None` when the call asks for none
+/// of them (then the plain offset page answers, as before). A key that is not a valid
+/// `FieldKey` is refused here, so it never reaches the store, let alone SQL.
+fn row_select(q: &RowQuery) -> Result<Option<RowSelect>, ApiError> {
+    if q.filter.is_none() && q.sort.is_none() && q.after.is_none() && q.desc.is_none() {
+        return Ok(None);
+    }
+    let filters = match q.filter.as_deref() {
+        None => Vec::new(),
+        Some(text) => serde_json::from_str(text)
+            .map_err(|e| ApiError::Invalid(format!("filter is not a valid filter list: {e}")))?,
+    };
+    let sort = match q.sort.as_deref() {
+        None => None,
+        Some(key) => Some((
+            FieldKey::parse(key).map_err(|e| ApiError::Invalid(e.to_string()))?,
+            q.desc.unwrap_or(false),
+        )),
+    };
+    Ok(Some(RowSelect {
+        filters,
+        sort,
+        after: q.after.clone(),
+        limit: q.limit.unwrap_or(50),
+    }))
 }
 
 /// Why a row call failed: an ordinary API error, or a stale version, the one answer with a
@@ -132,13 +169,22 @@ async fn get_row(
     let principal = state.principal(&jar).await;
     let fail = |e| RowFail::Api(ApiError::Internal(e));
     let signed_in = principal.is_authenticated();
-    // One row with `?id=`, otherwise a page with the dataset's count. Both go through the
+    let select = row_select(&q)?;
+    // One row with `?id=`,otherwise a page with the dataset's count. Both go through the
     // store's single read seam.
     match q.id {
         Some(id) => {
             let out = state
                 .store
                 .dataset_row(&principal, &full(&path), &id)
+                .await
+                .map_err(fail)?;
+            Ok(Json(row_answer(out, signed_in)?).into_response())
+        }
+        None if select.is_some() => {
+            let out = state
+                .store
+                .dataset_rows_query(&principal, &full(&path), &select.unwrap_or_default())
                 .await
                 .map_err(fail)?;
             Ok(Json(row_answer(out, signed_in)?).into_response())

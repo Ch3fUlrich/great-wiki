@@ -2295,6 +2295,29 @@ mutation crates/gw-store/src/datasets.rs killed \
   '/pub async fn dataset_rows/,/^    }$/ s/SELECT COUNT(\*) FROM dataset_row WHERE doc_id = ?"/SELECT COUNT(*) FROM dataset_row WHERE doc_id = ? OR 1=1"/' \
   'datasets: the row count is this dataset only - counted before narrowing it leaks the others'
 
+# --- datasets: the query layer (ADR 0029, M8 A8) ----------------------------------------------
+#
+# A field name reaches the SQL only as the bound JSON path of `json_extract`, never as text.
+# (1) is the "key interpolated" variant: the bound parameter becomes a `format!` of the key.
+# `FieldKey` keeps today's keys harmless, so the damage is invisible to behaviour - which is why
+# the builder tests assert the statement text contains no key and no value, and why this must
+# be KILLED: the day a looser key rule lands, interpolation is an injection.
+mutation crates/gw-store/src/datasets/query.rs killed \
+  's/^            format!("{CELL} = ?")$/            format!("json_extract(\\"values\\", \x27$.{}\x27) = ?", key.as_str())/' \
+  'datasets: query key interpolated into the SQL text instead of bound'
+# (2) A number field must sort as a number: cast to text, 10 lands before 9.
+mutation crates/gw-store/src/datasets/query.rs killed \
+  's/SortKind::Number => "REAL",/SortKind::Number => "TEXT",/' \
+  'datasets: query sorts a number field as text'
+# (3) Descending keyset must walk the other way, or page two repeats or skips rows.
+mutation crates/gw-store/src/datasets/query.rs killed \
+  's/let op = if sort.desc { "<" } else { ">" };/let op = if sort.desc { ">" } else { "<" };/' \
+  'datasets: query cursor direction follows the sort direction'
+# (4) The filtered list is one more door onto the rows; it must pass the same seam.
+mutation crates/gw-store/src/datasets.rs killed \
+  '/pub async fn dataset_rows_query/,/^    }$/ s/self.readable_dataset(principal, path).await?/self.document_by_path_unchecked(path).await?/' \
+  'datasets: the filtered row list skips the access check and lists a stranger the rows'
+
 # HOW LONG THIS IS ALLOWED TO TAKE
 # --------------------------------
 # A gate too slow to run stops being run. This one got there: eighteen mutations, a whole
