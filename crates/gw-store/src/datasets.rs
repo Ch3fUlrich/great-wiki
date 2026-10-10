@@ -184,16 +184,6 @@ impl Store {
             )));
         }
         let mut tx = self.pool.begin().await?;
-        let (count, last): (i64, Option<i64>) =
-            sqlx::query_as("SELECT COUNT(*), MAX(position) FROM dataset_field WHERE doc_id = ?")
-                .bind(&doc_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        if count as usize >= MAX_FIELDS {
-            return Ok(SchemaOutcome::Invalid(format!(
-                "a dataset has at most {MAX_FIELDS} fields"
-            )));
-        }
         let taken: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM dataset_field WHERE doc_id = ? AND key = ?")
                 .bind(&doc_id)
@@ -206,20 +196,31 @@ impl Store {
                 key.as_str()
             )));
         }
-        let position = last.map_or(0, |p| p + 1);
-        sqlx::query(
+        // Count and insert in one statement so two racing writers cannot pass the cap.
+        let id = uuid::Uuid::now_v7().to_string();
+        let done = sqlx::query(
             "INSERT INTO dataset_field (id, doc_id, key, label, kind, config, position) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, COALESCE(MAX(position) + 1, 0) \
+             FROM dataset_field WHERE doc_id = ?2 HAVING COUNT(*) < ?7",
         )
-        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(&id)
         .bind(&doc_id)
         .bind(key.as_str())
         .bind(&label)
         .bind(new.kind.as_str())
         .bind(&config)
-        .bind(position)
+        .bind(MAX_FIELDS as i64)
         .execute(&mut *tx)
         .await?;
+        if done.rows_affected() == 0 {
+            return Ok(SchemaOutcome::Invalid(format!(
+                "a dataset has at most {MAX_FIELDS} fields"
+            )));
+        }
+        let position: i64 = sqlx::query_scalar("SELECT position FROM dataset_field WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(SchemaOutcome::Done(DatasetField {
             key: key.as_str().to_string(),
@@ -1657,6 +1658,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((done, n as usize), (1, MAX_ROWS));
+    }
+
+    #[tokio::test]
+    async fn racing_field_adds_at_the_cap_admit_exactly_one() {
+        let (store, anna, _, _, path) = schema_fixture().await;
+        let doc = doc_id_of(&store, &path).await;
+        sqlx::query(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2) \
+             INSERT INTO dataset_field (id, doc_id, key, label, kind, config, position) \
+             SELECT 'f' || i, ?1, 'k' || i, 'L', 'text', '{}', i FROM n",
+        )
+        .bind(&doc)
+        .bind(super::MAX_FIELDS as i64 - 1)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let (fa, fb) = (nf("ra", FieldKind::Text), nf("rb", FieldKind::Text));
+        let (a, b) = tokio::join!(
+            store.add_dataset_field(&anna, &path, &fa),
+            store.add_dataset_field(&anna, &path, &fb)
+        );
+        let done = [a, b]
+            .into_iter()
+            .filter(|r| matches!(r, Ok(SchemaOutcome::Done(_))))
+            .count();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dataset_field WHERE doc_id = ?")
+            .bind(&doc)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!((done, n as usize), (1, super::MAX_FIELDS));
     }
 
     #[tokio::test]

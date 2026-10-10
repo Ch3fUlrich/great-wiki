@@ -2267,6 +2267,9 @@ mutation crates/gw-store/src/datasets.rs killed \
 mutation crates/gw-store/src/datasets.rs killed \
   's/^pub const MAX_FIELDS: usize = 100;/pub const MAX_FIELDS: usize = usize::MAX;/' \
   'datasets: a dataset has a bounded number of fields'
+mutation crates/gw-store/src/datasets.rs killed \
+  's/FROM dataset_field WHERE doc_id = ?2 HAVING COUNT(\*) < ?7/FROM dataset_field WHERE doc_id = ?2 HAVING COUNT(*) < ?7 + 1000000/' \
+  'datasets: the field cap is checked inside the insert'
 # `deny_unknown_fields` is what keeps `kind` and `key` immutable through the relabel route.
 mutation crates/gw-api/src/routes/datasets.rs killed \
   '/^#\[serde(deny_unknown_fields)\]$/d' \

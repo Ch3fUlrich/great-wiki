@@ -710,6 +710,31 @@ async fn the_row_list_filters_sorts_and_pages_by_cursor_and_refuses_hostile_keys
 }
 
 #[tokio::test]
+async fn desc_without_a_sort_is_ignored_and_an_unknown_field_body_member_is_refused() {
+    let store = with_columns().await;
+    new_row(&store, json!({ "name": "x", "alter": 1 })).await;
+    let plain = send(&store, Some("leser"), "GET", ROWS, None).await;
+    let desc = send(
+        &store,
+        Some("leser"),
+        "GET",
+        &format!("{ROWS}?desc=true"),
+        None,
+    )
+    .await;
+    assert_eq!(desc, plain, "desc alone must not change the plain page");
+    let (s, b) = send(
+        &store,
+        Some("schreiber"),
+        "POST",
+        SCHEMA,
+        Some(json!({ "key": "extra", "label": "E", "kind": "text", "position": 0 })),
+    )
+    .await;
+    assert!(s.is_client_error(), "{s} {b}");
+}
+
+#[tokio::test]
 async fn a_filtered_list_of_an_unreadable_dataset_is_byte_identical_to_an_absent_one() {
     let store = with_columns().await;
     new_row(&store, json!({ "name": "x", "alter": 1 })).await;

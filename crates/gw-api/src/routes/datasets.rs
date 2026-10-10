@@ -106,7 +106,8 @@ pub struct RowQuery {
 /// of them (then the plain offset page answers, as before). A key that is not a valid
 /// `FieldKey` is refused here, so it never reaches the store, let alone SQL.
 fn row_select(q: &RowQuery) -> Result<Option<RowSelect>, ApiError> {
-    if q.filter.is_none() && q.sort.is_none() && q.after.is_none() && q.desc.is_none() {
+    if q.filter.is_none() && q.sort.is_none() && q.after.is_none() {
+        // `desc` alone has nothing to reverse: it is ignored, the plain page answers.
         return Ok(None);
     }
     let filters = match q.filter.as_deref() {
@@ -275,6 +276,7 @@ pub struct Fields {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AddField {
     pub key: String,
     pub label: String,
