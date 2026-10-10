@@ -8,16 +8,13 @@
    * first page), so they work with JavaScript switched off; "Mehr laden" and the add-row form
    * need a script and say nothing without one.
    */
-  import { invalidateAll } from '$app/navigation';
-  import { apiSendBrowser } from './browser';
+  import RowEditor from './RowEditor.svelte';
+  import { editableFields } from './rowedit';
   import {
-    ADDABLE,
     cellOf,
-    describeAddFailure,
     describeRowsFailure,
     rowsApiPath,
     sortHref,
-    valueFromInput,
     withoutFilterHref,
     type Field,
     type FilterState,
@@ -48,8 +45,7 @@
   let cursor = $state<string | null | undefined>(undefined);
   let loadError = $state<string | null>(null);
   let busy = $state(false);
-  let addError = $state<string | null>(null);
-  let draft = $state<Record<string, string | boolean>>({});
+  let editing = $state<string | null>(null);
 
   // A new first page (sort, filter or reload) discards what was appended to the old one.
   $effect(() => {
@@ -64,7 +60,7 @@
   const labelOf = (key: string) => fields.find((f) => f.key === key)?.label ?? key;
   const ariaSort = (key: string) =>
     sort && sort.sort === key ? (sort.desc ? 'descending' : 'ascending') : 'none';
-  const addable = $derived(fields.filter((f) => ADDABLE.includes(f.kind)));
+  const addable = $derived(editableFields(fields));
 
   async function loadMore(event: Event) {
     event.preventDefault();
@@ -85,23 +81,6 @@
     } finally {
       busy = false;
     }
-  }
-
-  async function addRow(event: Event) {
-    event.preventDefault();
-    addError = null;
-    const values: Record<string, unknown> = {};
-    for (const f of addable) {
-      const v = valueFromInput(f.kind, draft[f.key] ?? '');
-      if (v !== undefined) values[f.key] = v;
-    }
-    const answer = await apiSendBrowser('POST', rowsApiPath(path, {}), { values });
-    if (answer.status !== 201) {
-      addError = describeAddFailure(answer.status, answer.message);
-      return;
-    }
-    draft = {};
-    await invalidateAll();
   }
 </script>
 
@@ -149,6 +128,7 @@
                   <a href={sortHref(sort, f.key, filter)}>{f.label}</a>
                 </th>
               {/each}
+              {#if mayWrite}<th scope="col"><span class="sr-only">Aktionen</span></th>{/if}
             </tr>
           </thead>
           <tbody>
@@ -169,7 +149,21 @@
                     {/if}
                   </td>
                 {/each}
+                {#if mayWrite}
+                  <td>
+                    <button type="button" class="bearbeiten" onclick={() => (editing = editing === row.id ? null : row.id)}
+                      >Bearbeiten</button
+                    >
+                  </td>
+                {/if}
               </tr>
+              {#if editing === row.id}
+                <tr class="editor-zeile">
+                  <td colspan={fields.length + 1}>
+                    <RowEditor {path} {fields} {row} onclose={() => (editing = null)} />
+                  </td>
+                </tr>
+              {/if}
             {/each}
           </tbody>
         </table>
@@ -189,25 +183,7 @@
     {#if loadError}<p class="tabelle-fehler" role="alert">{loadError}</p>{/if}
 
     {#if mayWrite && addable.length > 0}
-      <form class="neu-zeile" onsubmit={addRow}>
-        <h3>Zeile hinzufügen</h3>
-        {#each addable as f (f.key)}
-          <label>
-            {f.label}
-            {#if f.kind === 'bool'}
-              <input type="checkbox" bind:checked={() => draft[f.key] === true, (v) => (draft[f.key] = v)} />
-            {:else}
-              <input
-                type="text"
-                name={f.key}
-                bind:value={() => (draft[f.key] as string) ?? '', (v) => (draft[f.key] = v)}
-              />
-            {/if}
-          </label>
-        {/each}
-        <button type="submit">Speichern</button>
-        {#if addError}<p class="tabelle-fehler" role="alert">{addError}</p>{/if}
-      </form>
+      <RowEditor {path} {fields} />
     {/if}
   {/if}
 </section>
@@ -247,11 +223,13 @@
       align-items: end;
       margin-block-end: var(--space-3);
     }
-    .neu-zeile {
-      display: grid;
-      gap: var(--space-2);
-      max-inline-size: 28rem;
-      margin-block-start: var(--space-4);
+    .sr-only {
+      position: absolute;
+      inline-size: 1px;
+      block-size: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
     }
     .err {
       font-weight: 600;

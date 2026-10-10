@@ -29,7 +29,7 @@ const same = (a: unknown, b: unknown) => JSON.stringify(a ?? null) === JSON.stri
 
 export function describeSaveFailure(status: number, message: string | null): string {
   if (status === 0) return 'Die Zeile konnte nicht gespeichert werden: keine Antwort.';
-  if (status === 403) return 'Du darfst diese Zeile nicht ändern (Fehler 403).';
+  if (status === 403) return 'Sie dürfen diese Zeile nicht ändern (Fehler 403).';
   return describeAddFailure(status, message);
 }
 

@@ -36,6 +36,31 @@ describe('fromRaw scalar kinds', () => {
   });
 });
 
+describe('fromRaw choice kinds', () => {
+  const cfg = { options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] };
+  it('select emits the option id, refuses an unknown one, empty clears', () => {
+    expect(fromRaw('select', cfg, 'a')).toEqual(ok('a'));
+    expect(fromRaw('select', cfg, 'zz')).toEqual(bad);
+    expect(fromRaw('select', cfg, '')).toEqual(ok(null));
+  });
+  it('multi_select emits a deduped id array, refuses unknown, empty list clears', () => {
+    expect(fromRaw('multi_select', cfg, ['a', 'b', 'a'])).toEqual(ok(['a', 'b']));
+    expect(fromRaw('multi_select', cfg, ['a', 'zz'])).toEqual(bad);
+    expect(fromRaw('multi_select', cfg, [])).toEqual(ok(null));
+  });
+  it('tags split on commas into a trimmed deduped string array', () => {
+    expect(fromRaw('tags', {}, ' x, y ,x,, z')).toEqual(ok(['x', 'y', 'z']));
+    expect(fromRaw('tags', {}, 'a'.repeat(129))).toEqual(bad);
+    expect(fromRaw('tags', {}, ' , ')).toEqual(ok(null));
+  });
+  it('toRaw returns the id, the id array, or comma text', () => {
+    expect(toRaw('select', 'a')).toBe('a');
+    expect(toRaw('multi_select', ['a', 'b'])).toEqual(['a', 'b']);
+    expect(toRaw('multi_select', null)).toEqual([]);
+    expect(toRaw('tags', ['x', 'y'])).toBe('x, y');
+  });
+});
+
 describe('toRaw', () => {
   it('shows stored values as editable strings', () => {
     expect(toRaw('number', 36.5)).toBe('36.5');

@@ -9,6 +9,9 @@ const fields: Field[] = [
   { key: 'ok', label: 'Fertig', kind: 'bool', config: {}, position: 2 },
   { key: 'tag', label: 'Datum', kind: 'date', config: {}, position: 3 },
   { key: 'url', label: 'Seite', kind: 'url', config: {}, position: 4 },
+  { key: 'sel', label: 'Stufe', kind: 'select', config: { options: [{ id: 'hi', label: 'Hoch' }, { id: 'lo', label: 'Niedrig' }] }, position: 5 },
+  { key: 'mul', label: 'Mehrfach', kind: 'multi_select', config: { options: [{ id: 'x', label: 'Ex' }, { id: 'y', label: 'Why' }] }, position: 6 },
+  { key: 'tgs', label: 'Schlagworte', kind: 'tags', config: {}, position: 7 },
   { key: 'calc', label: 'Rechnung', kind: 'formula', config: {}, position: 5 }
 ];
 const row: Row = {
@@ -37,6 +40,14 @@ describe('RowEditor', () => {
     expect(out).not.toContain('<b>Ada');
     expect(out).toContain('36.5');
     expect(out).toContain('2026-10-10');
+  });
+
+  it('renders options as labels and marks the stored choice', () => {
+    const out = html({ row: { ...row, values: { sel: 'lo', mul: ['y'], tgs: ['a', 'b'] } } });
+    expect(out).toContain('Hoch');
+    expect(out).toMatch(/<option value="lo"[^>]*selected/);
+    expect(out).toMatch(/value="y"[^>]*checked|checked[^>]*value="y"/);
+    expect(out).toContain('value="a, b"');
   });
 
   it('names the action by mode', () => {

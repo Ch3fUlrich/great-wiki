@@ -6,6 +6,7 @@
    */
   import { invalidateAll } from '$app/navigation';
   import { apiSendBrowser } from './browser';
+  import ChoiceCell from './cells/ChoiceCell.svelte';
   import BoolCell from './cells/BoolCell.svelte';
   import ScalarCell from './cells/ScalarCell.svelte';
   import { toRaw, type Raw } from './cells/edit';
@@ -34,6 +35,7 @@
   let busy = $state(false);
 
   const text = (key: string) => (drafts[key] as string) ?? '';
+  const raw = (key: string): Raw => drafts[key] ?? '';
   const textOf = (f: Field, v: unknown) => {
     const c = cellOf(f, v);
     return c.kind === 'chips' ? c.items.join(', ') : c.kind === 'error' ? c.reason : c.text;
@@ -55,7 +57,7 @@
         stale = null;
         if (!row) {
           const d: Drafts = {};
-          for (const f of editable) d[f.key] = '';
+          for (const f of editable) d[f.key] = f.kind === 'multi_select' ? [] : '';
           drafts = d;
         }
         onclose?.();
@@ -79,6 +81,8 @@
       {f.label}
       {#if f.kind === 'bool'}
         <BoolCell field={f} bind:value={() => text(f.key), (v) => (drafts[f.key] = v)} error={errors[f.key]} />
+      {:else if f.kind === 'select' || f.kind === 'multi_select' || f.kind === 'tags'}
+        <ChoiceCell field={f} bind:value={() => raw(f.key), (v) => (drafts[f.key] = v)} error={errors[f.key]} />
       {:else}
         <ScalarCell field={f} bind:value={() => text(f.key), (v) => (drafts[f.key] = v)} error={errors[f.key]} />
       {/if}
@@ -87,7 +91,7 @@
 
   {#if stale}
     <div class="konflikt" role="alert">
-      <p>Die Zeile wurde inzwischen von jemand anderem geändert. Dein Entwurf bleibt erhalten.</p>
+      <p>Die Zeile wurde inzwischen von jemand anderem geändert. Ihr Entwurf bleibt erhalten.</p>
       <dl>
         {#each editable as f (f.key)}
           <dt>{f.label}</dt>
