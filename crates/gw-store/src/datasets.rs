@@ -1497,4 +1497,69 @@ mod tests {
             .unwrap();
         assert!(store.notifications_for(anna, 10).await.unwrap().is_empty());
     }
+
+    #[tokio::test]
+    async fn racing_creates_at_the_cap_admit_exactly_one() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        let doc = doc_id_of(&store, &path).await;
+        sqlx::query(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2) \
+             INSERT INTO dataset_row (id, doc_id) SELECT 'r' || i, ?1 FROM n",
+        )
+        .bind(&doc)
+        .bind(MAX_ROWS as i64 - 1)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let (va, vb) = (vals(json!({"name": "a"})), vals(json!({"name": "b"})));
+        let (a, b) = tokio::join!(
+            store.create_dataset_row(&anna, &path, &va),
+            store.create_dataset_row(&anna, &path, &vb)
+        );
+        let done = [a, b]
+            .into_iter()
+            .filter(|r| matches!(r, Ok(RowOutcome::Done(_))))
+            .count();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dataset_row WHERE doc_id = ?")
+            .bind(&doc)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!((done, n as usize), (1, MAX_ROWS));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_row_is_refused_on_create() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        let big = "x".repeat(gw_core::dataset::MAX_ROW_BYTES);
+        assert!(matches!(
+            store
+                .create_dataset_row(&anna, &path, &vals(json!({"name": big})))
+                .await
+                .unwrap(),
+            RowOutcome::Invalid(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_actor_who_revised_the_page_does_not_hear_of_their_own_row() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        let doc = doc_id_of(&store, &path).await;
+        let authors: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM revisions WHERE document_id = ? AND author_id = ?",
+        )
+        .bind(&doc)
+        .bind(&anna.id)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert!(authors > 0, "fixture: anna must have revised the page");
+        made(&store, &anna, &path, json!({"name": "Ada"})).await;
+        let to_actor: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE recipient = ?")
+            .bind(&anna.id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(to_actor, 0);
+    }
 }
