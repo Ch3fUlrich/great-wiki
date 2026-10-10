@@ -13,14 +13,16 @@ items:
   - {key: GW-M8-A11, title: "Row editing UI (A11a/A11b)", est: 4, deps: [GW-M8-A10], phase: M8a}
   - {key: GW-M8-B1, title: "Formula lexer/parser/evaluator (gw-core)", est: 6, deps: [GW-M8-A2], phase: M8b}
   - {key: GW-M8-B2, title: "Formula in schema, cycle check", est: 3, deps: [GW-M8-B1, GW-M8-A5], phase: M8b}
-  - {key: GW-M8-B3, title: "person + file fields", est: 3, deps: [GW-M8-A6], phase: M8b}
+  - {key: GW-M8-B3, title: "person + file fields", est: 3, deps: [GW-M8-A6, GW-M8-A7], phase: M8b}
   - {key: GW-M8-B4, title: "Relation + 0022 index + mutate", est: 5, deps: [GW-M8-A8], phase: M8b}
   - {key: GW-M8-B5, title: "Rollup over visible rows + mutate", est: 4, deps: [GW-M8-B4], phase: M8b}
-  - {key: GW-M8-B6, title: "Computed fields in query", est: 3, deps: [GW-M8-B2, GW-M8-B5], phase: M8b}
+  - {key: GW-M8-B5B, title: "Field visibility in queries + mutate", est: 3, deps: [GW-M8-B5], phase: M8b}
+  - {key: GW-M8-B6, title: "Computed fields in query", est: 3, deps: [GW-M8-B2, GW-M8-B5B], phase: M8b}
   - {key: GW-M8-B7, title: "Relation/computed cells + behaviour", est: 3, deps: [GW-M8-B6, GW-M8-A11], phase: M8b}
   - {key: GW-M8-C1, title: "RowSource seam", est: 2, deps: [GW-M8-A10], phase: M8c}
   - {key: GW-M8-C2, title: "Generic Board component", est: 4, deps: [GW-M8-C1], phase: M8c}
-  - {key: GW-M8-C3, title: "TaskRowSource; old task board removed", est: 5, deps: [GW-M8-C2], phase: M8c}
+  - {key: GW-M8-C3A, title: "TaskRowSource + /aufgaben wired", est: 3, deps: [GW-M8-C2], phase: M8c}
+  - {key: GW-M8-C3B, title: "Embedded board wired; old Board.svelte removed", est: 2, deps: [GW-M8-C3A], phase: M8c}
   - {key: GW-M8-C4, title: "Dataset board view", est: 3, deps: [GW-M8-C2, GW-M8-A9], phase: M8c}
   - {key: GW-M8-C5, title: "Form view backend + mutate", est: 3, deps: [GW-M8-A9], phase: M8c}
   - {key: GW-M8-C6, title: "Form UI", est: 3, deps: [GW-M8-C5], phase: M8c}
@@ -30,5 +32,5 @@ items:
   - {key: GW-M8-D4, title: "Gallery view", est: 3, deps: [GW-M8-A9, GW-M8-B3], phase: M8d}
   - {key: GW-M8-E1, title: "Timeline view (subject timeline)", est: 4, deps: [GW-M8-A9], phase: M8e}
   - {key: GW-M8-E2, title: "Row-text search (optional, OQ3)", est: 5, deps: [GW-M8-A6], phase: M8e}
-  - {key: GW-M8-E3, title: "Task storage migration (optional, OQ1; own plan)", est: 8, deps: [GW-M8-C3], phase: M8e}
+  - {key: GW-M8-E3, title: "Task storage migration (optional, OQ1; own plan)", est: 8, deps: [GW-M8-C3B], phase: M8e}
   - {key: GW-M8-E4, title: "Changelog, ADR 0029 accepted, Omnigraph record", est: 1, deps: [GW-M8-D4, GW-M8-E1], phase: M8e}

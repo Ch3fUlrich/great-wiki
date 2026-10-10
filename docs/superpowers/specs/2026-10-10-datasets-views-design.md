@@ -59,7 +59,7 @@ refused, not stored.
 - Relation write: caller reads source **and** target dataset; target row must belong to
   `config.target`. Cross-dataset targets the caller cannot read are never resolved, counted or
   named — field omitted in schema and row output for that caller.
-- Rollup/formula over a relation aggregates only visible rows.
+- Rollup/formula over a relation aggregates only visible rows. A computed field whose dependency chain reaches a field omitted for the caller is itself omitted.
 - **Person fields:** setting a person who cannot read the page is refused (ADR 0009 cl. 2);
   unassign/clear is always allowed with write.
 - Views are saved config only. Filtering/sorting hidden fields is refused (hidden = omitted
