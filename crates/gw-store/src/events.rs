@@ -41,6 +41,13 @@ pub enum EventKind {
     InviteAccepted,
     /// Admin kind: also needs the reader to still administer the path.
     GrantChanged,
+    /// A dataset row was added, changed or removed (ADR 0029). Names the dataset page only.
+    #[serde(rename = "dataset.row.created")]
+    DatasetRowCreated,
+    #[serde(rename = "dataset.row.updated")]
+    DatasetRowUpdated,
+    #[serde(rename = "dataset.row.deleted")]
+    DatasetRowDeleted,
 }
 
 impl EventKind {
@@ -53,6 +60,9 @@ impl EventKind {
             EventKind::TaskDue => "task_due",
             EventKind::InviteAccepted => "invite_accepted",
             EventKind::GrantChanged => "grant_changed",
+            EventKind::DatasetRowCreated => "dataset.row.created",
+            EventKind::DatasetRowUpdated => "dataset.row.updated",
+            EventKind::DatasetRowDeleted => "dataset.row.deleted",
         }
     }
 
@@ -67,6 +77,9 @@ impl EventKind {
             "task_due" => EventKind::TaskDue,
             "invite_accepted" => EventKind::InviteAccepted,
             "grant_changed" => EventKind::GrantChanged,
+            "dataset.row.created" => EventKind::DatasetRowCreated,
+            "dataset.row.updated" => EventKind::DatasetRowUpdated,
+            "dataset.row.deleted" => EventKind::DatasetRowDeleted,
             _ => return None,
         })
     }

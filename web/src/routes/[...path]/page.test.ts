@@ -172,6 +172,7 @@ function html(
         // From the root layout, like `me`: the workspace the address named. This view
         // renders no strip of its own — the shell does — but it is part of `PageData`.
         tabHrefs: [],
+        dataset: null,
         hier: doc.path,
         doc,
         body: koerper,

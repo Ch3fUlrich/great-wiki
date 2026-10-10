@@ -2244,6 +2244,105 @@ mutation crates/gw-store/src/moves.rs killed \
   '/pub async fn move_document/,/^    }$/ s/if let Some(reason) = title_problem(title) {/if let Some(reason) = None::<\&str> {/' \
   'move: a title may not contain control or invisible formatting characters'
 
+# --- datasets: schema writes (ADR 0029, M8 A5) -----------------------------------------------
+#
+# A dataset's columns are changed by whoever may WRITE its page; reading it is not enough. The
+# first mutation is the one that matters: `Action::Write` -> `Action::Read` in the shared gate
+# lets every reader add, relabel, reorder and delete columns. `leser`/`bea` hold read only in
+# `crates/gw-store/src/datasets.rs` and `crates/gw-api/tests/datasets.rs`, and each test also
+# asserts the schema is unchanged afterwards, so it cannot pass with the gate deleted.
+mutation crates/gw-store/src/datasets.rs killed \
+  's/let writable = self.document_for(principal, path, Action::Write).await?;/let writable = self.document_for(principal, path, Action::Read).await?;/' \
+  'datasets: a schema write without a write check - a reader may not change the columns'
+# A plain page answers `no dataset` like an absent one; without the type filter the schema
+# calls would accept any page the caller can read.
+mutation crates/gw-store/src/datasets.rs killed \
+  's/found.filter(|d| d.doc_type == DocumentType::Dataset.as_str())/found/' \
+  'datasets: only a page of type dataset has a schema'
+# Deleting a column must clear its key from every row, or the value outlives the column and
+# comes back under a re-added field of the same key.
+mutation crates/gw-store/src/datasets.rs killed \
+  's/json_remove(\\"values\\", ?1)/\\"values\\"/' \
+  'datasets: deleting a field strips its key from every row'
+mutation crates/gw-store/src/datasets.rs killed \
+  's/^pub const MAX_FIELDS: usize = 100;/pub const MAX_FIELDS: usize = usize::MAX;/' \
+  'datasets: a dataset has a bounded number of fields'
+mutation crates/gw-store/src/datasets.rs killed \
+  's/FROM dataset_field WHERE doc_id = ?2 HAVING COUNT(\*) < ?7/FROM dataset_field WHERE doc_id = ?2 HAVING COUNT(*) < ?7 + 1000000/' \
+  'datasets: the field cap is checked inside the insert'
+# `deny_unknown_fields` is what keeps `kind` and `key` immutable through the relabel route.
+mutation crates/gw-api/src/routes/datasets.rs killed \
+  '/^#\[serde(deny_unknown_fields)\]$/d' \
+  'datasets: the relabel body cannot carry a new kind or key'
+
+# --- datasets: the read seam (ADR 0022, ADR 0029, M8 A7) --------------------------------------
+#
+# Every read of a dataset - schema, row, row list and count - goes through one function,
+# `readable_dataset`, and an unreadable dataset must be byte-identical to an absent one. The
+# tests compare the full status and body against a nonexistent path for a guest, a stranger and
+# an admin viewing as that stranger, with an admin read as the positive control.
+#
+# (1) The seam answers for pages the caller may not read: the lookup ignores access altogether.
+mutation crates/gw-store/src/datasets.rs killed \
+  's/let found = self.document_for(principal, path, Action::Read).await?;/let found = self.document_by_path_unchecked(path).await?;/' \
+  'datasets: readable_dataset always true - an unreadable dataset is not the same as an absent one'
+# (2) The row list is the one door that could forget the seam, because it is the newest.
+mutation crates/gw-store/src/datasets.rs killed \
+  '/pub async fn dataset_rows/,/^    }$/ s/self.readable_dataset(principal, path).await?/self.document_by_path_unchecked(path).await?/' \
+  'datasets: the row list skips the access check and lists a stranger the rows'
+# (3) The count is the dataset's own, taken after the gate. Counting the whole table instead
+# is what a count computed ahead of the narrowing would report: other datasets' rows, which
+# a reader of this one may not see. (A count taken before the gate but discarded on refusal
+# changes no answer, so that ordering is not a separate mutation.)
+mutation crates/gw-store/src/datasets.rs killed \
+  '/pub async fn dataset_rows/,/^    }$/ s/SELECT COUNT(\*) FROM dataset_row WHERE doc_id = ?"/SELECT COUNT(*) FROM dataset_row WHERE doc_id = ? OR 1=1"/' \
+  'datasets: the row count is this dataset only - counted before narrowing it leaks the others'
+
+# --- datasets: the query layer (ADR 0029, M8 A8) ----------------------------------------------
+#
+# A field name reaches the SQL only as the bound JSON path of `json_extract`, never as text.
+# (1) is the "key interpolated" variant: the bound parameter becomes a `format!` of the key.
+# `FieldKey` keeps today's keys harmless, so the damage is invisible to behaviour - which is why
+# the builder tests assert the statement text contains no key and no value, and why this must
+# be KILLED: the day a looser key rule lands, interpolation is an injection.
+mutation crates/gw-store/src/datasets/query.rs killed \
+  's/^            format!("{CELL} = ?")$/            format!("json_extract(\\"values\\", \x27$.{}\x27) = ?", key.as_str())/' \
+  'datasets: query key interpolated into the SQL text instead of bound'
+# (2) A number field must sort as a number: cast to text, 10 lands before 9.
+mutation crates/gw-store/src/datasets/query.rs killed \
+  's/SortKind::Number => "REAL",/SortKind::Number => "TEXT",/' \
+  'datasets: query sorts a number field as text'
+# (3) Descending keyset must walk the other way, or page two repeats or skips rows.
+mutation crates/gw-store/src/datasets/query.rs killed \
+  's/let op = if sort.desc { "<" } else { ">" };/let op = if sort.desc { ">" } else { "<" };/' \
+  'datasets: query cursor direction follows the sort direction'
+# (4) The filtered list is one more door onto the rows; it must pass the same seam.
+mutation crates/gw-store/src/datasets.rs killed \
+  '/pub async fn dataset_rows_query/,/^    }$/ s/self.readable_dataset(principal, path).await?/self.document_by_path_unchecked(path).await?/' \
+  'datasets: the filtered row list skips the access check and lists a stranger the rows'
+
+# --- datasets: saved views (ADR 0029, M8 A9) -------------------------------------------------
+#
+# A view is config, saved by whoever may WRITE the page; listing is for readers.
+# (1)-(2) turn the write gate of save / delete into a plain read check, so a reader could
+# save and delete views. (3) accepts a config naming a field the dataset lacks. (4) is the
+# list door skipping the read seam. (5) lets a delete reach another dataset's view.
+mutation crates/gw-store/src/datasets/views.rs killed \
+  '/pub async fn create_dataset_view/,/^    }$/ s/let doc_id = match self.writable_dataset(principal, path).await? {/let doc_id = match self.readable_dataset(principal, path).await?.map_or(Gate::NoDataset, |d| Gate::Open(d.id)) {/' \
+  'datasets: a view save without a write check - a reader may not save views'
+mutation crates/gw-store/src/datasets/views.rs killed \
+  '/pub async fn delete_dataset_view/,/^    }$/ s/let doc_id = match self.writable_dataset(principal, path).await? {/let doc_id = match self.readable_dataset(principal, path).await?.map_or(Gate::NoDataset, |d| Gate::Open(d.id)) {/' \
+  'datasets: a view delete without a write check - a reader may not delete views'
+mutation crates/gw-store/src/datasets/views.rs killed \
+  's/if !known.contains(&key) {/if false \&\& !known.contains(\&key) {/' \
+  'datasets: a view config naming a missing field is accepted'
+mutation crates/gw-store/src/datasets/views.rs killed \
+  '/pub async fn dataset_views/,/^    }$/ s/self.readable_dataset(principal, path).await?/self.document_by_path_unchecked(path).await?/' \
+  'datasets: the view list skips the access check and lists a stranger the views'
+mutation crates/gw-store/src/datasets/views.rs killed \
+  's/DELETE FROM dataset_view WHERE id = ? AND doc_id = ?/DELETE FROM dataset_view WHERE id = ?/' \
+  'datasets: a view delete is scoped to its own dataset'
+
 # HOW LONG THIS IS ALLOWED TO TAKE
 # --------------------------------
 # A gate too slow to run stops being run. This one got there: eighteen mutations, a whole
@@ -2294,6 +2393,8 @@ probe_for() {
     # own tests, and the filter spares the rest of the crate's 400 unit tests.
     crates/gw-store/src/search.rs) echo "-p gw-store --lib search::" ;;
     crates/gw-store/src/templates.rs) echo "-p gw-store --lib templates::" ;;
+    crates/gw-store/src/datasets.rs) echo "-p gw-store --lib datasets::" ;;
+    crates/gw-api/src/routes/datasets.rs) echo "-p gw-api --test datasets" ;;
     crates/gw-store/src/access_epoch.rs) echo "-p gw-store --lib access_epoch::" ;;
     crates/gw-store/*) echo "-p gw-store --lib" ;;
     crates/gw-auth/*) echo "-p gw-auth --lib" ;;

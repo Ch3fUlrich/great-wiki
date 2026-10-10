@@ -144,6 +144,25 @@ impl Store {
         administers_destination: bool,
         today: &str,
     ) -> Result<CreateOutcome> {
+        self.create_typed(principal, request, administers_destination, today, None)
+            .await
+    }
+
+    /// The one creation door. `forced` makes the page of that type with an empty body and
+    /// refuses a template; `None` is the ordinary page, optionally copied from a template.
+    pub(crate) async fn create_typed(
+        &self,
+        principal: &Principal,
+        request: &CreateRequest,
+        administers_destination: bool,
+        today: &str,
+        forced: Option<gw_core::DocumentType>,
+    ) -> Result<CreateOutcome> {
+        if forced.is_some() && request.template.is_some() {
+            return Ok(CreateOutcome::Blocked(
+                "a dataset cannot be made from a template".into(),
+            ));
+        }
         if !principal.is_authenticated() || !principal.active {
             return Ok(CreateOutcome::Refused);
         }
@@ -237,7 +256,7 @@ impl Store {
 
         let (doc_type, language, mut body) = match request.template.as_deref() {
             None => (
-                gw_core::DocumentType::Page,
+                forced.unwrap_or(gw_core::DocumentType::Page),
                 "de".to_string(),
                 Block {
                     kind: gw_core::BlockKind::Doc,

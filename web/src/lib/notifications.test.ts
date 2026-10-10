@@ -36,7 +36,10 @@ suite('describe', () => {
       'task_assigned',
       'task_due',
       'invite_accepted',
-      'grant_changed'
+      'grant_changed',
+      'dataset.row.created',
+      'dataset.row.updated',
+      'dataset.row.deleted'
     ] as const) {
       expect(describe(n({ kind })).text.length).toBeGreaterThan(3);
     }

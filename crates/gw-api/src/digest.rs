@@ -184,10 +184,13 @@ fn heading(kind: EventKind) -> &'static str {
         EventKind::TaskDue => "Fällige Aufgaben",
         EventKind::InviteAccepted => "Angenommene Einladungen",
         EventKind::GrantChanged => "Geänderte Berechtigungen",
+        EventKind::DatasetRowCreated => "Neue Tabellenzeilen",
+        EventKind::DatasetRowUpdated => "Geänderte Tabellenzeilen",
+        EventKind::DatasetRowDeleted => "Gelöschte Tabellenzeilen",
     }
 }
 
-const ORDER: [EventKind; 7] = [
+const ORDER: [EventKind; 10] = [
     EventKind::Mention,
     EventKind::CommentReply,
     EventKind::TaskAssigned,
@@ -195,6 +198,9 @@ const ORDER: [EventKind; 7] = [
     EventKind::PageEdited,
     EventKind::InviteAccepted,
     EventKind::GrantChanged,
+    EventKind::DatasetRowCreated,
+    EventKind::DatasetRowUpdated,
+    EventKind::DatasetRowDeleted,
 ];
 
 /// One line of a plain-text mail: every control character, Unicode line or paragraph

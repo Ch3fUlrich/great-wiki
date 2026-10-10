@@ -4554,6 +4554,115 @@ await check('V3 a parent this identity may only read refuses, in words, and crea
   assert(made.status() === 404, `a page appeared under a read-only parent (${made.status()})`);
 });
 
+// ---------------------------------------------------------------------------------------
+// Group W — dataset table: typed cells, sorting, filtering and adding a row (ADR 0029)
+// ---------------------------------------------------------------------------------------
+//
+// /verweisbeispiel/tabelle (behaviour-extra) is a `type: dataset` page the editors may write
+// and the public may not read. It starts with no columns and no rows: W1 creates them through
+// the API as setup, so the fixture stays a plain seed and the checks below read what a person
+// would see.
+
+const TABELLE = '/verweisbeispiel/tabelle';
+
+async function tabelleSetup(page) {
+  const have = await (await page.request.get(BASE + '/api/datasets/schema' + TABELLE)).json();
+  if (have.fields.length > 0) return;
+  for (const [key, label, kind] of [['name', 'Name', 'text'], ['alter', 'Alter', 'number']]) {
+    const r = await page.request.post(BASE + '/api/datasets/schema' + TABELLE, { data: { key, label, kind } });
+    assert(r.status() === 201 || r.status() === 200, `adding column ${key} answered ${r.status()}`);
+  }
+  for (const [name, alter] of [['Clara', 30], ['Anton', 9], ['<b>Berta</b>', 100]]) {
+    const r = await page.request.post(BASE + '/api/datasets/rows' + TABELLE, { data: { values: { name, alter } } });
+    assert(r.status() === 201, `adding row ${name} answered ${r.status()}`);
+  }
+}
+
+const tabelleNamen = (page) => page.locator('section.datensatz tbody tr td:first-child').allInnerTexts();
+
+await check('W1 an editor sees the typed table, sorts it by number, filters it and adds a row that survives a reload', async (page) => {
+  await tabelleSetup(page);
+  await page.goto(BASE + TABELLE, { waitUntil: 'networkidle' });
+  const table = page.locator('section.datensatz table');
+  await table.waitFor({ state: 'visible', timeout: 10_000 });
+  assert((await tabelleNamen(page)).length === 3, 'the table does not show the three rows');
+  // Text is text: the markup in a cell is shown, not applied.
+  assert((await page.locator('section.datensatz b').count()) === 0, 'a cell value was rendered as markup');
+  assert((await tabelleNamen(page)).includes('<b>Berta</b>'), 'the markup-looking cell is not shown as text');
+
+  // Sort by the number column: numerically (9 < 30 < 100), then descending.
+  await page.getByRole('link', { name: 'Alter', exact: true }).click();
+  await page.waitForURL((u) => u.searchParams.get('sort') === 'alter' && u.searchParams.get('desc') === '0');
+  assert((await tabelleNamen(page)).join('|') === ['Anton', 'Clara', '<b>Berta</b>'].join('|'), 'ascending order is not numeric');
+  await page.getByRole('link', { name: 'Alter', exact: true }).click();
+  await page.waitForURL((u) => u.searchParams.get('desc') === '1');
+  assert((await tabelleNamen(page))[0] === '<b>Berta</b>', 'descending order did not put 100 first');
+
+  // Filter chip.
+  await page.getByRole('textbox', { name: 'enthält' }).fill('ant');
+  await page.getByRole('button', { name: 'Filtern' }).click();
+  await page.waitForURL((u) => u.searchParams.get('fv') === 'ant');
+  assert((await tabelleNamen(page)).join('|') === 'Anton', 'the filter did not narrow the rows');
+  assert((await page.locator('.filter-chip').innerText()).includes('Name enthält'), 'no filter chip');
+
+  // Add a row, then reload: it is stored, not just drawn.
+  await page.goto(BASE + TABELLE, { waitUntil: 'networkidle' });
+  const form = page.locator('form.zeile-editor[aria-label="Zeile hinzufügen"]');
+  await form.getByLabel('Name').fill('Doris');
+  await form.getByLabel('Alter').fill('41');
+  await form.getByRole('button', { name: 'Speichern' }).click();
+  await page.locator('section.datensatz td', { hasText: 'Doris' }).waitFor({ state: 'visible', timeout: 10_000 });
+  await page.reload({ waitUntil: 'networkidle' });
+  assert((await tabelleNamen(page)).includes('Doris'), 'the added row is gone after a reload');
+});
+
+await check('W3 an editor edits a cell in place; a concurrent change shows the current row and keeps the draft (409)', async (page) => {
+  await tabelleSetup(page);
+  await page.goto(BASE + TABELLE, { waitUntil: 'networkidle' });
+  const rowOf = (name) => page.locator('section.datensatz tbody tr', { has: page.locator('td', { hasText: name }) });
+  const editor = page.locator('form.zeile-editor[aria-label="Zeile bearbeiten"]');
+
+  // Plain edit: change a number, reload, it is stored.
+  await rowOf('Clara').getByRole('button', { name: 'Bearbeiten' }).click();
+  await editor.getByLabel('Alter').fill('31');
+  await editor.getByRole('button', { name: 'Speichern' }).click();
+  await editor.waitFor({ state: 'detached', timeout: 10_000 });
+  await page.reload({ waitUntil: 'networkidle' });
+  assert((await rowOf('Clara').innerText()).includes('31'), 'the edited number is not stored');
+
+  // Conflict: the row moves on behind the editor's back.
+  await rowOf('Anton').getByRole('button', { name: 'Bearbeiten' }).click();
+  await editor.getByLabel('Name').fill('Anton Neu');
+  const list = await (await page.request.get(BASE + '/api/datasets/rows' + TABELLE)).json();
+  const anton = list.rows.find((r) => r.values.name === 'Anton');
+  assert(anton, 'Anton is not in the rows');
+  const bump = await page.request.patch(BASE + '/api/datasets/rows' + TABELLE, {
+    data: { id: anton.id, version: anton.version, values: { alter: 10 } }
+  });
+  assert(bump.status() === 200, `the concurrent change answered ${bump.status()}`);
+  await editor.getByRole('button', { name: 'Speichern' }).click();
+  await editor.getByRole('alert').filter({ hasText: 'inzwischen' }).waitFor({ state: 'visible', timeout: 10_000 });
+  assert((await editor.getByLabel('Name').inputValue()) === 'Anton Neu', 'the draft was lost on a conflict');
+  assert((await editor.locator('.konflikt').innerText()).includes('10'), 'the current row is not shown');
+
+  // Adopting the current version lets the same draft save.
+  await editor.getByRole('button', { name: 'Aktuelle Version übernehmen' }).click();
+  await editor.getByRole('button', { name: 'Speichern' }).click();
+  await editor.waitFor({ state: 'detached', timeout: 10_000 });
+  await page.reload({ waitUntil: 'networkidle' });
+  assert((await tabelleNamen(page)).includes('Anton Neu'), 'the draft did not save after adopting');
+});
+
+await check('W2 a guest gets the same 404 for the dataset page and its rows as for a page that is not there', async (page) => {
+  assert(ANON, 'SHOT_BASE_ANON is unset — the anonymous half must never be skipped');
+  const view = await page.request.get(ANON + TABELLE, { maxRedirects: 0 });
+  assert(view.status() === 404, `the page answered a guest ${view.status()}`);
+  const gone = await page.request.get(ANON + '/verweisbeispiel/gibt-es-nicht', { maxRedirects: 0 });
+  assert(gone.status() === view.status(), 'the dataset 404 differs from the absent-page 404');
+  const rows = await page.request.get(ANON + '/api/datasets/rows' + TABELLE);
+  assert(rows.status() === 404, `the rows answered a guest ${rows.status()}`);
+});
+
 await browser.close();
 
 // ---------------------------------------------------------------------------------------

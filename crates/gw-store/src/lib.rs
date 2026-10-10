@@ -6,6 +6,7 @@ pub mod audit;
 pub mod blobs;
 pub mod comments;
 pub mod crdt;
+pub mod datasets;
 pub mod documents;
 pub mod events;
 pub mod invites;

@@ -1,0 +1,2 @@
+### Added
+- A dataset page now shows its table: typed cells (numbers, dates, yes/no, tags, links), sorting by clicking a column header, a filter on one column shown as a chip, "Mehr laden" for further pages, and a plain empty state. A failed load says so instead of showing an empty table. Anyone who may write the page can add a row from a small form under the table. Cell text is always shown as text.
