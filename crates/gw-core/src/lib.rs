@@ -5,6 +5,7 @@
 //! this crate.
 
 pub mod block;
+pub mod dataset;
 pub mod diff;
 pub mod document;
 pub mod frontmatter;
@@ -13,6 +14,7 @@ pub mod slug;
 pub mod title;
 
 pub use block::{body_plain_text, Block, BlockKind, Heading, Mark, MarkKind, MARK_ORDER};
+pub use dataset::{FieldKey, FieldKind, KeyError};
 pub use diff::{
     diff_design, diff_prose, diff_structure, ChangeKind, DesignChange, ProseChange, StructureChange,
 };
