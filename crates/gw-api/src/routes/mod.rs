@@ -2,6 +2,7 @@ pub mod admin;
 pub mod attachments;
 pub mod collab;
 pub mod comments;
+pub mod datasets;
 pub mod docs;
 pub mod links;
 pub mod moves;
@@ -412,6 +413,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .merge(collab::routes())
         .merge(comments::routes())
+        .merge(datasets::routes())
         .merge(links::routes())
         .merge(moves::routes())
         .merge(revisions::routes())

@@ -43,7 +43,7 @@ pub struct Created {
 }
 
 /// TT.MM.JJJJ, UTC — the server's day, the same for everyone who creates a page today.
-fn today() -> String {
+pub(super) fn today() -> String {
     let t = time::OffsetDateTime::now_utc();
     format!("{:02}.{:02}.{}", t.day(), u8::from(t.month()), t.year())
 }
