@@ -2244,6 +2244,34 @@ mutation crates/gw-store/src/moves.rs killed \
   '/pub async fn move_document/,/^    }$/ s/if let Some(reason) = title_problem(title) {/if let Some(reason) = None::<\&str> {/' \
   'move: a title may not contain control or invisible formatting characters'
 
+# --- datasets: schema writes (ADR 0029, M8 A5) -----------------------------------------------
+#
+# A dataset's columns are changed by whoever may WRITE its page; reading it is not enough. The
+# first mutation is the one that matters: `Action::Write` -> `Action::Read` in the shared gate
+# lets every reader add, relabel, reorder and delete columns. `leser`/`bea` hold read only in
+# `crates/gw-store/src/datasets.rs` and `crates/gw-api/tests/datasets.rs`, and each test also
+# asserts the schema is unchanged afterwards, so it cannot pass with the gate deleted.
+mutation crates/gw-store/src/datasets.rs killed \
+  's/let writable = self.document_for(principal, path, Action::Write).await?;/let writable = self.document_for(principal, path, Action::Read).await?;/' \
+  'datasets: a schema write without a write check - a reader may not change the columns'
+# A plain page answers `no dataset` like an absent one; without the type filter the schema
+# calls would accept any page the caller can read.
+mutation crates/gw-store/src/datasets.rs killed \
+  's/found.filter(|d| d.doc_type == DocumentType::Dataset.as_str())/found/' \
+  'datasets: only a page of type dataset has a schema'
+# Deleting a column must clear its key from every row, or the value outlives the column and
+# comes back under a re-added field of the same key.
+mutation crates/gw-store/src/datasets.rs killed \
+  's/json_remove(\\"values\\", ?1)/\\"values\\"/' \
+  'datasets: deleting a field strips its key from every row'
+mutation crates/gw-store/src/datasets.rs killed \
+  's/^pub const MAX_FIELDS: usize = 100;/pub const MAX_FIELDS: usize = usize::MAX;/' \
+  'datasets: a dataset has a bounded number of fields'
+# `deny_unknown_fields` is what keeps `kind` and `key` immutable through the relabel route.
+mutation crates/gw-api/src/routes/datasets.rs killed \
+  '/^#\[serde(deny_unknown_fields)\]$/d' \
+  'datasets: the relabel body cannot carry a new kind or key'
+
 # HOW LONG THIS IS ALLOWED TO TAKE
 # --------------------------------
 # A gate too slow to run stops being run. This one got there: eighteen mutations, a whole
@@ -2294,6 +2322,8 @@ probe_for() {
     # own tests, and the filter spares the rest of the crate's 400 unit tests.
     crates/gw-store/src/search.rs) echo "-p gw-store --lib search::" ;;
     crates/gw-store/src/templates.rs) echo "-p gw-store --lib templates::" ;;
+    crates/gw-store/src/datasets.rs) echo "-p gw-store --lib datasets::" ;;
+    crates/gw-api/src/routes/datasets.rs) echo "-p gw-api --test datasets" ;;
     crates/gw-store/src/access_epoch.rs) echo "-p gw-store --lib access_epoch::" ;;
     crates/gw-store/*) echo "-p gw-store --lib" ;;
     crates/gw-auth/*) echo "-p gw-auth --lib" ;;

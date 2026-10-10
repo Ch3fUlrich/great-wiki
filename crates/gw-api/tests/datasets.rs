@@ -175,3 +175,177 @@ async fn the_gates_answer_with_the_right_status() {
     assert!(b1.contains("there is no page at /privat"), "{b1}");
     assert_eq!(b1.replace("/privat", "/x"), b2.replace("/nichts", "/x"));
 }
+
+// --- schema CRUD: /api/datasets/schema/{path} ---------------------------------------------
+
+use serde_json::json;
+
+const SCHEMA: &str = "/api/datasets/schema/raum/tabelle";
+
+async fn with_dataset() -> Arc<Store> {
+    let store = fixture().await;
+    let (s, b) = send(
+        &store,
+        Some("schreiber"),
+        "POST",
+        "/api/datasets",
+        Some(make("/raum")),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    store
+}
+
+async fn add(store: &Arc<Store>, who: &str, key: &str, kind: &str) -> (StatusCode, String) {
+    send(
+        store,
+        Some(who),
+        "POST",
+        SCHEMA,
+        Some(json!({ "key": key, "label": key.to_uppercase(), "kind": kind })),
+    )
+    .await
+}
+
+fn keys_of(body: &str) -> Vec<String> {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    v["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["key"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_writer_builds_and_reads_back_a_schema() {
+    let store = with_dataset().await;
+    let (s, b) = add(&store, "schreiber", "name", "text").await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let (s, b) = add(&store, "schreiber", "alter", "number").await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    // A duplicate key is a conflict; a hostile one a bad request.
+    assert_eq!(
+        add(&store, "schreiber", "name", "text").await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        add(&store, "schreiber", "a') OR 1=1 --", "text").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        add(&store, "schreiber", "f", "formula").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    // Rename the label; reorder; the reader sees the result.
+    let (s, b) = send(
+        &store,
+        Some("schreiber"),
+        "PATCH",
+        SCHEMA,
+        Some(json!({ "key": "name", "label": "Vorname" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(b.contains("Vorname"), "{b}");
+    let (s, b) = send(
+        &store,
+        Some("schreiber"),
+        "PUT",
+        SCHEMA,
+        Some(json!({ "keys": ["alter", "name"] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, b) = send(&store, Some("leser"), "GET", SCHEMA, None).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(keys_of(&b), ["alter", "name"]);
+    assert!(b.contains("Vorname"), "{b}");
+    let (s, _) = send(
+        &store,
+        Some("schreiber"),
+        "DELETE",
+        SCHEMA,
+        Some(json!({ "key": "alter" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, b) = send(&store, Some("schreiber"), "GET", SCHEMA, None).await;
+    assert_eq!(keys_of(&b), ["name"]);
+    let (s, _) = send(
+        &store,
+        Some("schreiber"),
+        "DELETE",
+        SCHEMA,
+        Some(json!({ "key": "alter" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn key_and_kind_cannot_be_changed_through_the_rename() {
+    let store = with_dataset().await;
+    add(&store, "schreiber", "name", "text").await;
+    for body in [
+        json!({ "key": "name", "label": "X", "kind": "number" }),
+        json!({ "key": "name", "label": "X", "new_key": "other" }),
+    ] {
+        let (s, _) = send(&store, Some("schreiber"), "PATCH", SCHEMA, Some(body)).await;
+        assert!(s.is_client_error(), "{s}");
+    }
+    let (_, b) = send(&store, Some("schreiber"), "GET", SCHEMA, None).await;
+    assert_eq!(keys_of(&b), ["name"]);
+    assert!(b.contains("\"kind\":\"text\""), "{b}");
+    assert!(!b.contains("\"label\":\"X\""), "{b}");
+}
+
+#[tokio::test]
+async fn a_reader_gets_forbidden_and_a_stranger_gets_nothing_to_tell_apart() {
+    let store = with_dataset().await;
+    add(&store, "schreiber", "name", "text").await;
+    // Reader: the normal forbidden, for every verb, and nothing changed.
+    let (s, _) = add(&store, "leser", "x", "text").await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    for (m, body) in [
+        ("PATCH", json!({ "key": "name", "label": "Z" })),
+        ("PUT", json!({ "keys": ["name"] })),
+        ("DELETE", json!({ "key": "name" })),
+    ] {
+        let (s, _) = send(&store, Some("leser"), m, SCHEMA, Some(body)).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{m}");
+    }
+    let (_, b) = send(&store, Some("schreiber"), "GET", SCHEMA, None).await;
+    assert_eq!(keys_of(&b), ["name"]);
+    assert!(!b.contains("\"Z\""), "{b}");
+    // Stranger (no grant) and a path that does not exist: same status, same bytes.
+    let (s1, b1) = send(&store, Some("fremde"), "GET", SCHEMA, None).await;
+    let (s2, b2) = send(
+        &store,
+        Some("fremde"),
+        "GET",
+        "/api/datasets/schema/raum/nichts",
+        None,
+    )
+    .await;
+    assert_eq!(s1, StatusCode::NOT_FOUND);
+    assert_eq!((s1, &b1), (s2, &b2));
+    let (s3, b3) = add(&store, "fremde", "x", "text").await;
+    assert_eq!((s3, b3), (s1, b1));
+    // Anonymous: nothing to read on a restricted dataset either.
+    let (s, _) = send(&store, None, "GET", SCHEMA, None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn the_hundred_and_first_field_is_a_bad_request() {
+    let store = with_dataset().await;
+    for i in 0..100 {
+        let (s, b) = add(&store, "schreiber", &format!("f{i}"), "text").await;
+        assert_eq!(s, StatusCode::CREATED, "{i}: {b}");
+    }
+    assert_eq!(
+        add(&store, "schreiber", "extra", "text").await.0,
+        StatusCode::BAD_REQUEST
+    );
+}
