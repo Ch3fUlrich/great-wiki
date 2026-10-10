@@ -350,6 +350,16 @@ pub struct DatasetRow {
     pub updated_at: String,
 }
 
+/// Most rows one list call returns.
+pub const MAX_PAGE: i64 = 200;
+
+/// One page of rows and how many the dataset holds in all.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RowPage {
+    pub rows: Vec<DatasetRow>,
+    pub total: i64,
+}
+
 /// How a row call ended. `NoDataset` is the same uniform refusal as [`SchemaOutcome`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum RowOutcome<T> {
@@ -432,6 +442,38 @@ impl Store {
             Some(r) => RowOutcome::Done(r),
             None => RowOutcome::NoRow,
         })
+    }
+
+    /// A page of rows of the dataset at `path`, with the dataset's row count, for anybody who
+    /// may read it. The count is taken only after the access seam has passed, and only over
+    /// that dataset: an unreadable dataset yields `NoDataset`, never a number.
+    pub async fn dataset_rows(
+        &self,
+        principal: &Principal,
+        path: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<RowOutcome<RowPage>> {
+        let Some(doc) = self.readable_dataset(principal, path).await? else {
+            return Ok(RowOutcome::NoDataset);
+        };
+        let tuples: Vec<RowTuple> = sqlx::query_as(&format!(
+            "SELECT {ROW_COLS} FROM dataset_row WHERE doc_id = ? \
+             ORDER BY created_at, id LIMIT ? OFFSET ?"
+        ))
+        .bind(&doc.id)
+        .bind(limit.clamp(1, MAX_PAGE))
+        .bind(offset.max(0))
+        .fetch_all(&self.pool)
+        .await?;
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dataset_row WHERE doc_id = ?")
+            .bind(&doc.id)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(RowOutcome::Done(RowPage {
+            rows: tuples.into_iter().map(row_from).collect(),
+            total,
+        }))
     }
 
     /// Add a row. Needs write. Values are validated against the schema; a dataset holds at
@@ -1305,6 +1347,35 @@ mod tests {
                 .unwrap(),
             RowOutcome::Invalid(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn the_row_list_counts_what_the_caller_may_see_and_hides_what_they_may_not() {
+        let (store, anna, bea, cleo, path) = row_fixture().await;
+        for n in 0..3 {
+            made(&store, &anna, &path, json!({ "name": format!("r{n}") })).await;
+        }
+        // A reader gets a page and the whole count; the limit does not shrink the count.
+        let RowOutcome::Done(page) = store.dataset_rows(&bea, &path, 2, 0).await.unwrap() else {
+            panic!("a reader lists rows");
+        };
+        assert_eq!((page.rows.len(), page.total), (2, 3));
+        let RowOutcome::Done(rest) = store.dataset_rows(&bea, &path, 2, 2).await.unwrap() else {
+            panic!("second page");
+        };
+        assert_eq!((rest.rows.len(), rest.total), (1, 3));
+        // A stranger learns neither rows nor count: the same answer as for an absent page.
+        assert_eq!(
+            store.dataset_rows(&cleo, &path, 2, 0).await.unwrap(),
+            RowOutcome::NoDataset
+        );
+        assert_eq!(
+            store
+                .dataset_rows(&cleo, "/nirgends/nichts", 2, 0)
+                .await
+                .unwrap(),
+            RowOutcome::NoDataset
+        );
     }
 
     #[tokio::test]

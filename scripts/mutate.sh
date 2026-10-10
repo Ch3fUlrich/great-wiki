@@ -2272,6 +2272,29 @@ mutation crates/gw-api/src/routes/datasets.rs killed \
   '/^#\[serde(deny_unknown_fields)\]$/d' \
   'datasets: the relabel body cannot carry a new kind or key'
 
+# --- datasets: the read seam (ADR 0022, ADR 0029, M8 A7) --------------------------------------
+#
+# Every read of a dataset - schema, row, row list and count - goes through one function,
+# `readable_dataset`, and an unreadable dataset must be byte-identical to an absent one. The
+# tests compare the full status and body against a nonexistent path for a guest, a stranger and
+# an admin viewing as that stranger, with an admin read as the positive control.
+#
+# (1) The seam answers for pages the caller may not read: the lookup ignores access altogether.
+mutation crates/gw-store/src/datasets.rs killed \
+  's/let found = self.document_for(principal, path, Action::Read).await?;/let found = self.document_by_path_unchecked(path).await?;/' \
+  'datasets: readable_dataset always true - an unreadable dataset is not the same as an absent one'
+# (2) The row list is the one door that could forget the seam, because it is the newest.
+mutation crates/gw-store/src/datasets.rs killed \
+  '/pub async fn dataset_rows/,/^    }$/ s/self.readable_dataset(principal, path).await?/self.document_by_path_unchecked(path).await?/' \
+  'datasets: the row list skips the access check and lists a stranger the rows'
+# (3) The count is the dataset's own, taken after the gate. Counting the whole table instead
+# is what a count computed ahead of the narrowing would report: other datasets' rows, which
+# a reader of this one may not see. (A count taken before the gate but discarded on refusal
+# changes no answer, so that ordering is not a separate mutation.)
+mutation crates/gw-store/src/datasets.rs killed \
+  '/pub async fn dataset_rows/,/^    }$/ s/SELECT COUNT(\*) FROM dataset_row WHERE doc_id = ?"/SELECT COUNT(*) FROM dataset_row WHERE doc_id = ? OR 1=1"/' \
+  'datasets: the row count is this dataset only - counted before narrowing it leaks the others'
+
 # HOW LONG THIS IS ALLOWED TO TAKE
 # --------------------------------
 # A gate too slow to run stops being run. This one got there: eighteen mutations, a whole

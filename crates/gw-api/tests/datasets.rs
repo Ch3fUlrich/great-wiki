@@ -491,3 +491,156 @@ async fn row_access_mirrors_the_schema_door() {
     assert_eq!(s1, StatusCode::NOT_FOUND);
     assert_eq!((s1, b1), (s2, b2));
 }
+
+// --- A7: one access seam. An unreadable dataset is indistinguishable from an absent one. ---
+
+const GHOST: &str = "/api/datasets/rows/raum/nichts";
+
+async fn with_chef(store: &Arc<Store>) {
+    store
+        .upsert_oidc_principal("chef", "Chef", None, &["admins".into()])
+        .await
+        .unwrap();
+}
+
+/// Everything a caller can ask of a dataset's rows and schema, as (status, body) pairs.
+async fn probes(
+    store: &Arc<Store>,
+    who: Option<&str>,
+    base: &str,
+    id: &str,
+) -> Vec<(StatusCode, String)> {
+    let schema = base.replace("/rows/", "/schema/");
+    vec![
+        send(store, who, "GET", base, None).await,
+        send(store, who, "GET", &format!("{base}?limit=1"), None).await,
+        send(store, who, "GET", &format!("{base}?id={id}"), None).await,
+        send(store, who, "GET", &schema, None).await,
+    ]
+}
+
+#[tokio::test]
+async fn an_unreadable_dataset_answers_the_same_bytes_as_an_absent_one() {
+    let store = with_columns().await;
+    with_chef(&store).await;
+    let row = new_row(&store, json!({ "name": "Ada" })).await;
+    let id = row["id"].as_str().unwrap().to_string();
+
+    // Guest and a user whose grants are on other pages only.
+    for who in [None, Some("fremde")] {
+        let real = probes(&store, who, ROWS, &id).await;
+        let ghost = probes(&store, who, GHOST, &id).await;
+        assert_eq!(real, ghost, "{who:?}");
+        for (s, _) in &real {
+            assert_eq!(*s, StatusCode::NOT_FOUND, "{who:?}");
+        }
+        assert!(
+            real.iter()
+                .all(|(_, b)| !b.contains("Ada") && !b.contains("total")),
+            "{who:?}: {real:?}"
+        );
+    }
+
+    // Admin reads everything (positive control: the checks above are not vacuous), and an
+    // absent page is still a 404 for them.
+    let (s, b) = send(&store, Some("chef"), "GET", ROWS, None).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(b.contains("Ada") && b.contains("\"total\":1"), "{b}");
+    let (s, _) = send(&store, Some("chef"), "GET", GHOST, None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // Admin viewing as the stranger sees what the stranger sees: byte for byte.
+    let (chef, _) = store.principal_by_username("chef").await.unwrap().unwrap();
+    let (fremde, _) = store
+        .principal_by_username("fremde")
+        .await
+        .unwrap()
+        .unwrap();
+    let router = gw_api::build_router(gw_api::AppState::for_test_principal(
+        Arc::clone(&store),
+        &chef,
+    ));
+    let start = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/admin/view-as/{}", fremde.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = start
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|v| v.contains("view_as="))
+        .map(|v| v.split(';').next().unwrap().to_string())
+        .expect("view-as issues a cookie");
+    let as_view = |uri: String| {
+        let router = router.clone();
+        let cookie = cookie.clone();
+        async move {
+            let r = router
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("cookie", cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let s = r.status();
+            let b = axum::body::to_bytes(r.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (s, String::from_utf8(b.to_vec()).unwrap())
+        }
+    };
+    let viewed = as_view(ROWS.to_string()).await;
+    let ghost = as_view(GHOST.to_string()).await;
+    assert_eq!(viewed.0, StatusCode::NOT_FOUND, "{viewed:?}");
+    assert_eq!(viewed, ghost);
+}
+
+#[tokio::test]
+async fn the_count_is_this_datasets_own_and_follows_the_page() {
+    let store = with_columns().await;
+    // A second dataset with its own rows must not leak into the first one's count.
+    let (s, b) = send(
+        &store,
+        Some("schreiber"),
+        "POST",
+        "/api/datasets",
+        Some(json!({ "parent": "/raum", "title": "Zweite" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    for _ in 0..2 {
+        new_row(&store, json!({})).await;
+    }
+    let (s, _) = send(
+        &store,
+        Some("schreiber"),
+        "POST",
+        "/api/datasets/rows/raum/zweite",
+        Some(json!({ "values": {} })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (s, b) = send(
+        &store,
+        Some("leser"),
+        "GET",
+        &format!("{ROWS}?limit=1"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(v["total"], 2, "{b}");
+    assert_eq!(v["rows"].as_array().unwrap().len(), 1, "{b}");
+}

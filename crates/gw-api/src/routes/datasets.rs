@@ -71,6 +71,15 @@ pub struct RowId {
     pub id: String,
 }
 
+/// `GET rows`: `id` picks one row; without it, a page (`limit`, `offset`) plus the count.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RowQuery {
+    pub id: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
 /// Why a row call failed: an ordinary API error, or a stale version, the one answer with a
 /// body of its own - the editor needs the row as it is now to show the difference and keep
 /// their draft.
@@ -118,15 +127,36 @@ async fn get_row(
     State(state): State<AppState>,
     jar: CookieJar,
     Path(path): Path<String>,
-    Query(q): Query<RowId>,
-) -> Result<Json<DatasetRow>, RowFail> {
+    Query(q): Query<RowQuery>,
+) -> Result<Response, RowFail> {
     let principal = state.principal(&jar).await;
-    let out = state
-        .store
-        .dataset_row(&principal, &full(&path), &q.id)
-        .await
-        .map_err(|e| RowFail::Api(ApiError::Internal(e)))?;
-    row_answer(out, principal.is_authenticated()).map(Json)
+    let fail = |e| RowFail::Api(ApiError::Internal(e));
+    let signed_in = principal.is_authenticated();
+    // One row with `?id=`, otherwise a page with the dataset's count. Both go through the
+    // store's single read seam.
+    match q.id {
+        Some(id) => {
+            let out = state
+                .store
+                .dataset_row(&principal, &full(&path), &id)
+                .await
+                .map_err(fail)?;
+            Ok(Json(row_answer(out, signed_in)?).into_response())
+        }
+        None => {
+            let out = state
+                .store
+                .dataset_rows(
+                    &principal,
+                    &full(&path),
+                    q.limit.unwrap_or(50),
+                    q.offset.unwrap_or(0),
+                )
+                .await
+                .map_err(fail)?;
+            Ok(Json(row_answer(out, signed_in)?).into_response())
+        }
+    }
 }
 
 async fn add_row(
