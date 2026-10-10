@@ -12,7 +12,10 @@ export type NotificationKind =
   | 'task_assigned'
   | 'task_due'
   | 'invite_accepted'
-  | 'grant_changed';
+  | 'grant_changed'
+  | 'dataset.row.created'
+  | 'dataset.row.updated'
+  | 'dataset.row.deleted';
 
 export interface Notification {
   id: string;
@@ -41,7 +44,10 @@ const TEXT: Record<NotificationKind, string> = {
   task_assigned: 'hat Ihnen eine Aufgabe zugewiesen auf',
   task_due: 'Eine Ihrer Aufgaben ist fällig auf',
   invite_accepted: 'hat eine Einladung angenommen für',
-  grant_changed: 'hat eine Freigabe geändert für'
+  grant_changed: 'hat eine Freigabe geändert für',
+  'dataset.row.created': 'hat eine Zeile hinzugefügt in',
+  'dataset.row.updated': 'hat eine Zeile geändert in',
+  'dataset.row.deleted': 'hat eine Zeile gelöscht in'
 };
 
 /** German sentence parts for one notification, from API fields only. */

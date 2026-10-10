@@ -349,3 +349,145 @@ async fn the_hundred_and_first_field_is_a_bad_request() {
         StatusCode::BAD_REQUEST
     );
 }
+
+// --- row CRUD: /api/datasets/rows/{path} ----------------------------------------------------
+
+const ROWS: &str = "/api/datasets/rows/raum/tabelle";
+
+async fn with_columns() -> Arc<Store> {
+    let store = with_dataset().await;
+    add(&store, "schreiber", "name", "text").await;
+    add(&store, "schreiber", "alter", "number").await;
+    store
+}
+
+async fn new_row(store: &Arc<Store>, values: serde_json::Value) -> serde_json::Value {
+    let (s, b) = send(
+        store,
+        Some("schreiber"),
+        "POST",
+        ROWS,
+        Some(json!({ "values": values })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    serde_json::from_str(&b).unwrap()
+}
+
+#[tokio::test]
+async fn a_writer_creates_reads_updates_and_deletes_a_row() {
+    let store = with_columns().await;
+    let row = new_row(&store, json!({ "name": "Ada", "alter": 36 })).await;
+    assert_eq!(row["version"], 1);
+    assert_eq!(row["values"]["name"], "Ada");
+    let id = row["id"].as_str().unwrap().to_string();
+    let one = format!("{ROWS}?id={id}");
+    let (s, b) = send(&store, Some("leser"), "GET", &one, None).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(b.contains("Ada"), "{b}");
+    let (s, b) = send(
+        &store,
+        Some("schreiber"),
+        "PATCH",
+        ROWS,
+        Some(json!({ "id": id, "version": 1, "values": { "name": "Eva" } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(v["version"], 2);
+    assert_eq!(v["values"]["name"], "Eva");
+    assert_eq!(v["values"]["alter"], 36);
+    let (s, _) = send(
+        &store,
+        Some("schreiber"),
+        "DELETE",
+        ROWS,
+        Some(json!({ "id": id })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = send(&store, Some("schreiber"), "GET", &one, None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn bad_values_are_a_400_and_a_stale_version_a_409_with_the_current_row() {
+    let store = with_columns().await;
+    for bad in [json!({ "alter": "viel" }), json!({ "nope": 1 })] {
+        let (s, _) = send(
+            &store,
+            Some("schreiber"),
+            "POST",
+            ROWS,
+            Some(json!({ "values": bad })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+    let row = new_row(&store, json!({ "name": "Ada" })).await;
+    let id = row["id"].as_str().unwrap();
+    let patch = |version: i64, name: &str| json!({ "id": id, "version": version, "values": { "name": name } });
+    let (s, _) = send(
+        &store,
+        Some("schreiber"),
+        "PATCH",
+        ROWS,
+        Some(patch(1, "Bo")),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, b) = send(
+        &store,
+        Some("schreiber"),
+        "PATCH",
+        ROWS,
+        Some(patch(1, "Cy")),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(v["current"]["version"], 2, "{b}");
+    assert_eq!(v["current"]["values"]["name"], "Bo", "{b}");
+}
+
+#[tokio::test]
+async fn row_access_mirrors_the_schema_door() {
+    let store = with_columns().await;
+    let row = new_row(&store, json!({ "name": "Ada" })).await;
+    let id = row["id"].as_str().unwrap();
+    // A reader gets the ordinary 403; a visitor with no grant, the bare 404.
+    let (s, _) = send(
+        &store,
+        Some("leser"),
+        "POST",
+        ROWS,
+        Some(json!({ "values": {} })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _) = send(&store, None, "POST", ROWS, Some(json!({ "values": {} }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _) = send(
+        &store,
+        Some("leser"),
+        "DELETE",
+        ROWS,
+        Some(json!({ "id": id })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    // A stranger and a path that does not exist: same status, same bytes.
+    let one = format!("{ROWS}?id={id}");
+    let (s1, b1) = send(&store, Some("fremde"), "GET", &one, None).await;
+    let (s2, b2) = send(
+        &store,
+        Some("fremde"),
+        "GET",
+        &format!("/api/datasets/rows/raum/nichts?id={id}"),
+        None,
+    )
+    .await;
+    assert_eq!(s1, StatusCode::NOT_FOUND);
+    assert_eq!((s1, b1), (s2, b2));
+}

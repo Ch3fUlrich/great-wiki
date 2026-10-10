@@ -6,6 +6,11 @@
 //! - `GET|POST|PATCH|PUT|DELETE /api/datasets/schema/{path}` - list, add, relabel, reorder and
 //!   delete columns. Reading needs read; every change needs write.
 //!
+//! - `POST|GET|PATCH|DELETE /api/datasets/rows/{path}` - add a row (`{values}`, 201), read one
+//!   (`?id=`), change cells (`{id, version, values}`; a stale `version` answers 409 with
+//!   `{error, current}`), delete (`{id}`). Reading needs read; every change needs write.
+//!   An unreadable dataset is the same bare 404 as an absent one.
+//!
 //! The same door as `POST /api/pages` ([`gw_store::Store::create_dataset_for`]): the store
 //! decides, this file supplies the `path_admin` gate and the server's date.
 
@@ -13,25 +18,167 @@ use super::admin::path_admin;
 use super::templates::{today, Created};
 use super::AppState;
 use crate::error::ApiError;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
 use gw_core::FieldKind;
-use gw_store::datasets::{DatasetField, NewField, SchemaOutcome};
+use gw_store::datasets::{DatasetField, DatasetRow, NewField, RowOutcome, SchemaOutcome};
 use gw_store::{CreateOutcome, CreateRequest};
 use serde::{Deserialize, Serialize};
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/datasets", post(create)).route(
-        "/api/datasets/schema/{*path}",
-        get(fields)
-            .post(add_field)
-            .patch(rename_field)
-            .put(reorder_fields)
-            .delete(delete_field),
-    )
+    Router::new()
+        .route("/api/datasets", post(create))
+        .route(
+            "/api/datasets/schema/{*path}",
+            get(fields)
+                .post(add_field)
+                .patch(rename_field)
+                .put(reorder_fields)
+                .delete(delete_field),
+        )
+        .route(
+            "/api/datasets/rows/{*path}",
+            get(get_row)
+                .post(add_row)
+                .patch(update_row)
+                .delete(delete_row),
+        )
+}
+
+type Values = serde_json::Map<String, serde_json::Value>;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewRow {
+    pub values: Values,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RowPatch {
+    pub id: String,
+    pub version: i64,
+    pub values: Values,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RowId {
+    pub id: String,
+}
+
+/// Why a row call failed: an ordinary API error, or a stale version, the one answer with a
+/// body of its own - the editor needs the row as it is now to show the difference and keep
+/// their draft.
+pub enum RowFail {
+    Api(ApiError),
+    Stale(Box<DatasetRow>),
+}
+
+impl From<ApiError> for RowFail {
+    fn from(e: ApiError) -> Self {
+        RowFail::Api(e)
+    }
+}
+
+impl IntoResponse for RowFail {
+    fn into_response(self) -> Response {
+        match self {
+            RowFail::Api(e) => e.into_response(),
+            RowFail::Stale(current) => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "the row changed since you read it",
+                    "current": current,
+                })),
+            )
+                .into_response(),
+        }
+    }
+}
+
+fn row_answer<T>(outcome: RowOutcome<T>, signed_in: bool) -> Result<T, RowFail> {
+    let api = |e: ApiError| Err(RowFail::Api(e));
+    match outcome {
+        RowOutcome::Done(v) => Ok(v),
+        RowOutcome::NoDataset | RowOutcome::NoRow => api(ApiError::NotFound),
+        RowOutcome::ReadOnly if signed_in => api(ApiError::Forbidden),
+        RowOutcome::ReadOnly => api(ApiError::Unauthorized),
+        RowOutcome::Invalid(m) => api(ApiError::Invalid(m)),
+        RowOutcome::Full(m) => api(ApiError::Conflict(m)),
+        RowOutcome::Stale(current) => Err(RowFail::Stale(Box::new(current))),
+    }
+}
+
+async fn get_row(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(path): Path<String>,
+    Query(q): Query<RowId>,
+) -> Result<Json<DatasetRow>, RowFail> {
+    let principal = state.principal(&jar).await;
+    let out = state
+        .store
+        .dataset_row(&principal, &full(&path), &q.id)
+        .await
+        .map_err(|e| RowFail::Api(ApiError::Internal(e)))?;
+    row_answer(out, principal.is_authenticated()).map(Json)
+}
+
+async fn add_row(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(path): Path<String>,
+    Json(body): Json<NewRow>,
+) -> Result<(StatusCode, Json<DatasetRow>), RowFail> {
+    let principal = state.principal(&jar).await;
+    let out = state
+        .store
+        .create_dataset_row(&principal, &full(&path), &body.values)
+        .await
+        .map_err(|e| RowFail::Api(ApiError::Internal(e)))?;
+    row_answer(out, principal.is_authenticated()).map(|r| (StatusCode::CREATED, Json(r)))
+}
+
+async fn update_row(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(path): Path<String>,
+    Json(body): Json<RowPatch>,
+) -> Result<Json<DatasetRow>, RowFail> {
+    let principal = state.principal(&jar).await;
+    let out = state
+        .store
+        .update_dataset_row(
+            &principal,
+            &full(&path),
+            &body.id,
+            body.version,
+            &body.values,
+        )
+        .await
+        .map_err(|e| RowFail::Api(ApiError::Internal(e)))?;
+    row_answer(out, principal.is_authenticated()).map(Json)
+}
+
+async fn delete_row(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(path): Path<String>,
+    Json(body): Json<RowId>,
+) -> Result<StatusCode, RowFail> {
+    let principal = state.principal(&jar).await;
+    let out = state
+        .store
+        .delete_dataset_row(&principal, &full(&path), &body.id)
+        .await
+        .map_err(|e| RowFail::Api(ApiError::Internal(e)))?;
+    row_answer(out, principal.is_authenticated())?;
+    Ok(StatusCode::OK)
 }
 
 #[derive(Debug, Serialize)]

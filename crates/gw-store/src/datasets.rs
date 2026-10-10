@@ -2,11 +2,12 @@
 //! `dataset_field` and its rows in `dataset_row` (one JSON object of values per row).
 //! Rows inherit the page's access; there is no per-row ACL. Migration 0020 owns the tables.
 
+use crate::events::{EventKind, NewEvent};
 use crate::{CreateOutcome, CreateRequest, Store};
 use anyhow::Result;
 use gw_auth::Action;
 use gw_auth::Principal;
-use gw_core::dataset::{FieldKey, FieldKind};
+use gw_core::dataset::{validate_row, FieldKey, FieldKind, FieldSpec, MAX_ROW_BYTES};
 use gw_core::DocumentType;
 use serde::Serialize;
 use serde_json::Value;
@@ -333,6 +334,272 @@ enum Gate {
     Open(String),
     NoDataset,
     ReadOnly,
+}
+
+/// Most rows one dataset may hold (ADR 0029: filters scan, so the table is bounded).
+pub const MAX_ROWS: usize = 50_000;
+
+/// One row. `version` starts at 1 and moves on with every change, so an editor holding an
+/// old copy is told rather than overwriting.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DatasetRow {
+    pub id: String,
+    pub values: Value,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// How a row call ended. `NoDataset` is the same uniform refusal as [`SchemaOutcome`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum RowOutcome<T> {
+    Done(T),
+    NoDataset,
+    ReadOnly,
+    NoRow,
+    Invalid(String),
+    /// The dataset already holds [`MAX_ROWS`] rows.
+    Full(String),
+    /// The caller's `version` is out of date; carries the row as it is now.
+    Stale(DatasetRow),
+}
+
+type RowTuple = (String, String, i64, String, String);
+
+fn row_from(t: RowTuple) -> DatasetRow {
+    DatasetRow {
+        id: t.0,
+        values: serde_json::from_str(&t.1).unwrap_or(Value::Null),
+        version: t.2,
+        created_at: t.3,
+        updated_at: t.4,
+    }
+}
+
+const ROW_COLS: &str = "id, \"values\", version, created_at, updated_at";
+
+impl Store {
+    /// Validate `patch` against the dataset's current schema. Unknown keys, wrong types and
+    /// the kinds that need the store (person, file, relation: M8b) are refused; `null` stays
+    /// as `null` so an update can clear a cell.
+    async fn checked_values(
+        &self,
+        doc_id: &str,
+        patch: &serde_json::Map<String, Value>,
+    ) -> Result<std::result::Result<serde_json::Map<String, Value>, String>> {
+        let fields = self.fields_of(doc_id).await?;
+        let parsed: Vec<(FieldKey, FieldKind, Value)> = fields
+            .into_iter()
+            .filter_map(|f| {
+                let key = FieldKey::parse(&f.key).ok()?;
+                let kind = serde_json::from_value(Value::String(f.kind)).ok()?;
+                Some((key, kind, f.config))
+            })
+            .collect();
+        let specs: Vec<FieldSpec<'_>> = parsed
+            .iter()
+            .map(|(key, kind, config)| FieldSpec {
+                key,
+                kind: *kind,
+                config,
+            })
+            .collect();
+        Ok(validate_row(&specs, patch).map_err(|e| e.to_string()))
+    }
+
+    async fn fetch_row(&self, doc_id: &str, row_id: &str) -> Result<Option<DatasetRow>> {
+        let t: Option<RowTuple> = sqlx::query_as(&format!(
+            "SELECT {ROW_COLS} FROM dataset_row WHERE doc_id = ? AND id = ?"
+        ))
+        .bind(doc_id)
+        .bind(row_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(t.map(row_from))
+    }
+
+    /// One row of the dataset at `path`, for anybody who may read it.
+    pub async fn dataset_row(
+        &self,
+        principal: &Principal,
+        path: &str,
+        row_id: &str,
+    ) -> Result<RowOutcome<DatasetRow>> {
+        let Some(doc) = self.readable_dataset(principal, path).await? else {
+            return Ok(RowOutcome::NoDataset);
+        };
+        Ok(match self.fetch_row(&doc.id, row_id).await? {
+            Some(r) => RowOutcome::Done(r),
+            None => RowOutcome::NoRow,
+        })
+    }
+
+    /// Add a row. Needs write. Values are validated against the schema; a dataset holds at
+    /// most [`MAX_ROWS`].
+    pub async fn create_dataset_row(
+        &self,
+        principal: &Principal,
+        path: &str,
+        values: &serde_json::Map<String, Value>,
+    ) -> Result<RowOutcome<DatasetRow>> {
+        let doc_id = match self.writable_dataset(principal, path).await? {
+            Gate::Open(id) => id,
+            Gate::NoDataset => return Ok(RowOutcome::NoDataset),
+            Gate::ReadOnly => return Ok(RowOutcome::ReadOnly),
+        };
+        let mut clean = match self.checked_values(&doc_id, values).await? {
+            Ok(v) => v,
+            Err(m) => return Ok(RowOutcome::Invalid(m)),
+        };
+        clean.retain(|_, v| !v.is_null());
+        let id = uuid::Uuid::now_v7().to_string();
+        let mut tx = self.pool.begin().await?;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dataset_row WHERE doc_id = ?")
+            .bind(&doc_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if count as usize >= MAX_ROWS {
+            return Ok(RowOutcome::Full(format!(
+                "a dataset has at most {MAX_ROWS} rows"
+            )));
+        }
+        sqlx::query("INSERT INTO dataset_row (id, doc_id, \"values\") VALUES (?, ?, ?)")
+            .bind(&id)
+            .bind(&doc_id)
+            .bind(Value::Object(clean).to_string())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        let row = self
+            .fetch_row(&doc_id, &id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("row vanished after insert"))?;
+        self.emit_row_event(principal, &doc_id, EventKind::DatasetRowCreated, &id)
+            .await;
+        Ok(RowOutcome::Done(row))
+    }
+
+    /// Change cells of a row. Needs write. `patch` is merged over the stored values (`null`
+    /// clears a cell). `version` must be the row's current one, else the call answers
+    /// [`RowOutcome::Stale`] with the row as it is, and nothing is written.
+    pub async fn update_dataset_row(
+        &self,
+        principal: &Principal,
+        path: &str,
+        row_id: &str,
+        version: i64,
+        patch: &serde_json::Map<String, Value>,
+    ) -> Result<RowOutcome<DatasetRow>> {
+        let doc_id = match self.writable_dataset(principal, path).await? {
+            Gate::Open(id) => id,
+            Gate::NoDataset => return Ok(RowOutcome::NoDataset),
+            Gate::ReadOnly => return Ok(RowOutcome::ReadOnly),
+        };
+        let patch = match self.checked_values(&doc_id, patch).await? {
+            Ok(v) => v,
+            Err(m) => return Ok(RowOutcome::Invalid(m)),
+        };
+        let Some(current) = self.fetch_row(&doc_id, row_id).await? else {
+            return Ok(RowOutcome::NoRow);
+        };
+        if current.version != version {
+            return Ok(RowOutcome::Stale(current));
+        }
+        let mut merged = current.values.as_object().cloned().unwrap_or_default();
+        for (k, v) in patch {
+            if v.is_null() {
+                merged.remove(&k);
+            } else {
+                merged.insert(k, v);
+            }
+        }
+        let text = Value::Object(merged).to_string();
+        if text.len() > MAX_ROW_BYTES {
+            return Ok(RowOutcome::Invalid(format!(
+                "row is larger than {MAX_ROW_BYTES} bytes"
+            )));
+        }
+        // The version in the WHERE is the lock: two editors holding version N, one wins.
+        let done = sqlx::query(
+            "UPDATE dataset_row SET \"values\" = ?, version = version + 1, \
+             updated_at = datetime('now') WHERE doc_id = ? AND id = ? AND version = ?",
+        )
+        .bind(&text)
+        .bind(&doc_id)
+        .bind(row_id)
+        .bind(version)
+        .execute(&self.pool)
+        .await?;
+        let Some(now) = self.fetch_row(&doc_id, row_id).await? else {
+            return Ok(RowOutcome::NoRow);
+        };
+        if done.rows_affected() == 0 {
+            return Ok(RowOutcome::Stale(now));
+        }
+        self.emit_row_event(principal, &doc_id, EventKind::DatasetRowUpdated, row_id)
+            .await;
+        Ok(RowOutcome::Done(now))
+    }
+
+    /// Remove a row. Needs write.
+    pub async fn delete_dataset_row(
+        &self,
+        principal: &Principal,
+        path: &str,
+        row_id: &str,
+    ) -> Result<RowOutcome<()>> {
+        let doc_id = match self.writable_dataset(principal, path).await? {
+            Gate::Open(id) => id,
+            Gate::NoDataset => return Ok(RowOutcome::NoDataset),
+            Gate::ReadOnly => return Ok(RowOutcome::ReadOnly),
+        };
+        let gone = sqlx::query("DELETE FROM dataset_row WHERE doc_id = ? AND id = ?")
+            .bind(&doc_id)
+            .bind(row_id)
+            .execute(&self.pool)
+            .await?;
+        if gone.rows_affected() == 0 {
+            return Ok(RowOutcome::NoRow);
+        }
+        self.emit_row_event(principal, &doc_id, EventKind::DatasetRowDeleted, row_id)
+            .await;
+        Ok(RowOutcome::Done(()))
+    }
+
+    /// Record a row event (ADR 0025): candidates are everyone who ever revised the dataset
+    /// page, minus the actor. Ids only, no cell text; delivery re-asks read access, so a
+    /// candidate who lost the page hears nothing. Per-dataset dedupe keeps a burst of edits
+    /// to one unread row. A failure is logged, never the writer's problem.
+    async fn emit_row_event(&self, actor: &Principal, doc_id: &str, kind: EventKind, row_id: &str) {
+        let authors: Result<Vec<String>> = async {
+            Ok(sqlx::query_scalar(
+                "SELECT DISTINCT author_id FROM revisions WHERE document_id = ?1 \
+                 AND author_id <> ?2",
+            )
+            .bind(doc_id)
+            .bind(crate::revisions::IMPORT_AUTHOR_ID)
+            .fetch_all(&self.pool)
+            .await?)
+        }
+        .await;
+        match authors {
+            Ok(recipients) => {
+                for recipient in recipients {
+                    self.emit_logged(&NewEvent {
+                        kind,
+                        recipient,
+                        actor: Some(actor.id.clone()),
+                        doc_id: Some(doc_id.to_string()),
+                        path: None,
+                        subject: Some(row_id.to_string()),
+                        dedupe_key: Some(format!("{}:{doc_id}", kind.as_str())),
+                    })
+                    .await;
+                }
+            }
+            Err(err) => tracing::warn!(error = %err, "row event not recorded"),
+        }
+    }
 }
 
 fn clean_label(label: &str) -> Result<String, String> {
@@ -883,5 +1150,280 @@ mod tests {
             store.dataset_fields(&anna, "/raum").await.unwrap(),
             SchemaOutcome::NoDataset
         );
+    }
+
+    // --- row CRUD (A6) ---------------------------------------------------------------
+
+    use super::{DatasetRow, RowOutcome, MAX_ROWS};
+    use serde_json::Map;
+
+    fn vals(v: serde_json::Value) -> Map<String, serde_json::Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    async fn row_fixture() -> (Store, Principal, Principal, Principal, String) {
+        let (store, anna, bea, cleo, path) = schema_fixture().await;
+        for (k, kind) in [("name", FieldKind::Text), ("alter", FieldKind::Number)] {
+            store
+                .add_dataset_field(&anna, &path, &nf(k, kind))
+                .await
+                .unwrap();
+        }
+        (store, anna, bea, cleo, path)
+    }
+
+    async fn made(store: &Store, who: &Principal, path: &str, v: serde_json::Value) -> DatasetRow {
+        match store.create_dataset_row(who, path, &vals(v)).await.unwrap() {
+            RowOutcome::Done(r) => r,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    async fn doc_id_of(store: &Store, path: &str) -> String {
+        sqlx::query_scalar("SELECT id FROM documents WHERE path = ?")
+            .bind(path)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_validated_row_is_created_read_updated_and_deleted() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        let r = made(&store, &anna, &path, json!({"name": "Ada", "alter": 36})).await;
+        assert_eq!(r.version, 1);
+        assert_eq!(r.values, json!({"name": "Ada", "alter": 36}));
+        // Wrong type and unknown key: refused, nothing stored.
+        for bad in [json!({"alter": "viel"}), json!({"nope": 1})] {
+            assert!(matches!(
+                store
+                    .create_dataset_row(&anna, &path, &vals(bad))
+                    .await
+                    .unwrap(),
+                RowOutcome::Invalid(_)
+            ));
+        }
+        // Update merges, null clears, version moves on.
+        let RowOutcome::Done(u) = store
+            .update_dataset_row(
+                &anna,
+                &path,
+                &r.id,
+                1,
+                &vals(json!({"alter": null, "name": "Eva"})),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("update")
+        };
+        assert_eq!(u.version, 2);
+        assert_eq!(u.values, json!({"name": "Eva"}));
+        let RowOutcome::Done(got) = store.dataset_row(&anna, &path, &r.id).await.unwrap() else {
+            panic!("get")
+        };
+        assert_eq!(got, u);
+        // An unknown key on update is refused and leaves the row alone.
+        assert!(matches!(
+            store
+                .update_dataset_row(&anna, &path, &r.id, 2, &vals(json!({"nope": 1})))
+                .await
+                .unwrap(),
+            RowOutcome::Invalid(_)
+        ));
+        assert_eq!(
+            store.delete_dataset_row(&anna, &path, &r.id).await.unwrap(),
+            RowOutcome::Done(())
+        );
+        assert_eq!(
+            store.delete_dataset_row(&anna, &path, &r.id).await.unwrap(),
+            RowOutcome::NoRow
+        );
+        assert_eq!(
+            store.dataset_row(&anna, &path, &r.id).await.unwrap(),
+            RowOutcome::NoRow
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_version_conflicts_and_returns_the_current_row() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        let r = made(&store, &anna, &path, json!({"name": "Ada"})).await;
+        let RowOutcome::Done(v2) = store
+            .update_dataset_row(&anna, &path, &r.id, 1, &vals(json!({"name": "Bo"})))
+            .await
+            .unwrap()
+        else {
+            panic!("first update")
+        };
+        let out = store
+            .update_dataset_row(&anna, &path, &r.id, 1, &vals(json!({"name": "Cy"})))
+            .await
+            .unwrap();
+        assert_eq!(out, RowOutcome::Stale(v2));
+        let RowOutcome::Done(now) = store.dataset_row(&anna, &path, &r.id).await.unwrap() else {
+            panic!("get")
+        };
+        assert_eq!(now.values, json!({"name": "Bo"}));
+    }
+
+    #[tokio::test]
+    async fn the_row_cap_refuses_the_next_row() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        let doc = doc_id_of(&store, &path).await;
+        sqlx::query(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2) \
+             INSERT INTO dataset_row (id, doc_id) SELECT 'r' || i, ?1 FROM n",
+        )
+        .bind(&doc)
+        .bind(MAX_ROWS as i64)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert!(matches!(
+            store
+                .create_dataset_row(&anna, &path, &vals(json!({"name": "zu viel"})))
+                .await
+                .unwrap(),
+            RowOutcome::Full(_)
+        ));
+        // Deleting one makes room for exactly one.
+        store.delete_dataset_row(&anna, &path, "r1").await.unwrap();
+        made(&store, &anna, &path, json!({"name": "passt"})).await;
+    }
+
+    #[tokio::test]
+    async fn needs_store_kinds_are_refused_in_m8a() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        let doc = doc_id_of(&store, &path).await;
+        // A person column cannot be added through the API, so plant one underneath.
+        add_field(&store, &doc, "wer", "person").await.unwrap();
+        assert!(matches!(
+            store
+                .create_dataset_row(&anna, &path, &vals(json!({"wer": "p1"})))
+                .await
+                .unwrap(),
+            RowOutcome::Invalid(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn row_writes_need_write_and_unreadable_looks_absent() {
+        let (store, anna, bea, cleo, path) = row_fixture().await;
+        let r = made(&store, &anna, &path, json!({"name": "Ada"})).await;
+        // Reader: reads, cannot write.
+        assert!(matches!(
+            store.dataset_row(&bea, &path, &r.id).await.unwrap(),
+            RowOutcome::Done(_)
+        ));
+        assert_eq!(
+            store
+                .create_dataset_row(&bea, &path, &vals(json!({"name": "x"})))
+                .await
+                .unwrap(),
+            RowOutcome::ReadOnly
+        );
+        assert_eq!(
+            store
+                .update_dataset_row(&bea, &path, &r.id, 1, &vals(json!({"name": "x"})))
+                .await
+                .unwrap(),
+            RowOutcome::ReadOnly
+        );
+        assert_eq!(
+            store.delete_dataset_row(&bea, &path, &r.id).await.unwrap(),
+            RowOutcome::ReadOnly
+        );
+        // Stranger, anonymous: the uniform absence.
+        for who in [&cleo, &Principal::anonymous()] {
+            assert_eq!(
+                store.dataset_row(who, &path, &r.id).await.unwrap(),
+                RowOutcome::NoDataset
+            );
+            assert_eq!(
+                store
+                    .create_dataset_row(who, &path, &vals(json!({})))
+                    .await
+                    .unwrap(),
+                RowOutcome::NoDataset
+            );
+            assert_eq!(
+                store.delete_dataset_row(who, &path, &r.id).await.unwrap(),
+                RowOutcome::NoDataset
+            );
+        }
+        // A plain page and a missing path look the same.
+        for p in ["/raum", "/raum/nichts"] {
+            assert_eq!(
+                store.dataset_row(&anna, p, &r.id).await.unwrap(),
+                RowOutcome::NoDataset
+            );
+        }
+        assert_eq!(
+            store.dataset_row(&anna, &path, "fremd").await.unwrap(),
+            RowOutcome::NoRow
+        );
+    }
+
+    #[tokio::test]
+    async fn row_events_are_recorded_and_withheld_once_access_goes() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        room(&store, "raum").await;
+        let mut who = Vec::new();
+        for u in ["anna", "bea"] {
+            let p = store
+                .create_local_principal(u, u, None, "$argon2id$fake")
+                .await
+                .unwrap();
+            store
+                .add_grant("/raum", Subject::Principal(p.id.clone()), Permission::Write)
+                .await
+                .unwrap();
+            who.push(p);
+        }
+        let (anna, bea) = (&who[0], &who[1]);
+        let CreateOutcome::Created { path, .. } = store
+            .create_dataset_for(anna, &dreq(Some("/raum"), None), false, "d")
+            .await
+            .unwrap()
+        else {
+            panic!("create")
+        };
+        store
+            .add_dataset_field(anna, &path, &nf("name", FieldKind::Text))
+            .await
+            .unwrap();
+        let r = made(&store, bea, &path, json!({"name": "Ada"})).await;
+        store
+            .update_dataset_row(bea, &path, &r.id, 1, &vals(json!({"name": "Bo"})))
+            .await
+            .unwrap();
+        store.delete_dataset_row(bea, &path, &r.id).await.unwrap();
+        // The dataset's author hears of it; the actor does not hear of themselves.
+        let inbox = store.notifications_for(anna, 10).await.unwrap();
+        assert!(!inbox.is_empty());
+        assert!(inbox
+            .iter()
+            .all(|n| n.kind.as_str().starts_with("dataset.row.") && n.page.path == path));
+        assert!(store.notifications_for(bea, 10).await.unwrap().is_empty());
+        // No cell text rides on the event row.
+        let stored: Vec<String> =
+            sqlx::query_scalar("SELECT COALESCE(subject, '') || COALESCE(path, '') FROM events")
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+        assert!(stored
+            .iter()
+            .all(|s| !s.contains("Ada") && !s.contains("Bo")));
+        // Delivery re-asks: take anna's access away and her inbox empties.
+        store
+            .remove_grant(
+                "/raum",
+                &Subject::Principal(anna.id.clone()),
+                Permission::Write,
+            )
+            .await
+            .unwrap();
+        assert!(store.notifications_for(anna, 10).await.unwrap().is_empty());
     }
 }
