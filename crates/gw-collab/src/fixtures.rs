@@ -114,6 +114,15 @@ pub fn one_per_kind() -> Vec<(&'static str, Block)> {
 
     cases.push(("embed", embedded_pages()));
 
+    cases.push(("dataset-view", dataset_view_all_attrs()));
+
+    cases.push(("dataset-view (empty label)", dataset_view_empty_label()));
+
+    cases.push((
+        "dataset-view (between paragraphs)",
+        dataset_view_between_paragraphs(),
+    ));
+
     cases.push(("heading (with a stable id)", anchored_headings()));
 
     cases
@@ -164,6 +173,58 @@ pub fn embedded_pages() -> Block {
             "Dosierung",
         ),
         embed(None, Some("/darm/labor"), None, ""),
+    ])
+}
+
+/// A dataset view, named entirely by its attributes.
+///
+/// The same fragility shape as an embed's: an atom, no children, no text, and both id
+/// attributes always present — `gw_core::markdown::dataset_view_reference` refuses a
+/// destination with either missing or not uuid-shaped, so a block the reader agreed to
+/// must survive this conversion whole. `label` is written even when empty, for the embed's
+/// reason: it is the author's own words and the only thing a reader who may not read the
+/// dataset is ever shown, so an empty one and no key at all must not become the same
+/// document.
+fn dataset_view(dataset_doc: &str, view: &str, label: &str) -> Block {
+    let b = with_attr(
+        block(BlockKind::DatasetView),
+        "dataset_doc",
+        Value::from(dataset_doc),
+    );
+    let b = with_attr(b, "view", Value::from(view));
+    with_attr(b, "label", Value::from(label))
+}
+
+/// One dataset view with all three attributes set.
+pub fn dataset_view_all_attrs() -> Block {
+    doc(vec![dataset_view(
+        "0199c0de-0000-7000-8000-000000000001",
+        "0199c0de-0000-7000-8000-00000000000b",
+        "Blutwerte",
+    )])
+}
+
+/// One dataset view whose `label` is empty: the empty string must come back as an empty
+/// attribute, not as a missing one.
+pub fn dataset_view_empty_label() -> Block {
+    doc(vec![dataset_view(
+        "0199c0de-0000-7000-8000-000000000002",
+        "0199c0de-0000-7000-8000-00000000000c",
+        "",
+    )])
+}
+
+/// A dataset view standing alone between two paragraphs — its legal position is top-level
+/// only, which is also the shape the reader of the page sees.
+pub fn dataset_view_between_paragraphs() -> Block {
+    doc(vec![
+        paragraph("Der Verlauf:"),
+        dataset_view(
+            "0199c0de-0000-7000-8000-000000000003",
+            "0199c0de-0000-7000-8000-00000000000d",
+            "Gewichtsverlauf",
+        ),
+        paragraph("Danach stabil."),
     ])
 }
 
