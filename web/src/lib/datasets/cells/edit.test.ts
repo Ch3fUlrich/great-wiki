@@ -53,8 +53,19 @@ describe('fromRaw choice kinds', () => {
     expect(fromRaw('tags', {}, 'a'.repeat(129))).toEqual(bad);
     expect(fromRaw('tags', {}, ' , ')).toEqual(ok(null));
   });
+  it('relation: empty clears, one id stays one id', () => {
+    expect(fromRaw('relation', { multiple: false }, '')).toEqual(ok(null));
+    expect(fromRaw('relation', { multiple: false }, 'r1')).toEqual(ok('r1'));
+  });
+  it('relation: multiple emits a deduped id array, an empty list clears', () => {
+    expect(fromRaw('relation', { multiple: true }, ['a', 'b', 'a'])).toEqual(ok(['a', 'b']));
+    expect(fromRaw('relation', { multiple: true }, [])).toEqual(ok(null));
+  });
   it('toRaw returns the id, the id array, or comma text', () => {
     expect(toRaw('select', 'a')).toBe('a');
+    expect(toRaw('relation', ['a', 'b'])).toEqual(['a', 'b']);
+    expect(toRaw('relation', 'a')).toBe('a');
+    expect(toRaw('relation', null)).toBe('');
     expect(toRaw('multi_select', ['a', 'b'])).toEqual(['a', 'b']);
     expect(toRaw('multi_select', null)).toEqual([]);
     expect(toRaw('tags', ['x', 'y'])).toBe('x, y');

@@ -1,5 +1,8 @@
 //! The dataset query builder (ADR 0029): filters, a typed sort and a keyset cursor over
-//! `dataset_row`, as SQL whose every variable part is a bound parameter.
+//! `dataset_row`, as SQL whose every variable part is a bound parameter. A [`Cursor`] is either
+//! that keyset position or, for the computed-field path of `Store::dataset_rows_query`, an
+//! opaque offset (`o:<n>`) — that one pages by row count, not by key, and is not stable under
+//! concurrent inserts.
 //!
 //! **Field references exist only as [`FieldKey`].** There is no constructor taking a `&str`
 //! or `String` name: a key is validated by `FieldKey::parse` (`^[a-z][a-z0-9_]*$`) before it
@@ -35,6 +38,18 @@ pub enum SortKind {
     Text,
 }
 
+impl Filter {
+    /// The field this condition names.
+    pub fn key(&self) -> &FieldKey {
+        match self {
+            Filter::Eq { key, .. }
+            | Filter::Contains { key, .. }
+            | Filter::IsEmpty { key }
+            | Filter::In { key, .. } => key,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sort {
     pub key: FieldKey,
@@ -42,18 +57,21 @@ pub struct Sort {
     pub desc: bool,
 }
 
+/// The sort value a keyset cursor remembers, as one of the shapes a cell can cast to.
 #[derive(Debug, Clone, PartialEq)]
-enum CursorValue {
+pub enum CursorValue {
     Null,
     Num(f64),
     Text(String),
 }
 
-/// Where the previous page ended: the last row's sort value and id.
+/// Where the previous page ended. `Keyset` is the SQL path's position — the last row's sort
+/// value and id, stable under concurrent inserts. `Offset` is the computed path's position:
+/// a plain count of rows already served, which is stable only while nobody inserts.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Cursor {
-    value: CursorValue,
-    id: String,
+pub enum Cursor {
+    Keyset { value: CursorValue, id: String },
+    Offset(usize),
 }
 
 impl Cursor {
@@ -63,17 +81,27 @@ impl Cursor {
             (None, Some(t)) => CursorValue::Text(t),
             (None, None) => CursorValue::Null,
         };
-        Cursor { value, id }
+        Cursor::Keyset { value, id }
     }
 
-    /// Opaque token: hex of a small JSON object.
+    /// Opaque token: hex of a small JSON object, or hex of `o:<n>` for an offset.
     pub fn encode(&self) -> String {
-        let v = match &self.value {
-            CursorValue::Null => Value::Null,
-            CursorValue::Num(n) => serde_json::json!(n),
-            CursorValue::Text(t) => Value::String(t.clone()),
+        let json = match self {
+            Cursor::Offset(n) => {
+                return format!("o:{n}")
+                    .bytes()
+                    .map(|b| format!("{b:02x}"))
+                    .collect()
+            }
+            Cursor::Keyset { value, id } => {
+                let v = match value {
+                    CursorValue::Null => Value::Null,
+                    CursorValue::Num(n) => serde_json::json!(n),
+                    CursorValue::Text(t) => Value::String(t.clone()),
+                };
+                serde_json::json!({ "v": v, "id": id }).to_string()
+            }
         };
-        let json = serde_json::json!({ "v": v, "id": self.id }).to_string();
         json.bytes().map(|b| format!("{b:02x}")).collect()
     }
 
@@ -87,6 +115,13 @@ impl Cursor {
             .map(|i| u8::from_str_radix(&token[i..i + 2], 16))
             .collect::<Result<_, _>>()
             .map_err(|_| bad())?;
+        if let Some(rest) = bytes.strip_prefix(b"o:") {
+            if rest.is_empty() || !rest.iter().all(u8::is_ascii_digit) {
+                return Err(bad());
+            }
+            let text = std::str::from_utf8(rest).map_err(|_| bad())?;
+            return text.parse::<usize>().map(Cursor::Offset).map_err(|_| bad());
+        }
         let v: Value = serde_json::from_slice(&bytes).map_err(|_| bad())?;
         let id = v.get("id").and_then(Value::as_str).ok_or_else(bad)?;
         let value = match v.get("v") {
@@ -95,7 +130,7 @@ impl Cursor {
             Some(Value::String(s)) => CursorValue::Text(s.clone()),
             Some(_) => return Err(bad()),
         };
-        Ok(Cursor {
+        Ok(Cursor::Keyset {
             value,
             id: id.to_string(),
         })
@@ -220,13 +255,17 @@ impl RowQuery {
             None => {
                 sort_cols_sql = ", NULL AS sn, created_at AS st".to_string();
                 if let Some(c) = &self.after {
-                    let CursorValue::Text(v) = &c.value else {
+                    let Cursor::Keyset {
+                        value: CursorValue::Text(v),
+                        id,
+                    } = c
+                    else {
                         return Err("the cursor does not belong to this order".into());
                     };
                     page_sql.push_str(" AND (created_at > ? OR (created_at = ? AND id > ?))");
                     page_binds.push(Bind::Text(v.clone()));
                     page_binds.push(Bind::Text(v.clone()));
-                    page_binds.push(Bind::Text(c.id.clone()));
+                    page_binds.push(Bind::Text(id.clone()));
                 }
                 order = "created_at, id".to_string();
             }
@@ -237,7 +276,10 @@ impl RowQuery {
                     SortKind::Text => format!(", NULL AS sn, {e} AS st"),
                 };
                 if let Some(c) = &self.after {
-                    let value = match (&c.value, sort.kind) {
+                    let Cursor::Keyset { value, id } = c else {
+                        return Err("the cursor does not belong to this order".into());
+                    };
+                    let value = match (value, sort.kind) {
                         (CursorValue::Null, _) => None,
                         (CursorValue::Num(n), SortKind::Number) => Some(Bind::Real(*n)),
                         (CursorValue::Text(t), SortKind::Text) => Some(Bind::Text(t.clone())),
@@ -247,7 +289,7 @@ impl RowQuery {
                         None => {
                             page_sql.push_str(&format!(" AND ({e} IS NULL AND id > ?)"));
                             page_binds.push(path_bind(&sort.key));
-                            page_binds.push(Bind::Text(c.id.clone()));
+                            page_binds.push(Bind::Text(id.clone()));
                         }
                         Some(v) => {
                             let op = if sort.desc { "<" } else { ">" };
@@ -258,7 +300,7 @@ impl RowQuery {
                             page_binds.push(v.clone());
                             page_binds.push(path_bind(&sort.key));
                             page_binds.push(v);
-                            page_binds.push(Bind::Text(c.id.clone()));
+                            page_binds.push(Bind::Text(id.clone()));
                             page_binds.push(path_bind(&sort.key));
                         }
                     }
@@ -460,11 +502,41 @@ mod tests {
             Cursor::of(Some(10.0), None, "a".into()),
             Cursor::of(None, Some("x y".into()), "b".into()),
             Cursor::of(None, None, "c".into()),
+            Cursor::Offset(0),
+            Cursor::Offset(4200),
         ] {
             assert_eq!(Cursor::decode(&c.encode()).unwrap(), c);
         }
         for bad in ["", "zz", "abc", "7b7d", "7b226964223a317d"] {
             assert!(Cursor::decode(bad).is_err(), "{bad}");
         }
+        // The offset form is hex of `o:<digits>` only: "o:", "o:x", a sign, a second colon.
+        for bad in ["6f3a", "6f3a78", "6f3a2d31", "6f3a313a32", "6f3a3120"] {
+            assert!(Cursor::decode(bad).is_err(), "offset {bad}");
+        }
+    }
+
+    #[test]
+    fn an_offset_cursor_is_refused_by_the_sql_keyset_path() {
+        let q = RowQuery {
+            limit: 5,
+            after: Some(Cursor::Offset(2)),
+            ..Default::default()
+        };
+        assert_eq!(
+            q.build("d").err().unwrap(),
+            "the cursor does not belong to this order"
+        );
+        let sorted = RowQuery {
+            sort: Some(Sort {
+                key: key("amount"),
+                kind: SortKind::Number,
+                desc: false,
+            }),
+            limit: 5,
+            after: Some(Cursor::Offset(2)),
+            ..Default::default()
+        };
+        assert!(sorted.build("d").is_err());
     }
 }

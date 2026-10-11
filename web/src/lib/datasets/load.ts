@@ -1,4 +1,5 @@
 import { apiGet } from '$lib/api';
+import { labelMap, relationConfig } from './cells/relation';
 import {
   describeRowsFailure,
   fieldsApiPath,
@@ -17,6 +18,8 @@ export interface DatasetLoad {
   error: string | null;
   sort: SortState | null;
   filter: FilterState | null;
+  /** `fieldKey -> target rowId -> label`, one page per relation column; absent on failure. */
+  labels: Record<string, Record<string, string>>;
 }
 
 /**
@@ -54,12 +57,45 @@ export async function loadDataset(
       cookie
     );
     if (!rows.data) return { ...fail(rows.status), fields, sort, filter };
-    return { fields, page: rows.data, error: null, sort, filter };
+    const labels = await relationLabels(fetchFn, fields, cookie);
+    return { fields, page: rows.data, error: null, sort, filter, labels };
   } catch {
     return { ...fail(0), fields, sort, filter };
   }
 }
 
 function fail(status: number): DatasetLoad {
-  return { fields: [], page: null, error: describeRowsFailure(status), sort: null, filter: null };
+  return { fields: [], page: null, error: describeRowsFailure(status), sort: null, filter: null, labels: {} };
+}
+
+/**
+ * Labels for the rows the relation columns point at: each visible target's first page, read
+ * once — two columns onto one target share the read. A target that cannot be read simply gets
+ * no map, and the table falls back to counting ids; the page is not an error because of it.
+ * The column itself is only in the schema when the caller may read its target, so this asks
+ * nothing the caller could not already see.
+ */
+async function relationLabels(
+  fetchFn: typeof fetch,
+  fields: Field[],
+  cookie: string | null
+): Promise<DatasetLoad['labels']> {
+  const labels: DatasetLoad['labels'] = {};
+  const byPath = new Map<string, Record<string, string> | null>();
+  for (const f of fields) {
+    if (f.kind !== 'relation') continue;
+    const cfg = relationConfig(f.config);
+    if (!cfg) continue;
+    if (!byPath.has(cfg.targetPath)) {
+      try {
+        const res = await apiGet<RowPage>(fetchFn, rowsApiPath(cfg.targetPath, {}), cookie);
+        byPath.set(cfg.targetPath, res.data ? labelMap(res.data.rows) : null);
+      } catch {
+        byPath.set(cfg.targetPath, null);
+      }
+    }
+    const m = byPath.get(cfg.targetPath);
+    if (m) labels[f.key] = m;
+  }
+  return labels;
 }

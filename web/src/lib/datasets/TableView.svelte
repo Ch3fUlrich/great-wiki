@@ -30,7 +30,8 @@
     error = null,
     sort = null,
     filter = null,
-    mayWrite = false
+    mayWrite = false,
+    labels = {}
   }: {
     path: string;
     fields: Field[];
@@ -39,6 +40,7 @@
     sort?: SortState | null;
     filter?: FilterState | null;
     mayWrite?: boolean;
+    labels?: Record<string, Record<string, string>>;
   } = $props();
 
   let more = $state<Row[]>([]);
@@ -135,15 +137,14 @@
             {#each rows as row (row.id)}
               <tr>
                 {#each fields as f (f.key)}
-                  {@const cell = cellOf(f, row.values?.[f.key])}
+                  {@const cell = cellOf(f, row.values?.[f.key], labels[f.key])}
                   <td class:end={cell.kind === 'text' && cell.align === 'end'}>
                     {#if cell.kind === 'chips'}
                       {#each cell.items as item}<span class="chip">{item}</span>{/each}
                     {:else if cell.kind === 'link'}
                       <a href={cell.href} rel="noopener noreferrer">{cell.text}</a>
                     {:else if cell.kind === 'error'}
-                      <span class="err" title={cell.reason}>#ERR</span>
-                      <span class="err-grund">{cell.reason}</span>
+                      <span class="err">{cell.reason}</span>
                     {:else}
                       {cell.text}
                     {/if}

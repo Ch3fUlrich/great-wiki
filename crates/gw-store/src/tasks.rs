@@ -557,7 +557,11 @@ impl Store {
     /// `None` means refused: they may not read that page, or the account is suspended and
     /// may read nothing at all. It never means "they have no name" — [`byline`] always
     /// yields one — so a caller may read the `Option` as the verdict.
-    async fn assignee_named(
+    ///
+    /// `pub(crate)` rather than private because a dataset's `person` column asks exactly this
+    /// question of the account it is about to store (`crates/gw-store/src/datasets/links.rs`),
+    /// and a second copy of clause 2 is how two paths start disagreeing about the same person.
+    pub(crate) async fn assignee_named(
         &self,
         account: &Principal,
         governing_path: &str,

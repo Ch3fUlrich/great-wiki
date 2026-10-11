@@ -67,6 +67,19 @@ describe('cellOf', () => {
       reason: 'Division durch Null'
     });
   });
+  it('counts linked ids when there is no label map, chips them when there is one', () => {
+    expect(cellOf(f('a', 'relation'), 'r1')).toEqual({ kind: 'text', text: '1 verknüpft' });
+    expect(cellOf(f('a', 'relation'), ['r1', 'r2'])).toEqual({ kind: 'text', text: '2 verknüpft' });
+    expect(cellOf(f('a', 'relation'), [])).toEqual({ kind: 'text', text: '' });
+    expect(cellOf(f('a', 'relation'), 'r1', { r1: 'Ada' })).toEqual({ kind: 'chips', items: ['Ada'] });
+    expect(cellOf(f('a', 'relation'), ['x', 'y'], {})).toEqual({ kind: 'chips', items: ['x', 'y'] });
+  });
+  it('prints computed values as text: numbers formatted, lists joined', () => {
+    expect(cellOf(f('a', 'formula'), 1234.5)).toEqual({ kind: 'text', text: '1.234,5', align: 'end' });
+    expect(cellOf(f('a', 'rollup'), ['a', 'b'])).toEqual({ kind: 'text', text: 'a, b' });
+    expect(cellOf(f('a', 'formula'), 'x')).toEqual({ kind: 'text', text: 'x' });
+    expect(cellOf(f('a', 'formula'), true)).toEqual({ kind: 'text', text: 'Ja' });
+  });
 });
 
 describe('describeRowsFailure', () => {

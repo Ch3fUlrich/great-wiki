@@ -44,4 +44,46 @@ describe('loadDataset', () => {
     expect(out.page).toBeNull();
     expect(out.error).toContain('500');
   });
+
+  const REL_FIELDS = {
+    fields: [
+      { key: 'name', label: 'Name', kind: 'text', config: {}, position: 0 },
+      { key: 'wer', label: 'Wer', kind: 'relation', config: { multiple: false, target_path: '/d2' }, position: 1 },
+      { key: 'wo', label: 'Wo', kind: 'relation', config: { multiple: true, target_path: '/d2' }, position: 2 }
+    ]
+  };
+  const targetRow = { id: 'a', values: { name: 'Ada' }, version: 1, created_at: '', updated_at: '' };
+
+  function relFetch(target: Response) {
+    const seen: string[] = [];
+    const f = vi.fn(async (url: string | URL | Request) => {
+      const u = String(url);
+      seen.push(u);
+      if (u.includes('/schema/')) return json(REL_FIELDS);
+      if (u.includes('/rows/d2')) return target;
+      return json({ rows: [{ id: '1', values: { wer: 'a' }, version: 1, created_at: '', updated_at: '' }], total: 1 });
+    }) as unknown as typeof fetch;
+    return { f, seen };
+  }
+
+  it('fetches each relation column\'s target page once and maps its row labels', async () => {
+    const { f, seen } = relFetch(json({ rows: [targetRow], total: 1 }));
+    const out = await loadDataset(f, '/d', new URLSearchParams(), null);
+    expect(seen.filter((u) => u.includes('/rows/d2'))).toHaveLength(1);
+    expect(out.labels).toEqual({ wer: { a: 'Ada' }, wo: { a: 'Ada' } });
+  });
+
+  it('survives a failing target: the page loads, the labels are simply absent', async () => {
+    const { f } = relFetch(json({ error: 'x' }, 500));
+    const out = await loadDataset(f, '/d', new URLSearchParams(), null);
+    expect(out.error).toBeNull();
+    expect(out.labels).toEqual({});
+  });
+
+  it('asks no target when the dataset has no relation column', async () => {
+    const { f, seen } = fakeFetch(json({ rows: [], total: 0 }));
+    const out = await loadDataset(f, '/d', new URLSearchParams(), null);
+    expect(seen.filter((u) => u.includes('/rows/'))).toHaveLength(1);
+    expect(out.labels).toEqual({});
+  });
 });

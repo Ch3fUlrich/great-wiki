@@ -7,14 +7,14 @@
 //! by `FieldKey` and must be fields of this dataset; they are only ever JSON, never SQL.
 
 use super::query::Filter;
-use super::{clean_label, Gate, SchemaOutcome};
+use super::{clean_label, is_computed_kind, Gate, SchemaOutcome};
 use crate::Store;
 use anyhow::Result;
 use gw_auth::Principal;
-use gw_core::dataset::FieldKey;
+use gw_core::dataset::{FieldKey, FieldKind};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Most views one dataset may carry.
 pub const MAX_VIEWS: usize = 50;
@@ -42,6 +42,10 @@ struct TableConfig {
     filters: Vec<Filter>,
     #[serde(default)]
     widths: BTreeMap<String, u32>,
+    /// The column a board-style grouping runs over: any view kind may carry it, and it must
+    /// name a visible, stored field — see [`validate`].
+    #[serde(default)]
+    group_by: Option<FieldKey>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,12 +63,9 @@ impl TableConfig {
     fn keys(&self) -> Result<Vec<String>, String> {
         let mut out: Vec<String> = self.fields.iter().map(|k| k.as_str().to_string()).collect();
         out.extend(self.sort.iter().map(|s| s.key.as_str().to_string()));
+        out.extend(self.group_by.iter().map(|g| g.as_str().to_string()));
         for f in &self.filters {
-            let (Filter::Eq { key, .. }
-            | Filter::Contains { key, .. }
-            | Filter::IsEmpty { key }
-            | Filter::In { key, .. }) = f;
-            out.push(key.as_str().to_string());
+            out.push(f.key().as_str().to_string());
         }
         for k in self.widths.keys() {
             let parsed = FieldKey::parse(k).map_err(|e| e.to_string())?;
@@ -74,9 +75,12 @@ impl TableConfig {
     }
 }
 
-/// Check `config` for `kind` against the dataset's field keys. M8a has the table view only;
-/// the other kinds are in the schema's CHECK for later milestones and refused until then.
-fn validate(kind: &str, config: &Value, known: &HashSet<String>) -> Result<(), String> {
+/// Check `config` for `kind` against the fields `known` — the dataset's keys this caller may
+/// see, by kind. M8a has the table view only; the other kinds are in the schema's CHECK for
+/// later milestones and refused until then. `group_by` has a rule of its own: it groups rows
+/// under a head, and only a stored column can head a group — a formula or rollup is evaluated
+/// per row, not enumerable, and a relation is not groupable yet.
+fn validate(kind: &str, config: &Value, known: &HashMap<String, String>) -> Result<(), String> {
     if kind != "table" {
         return Err(format!("the view kind {kind:?} is not available"));
     }
@@ -88,16 +92,25 @@ fn validate(kind: &str, config: &Value, known: &HashSet<String>) -> Result<(), S
     let parsed: TableConfig = serde_json::from_value(config.clone())
         .map_err(|e| format!("not a valid table view config: {e}"))?;
     for key in parsed.keys()? {
-        if !known.contains(&key) {
+        if !known.contains_key(&key) {
             return Err(format!("the dataset has no field {key:?}"));
+        }
+    }
+    if let Some(group) = &parsed.group_by {
+        let field_kind = &known[group.as_str()];
+        if is_computed_kind(field_kind) {
+            return Err("computed fields cannot be grouped".into());
+        }
+        if field_kind == FieldKind::Relation.as_str() {
+            return Err("relation fields cannot be grouped yet".into());
         }
     }
     Ok(())
 }
 
 /// Drop everything in a table config that names a field outside `visible`: the column, a
-/// width, and a sort or filter on it (filtering a hidden field is refused, not ignored, so a
-/// saved one cannot survive for a caller who may not see the field).
+/// width, and a sort, filter or grouping on it (filtering a hidden field is refused, not
+/// ignored, so a saved one cannot survive for a caller who may not see the field).
 pub(crate) fn strip_hidden(config: &mut Value, visible: &HashSet<String>) {
     let shown = |v: &Value| v.as_str().is_some_and(|k| visible.contains(k));
     let Some(obj) = config.as_object_mut() else {
@@ -114,6 +127,9 @@ pub(crate) fn strip_hidden(config: &mut Value, visible: &HashSet<String>) {
         .is_some_and(|s| !s.get("key").is_some_and(shown))
     {
         obj.remove("sort");
+    }
+    if obj.get("group_by").is_some_and(|g| !shown(g)) {
+        obj.remove("group_by");
     }
     if let Some(Value::Array(filters)) = obj.get_mut("filters") {
         filters.retain(|f| f.get("key").is_some_and(shown));
@@ -137,22 +153,37 @@ fn view_name(name: &str) -> Result<String, String> {
 }
 
 impl Store {
-    /// The field keys `principal` may see in the dataset. The seam for per-field access:
-    /// in M8a no field is hidden from a reader, so this is every key.
+    /// The field keys `principal` may see in the dataset: every stored key minus the ones hidden
+    /// from this caller — a relation they may not resolve, a rollup over it, a formula reaching
+    /// either. This is the seam the schema and the query use, so a view cannot name a field the
+    /// caller could not otherwise see or filter.
     async fn visible_field_keys(
         &self,
-        _principal: &Principal,
+        principal: &Principal,
         doc_id: &str,
     ) -> Result<HashSet<String>> {
-        self.all_field_keys(doc_id).await
+        Ok(self
+            .visible_field_kinds(principal, doc_id)
+            .await?
+            .into_keys()
+            .collect())
     }
 
-    async fn all_field_keys(&self, doc_id: &str) -> Result<HashSet<String>> {
+    /// The same seam as [`Store::visible_field_keys`], keeping each key's kind: `group_by` needs
+    /// the kind to refuse a computed or relation head while still answering an unknown key as
+    /// "no field".
+    async fn visible_field_kinds(
+        &self,
+        principal: &Principal,
+        doc_id: &str,
+    ) -> Result<HashMap<String, String>> {
+        let hidden = self.hidden_field_keys(principal, doc_id).await?;
         Ok(self
             .fields_of(doc_id)
             .await?
             .into_iter()
-            .map(|f| f.key)
+            .filter(|f| !hidden.contains(f.key.as_str()))
+            .map(|f| (f.key, f.kind))
             .collect())
     }
 
@@ -203,7 +234,7 @@ impl Store {
             Ok(n) => n,
             Err(m) => return Ok(SchemaOutcome::Invalid(m)),
         };
-        let known = self.all_field_keys(&doc_id).await?;
+        let known = self.visible_field_kinds(principal, &doc_id).await?;
         if let Err(m) = validate(kind, config, &known) {
             return Ok(SchemaOutcome::Invalid(m));
         }
@@ -262,7 +293,7 @@ impl Store {
             Err(m) => return Ok(SchemaOutcome::Invalid(m)),
         };
         let config = config.cloned().unwrap_or(current.config);
-        let known = self.all_field_keys(&doc_id).await?;
+        let known = self.visible_field_kinds(principal, &doc_id).await?;
         if let Err(m) = validate(&current.kind, &config, &known) {
             return Ok(SchemaOutcome::Invalid(m));
         }
@@ -527,10 +558,15 @@ mod tests {
     async fn the_hidden_field_filter_drops_hidden_keys_from_a_listed_view() {
         let (_, _, _, _, _) = fixture().await;
         let mut cfg = table();
+        cfg["group_by"] = json!("alter");
         let visible: std::collections::HashSet<String> = ["name".to_string()].into();
         strip_hidden(&mut cfg, &visible);
         assert_eq!(cfg["fields"], json!(["name"]));
         assert!(cfg.get("sort").is_none());
+        assert!(
+            cfg.get("group_by").is_none(),
+            "a grouping on a hidden field goes too: {cfg}"
+        );
         assert_eq!(cfg["filters"].as_array().unwrap().len(), 1);
         assert_eq!(cfg["widths"], json!({"name": 200}));
     }
@@ -602,5 +638,261 @@ mod tests {
         };
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "Alle");
+    }
+
+    /// A source under `/raum` both may read, a target under `/geheim` only `anna` may. `bea` holds
+    /// write on the source (so she may create and list views) but not read on the target, so the
+    /// relation, the rollup over it and the formula over that rollup are all hidden for her.
+    async fn hidden_view_fixture() -> (Store, Principal, Principal, String) {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        for slug in ["raum", "geheim"] {
+            let body: Block = serde_json::from_str(r#"{"kind":"doc","content":[]}"#).unwrap();
+            store
+                .create_document(
+                    Author::Import,
+                    &NewDocument {
+                        parent_path: None,
+                        doc_type: DocumentType::Page,
+                        title: slug.into(),
+                        slug: Some(slug.into()),
+                        language: "de".into(),
+                        visibility: Visibility::Restricted,
+                        body,
+                        sort_key: 0,
+                        topics: Vec::new(),
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let anna = Principal::test("anna", &[], &[]);
+        let bea = Principal::test("bea", &[], &[]);
+        for (slug, who, perm) in [
+            ("/raum", &anna, Permission::Write),
+            ("/geheim", &anna, Permission::Write),
+            ("/raum", &bea, Permission::Read),
+            ("/raum", &bea, Permission::Write),
+        ] {
+            store
+                .add_grant(slug, Subject::Principal(who.id.clone()), perm)
+                .await
+                .unwrap();
+        }
+        let req = |parent: &str| CreateRequest {
+            parent: Some(parent.into()),
+            title: "d".into(),
+            slug: None,
+            template: None,
+        };
+        let CreateOutcome::Created { path: source, .. } = store
+            .create_dataset_for(&anna, &req("/raum"), false, "d")
+            .await
+            .unwrap()
+        else {
+            panic!("no source dataset")
+        };
+        let CreateOutcome::Created { path: target, .. } = store
+            .create_dataset_for(&anna, &req("/geheim"), false, "z")
+            .await
+            .unwrap()
+        else {
+            panic!("no target dataset")
+        };
+        for (key, kind) in [("name", FieldKind::Text), ("alter", FieldKind::Number)] {
+            store
+                .add_dataset_field(
+                    &anna,
+                    &source,
+                    &NewField {
+                        key: key.into(),
+                        label: key.into(),
+                        kind,
+                        config: json!({}),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .add_dataset_field(
+                &anna,
+                &source,
+                &NewField {
+                    key: "mit".into(),
+                    label: "Mit".into(),
+                    kind: FieldKind::Relation,
+                    config: json!({ "target": target, "multiple": true }),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .add_dataset_field(
+                &anna,
+                &source,
+                &NewField {
+                    key: "cnt".into(),
+                    label: "Cnt".into(),
+                    kind: FieldKind::Rollup,
+                    config: json!({ "relation": "mit", "target_field": "x", "fn": "count" }),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .add_dataset_field(
+                &anna,
+                &source,
+                &NewField {
+                    key: "fr".into(),
+                    label: "Fr".into(),
+                    kind: FieldKind::Formula,
+                    config: json!({ "expr": "{cnt} + 1" }),
+                },
+            )
+            .await
+            .unwrap();
+        (store, anna, bea, source)
+    }
+
+    #[tokio::test]
+    async fn a_view_config_naming_a_hidden_field_is_refused_as_an_unknown_one() {
+        let (store, _, bea, source) = hidden_view_fixture().await;
+        // A key bea may not see is refused in the exact words of a key that does not exist.
+        let shape = |key: &str| format!("the dataset has no field {key:?}");
+        for key in ["mit", "cnt", "fr", "gibtsnicht"] {
+            let want = shape(key);
+            for cfg in [
+                json!({"fields": [key]}),
+                json!({"sort": {"key": key}}),
+                json!({"filters": [{"op": "is_empty", "key": key}]}),
+                json!({"widths": {key: 10}}),
+            ] {
+                let out = store
+                    .create_dataset_view(&bea, &source, "X", "table", &cfg)
+                    .await
+                    .unwrap();
+                assert_eq!(out, SchemaOutcome::Invalid(want.clone()), "{key} in {cfg}");
+            }
+        }
+    }
+
+    /// `group_by` may ride on any view kind, but it names the column rows are grouped under, and
+    /// only a stored column can head a group: a formula or a rollup is answered per row, a relation
+    /// is not groupable in this milestone. A column hidden from the caller is refused as an unknown
+    /// one, in the same words as a key that does not exist.
+    #[tokio::test]
+    async fn a_group_by_names_a_visible_stored_field_and_nothing_else() {
+        let (store, anna, bea, source) = hidden_view_fixture().await;
+        store
+            .add_dataset_field(
+                &anna,
+                &source,
+                &NewField {
+                    key: "state".into(),
+                    label: "State".into(),
+                    kind: FieldKind::Select,
+                    config: json!({"options": [{"id": "off"}, {"id": "on"}]}),
+                },
+            )
+            .await
+            .unwrap();
+        let out = store
+            .create_dataset_view(&anna, &source, "G", "table", &json!({"group_by": "state"}))
+            .await
+            .unwrap();
+        let SchemaOutcome::Done(v) = out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(v.config["group_by"], json!("state"));
+        for (who, cfg, want) in [
+            (
+                &anna,
+                json!({"group_by": "fr"}),
+                "computed fields cannot be grouped",
+            ),
+            (
+                &anna,
+                json!({"group_by": "cnt"}),
+                "computed fields cannot be grouped",
+            ),
+            (
+                &anna,
+                json!({"group_by": "mit"}),
+                "relation fields cannot be grouped yet",
+            ),
+            (
+                &bea,
+                json!({"group_by": "mit"}),
+                "the dataset has no field \"mit\"",
+            ),
+            (
+                &bea,
+                json!({"group_by": "cnt"}),
+                "the dataset has no field \"cnt\"",
+            ),
+            (
+                &anna,
+                json!({"group_by": "gibtsnicht"}),
+                "the dataset has no field \"gibtsnicht\"",
+            ),
+        ] {
+            assert_eq!(
+                store
+                    .create_dataset_view(who, &source, "X", "table", &cfg)
+                    .await
+                    .unwrap(),
+                SchemaOutcome::Invalid(want.into()),
+                "{cfg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_views_strips_fields_hidden_from_the_reader() {
+        let (store, anna, bea, source) = hidden_view_fixture().await;
+        // anna, who sees every column, saves a view that names them all.
+        let cfg = json!({
+            "fields": ["name", "mit", "cnt", "fr", "alter"],
+            "sort": {"key": "fr"},
+            "filters": [{"op": "is_empty", "key": "cnt"}, {"op": "contains", "key": "name", "value": "a"}],
+            "widths": {"mit": 100, "name": 200}
+        });
+        let SchemaOutcome::Done(v) = store
+            .create_dataset_view(&anna, &source, "Alle", "table", &cfg)
+            .await
+            .unwrap()
+        else {
+            panic!("anna names the fields she may read")
+        };
+        // Her own listing is untouched.
+        let SchemaOutcome::Done(list) = store.dataset_views(&anna, &source).await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(list[0].config, cfg);
+        assert_eq!(list[0].id, v.id);
+        // bea's listing has the hidden columns stripped from the config, not the whole view failed.
+        let SchemaOutcome::Done(list) = store.dataset_views(&bea, &source).await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            list.len(),
+            1,
+            "the view still lists; only its hidden keys go"
+        );
+        let c = &list[0].config;
+        assert_eq!(c["fields"], json!(["name", "alter"]));
+        assert!(
+            c.get("sort").is_none(),
+            "a sort on a hidden field is dropped: {c}"
+        );
+        assert_eq!(
+            c["filters"].as_array().unwrap().len(),
+            1,
+            "only the filter on a visible field survives: {c}"
+        );
+        assert_eq!(c["filters"][0]["key"], json!("name"));
+        assert_eq!(c["widths"], json!({"name": 200}));
     }
 }

@@ -2343,6 +2343,106 @@ mutation crates/gw-store/src/datasets/views.rs killed \
   's/DELETE FROM dataset_view WHERE id = ? AND doc_id = ?/DELETE FROM dataset_view WHERE id = ?/' \
   'datasets: a view delete is scoped to its own dataset'
 
+# --- datasets: person and file fields (ADR 0009 clause 2, M8b B3) ---------------------------
+#
+# A `person` cell may only name somebody who could read the page it is being named on, and a
+# `file` cell may only name a file that is ON this page. Both are writes, both are asked in
+# `crates/gw-store/src/datasets/links.rs` (the checks need the database, so they cannot live in
+# core), and the two tests that notice are
+# `a_person_cell_is_written_only_for_somebody_who_could_read_this_page` and
+# `a_file_cell_is_one_of_this_page_s_attachments_and_reads_back_as_a_name`.
+#
+# (1) Clause 2 dropped: the person is taken as readable without asking them. A dataset would
+# then record which colleagues can read a page they were never given — the disclosure ADR 0009
+# exists to prevent, and the reason this reuses `assignee_named` rather than the caller's access.
+mutation crates/gw-store/src/datasets/links.rs killed \
+  's/Ok(self.assignee_named(&account, path).await?.is_some())/Ok(true)/' \
+  'datasets: a person cell skips the read check - naming somebody who cannot read the page'
+# (2) The ownership check dropped: the id is looked up without asking which page it belongs to.
+# Naming another page's file then writes that page's filename onto this dataset's rows, which is
+# D-16 undone — access belongs to the page, and a cell is not the page.
+mutation crates/gw-store/src/datasets/links.rs killed \
+  's/SELECT 1 FROM attachments WHERE id = ?1 AND doc_id = ?2/SELECT 1 FROM attachments WHERE id = ?1/' \
+  'datasets: person and file cells - a file may name another page'"'"'s attachment'
+
+# --- datasets: relation fields (ADR 0022, ADR 0029, M8b B4) ----------------------------------
+#
+# A relation column reaches into ANOTHER dataset, so every door onto it asks the target's
+# access, not the source's. (1) The write path: a caller who cannot read the target must be
+# refused, in the same words as a bad id. Without it a writer probes which rows exist in a
+# dataset they may not read.
+mutation crates/gw-store/src/datasets/relation.rs killed \
+  's/^            if !col.visible {$/            if false {/' \
+  'datasets: relation write without a read check on the target dataset'
+# (2) The omission. A column the caller cannot see is ABSENT; an empty array in its place
+# announces that a relation exists and points somewhere hidden.
+mutation crates/gw-store/src/datasets/relation.rs killed \
+  's/^                    values.remove(&col.key);$/                    values.insert(col.key.clone(), Value::Array(Vec::new()));/' \
+  'datasets: a hidden relation is shown as an empty array instead of omitted'
+# (3) A cell may name only rows of ITS target; another dataset's row id is a way to read
+# across datasets one hop at a time.
+mutation crates/gw-store/src/datasets/relation.rs killed \
+  's/if !self.row_is_in(target_doc, id).await? {/if false {/' \
+  'datasets: relation cell accepts a row of another dataset'
+
+# --- datasets: rollup fields (ADR 0022, ADR 0029 cl. 3, M8b B5) ------------------------------
+#
+# A rollup is an aggregate over the rows of ANOTHER dataset, reached through a relation column. The
+# order of the two operations is the whole of its security: ask whose target this is, then decide
+# whether to compute anything. Computing first and blanking afterwards still leaks, because the
+# blanking has to be remembered at every door — and because `0`, `null` and `[]` are themselves
+# answers about the hidden dataset. The tests that notice are
+# `a_rollup_over_a_target_the_caller_cannot_read_is_absent_not_zero`, which compares whole snapshots
+# of the schema and the row list for a reader who may see the source but not the target, and
+# `a_rollup_follows_relinking_and_a_deleted_target_row`.
+#
+# (1) The gate removed, so a rollup aggregates whatever the relation reaches whatever the caller may
+# read. The number itself then moves when the hidden dataset grows — which is exactly the question
+# the row was never allowed to answer.
+mutation crates/gw-store/src/datasets/rollup.rs killed \
+  's/col.visible = rel.visible \&\& col.target_doc.is_some();/col.visible = true;/' \
+  'datasets: a rollup aggregates before the access gate - the hidden target leaks through the number'
+# (2) The omission replaced by an empty answer. A zero where a column should be absent tells the
+# caller there is a rollup and it counts nothing, which is a claim about a dataset they may not
+# read; the same reasoning made a hidden relation disappear rather than come back as `[]`.
+mutation crates/gw-store/src/datasets/rollup.rs killed \
+  's/^                values.remove(&col.key);$/                values.insert(col.key.clone(), json!(0));/' \
+  'datasets: a hidden rollup reads as zero instead of being omitted'
+
+# --- datasets: the one hidden-field set, everywhere (spec §2, M8b B5b) -----------------------
+#
+# "Hidden for this caller" is now ONE function, `hidden_field_keys`, read by the schema, the row,
+# the filter/sort refusal and the saved views. It hides a relation whose target cannot be read, a
+# rollup over it, and — transitively, through other formulas and rollups — a formula that reaches
+# any of them. The three mutations each break one of those consumers; the tests that notice are
+# `a_hidden_relation_rollup_or_formula_is_named_as_no_field_everywhere` (schema, row, filter and
+# sort compared for equality against the refusal a truly absent key gets) and the two view tests.
+#
+# (1) The hidden check lifted out of the query refusal: a hidden field named in a filter or sort
+# then falls through to the "computed ... yet" refusal instead of the "no field" that does not
+# admit it exists — the difference ADR 0022 is all about.
+mutation crates/gw-store/src/datasets.rs killed \
+  's/hidden\.contains(key\.as_str())/false/g' \
+  'datasets: a hidden field named in a query is no longer refused as no field'
+# (2) The transitive step removed: the fixpoint never runs, so a formula over a hidden rollup (or
+# over a formula over a hidden relation) stays visible and leaks the shape of the hidden chain.
+mutation crates/gw-store/src/datasets/relation.rs killed \
+  's/for _ in 0\.\.fields\.len() {/for _ in 0..0 {/' \
+  'datasets: hidden fields are not propagated transitively to formulas'
+# (3) The schema omission removed: hidden columns stay in the schema for a caller who may not see
+# them, which is exactly what the schema is not allowed to disclose.
+mutation crates/gw-store/src/datasets.rs killed \
+  's/^        fields\.retain(|f| !hidden\.contains(f\.key\.as_str()));$//' \
+  'datasets: hidden computed fields stay in the schema instead of being omitted'
+
+# --- datasets: computed-field paging (M8b B6 fix) -------------------------------------------
+#
+# The offset in a computed query's cursor is client text. Added without saturation, `usize::MAX`
+# overflows: a panic (a 500) under test, a wrapped and bogus next cursor in release.
+mutation crates/gw-store/src/datasets.rs killed \
+  's/offset\.saturating_add(take)/offset + take/g' \
+  'datasets: an offset cursor near usize::MAX overflows the next-page arithmetic'
+
 # HOW LONG THIS IS ALLOWED TO TAKE
 # --------------------------------
 # A gate too slow to run stops being run. This one got there: eighteen mutations, a whole
@@ -2393,6 +2493,9 @@ probe_for() {
     # own tests, and the filter spares the rest of the crate's 400 unit tests.
     crates/gw-store/src/search.rs) echo "-p gw-store --lib search::" ;;
     crates/gw-store/src/templates.rs) echo "-p gw-store --lib templates::" ;;
+    # Every dataset submodule (links, computed, query, views) is covered by the datasets module's
+    # own tests, so one prefix filter serves them all. A probe that passes falls through.
+    crates/gw-store/src/datasets/*) echo "-p gw-store --lib datasets::" ;;
     crates/gw-store/src/datasets.rs) echo "-p gw-store --lib datasets::" ;;
     crates/gw-api/src/routes/datasets.rs) echo "-p gw-api --test datasets" ;;
     crates/gw-store/src/access_epoch.rs) echo "-p gw-store --lib access_epoch::" ;;
