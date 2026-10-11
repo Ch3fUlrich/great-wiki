@@ -13,7 +13,7 @@ const done = (value: unknown): Parsed => ({ ok: true, value });
 const fail = (error: string): Parsed => ({ ok: false, error });
 
 /** Kinds a person can edit here; the rest are computed or wait for M8b. */
-export const EDITABLE = ['text', 'number', 'bool', 'date', 'url', 'select', 'multi_select', 'tags'];
+export const EDITABLE = ['text', 'number', 'bool', 'date', 'url', 'select', 'multi_select', 'tags', 'relation'];
 
 const MAX_TAG = 128;
 
@@ -39,6 +39,11 @@ export function fromRaw(kind: string, config: unknown, raw: Raw): Parsed {
     const unknown = ids.find((i) => !known.has(i));
     if (unknown !== undefined) return fail('Diese Auswahl gibt es nicht.');
     return done(kind === 'select' ? ids[0] : ids);
+  }
+  if (kind === 'relation') {
+    const ids = dedupe((Array.isArray(raw) ? raw : [raw]).filter((x) => x !== ''));
+    if (ids.length === 0) return done(null);
+    return done((config as { multiple?: unknown } | null)?.multiple === true ? ids : ids[0]);
   }
   const s = typeof raw === 'string' ? raw.trim() : '';
   switch (kind) {
@@ -73,6 +78,7 @@ export function toRaw(kind: string, value: unknown): Raw {
   if (value === null || value === undefined) return '';
   if (kind === 'number' && typeof value === 'number') return String(value);
   if (kind === 'multi_select') return Array.isArray(value) ? value.map(String) : [];
+  if (kind === 'relation' && Array.isArray(value)) return value.map(String);
   if (kind === 'tags') return Array.isArray(value) ? value.join(', ') : String(value);
   if (kind === 'bool') return value === true ? 'true' : value === false ? 'false' : '';
   return typeof value === 'string' ? value : String(value);

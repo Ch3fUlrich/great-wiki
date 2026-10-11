@@ -7,7 +7,14 @@ const fields: Field[] = [
   { key: 'name', label: 'Name', kind: 'text', config: {}, position: 0 },
   { key: 'alter', label: 'Alter', kind: 'number', config: {}, position: 1 },
   { key: 'url', label: 'Seite', kind: 'url', config: {}, position: 2 },
-  { key: 'calc', label: 'Rechnung', kind: 'formula', config: {}, position: 3 }
+  { key: 'calc', label: 'Rechnung', kind: 'formula', config: {}, position: 3 },
+  {
+    key: 'wer',
+    label: 'Wer',
+    kind: 'relation',
+    config: { multiple: false, target_path: '/d2' },
+    position: 4
+  }
 ];
 const row = (id: string, values: Record<string, unknown>) => ({
   id,
@@ -20,7 +27,7 @@ const page = (rows: ReturnType<typeof row>[], next?: string): RowPage => ({ rows
 
 function html(props: { page: RowPage | null } & Record<string, unknown>): string {
   return render(TableView, {
-    props: { path: '/d', fields, mayWrite: false, sort: null, filter: null, error: null, ...props }
+    props: { path: '/d', fields, mayWrite: false, sort: null, filter: null, error: null, labels: {}, ...props }
   }).body.replace(/<!--.*?-->/g, '');
 }
 
@@ -63,10 +70,20 @@ describe('TableView', () => {
     expect(html({ page: page([]), filter: { key: 'name', value: 'q' } })).toContain('Keine Zeile passt');
   });
 
-  it('shows an error cell with its reason as text', () => {
-    const out = html({ page: page([row('1', { calc: { error: 'Division durch Null' } })]) });
-    expect(out).toContain('#ERR');
-    expect(out).toContain('Division durch Null');
+  it('shows an error cell with its reason as visible text', () => {
+    const out = html({ page: page([row('1', { calc: { error: '#ERR(divide by zero)' } })]) });
+    expect(out).toContain('#ERR(divide by zero)');
+    expect(out).toMatch(/<span class="err[^"]*">#ERR\(divide by zero\)<\/span>/);
+  });
+
+  it('shows linked rows as label chips when it has their labels', () => {
+    const out = html({ page: page([row('1', { wer: 'r1' })]), labels: { wer: { r1: 'Ada' } } });
+    expect(out).toContain('Ada');
+    expect(out).not.toContain('verknüpft');
+  });
+
+  it('counts linked ids when no label map arrived', () => {
+    expect(html({ page: page([row('1', { wer: ['r1', 'r2'] })]) })).toContain('2 verknüpft');
   });
 
   it('states a failed load instead of an empty table', () => {

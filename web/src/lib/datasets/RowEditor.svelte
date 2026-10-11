@@ -9,6 +9,7 @@
   import ChoiceCell from './cells/ChoiceCell.svelte';
   import BoolCell from './cells/BoolCell.svelte';
   import ScalarCell from './cells/ScalarCell.svelte';
+  import RelationCell from './cells/RelationCell.svelte';
   import { toRaw, type Raw } from './cells/edit';
   import { editableFields, submitRow, type Drafts } from './rowedit';
   import { cellOf, type Field, type Row } from './table';
@@ -83,6 +84,8 @@
         <BoolCell field={f} bind:value={() => text(f.key), (v) => (drafts[f.key] = v)} error={errors[f.key]} />
       {:else if f.kind === 'select' || f.kind === 'multi_select' || f.kind === 'tags'}
         <ChoiceCell field={f} bind:value={() => raw(f.key), (v) => (drafts[f.key] = v)} error={errors[f.key]} />
+      {:else if f.kind === 'relation'}
+        <RelationCell field={f} bind:value={() => raw(f.key), (v) => (drafts[f.key] = v)} error={errors[f.key]} />
       {:else}
         <ScalarCell field={f} bind:value={() => text(f.key), (v) => (drafts[f.key] = v)} error={errors[f.key]} />
       {/if}

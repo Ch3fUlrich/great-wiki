@@ -402,6 +402,7 @@
         error={data.dataset.error}
         sort={data.dataset.sort}
         filter={data.dataset.filter}
+        labels={data.dataset.labels}
         mayWrite={data.doc.may_write === true}
       />
     {/if}

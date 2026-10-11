@@ -131,11 +131,35 @@ function plain(v: unknown): string {
   return JSON.stringify(v);
 }
 
-/** What one value looks like in a column of this kind. */
-export function cellOf(field: Field, value: unknown): Cell {
+/** The row ids a relation cell holds, whether stored as one id or as a list. */
+export function relationIds(value: unknown): string[] {
+  if (typeof value === 'string') return value === '' ? [] : [value];
+  if (Array.isArray(value)) return value.filter((v): v is string => typeof v === 'string' && v !== '');
+  return [];
+}
+
+/**
+ * What one value looks like in a column of this kind. `labels` — the target row ids mapped to
+ * their names, loaded once per relation column — turn linked ids into chips; without them a
+ * relation cell can only count the ids it holds.
+ */
+export function cellOf(field: Field, value: unknown, labels?: Record<string, string>): Cell {
   if (isErrorValue(value)) return { kind: 'error', reason: value.error };
   if (value === null || value === undefined || value === '') return { kind: 'text', text: '' };
   switch (field.kind) {
+    case 'relation': {
+      const ids = relationIds(value);
+      if (ids.length === 0) return { kind: 'text', text: '' };
+      if (labels) return { kind: 'chips', items: ids.map((id) => labels[id] ?? id) };
+      return { kind: 'text', text: `${ids.length} verknüpft` };
+    }
+    case 'formula':
+    case 'rollup': {
+      if (typeof value === 'number') return { kind: 'text', text: numberFormat.format(value), align: 'end' };
+      if (Array.isArray(value)) return { kind: 'text', text: value.map(plain).join(', ') };
+      if (typeof value === 'boolean') return { kind: 'text', text: value ? 'Ja' : 'Nein' };
+      return { kind: 'text', text: plain(value) };
+    }
     case 'number':
       return typeof value === 'number'
         ? { kind: 'text', text: numberFormat.format(value), align: 'end' }

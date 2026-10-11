@@ -12,6 +12,7 @@ const fields: Field[] = [
   { key: 'sel', label: 'Stufe', kind: 'select', config: { options: [{ id: 'hi', label: 'Hoch' }, { id: 'lo', label: 'Niedrig' }] }, position: 5 },
   { key: 'mul', label: 'Mehrfach', kind: 'multi_select', config: { options: [{ id: 'x', label: 'Ex' }, { id: 'y', label: 'Why' }] }, position: 6 },
   { key: 'tgs', label: 'Schlagworte', kind: 'tags', config: {}, position: 7 },
+  { key: 'wer', label: 'Wer', kind: 'relation', config: { multiple: false, target_path: '/d2' }, position: 8 },
   { key: 'calc', label: 'Rechnung', kind: 'formula', config: {}, position: 5 }
 ];
 const row: Row = {
@@ -53,5 +54,13 @@ describe('RowEditor', () => {
   it('names the action by mode', () => {
     expect(html({})).toContain('Zeile hinzufügen');
     expect(html({ row })).toContain('Zeile bearbeiten');
+  });
+
+  it('offers a picker for a relation field and keeps a stored id visible as absent', () => {
+    const out = html({ row: { ...row, values: { wer: 'r9' } } });
+    expect(out).toContain('<select');
+    expect(out).toContain('name="wer"');
+    expect(out).toContain('(nicht mehr vorhanden)');
+    expect(out).not.toContain('Rechnung');
   });
 });

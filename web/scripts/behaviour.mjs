@@ -4663,6 +4663,75 @@ await check('W2 a guest gets the same 404 for the dataset page and its rows as f
   assert(rows.status() === 404, `the rows answered a guest ${rows.status()}`);
 });
 
+const VERWEISE = '/verweisbeispiel/verweise';
+
+/** The relation and formula columns W4/W5 need, added once and only if absent. */
+async function relationSetup(page) {
+  const made = await page.request.post(BASE + '/api/datasets', {
+    data: { parent: '/verweisbeispiel', title: 'Verweise', slug: 'verweise' }
+  });
+  assert(
+    made.status() === 201 || made.status() === 409,
+    `creating the second dataset page answered ${made.status()}`
+  );
+  const have = (path) => page.request.get(BASE + '/api/datasets/schema' + path).then((r) => r.json());
+  const verweise = await have(VERWEISE);
+  if (!verweise.fields.some((f) => f.key === 'wer')) {
+    const r = await page.request.post(BASE + '/api/datasets/schema' + VERWEISE, {
+      data: { key: 'wer', label: 'Wer', kind: 'relation', config: { target: TABELLE, multiple: false } }
+    });
+    assert(r.status() === 201, `adding the relation column answered ${r.status()}`);
+  }
+  const tabelle = await have(TABELLE);
+  const add = async (field) => {
+    if (tabelle.fields.some((f) => f.key === field.key)) return;
+    const r = await page.request.post(BASE + '/api/datasets/schema' + TABELLE, { data: field });
+    assert(r.status() === 201, `adding the ${field.key} column answered ${r.status()}`);
+  };
+  await add({ key: 'plus1', label: 'Plus eins', kind: 'formula', config: { expr: '{alter} + 1' } });
+  await add({ key: 'nulldel', label: 'Durch Null', kind: 'formula', config: { expr: '{alter} / 0' } });
+  const rows = await (await page.request.get(BASE + '/api/datasets/rows' + TABELLE)).json();
+  if (!rows.rows.some((x) => x.values.name === 'Zenta')) {
+    const r = await page.request.post(BASE + '/api/datasets/rows' + TABELLE, {
+      data: { values: { name: 'Zenta', alter: 7 } }
+    });
+    assert(r.status() === 201, `adding the Zenta row answered ${r.status()}`);
+  }
+}
+
+await check('W4 an editor links a row to another dataset through the picker and sees the label and the formula value after a reload', async (page) => {
+  await tabelleSetup(page);
+  await relationSetup(page);
+
+  // Link through the UI: the picker must list the target's rows, loaded in the browser.
+  await page.goto(BASE + VERWEISE, { waitUntil: 'networkidle' });
+  const form = page.locator('form.zeile-editor[aria-label="Zeile hinzufügen"]');
+  await form.waitFor({ state: 'visible', timeout: 10_000 });
+  await form.locator('select[name="wer"] option', { hasText: 'Zenta' }).waitFor({ state: 'attached', timeout: 10_000 });
+  await form.getByLabel('Wer').selectOption({ label: 'Zenta' });
+  await form.getByRole('button', { name: 'Speichern' }).click();
+  await page.locator('section.datensatz .chip', { hasText: 'Zenta' }).waitFor({ state: 'visible', timeout: 10_000 });
+
+  // A reload proves both halves are stored and re-read, not just drawn: the relation cell
+  // shows the target row's LABEL (the labels the load fetched once for the column)…
+  await page.reload({ waitUntil: 'networkidle' });
+  assert((await page.locator('section.datensatz tbody').innerText()).includes('Zenta'), 'the linked row shows no label');
+  assert(!(await page.locator('section.datensatz tbody').innerText()).includes('verknüpft'), 'the label map did not reach the table');
+
+  // …and the formula column on the TARGET page computed alter + 1.
+  await page.goto(BASE + TABELLE, { waitUntil: 'networkidle' });
+  const zentaRow = page.locator('section.datensatz tbody tr', { has: page.locator('td', { hasText: 'Zenta' }) });
+  assert((await zentaRow.innerText()).includes('8'), 'the formula cell does not show 7 + 1');
+});
+
+await check('W5 a formula that divides by zero shows its #ERR(reason) as cell text', async (page) => {
+  await tabelleSetup(page);
+  await relationSetup(page);
+  await page.goto(BASE + TABELLE, { waitUntil: 'networkidle' });
+  const body = await page.locator('section.datensatz tbody').innerText();
+  assert(body.includes('#ERR('), 'a divide-by-zero formula shows no #ERR(reason) text');
+});
+
 await browser.close();
 
 // ---------------------------------------------------------------------------------------
