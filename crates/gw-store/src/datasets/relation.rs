@@ -41,14 +41,15 @@ pub(super) const MAX_RELATION_TARGETS: usize = 100;
 pub(super) const POINTS_AT_SQL: &str =
     "SELECT row_id FROM dataset_relation WHERE target_row_id = ?1 AND field_id = ?2";
 
-/// One column's relation state, resolved for a caller.
-struct RelCol {
-    id: String,
-    key: String,
-    multiple: bool,
-    target_doc: Option<String>,
+/// One column's relation state, resolved for a caller. Read by `rollup.rs`, which asks the same
+/// access question of the column a rollup sits on.
+pub(super) struct RelCol {
+    pub(super) id: String,
+    pub(super) key: String,
+    pub(super) multiple: bool,
+    pub(super) target_doc: Option<String>,
     /// Whether this caller may read the column's target dataset. `false` hides the whole column.
-    visible: bool,
+    pub(super) visible: bool,
 }
 
 /// One relation cell the caller is writing, as it must land in `dataset_relation`.
@@ -80,8 +81,13 @@ impl Store {
     }
 
     /// The relation columns of `doc_id` and whether this caller may see each. A dataset with no
-    /// relation column costs no queries beyond the one that says so.
-    async fn relation_cols(&self, principal: &Principal, doc_id: &str) -> Result<Vec<RelCol>> {
+    /// relation column costs no queries beyond the one that says so. `rollup.rs` asks the same
+    /// question, because a rollup reaches the target through one of these columns.
+    pub(super) async fn relation_cols(
+        &self,
+        principal: &Principal,
+        doc_id: &str,
+    ) -> Result<Vec<RelCol>> {
         let raw: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT id, key, config FROM dataset_field WHERE doc_id = ?1 AND kind = 'relation' \
              ORDER BY position, created_at, key",
@@ -223,8 +229,12 @@ impl Store {
         Ok(())
     }
 
-    /// The ids a row still points at, by column id — the set that has not been cascaded away.
-    async fn live_edges(&self, row_id: &str) -> Result<HashMap<String, HashSet<String>>> {
+    /// The ids a row still points at, by column id — the set that has not been cascaded away. Also
+    /// what a rollup counts, so that a target row deleted out from under the source leaves no trace.
+    pub(super) async fn live_edges(
+        &self,
+        row_id: &str,
+    ) -> Result<HashMap<String, HashSet<String>>> {
         let edges: Vec<(String, String)> = sqlx::query_as(
             "SELECT field_id, target_row_id FROM dataset_relation WHERE row_id = ?1",
         )

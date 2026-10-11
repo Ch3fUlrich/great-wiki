@@ -3,9 +3,10 @@
 //! every time, and the stored JSON keeps only what somebody typed.
 //!
 //! A formula may read another formula, so the fields are evaluated in dependency order and each
-//! result is fed to those that read it. A formula that reads a not-yet-computed kind — a rollup,
-//! until M8 gives it a value — reads as `null`. Anything that goes wrong becomes one error cell,
-//! never a panic and never a lost row.
+//! result is fed to those that read it. The row arrives here already holding its rollups — those
+//! are answered by `rollup.rs`, before formulas run, because a formula may read a rollup while a
+//! rollup never reads a formula. Anything that goes wrong becomes one error cell, never a panic
+//! and never a lost row.
 
 use super::{DatasetField, DatasetRow};
 use gw_core::dataset::FieldKind;
@@ -13,8 +14,9 @@ use gw_core::formula::{self, EvalCtx, Expr};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 
-/// The cell a formula error leaves behind: `{"error": "#ERR(reason)"}`, rendered as plain text.
-fn error_cell(error: &formula::FormulaError) -> Value {
+/// The cell an error leaves behind: `{"error": "#ERR(reason)"}`, rendered as plain text. The
+/// `rollup` kind answers with the same shape when it has no number to give.
+pub(super) fn error_cell(error: &formula::FormulaError) -> Value {
     json!({ "error": error.cell_text() })
 }
 

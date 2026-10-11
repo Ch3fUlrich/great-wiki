@@ -16,6 +16,7 @@ mod computed;
 mod links;
 mod query;
 mod relation;
+mod rollup;
 mod views;
 pub use query::{Cursor, Filter, RowQuery, Sort, SortKind};
 pub use views::{DatasetView, MAX_VIEWS};
@@ -146,7 +147,8 @@ impl Store {
     }
 
     /// The schema of the dataset at `path`, for anybody who may read it. A `relation` column whose
-    /// target the caller may not read is absent from the list, not shown empty.
+    /// target the caller may not read is absent from the list, not shown empty — and so is a
+    /// `rollup` over it, which would otherwise be a number about that target.
     pub async fn dataset_fields(
         &self,
         principal: &Principal,
@@ -157,15 +159,19 @@ impl Store {
         };
         let mut fields = self.fields_of(&doc.id).await?;
         self.filter_fields(principal, &doc.id, &mut fields).await?;
+        self.filter_rollups(principal, &doc.id, &mut fields).await?;
         Ok(SchemaOutcome::Done(fields))
     }
 
     /// Add a column. Needs write. `key` is validated by [`FieldKey::parse`] before it
-    /// reaches SQL; `kind` is fixed for the life of the field. Every stored kind and `formula`
-    /// are offered; only `rollup` waits for a later milestone. A `person` column may
-    /// say `{"multiple": true}`, a `file` column takes no config, and a `relation` column says
-    /// `{"target": "<dataset path>", "multiple": bool}` — its target resolved to a doc id under
-    /// the caller's own read access here, and stored by id so a rename cannot break the column.
+    /// reaches SQL; `kind` is fixed for the life of the field. Every stored kind, `formula` and
+    /// `rollup` are offered. A `person` column may say `{"multiple": true}`, a `file` column takes
+    /// no config, and a `relation` column says `{"target": "<dataset path>", "multiple": bool}` —
+    /// its target resolved to a doc id under the caller's own read access here, and stored by id so
+    /// a rename cannot break the column. A `rollup` says `{"relation": "<key>", "target_field":
+    /// "<key>", "fn": "count|sum|min|max|avg|list"}` and is checked against both ends here: the
+    /// relation must be one of this dataset's columns, its target readable by this caller, and the
+    /// field it aggregates a stored one the aggregate can answer.
     pub async fn add_dataset_field(
         &self,
         principal: &Principal,
@@ -181,12 +187,6 @@ impl Store {
             Ok(k) => k,
             Err(e) => return Ok(SchemaOutcome::Invalid(e.to_string())),
         };
-        if new.kind == FieldKind::Rollup {
-            return Ok(SchemaOutcome::Invalid(format!(
-                "field kind `{}` is not available yet",
-                new.kind.as_str()
-            )));
-        }
         let label = match clean_label(&new.label) {
             Ok(l) => l,
             Err(m) => return Ok(SchemaOutcome::Invalid(m)),
@@ -202,8 +202,15 @@ impl Store {
         }
         // A relation names its target by path; only the caller who can read that page may bind a
         // column to it, so the path is resolved to a doc id here and the path itself is discarded.
+        // A rollup names its target by the relation that reaches it, and is refused here if this
+        // caller cannot read what that relation points at.
         let stored_config = if new.kind == FieldKind::Relation {
             match self.resolve_target(principal, &new.config).await? {
+                Ok(cfg) => cfg,
+                Err(m) => return Ok(SchemaOutcome::Invalid(m)),
+            }
+        } else if new.kind == FieldKind::Rollup {
+            match self.rollup_check(principal, &doc_id, &new.config).await? {
                 Ok(cfg) => cfg,
                 Err(m) => return Ok(SchemaOutcome::Invalid(m)),
             }
@@ -548,8 +555,9 @@ impl Store {
         Ok(t.map(row_from))
     }
 
-    /// One row of the dataset at `path`, for anybody who may read it, with its file cells
-    /// resolved and its computed fields filled in.
+    /// One row of the dataset at `path`, for anybody who may read it, with its file cells resolved,
+    /// its relation cells narrowed to the links that are still alive and visible to this caller, its
+    /// rollups aggregated over those rows and its formulas then evaluated over both.
     pub async fn dataset_row(
         &self,
         principal: &Principal,
@@ -565,10 +573,12 @@ impl Store {
         let fields = self.fields_of(&doc.id).await?;
         let names = self.attachment_names(&doc.id, &fields).await?;
         let today = self.today().await?;
-        let mut row =
-            computed::with_computed(&fields, links::resolve_files(row, &fields, &names), &today);
+        let mut row = links::resolve_files(row, &fields, &names);
         self.decorate_rows(principal, &doc.id, std::slice::from_mut(&mut row))
             .await?;
+        self.with_rollups(principal, &doc.id, std::slice::from_mut(&mut row))
+            .await?;
+        let row = computed::with_computed(&fields, row, &today);
         Ok(RowOutcome::Done(row))
     }
 
@@ -605,9 +615,13 @@ impl Store {
             .into_iter()
             .map(row_from)
             .map(|r| links::resolve_files(r, &fields, &names))
-            .map(|r| computed::with_computed(&fields, r, &today))
             .collect();
         self.decorate_rows(principal, &doc.id, &mut rows).await?;
+        self.with_rollups(principal, &doc.id, &mut rows).await?;
+        let rows: Vec<DatasetRow> = rows
+            .into_iter()
+            .map(|r| computed::with_computed(&fields, r, &today))
+            .collect();
         Ok(RowOutcome::Done(RowPage {
             rows,
             total,
@@ -629,8 +643,9 @@ impl Store {
         // Every named field must exist in this dataset's schema; the sort kind comes from it.
         let fields = self.fields_of(&doc.id).await?;
         // A relation column the caller may not resolve (its target is unreadable) is a key they
-        // never see, so naming it in a filter names no field at all.
-        let hidden = self.hidden_relation_keys(principal, &doc.id).await?;
+        // never see, and so is a rollup over it: naming either names no field at all.
+        let mut hidden = self.hidden_relation_keys(principal, &doc.id).await?;
+        hidden.extend(self.hidden_rollup_keys(principal, &doc.id).await?);
         let kind_of = |key: &FieldKey| fields.iter().find(|f| f.key == key.as_str());
         for f in &select.filters {
             let (Filter::Eq { key, .. }
@@ -639,6 +654,9 @@ impl Store {
             | Filter::In { key, .. }) = f;
             match kind_of(key) {
                 None => return Ok(RowOutcome::Invalid(format!("no field `{}`", key.as_str()))),
+                Some(_) if hidden.contains(key.as_str()) => {
+                    return Ok(RowOutcome::Invalid(format!("no field `{}`", key.as_str())))
+                }
                 Some(field) if is_computed_kind(&field.kind) => {
                     return Ok(RowOutcome::Invalid(computed_refusal(key.as_str())))
                 }
@@ -654,6 +672,9 @@ impl Store {
                 let Some(field) = kind_of(key) else {
                     return Ok(RowOutcome::Invalid(format!("no field `{}`", key.as_str())));
                 };
+                if hidden.contains(key.as_str()) {
+                    return Ok(RowOutcome::Invalid(format!("no field `{}`", key.as_str())));
+                }
                 if is_computed_kind(&field.kind) {
                     return Ok(RowOutcome::Invalid(computed_refusal(key.as_str())));
                 }
@@ -738,9 +759,13 @@ impl Store {
             .into_iter()
             .map(|t| row_from((t.0, t.1, t.2, t.3, t.4)))
             .map(|r| links::resolve_files(r, &fields, &names))
-            .map(|r| computed::with_computed(&fields, r, &today))
             .collect();
         self.decorate_rows(principal, &doc.id, &mut rows).await?;
+        self.with_rollups(principal, &doc.id, &mut rows).await?;
+        let rows: Vec<DatasetRow> = rows
+            .into_iter()
+            .map(|r| computed::with_computed(&fields, r, &today))
+            .collect();
         Ok(RowOutcome::Done(RowPage { rows, total, next }))
     }
 
@@ -1313,8 +1338,8 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(dup, SchemaOutcome::Conflict(_)), "{dup:?}");
-        // Rollup is not offered yet; a relation without a target and `formula` with an empty config
-        // are refused by their own shape check, and `person`/`file` are accepted since M8b.
+        // A rollup with no config, a relation without a target and `formula` with an empty config
+        // are each refused by their own shape check; `person`/`file` are accepted since M8b.
         for kind in [FieldKind::Rollup, FieldKind::Relation] {
             let out = store
                 .add_dataset_field(&anna, &path, &nf("x", kind))
@@ -2349,7 +2374,8 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(out, SchemaOutcome::Done(_)), "{out:?}");
-        // The rollup has no value yet, so it reads as null and the sum is an error cell.
+        // Seeded straight into storage, so the config names no relation: a rollup that cannot be
+        // answered has no value to read, the formula reads null and the sum is an error cell.
         let r = made(&store, &anna, &path, json!({"name": "Ada"})).await;
         let v = read(&store, &anna, &path, &r.id).await;
         assert!(v["shown"].get("error").is_some(), "{:?}", v["shown"]);
@@ -2802,8 +2828,8 @@ mod tests {
             );
             assert!(!has(&keys(&store, &anna, &path).await, &mistyped.key));
         }
-        // A relation with no target and a rollup are both refused: the first by its own shape
-        // check, the second because it still waits for its milestone.
+        // A relation with no target and a rollup with no members are both refused: each by its own
+        // shape check, which is exactly the check a typo would otherwise slip past.
         for kind in [FieldKind::Relation, FieldKind::Rollup] {
             let out = store
                 .add_dataset_field(&anna, &path, &nf("later", kind))
@@ -3305,5 +3331,477 @@ mod tests {
             !text.contains("SCAN dataset_relation"),
             "a scan of the edge table: {text}"
         );
+    }
+
+    // --- rollup fields (ADR 0029 cl. 3, M8b B5) -------------------------------------
+
+    /// The refusal for a rollup whose target the caller may not read, spelled out here: an
+    /// unreadable dataset and a relation column whose stored config has gone are one sentence
+    /// (ADR 0022), so saving a rollup is no way to ask what sits behind the relation.
+    const NO_ROLLUP: &str = "rollup target is not available";
+    /// The six rollup keys `rollup_fixture` puts on the source dataset.
+    const ROLLUP_KEYS: [&str; 6] = ["n", "sum", "avg", "min", "max", "list"];
+
+    fn rollup_field(key: &str, relation: &str, target_field: &str, func: &str) -> NewField {
+        NewField {
+            key: key.into(),
+            label: key.to_uppercase(),
+            kind: FieldKind::Rollup,
+            config: json!({ "relation": relation, "target_field": target_field, "fn": func }),
+        }
+    }
+
+    /// A row of the target dataset with cells in it, so a rollup has something to aggregate.
+    async fn valued_row(store: &Store, target: &str, values: serde_json::Value) -> String {
+        let doc = doc_id_of(store, target).await;
+        let id = uuid::Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO dataset_row (id, doc_id, \"values\") VALUES (?, ?, ?)")
+            .bind(&id)
+            .bind(&doc)
+            .bind(values.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    /// The target's `amount` (number), `when` (date) and `note` (text) columns, a multi relation
+    /// from the source to it, and one rollup of each kind over it — all as `anna`, who may read
+    /// both ends. Every call is unwrapped, so a refusal fails the test that made it.
+    async fn rollup_fixture(store: &Store, anna: &Principal, source: &str, target: &str) {
+        for (key, kind) in [
+            ("amount", FieldKind::Number),
+            ("when", FieldKind::Date),
+            ("note", FieldKind::Text),
+        ] {
+            store
+                .add_dataset_field(anna, target, &plain_field(key, kind))
+                .await
+                .unwrap();
+        }
+        store
+            .add_dataset_field(anna, source, &relation_field("mit", target, true))
+            .await
+            .unwrap();
+        for (key, func, field) in [
+            ("n", "count", "amount"),
+            ("sum", "sum", "amount"),
+            ("avg", "avg", "amount"),
+            ("min", "min", "amount"),
+            ("max", "max", "amount"),
+            ("list", "list", "amount"),
+            ("first", "min", "when"),
+        ] {
+            let out = store
+                .add_dataset_field(anna, source, &rollup_field(key, "mit", field, func))
+                .await
+                .unwrap();
+            assert!(matches!(out, SchemaOutcome::Done(_)), "{key}: {out:?}");
+        }
+    }
+
+    /// Everything one caller sees of a dataset — its schema and its first page — as one JSON value.
+    /// Two snapshots are equal only when the reader's answer is equal down to the last byte, which
+    /// is the only way to say "nothing about the hidden dataset reached them".
+    async fn snapshot(store: &Store, who: &Principal, path: &str) -> Value {
+        let SchemaOutcome::Done(fields) = store.dataset_fields(who, path).await.unwrap() else {
+            panic!("no schema")
+        };
+        let RowOutcome::Done(page) = store.dataset_rows(who, path, 10, 0).await.unwrap() else {
+            panic!("no rows")
+        };
+        json!({ "fields": fields, "rows": page })
+    }
+
+    #[tokio::test]
+    async fn a_rollup_aggregates_the_rows_its_relation_points_at() {
+        let (store, anna, _, source, target) = relation_fixture().await;
+        rollup_fixture(&store, &anna, &source, &target).await;
+        let one = valued_row(&store, &target, json!({"amount": 10, "when": "2026-01-05"})).await;
+        let two = valued_row(
+            &store,
+            &target,
+            json!({"amount": 2.5, "when": "2026-01-02"}),
+        )
+        .await;
+        let blank = valued_row(&store, &target, json!({"when": "2026-01-01"})).await;
+        let r = made(
+            &store,
+            &anna,
+            &source,
+            json!({"mit": [one.clone(), two.clone(), blank.clone()]}),
+        )
+        .await;
+        let v = read(&store, &anna, &source, &r.id).await;
+        assert_eq!(
+            v["n"],
+            json!(3),
+            "count counts the links, not the filled cells"
+        );
+        assert_eq!(v["sum"].as_f64(), Some(12.5));
+        assert_eq!(
+            v["avg"].as_f64(),
+            Some(6.25),
+            "the mean of the two cells that hold a number"
+        );
+        assert_eq!(v["min"], json!(2.5));
+        assert_eq!(
+            v["max"],
+            json!(10),
+            "a value passes through as it was stored"
+        );
+        assert_eq!(
+            v["list"],
+            json!([10, 2.5]),
+            "in edge order, an empty cell skipped"
+        );
+        assert_eq!(
+            v["first"],
+            json!("2026-01-01"),
+            "min over dates compares the ISO text, which is calendar order"
+        );
+        assert_eq!(v["mit"], json!([one, two, blank]), "the relation itself");
+        // Nothing of a rollup is in storage: it is an answer, not a value.
+        let raw: String = sqlx::query_scalar("SELECT \"values\" FROM dataset_row WHERE id = ?")
+            .bind(&r.id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert!(!raw.contains("sum"), "a rollup reached storage: {raw}");
+    }
+
+    #[tokio::test]
+    async fn a_rollup_over_no_rows_counts_zero_and_answers_nothing_else() {
+        let (store, anna, _, source, target) = relation_fixture().await;
+        rollup_fixture(&store, &anna, &source, &target).await;
+        // Both shapes of empty: a cleared cell, and one nobody ever wrote.
+        let cleared = made(&store, &anna, &source, json!({"mit": []})).await;
+        let never = made(&store, &anna, &source, json!({})).await;
+        for id in [cleared.id, never.id] {
+            let v = read(&store, &anna, &source, &id).await;
+            assert_eq!(v["n"], json!(0), "count is a number, never null");
+            assert_eq!(v["sum"].as_f64(), Some(0.0), "a sum of nothing is nought");
+            assert!(
+                v["avg"].is_null(),
+                "the mean of nothing is nothing: {:?}",
+                v["avg"]
+            );
+            assert!(v["min"].is_null(), "{:?}", v["min"]);
+            assert!(v["max"].is_null(), "{:?}", v["max"]);
+            assert_eq!(v["list"], json!([]));
+            assert!(v["first"].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rollup_follows_relinking_and_a_deleted_target_row() {
+        let (store, anna, _, source, target) = relation_fixture().await;
+        rollup_fixture(&store, &anna, &source, &target).await;
+        let a = valued_row(&store, &target, json!({"amount": 4})).await;
+        let b = valued_row(&store, &target, json!({"amount": 6})).await;
+        let r = made(&store, &anna, &source, json!({"mit": [a.clone()]})).await;
+        let v = read(&store, &anna, &source, &r.id).await;
+        assert_eq!((v["n"].as_i64(), v["avg"].as_f64()), (Some(1), Some(4.0)));
+        // Re-point the cell: the aggregate moves with the edges, and no rollup was ever written.
+        assert!(matches!(
+            store
+                .update_dataset_row(
+                    &anna,
+                    &source,
+                    &r.id,
+                    1,
+                    &vals(json!({"mit": [a.clone(), b.clone()]}))
+                )
+                .await
+                .unwrap(),
+            RowOutcome::Done(_)
+        ));
+        let v = read(&store, &anna, &source, &r.id).await;
+        assert_eq!((v["n"].as_i64(), v["sum"].as_f64()), (Some(2), Some(10.0)));
+        assert_eq!(v["list"], json!([4, 6]));
+        // A target row deleted out from under the source: its edge cascades, and it leaves the
+        // count with the id it took.
+        sqlx::query("DELETE FROM dataset_row WHERE id = ?")
+            .bind(&b)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let v = read(&store, &anna, &source, &r.id).await;
+        assert_eq!(v["n"], json!(1));
+        assert_eq!(v["list"], json!([4]));
+        assert_eq!(v["sum"].as_f64(), Some(4.0));
+    }
+
+    #[tokio::test]
+    async fn a_rollup_over_a_target_the_caller_cannot_read_is_absent_not_zero() {
+        let (store, anna, bea, source, target) = relation_fixture().await;
+        rollup_fixture(&store, &anna, &source, &target).await;
+        let one = valued_row(&store, &target, json!({"amount": 7})).await;
+        let r = made(&store, &anna, &source, json!({"mit": [one.clone()]})).await;
+        // anna, who may read the target, gets real numbers — so the comparison below is not
+        // vacuous: there is something to hide, and it is hidden for exactly one reason.
+        let seen = read(&store, &anna, &source, &r.id).await;
+        assert_eq!(
+            (seen["n"].as_i64(), seen["list"].as_array().map(Vec::len)),
+            (Some(1), Some(1))
+        );
+        let ks = keys(&store, &bea, &source).await;
+        assert!(!has(&ks, "mit"), "the relation is hidden, so: {ks:?}");
+        let blind = read(&store, &bea, &source, &r.id).await;
+        for key in ROLLUP_KEYS.iter().chain(["first"].iter()) {
+            assert!(
+                !has(&ks, key),
+                "hidden rollup `{key}` in the schema: {ks:?}"
+            );
+            assert!(
+                blind.get(*key).is_none(),
+                "hidden rollup `{key}` in the row: {blind}"
+            );
+        }
+        // And her answer cannot move while the hidden dataset grows. Both the target row and the
+        // edge are laid straight into storage, with the source cell rewritten in place: a write
+        // through the API would bump the row's `version`, which she may legitimately see.
+        // A rollup that answers where it should be silent also upsets
+        // `a_formula_may_read_a_rollup_column`, whose unanswerable column must stay a hole rather
+        // than become a number — but one test noticing a hole is no licence to leave the checking
+        // to it.
+        let before = snapshot(&store, &bea, &source).await;
+        let two = valued_row(&store, &target, json!({"amount": 9999})).await;
+        let mit = field_id(&store, &source, "mit").await;
+        sqlx::query(
+            "INSERT INTO dataset_relation (row_id, field_id, target_row_id) VALUES (?1, ?2, ?3)",
+        )
+        .bind(&r.id)
+        .bind(&mit)
+        .bind(&two)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE dataset_row SET \"values\" = ?1 WHERE id = ?2")
+            .bind(json!({"mit": [one, two]}).to_string())
+            .bind(&r.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            read(&store, &anna, &source, &r.id).await["n"],
+            json!(2),
+            "anna sees the link bea must not feel"
+        );
+        assert_eq!(
+            snapshot(&store, &bea, &source).await,
+            before,
+            "a hidden target's growth moved bea's answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_formula_reads_a_rollup_because_the_rollup_is_answered_first() {
+        let (store, anna, _, source, target) = relation_fixture().await;
+        rollup_fixture(&store, &anna, &source, &target).await;
+        store
+            .add_dataset_field(&anna, &source, &formula_field("plus", "{n} + 1"))
+            .await
+            .unwrap();
+        let one = valued_row(&store, &target, json!({"amount": 7})).await;
+        let r = made(&store, &anna, &source, json!({"mit": [one]})).await;
+        let v = read(&store, &anna, &source, &r.id).await;
+        assert_eq!(v["plus"].as_f64(), Some(2.0), "{:?}", v["plus"]);
+    }
+
+    #[tokio::test]
+    async fn a_rollup_column_is_validated_when_it_is_saved() {
+        let (store, anna, _, source, target) = relation_fixture().await;
+        for (key, kind) in [
+            ("amount", FieldKind::Number),
+            ("when", FieldKind::Date),
+            ("note", FieldKind::Text),
+        ] {
+            store
+                .add_dataset_field(&anna, &target, &plain_field(key, kind))
+                .await
+                .unwrap();
+        }
+        store
+            .add_dataset_field(&anna, &target, &formula_field("doubled", "{amount} * 2"))
+            .await
+            .unwrap();
+        store
+            .add_dataset_field(&anna, &source, &relation_field("mit", &target, true))
+            .await
+            .unwrap();
+        store
+            .add_dataset_field(&anna, &source, &plain_field("name", FieldKind::Text))
+            .await
+            .unwrap();
+        let refusals = [
+            // Not exactly the three string members.
+            (json!({}), "all three members are needed"),
+            (
+                json!({"relation": "mit", "fn": "count"}),
+                "a target_field is needed even to count",
+            ),
+            (
+                json!({"relation": "mit", "target_field": "amount", "fn": "count", "multiple": true}),
+                "an extra member is refused, not ignored",
+            ),
+            (
+                json!({"relation": "mit", "target_field": 3, "fn": "count"}),
+                "a member that is not a string",
+            ),
+            // The relation must be a relation column of THIS dataset.
+            (
+                json!({"relation": "nichts", "target_field": "amount", "fn": "count"}),
+                "no relation of this dataset by that name",
+            ),
+            (
+                json!({"relation": "name", "target_field": "amount", "fn": "count"}),
+                "a column of the wrong kind named as the relation",
+            ),
+            // The aggregate must be one of six.
+            (
+                json!({"relation": "mit", "target_field": "amount", "fn": "median"}),
+                "an unknown fn",
+            ),
+            // The field aggregated must exist, be stored, and be of a type the fn can answer.
+            (
+                json!({"relation": "mit", "target_field": "nichts", "fn": "sum"}),
+                "a target field that is not there",
+            ),
+            (
+                json!({"relation": "mit", "target_field": "doubled", "fn": "list"}),
+                "a target field that is itself computed",
+            ),
+            (
+                json!({"relation": "mit", "target_field": "note", "fn": "sum"}),
+                "sum over text",
+            ),
+            (
+                json!({"relation": "mit", "target_field": "note", "fn": "avg"}),
+                "avg over text",
+            ),
+            (
+                json!({"relation": "mit", "target_field": "note", "fn": "min"}),
+                "min over text",
+            ),
+            (
+                json!({"relation": "mit", "target_field": "note", "fn": "max"}),
+                "max over text",
+            ),
+            (
+                json!({"relation": "mit", "target_field": "when", "fn": "sum"}),
+                "sum over a date",
+            ),
+        ];
+        for (i, (config, why)) in refusals.into_iter().enumerate() {
+            let mut field = rollup_field(&format!("r{i}"), "mit", "amount", "count");
+            field.config = config;
+            let out = store
+                .add_dataset_field(&anna, &source, &field)
+                .await
+                .unwrap();
+            assert!(matches!(out, SchemaOutcome::Invalid(_)), "{why}: {out:?}");
+            assert!(!has(&keys(&store, &anna, &source).await, &field.key));
+        }
+        // `min`/`max` over a date and over a number are both allowed, and `count` ignores the
+        // field it names but still needs the string.
+        for field in [
+            rollup_field("latest", "mit", "when", "max"),
+            rollup_field("later", "mit", "when", "min"),
+            rollup_field("how", "mit", "whatever", "count"),
+            rollup_field("amounts", "mit", "amount", "max"),
+        ] {
+            let out = store
+                .add_dataset_field(&anna, &source, &field)
+                .await
+                .unwrap();
+            assert!(
+                matches!(out, SchemaOutcome::Done(_)),
+                "{}: {out:?}",
+                field.key
+            );
+        }
+        // A writer of the source who cannot read the target: the uniform refusal, the same words
+        // whatever the reason the target is not available.
+        let blind = Principal::test("blind", &[], &[]);
+        store
+            .add_grant(
+                "/raum",
+                Subject::Principal(blind.id.clone()),
+                Permission::Write,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .add_dataset_field(&blind, &source, &rollup_field("x", "mit", "amount", "sum"))
+                .await
+                .unwrap(),
+            SchemaOutcome::Invalid(NO_ROLLUP.into())
+        );
+        // The config that lands is the three members, nothing resolved away and nothing added.
+        let SchemaOutcome::Done(f) = store
+            .add_dataset_field(
+                &anna,
+                &source,
+                &rollup_field("total", "mit", "amount", "sum"),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("a rollup over a readable target lands")
+        };
+        assert_eq!(
+            f.config,
+            json!({"relation": "mit", "target_field": "amount", "fn": "sum"})
+        );
+    }
+
+    #[tokio::test]
+    async fn writing_a_rollup_cell_is_refused_as_computed() {
+        let (store, anna, _, source, target) = relation_fixture().await;
+        rollup_fixture(&store, &anna, &source, &target).await;
+        for patch in [json!({"n": 3}), json!({"list": []}), json!({"sum": null})] {
+            let out = store
+                .create_dataset_row(&anna, &source, &vals(patch))
+                .await
+                .unwrap();
+            let RowOutcome::Invalid(msg) = out else {
+                panic!("a rollup cell is not a value anybody may write: {out:?}")
+            };
+            assert!(msg.contains("computed and never stored"), "{msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn filtering_or_sorting_a_rollup_is_refused_as_a_computed_field() {
+        let (store, anna, bea, source, target) = relation_fixture().await;
+        rollup_fixture(&store, &anna, &source, &target).await;
+        let want = "computed field `n` cannot be filtered or sorted yet";
+        for which in [
+            RowSelect {
+                filters: vec![Filter::Eq {
+                    key: k("n"),
+                    value: json!(3),
+                }],
+                limit: 5,
+                ..Default::default()
+            },
+            RowSelect {
+                sort: Some((k("n"), false)),
+                limit: 5,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                select(&store, &anna, &source, which.clone()).await,
+                RowOutcome::Invalid(want.into())
+            );
+            // Hidden, it is refused as the field it is not: the same words as a made-up key.
+            assert_eq!(
+                select(&store, &bea, &source, which).await,
+                RowOutcome::Invalid("no field `n`".into())
+            );
+        }
     }
 }

@@ -2385,6 +2385,30 @@ mutation crates/gw-store/src/datasets/relation.rs killed \
   's/if !self.row_is_in(target_doc, id).await? {/if false {/' \
   'datasets: relation cell accepts a row of another dataset'
 
+# --- datasets: rollup fields (ADR 0022, ADR 0029 cl. 3, M8b B5) ------------------------------
+#
+# A rollup is an aggregate over the rows of ANOTHER dataset, reached through a relation column. The
+# order of the two operations is the whole of its security: ask whose target this is, then decide
+# whether to compute anything. Computing first and blanking afterwards still leaks, because the
+# blanking has to be remembered at every door — and because `0`, `null` and `[]` are themselves
+# answers about the hidden dataset. The tests that notice are
+# `a_rollup_over_a_target_the_caller_cannot_read_is_absent_not_zero`, which compares whole snapshots
+# of the schema and the row list for a reader who may see the source but not the target, and
+# `a_rollup_follows_relinking_and_a_deleted_target_row`.
+#
+# (1) The gate removed, so a rollup aggregates whatever the relation reaches whatever the caller may
+# read. The number itself then moves when the hidden dataset grows — which is exactly the question
+# the row was never allowed to answer.
+mutation crates/gw-store/src/datasets/rollup.rs killed \
+  's/col.visible = rel.visible \&\& col.target_doc.is_some();/col.visible = true;/' \
+  'datasets: a rollup aggregates before the access gate - the hidden target leaks through the number'
+# (2) The omission replaced by an empty answer. A zero where a column should be absent tells the
+# caller there is a rollup and it counts nothing, which is a claim about a dataset they may not
+# read; the same reasoning made a hidden relation disappear rather than come back as `[]`.
+mutation crates/gw-store/src/datasets/rollup.rs killed \
+  's/^                values.remove(&col.key);$/                values.insert(col.key.clone(), json!(0));/' \
+  'datasets: a hidden rollup reads as zero instead of being omitted'
+
 # HOW LONG THIS IS ALLOWED TO TAKE
 # --------------------------------
 # A gate too slow to run stops being run. This one got there: eighteen mutations, a whole
