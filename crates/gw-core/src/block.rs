@@ -51,7 +51,10 @@ use serde::{Deserialize, Serialize};
 /// owner's backup. Both edits, or neither; see `Anchor` in `extensions.ts`.
 ///
 /// Adding `TaskList` cost exactly this, adding `Attachment` cost it again, and adding
-/// `Transclusion` cost all seven plus a store-side resolver.
+/// `Transclusion` cost all seven plus a store-side resolver. `DatasetView` costs the same
+/// seven — a reference block with attributes and no children is not a new shape, only a new
+/// target — and it is being added in four commits (M8 D1a–D1d) precisely because the mirrors
+/// outside Rust cannot move in one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
@@ -199,6 +202,63 @@ pub enum BlockKind {
     /// word because a type name is read by people who want the precise word.
     #[serde(rename = "embed")]
     Transclusion,
+    /// A live view of one saved view of a dataset (M8, ADR 0029 §8).
+    ///
+    /// A **reference**, exactly as [`BlockKind::Transclusion`] is, and the sibling it exists
+    /// beside: the block says *which* dataset and *which* of its saved views, and holds
+    /// nothing of either. **Rows are never stored in the block** — the `dataset_row` table is
+    /// the only storage of a row, and a copy here would be a second one that outlives every
+    /// edit, every schema change and every access change.
+    ///
+    /// What is drawn is fetched when the page is **read**, through the permission-checked
+    /// dataset endpoint — and the embedding page's permission **never** grants the dataset's.
+    /// A reader of this page who may not read that dataset sees the frame and this block's
+    /// `label`, and nothing else: no title, no field names, no rows, not even a count
+    /// (spec §6, ADR 0022's uniform refusal). This is the whole disclosure property of the
+    /// block and the reason it is a reference rather than a render-time include: an
+    /// aggregate view of rows is a disclosure surface, and a copy of one would keep
+    /// disclosing after the access was revoked.
+    ///
+    /// It carries three attributes and no fourth may be added without the editor's schema
+    /// being widened in the same change (`web/src/lib/editor/extensions.ts`):
+    ///
+    /// * `dataset_doc` — the document id (uuid) of the dataset page. Identity, not path, for
+    ///   [`BlockKind::Transclusion`]'s `doc` reason; there is no `path` twin here, because a
+    ///   dataset view cannot be named by address at all — `view` is an id minted by
+    ///   `dataset_view.id`, which no path carries.
+    /// * `view` — the id (uuid) of the saved `dataset_view` row to render. Required: a view
+    ///   is the thing being embedded, so a dataset with no view named is not a thing this
+    ///   block can show.
+    /// * `label` — the author's own words for what they embedded, written even when empty for
+    ///   [`BlockKind::Attachment`]'s `alt` reason. It is what the reader is shown when the
+    ///   view cannot be shown, and the **only** thing here a reader who may not read the
+    ///   dataset ever sees.
+    ///
+    /// **It has no children**, and it is not a table: a block that carried the rows it shows
+    /// would be a copy of `dataset_row` in `documents.body`, reconciled by nothing and
+    /// permission-checked by nobody.
+    ///
+    /// **It contributes nothing to [`Block::plain_text`]**, with Transclusion's sharper reason
+    /// plus one of its own: `plain_text` is computed in this crate, which has no store and
+    /// cannot ask a permission question, so pulling a dataset's words in here would put
+    /// content the reader may not see into this page's search index, its chunks and its
+    /// anchor ids. And a row is data, not prose — indexing one would make it a copy that has
+    /// to follow access changes, which is exactly what ADR 0024 deferred and ADR 0029 §6
+    /// refuses.
+    ///
+    /// **Top-level only**, exactly as a placement and an embed are and for the identical
+    /// reason: markdown writes it as an image standing alone in its own paragraph, and the
+    /// importer only reads one back at the root of the document.
+    ///
+    /// # `dataset-view` on the wire, `DatasetView` in Rust
+    ///
+    /// The wire name deviates from this enum's `camelCase` — `bulletList` and `taskItem` would
+    /// have made it `datasetView` — because `dataset-view` is the name the design (§3.2), the
+    /// plan (M8 D1) and ADR 0029 §8 all record, and it is the name the endpoint, the editor's
+    /// node and the reader's renderer are keyed by. Like [`BlockKind::Transclusion`]'s `embed`,
+    /// it is pinned by this enum's guard test: the wire name is what every mirror reads.
+    #[serde(rename = "dataset-view")]
+    DatasetView,
     Text,
 }
 
@@ -812,6 +872,7 @@ mod tests {
             BlockKind::TableCell,
             BlockKind::Attachment,
             BlockKind::Transclusion,
+            BlockKind::DatasetView,
             BlockKind::Text,
         ];
         for kind in EVERY_KIND {
@@ -832,6 +893,7 @@ mod tests {
                 | BlockKind::TableCell
                 | BlockKind::Attachment
                 | BlockKind::Transclusion
+                | BlockKind::DatasetView
                 | BlockKind::Text => {}
             }
         }
@@ -869,6 +931,7 @@ mod tests {
                 "tableCell",
                 "attachment",
                 "embed",
+                "dataset-view",
                 "text",
             ],
             "A `BlockKind` was added, removed or renamed. It has four mirrors outside Rust's \
@@ -1027,6 +1090,32 @@ mod tests {
         // The label is an attribute, like a placement's `alt`, so it is not in the search
         // index, not in an anchor id and not in the chunker.
         assert_eq!(doc.plain_text(), "Siehe:");
+    }
+
+    #[test]
+    fn a_dataset_view_has_no_children_and_contributes_no_text() {
+        // The same property an embed has, asserted where the shape is decided. A dataset view
+        // is a REFERENCE: the rows live in `dataset_row` and reach a reader only through the
+        // permission-checked endpoint, so nothing of them may be in this block — and nothing
+        // of them may reach `plain_text`, which feeds the search index, the chunker and every
+        // anchor id of the EMBEDDING page, whose reader may not read the dataset at all.
+        let doc: Block = serde_json::from_str(
+            r#"{"kind":"doc","content":[
+                 {"kind":"paragraph","content":[{"kind":"text","text":"Siehe:"}]},
+                 {"kind":"dataset-view","attrs":{
+                    "dataset_doc":"0199c0de-0000-7000-8000-000000000002",
+                    "view":"0199c0de-0000-7000-8000-000000000010",
+                    "label":"Laborwerte"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(doc.content[1].kind, BlockKind::DatasetView);
+        assert!(doc.content[1].content.is_empty());
+        assert_eq!(doc.plain_text(), "Siehe:");
+        // …and it is unchanged BY the block: the same document without one reads identically.
+        let mut without = doc.clone();
+        without.content.pop();
+        assert_eq!(doc.plain_text(), without.plain_text());
+        assert_eq!(doc.diff_text(), without.diff_text());
     }
 
     #[test]

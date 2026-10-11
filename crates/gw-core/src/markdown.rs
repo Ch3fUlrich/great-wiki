@@ -43,6 +43,21 @@
 //! attributes, so that only a uuid-shaped suffix counts and no heading anybody has already
 //! written changes meaning. [ADR 0020](../../../docs/decisions/0020-how-an-embedded-page-and-a-heading-s-anchor-are-written-in-markdown.md)
 //! has the reasoning and the cost.
+//!
+//! # Viewing one saved view of a dataset (M8, ADR 0029 §8)
+//!
+//! The shape a fourth time, and the same image path for the same reason:
+//! `![Beschriftung](datensatz:<dataset_doc>#<view>)` names one saved view of one dataset page.
+//! [`dataset_view_destination`] writes it and [`dataset_view_reference`] reads it, and both ids
+//! must be uuid-shaped — `dataset_doc` is a `documents.id` and `view` a `dataset_view.id`.
+//! A destination that fails that check stays an ordinary image, exactly as a malformed `dok:`
+//! stays an ordinary link.
+//!
+//! The block holds **no rows**, ever: it is a reference, and the rows are fetched at read time
+//! through the permission-checked dataset endpoint, which the embedding page's permission never
+//! grants. [ADR 0029](../../../docs/decisions/0029-datasets-are-pages-and-rows-inherit-their-access.md)
+//! §8 and the [M8 design](../../../docs/superpowers/specs/2026-10-10-datasets-views-design.md) §6
+//! have the reasoning.
 
 use crate::block::{Block, BlockKind, Mark, MarkKind};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -389,6 +404,76 @@ pub fn transclusion_reference(dest: &str) -> Option<Transclusion<'_>> {
     })
 }
 
+/// What an image destination has to say to be a **live view of a dataset's saved view**
+/// (M8, ADR 0029 §8).
+///
+/// [`ATTACHMENT_SCHEME`]'s argument a fourth time, and it needs none: a scheme rather than a
+/// shape, German because this wiki is, both halves in this crate because two copies of one
+/// rule in two crates stop agreeing the day one of them is edited.
+///
+/// Written as an **image**, for [`TRANSCLUSION_SCHEME`]'s reason unchanged: a dataset view is
+/// a top-level atom with no inline content, standing alone in its own paragraph, and the alt
+/// slot is already markdown's place for "what to show when the thing itself cannot be shown" —
+/// which here is not a hypothetical: the label is precisely what a reader who may not read the
+/// dataset is shown.
+pub const DATASET_VIEW_SCHEME: &str = "datensatz:";
+
+/// What a [`crate::BlockKind::DatasetView`] destination names: the dataset page and the one
+/// saved view of it to render.
+///
+/// Both are required and both are ids, never paths. A `dataset_view` row is minted by the
+/// store (`gw_store::datasets::views`) and has no address a file could carry, so there is no
+/// twin here for [`Transclusion::path`]'s restored-backup form — the reason that form exists
+/// (a seed into a fresh database mints `documents.id` anew) only reaches `dataset_doc`, and
+/// settling a dataset id is the store's later problem, not this syntax's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatasetViewRef<'a> {
+    /// The dataset page's document id.
+    pub dataset_doc: &'a str,
+    /// The saved view's `dataset_view.id`.
+    pub view: &'a str,
+}
+
+/// The markdown destination naming the view `view` of the dataset `dataset_doc`, or `None` for
+/// anything this syntax could not carry back unchanged.
+///
+/// The *writing* half of one agreement whose *reading* half is [`dataset_view_reference`],
+/// asking it rather than restating its rules — [`transclusion_destination`]'s reason and its
+/// safety property: `gw_api::export`'s renderer interpolates a destination with no escaping,
+/// and both ids reached `documents.body` over the collaboration socket without validation.
+pub fn dataset_view_destination(dataset_doc: &str, view: &str) -> Option<String> {
+    let written = format!("{DATASET_VIEW_SCHEME}{dataset_doc}#{view}");
+    let read = dataset_view_reference(&written)?;
+    (read.dataset_doc == dataset_doc && read.view == view).then_some(written)
+}
+
+/// What an image destination views, or `None` for a destination that views nothing.
+///
+/// The reading half of [`dataset_view_destination`]. Both halves of the destination must be
+/// uuid-shaped ([`is_document_id`], the same check the transclusion reader asks of an id) and
+/// the view may not be left out: a dataset with no view named is not a thing this block can
+/// show, so `datensatz:<uuid>` alone is not a partial reference — it is an ordinary image.
+///
+/// **Anything else is an ordinary image**, load-bearing for [`document_reference`]'s reason
+/// run once more: `datensatz:foo#bar` is a string anybody with write access could type into an
+/// image destination, it round-trips today as a broken picture, and a reader that accepted it
+/// would make that page re-import as a different tree — a page nobody edited becoming
+/// permanently unexportable.
+///
+/// Deliberately **not** an existence check and **not** a permission check: this crate has no
+/// store. Whether the dataset exists, whether the reader may read it, and whether the view
+/// belongs to it are questions the read-time endpoint re-asks every time.
+pub fn dataset_view_reference(dest: &str) -> Option<DatasetViewRef<'_>> {
+    let target = dest.strip_prefix(DATASET_VIEW_SCHEME)?;
+    // The LAST `#`, as [`transclusion_reference`] splits: an id may not contain `#`, so a
+    // destination with two of them has no reading in which both halves are ids anyway.
+    let (dataset_doc, view) = target.rsplit_once('#')?;
+    if !is_document_id(dataset_doc) || !is_document_id(view) {
+        return None;
+    }
+    Some(DatasetViewRef { dataset_doc, view })
+}
+
 /// The suffix that states a heading's **stable** id: `## Titel {#<uuid>}`.
 ///
 /// # Why a heading needs one at all, and why it is in the file
@@ -457,13 +542,18 @@ pub fn heading_anchor_id(text: &str) -> Option<(&str, &str)> {
 
 /// What an image destination really names, or `None` for an ordinary picture.
 ///
-/// The one place the two schemes are asked about together, so that "which schemes make an
-/// image a block" is a single list rather than a condition repeated at each end of the
-/// converter.
+/// The one place the schemes are asked about together, so that "which schemes make an image a
+/// block" is a single list rather than a condition repeated at each end of the converter.
 fn placed_by(dest: &str, title: &str) -> Option<Placed> {
     if let Some(filename) = attachment_reference(dest) {
         return Some(Placed::File {
             filename: filename.to_string(),
+        });
+    }
+    if let Some(view) = dataset_view_reference(dest) {
+        return Some(Placed::DatasetView {
+            dataset_doc: view.dataset_doc.to_string(),
+            view: view.view.to_string(),
         });
     }
     transclusion_reference(dest).map(|t| Placed::Page {
@@ -480,12 +570,35 @@ fn placed_by(dest: &str, title: &str) -> Option<Placed> {
     })
 }
 
-/// Whether this block is one an image destination produced — a placement or an embed.
+/// Whether this block is one an image destination produced — a placement, an embed or a
+/// dataset view.
 ///
-/// Both are top-level atoms written as an image alone in its own paragraph, so both take the
-/// same degradation when that paragraph turns out to hold something else as well.
+/// All three are top-level atoms written as an image alone in its own paragraph, so all three
+/// take the same degradation when that paragraph turns out to hold something else as well.
 fn is_placed(block: &Block) -> bool {
-    matches!(block.kind, BlockKind::Attachment | BlockKind::Transclusion)
+    matches!(
+        block.kind,
+        BlockKind::Attachment | BlockKind::Transclusion | BlockKind::DatasetView
+    )
+}
+
+/// The attribute holding an image destination's own words, keyed by the kind it produced.
+///
+/// One function because the answer is needed at both ends of the converter — writing the
+/// block ([`Builder::end`]) and degrading one that shared its paragraph
+/// ([`Builder::settle_placements`]) — and two copies of the pair would decide, in different
+/// places, which of the block's attributes is the one a reader sees.
+///
+/// Two names because they are two different things a reader is shown: a description of a
+/// picture (`alt`), and the author's own words for what they referenced (`label`). What an
+/// embed shows and what a dataset view shows are both *another page's content the reader may
+/// not be allowed to see*, so both name their fallback `label` and share that reasoning.
+fn placed_label_key(kind: BlockKind) -> &'static str {
+    match kind {
+        BlockKind::Attachment => "alt",
+        BlockKind::Transclusion | BlockKind::DatasetView => "label",
+        other => unreachable!("`{other:?}` is not a block an image destination produces"),
+    }
 }
 
 /// A markdown construct the M1 block schema cannot represent, and what became of it.
@@ -658,9 +771,10 @@ struct Table {
 
 /// An attachment reference between its `Start(Image)` and `End(Image)`.
 struct Placing {
-    /// What this image really is: a file on this page, or a live view of another page.
+    /// What this image really is: a file on this page, a live view of another page, or one
+    /// saved view of a dataset.
     ///
-    /// One field rather than two `Option`s on the builder, because the two are mutually
+    /// One field rather than two `Option`s on the builder, because the three are mutually
     /// exclusive by construction — an image destination states one scheme — and two options
     /// would make "both open at once" a state somebody has to reason about.
     what: Placed,
@@ -671,7 +785,7 @@ struct Placing {
     alt: String,
 }
 
-/// The two things an image destination can name that are not a picture.
+/// The things an image destination can name that are not a picture.
 enum Placed {
     /// A file on this page ([`ATTACHMENT_SCHEME`]).
     File { filename: String },
@@ -681,6 +795,8 @@ enum Placed {
         path: Option<String>,
         heading: Option<String>,
     },
+    /// One saved view of a dataset ([`DATASET_VIEW_SCHEME`]).
+    DatasetView { dataset_doc: String, view: String },
 }
 
 struct Builder {
@@ -808,13 +924,10 @@ impl Builder {
             let child = if is_placed(&child) {
                 self.note(Unsupported::Image);
                 let mut leaf = self::block(BlockKind::Text);
-                // The author's own words either way — a picture's description or an embed's
-                // label — which is exactly what an ordinary image degrades to, leaf for leaf.
-                let key = if child.kind == BlockKind::Transclusion {
-                    "label"
-                } else {
-                    "alt"
-                };
+                // The author's own words either way — a picture's description, an embed's or a
+                // dataset view's label — which is exactly what an ordinary image degrades to,
+                // leaf for leaf.
+                let key = placed_label_key(child.kind);
                 leaf.text = Some(
                     child
                         .attrs
@@ -1176,6 +1289,10 @@ impl Builder {
             // another page (D-27): an atom at the top level of the document, written as an
             // image because an image is markdown's only way to say "this stands alone and
             // its text is what to show when the thing itself cannot be shown".
+            //
+            // A `datensatz:` destination is that shape a fourth time and one saved view of a
+            // dataset (ADR 0029 §8) — the same atom, the same rule, the same degradation, and
+            // nothing of the dataset in the block.
             Tag::Image {
                 dest_url, title, ..
             } => match placed_by(&dest_url, &title) {
@@ -1269,6 +1386,17 @@ impl Builder {
                                 .insert("filename".into(), serde_json::Value::from(filename));
                             b
                         }
+                        // A dataset view's own two id attributes, both always present:
+                        // `dataset_view_reference` refuses a destination with either missing or
+                        // not shaped like an id, so a block built here is one the reader agreed
+                        // to. Rows are never among them — see [`crate::BlockKind::DatasetView`].
+                        Placed::DatasetView { dataset_doc, view } => {
+                            let mut b = block(BlockKind::DatasetView);
+                            b.attrs
+                                .insert("dataset_doc".into(), serde_json::Value::from(dataset_doc));
+                            b.attrs.insert("view".into(), serde_json::Value::from(view));
+                            b
+                        }
                         // An embed's own two-or-three attributes. `doc` and `path` are never
                         // both written — `transclusion_reference` guarantees exactly one —
                         // and `heading` is absent for a whole page rather than null, because
@@ -1289,21 +1417,13 @@ impl Builder {
                             b
                         }
                     };
-                    // Written even when it is empty, for the reason `checked` is: an empty
-                    // description and no description are the same thing to a reader and two
-                    // different documents to `render_file`'s comparison — and the editor's
-                    // schema fills a missing one in with `''`, so leaving it out here would
-                    // make every placement the editor touched differ from the imported one.
-                    // `alt` for a placement, `label` for an embed: two names because they
-                    // are two different things a reader is shown — a description of a picture
-                    // and the author's own words for what they quoted — and one key for both
-                    // would make the editor's two schemas share an attribute they each mean
-                    // something else by.
-                    let key = if placement.kind == BlockKind::Transclusion {
-                        "label"
-                    } else {
-                        "alt"
-                    };
+                    // `alt` for a placement, `label` for an embed and for a dataset view: see
+                    // [`placed_label_key`], and written even when empty for the reason `checked`
+                    // is — an empty label and no label are the same thing to a reader and two
+                    // different documents to `render_file`'s comparison, and the editor's schema
+                    // fills a missing one in with `''`, so leaving it out here would make every
+                    // block the editor touched differ from the imported one.
+                    let key = placed_label_key(placement.kind);
                     placement
                         .attrs
                         .insert(key.into(), serde_json::Value::from(placing.alt));
@@ -1395,9 +1515,10 @@ fn block(kind: BlockKind) -> Block {
 mod tests {
     use crate::block::{Block, BlockKind, MarkKind};
     use crate::markdown::{
-        attachment_destination, attachment_reference, convert, document_destination,
-        document_fallback, document_fallback_path, document_reference, heading_anchor,
-        heading_anchor_id, markdown_to_blocks, transclusion_destination, Unsupported,
+        attachment_destination, attachment_reference, convert, dataset_view_destination,
+        document_destination, document_fallback, document_fallback_path, document_reference,
+        heading_anchor, heading_anchor_id, markdown_to_blocks, transclusion_destination,
+        Unsupported,
     };
 
     fn keys(md: &str) -> Vec<&'static str> {
@@ -2496,6 +2617,162 @@ mod tests {
             None
         );
         assert_eq!(transclusion_destination(None, Some(EMBED_ID), None), None);
+    }
+
+    // --- a live view of a dataset's saved view (ADR 0029 §8, M8 design §6) ------------------
+
+    const DATASET_DOC: &str = "0199c0de-0000-7000-8000-000000000002";
+    const DATASET_VIEW: &str = "0199c0de-0000-7000-8000-000000000010";
+
+    /// The fixture the import, export and empty-label tests share: an image standing alone in
+    /// its own top-level paragraph, whose destination names a dataset page and one saved view.
+    fn dataset_view_markdown(label: &str) -> String {
+        format!("![{label}](datensatz:{DATASET_DOC}#{DATASET_VIEW})\n")
+    }
+
+    #[test]
+    fn an_image_naming_a_dataset_view_becomes_a_dataset_view_of_it() {
+        let doc = markdown_to_blocks(&dataset_view_markdown("Laborwerte"));
+        assert_eq!(doc.content.len(), 1);
+        let view = &doc.content[0];
+        assert_eq!(view.kind, BlockKind::DatasetView);
+        assert_eq!(view.attrs.get("dataset_doc").unwrap(), DATASET_DOC);
+        assert_eq!(view.attrs.get("view").unwrap(), DATASET_VIEW);
+        assert_eq!(view.attrs.get("label").unwrap(), "Laborwerte");
+        // Exactly the three attributes and no children: rows are never in the block.
+        assert_eq!(view.attrs.len(), 3, "a dataset-view grew an attribute");
+        assert!(view.content.is_empty());
+        // The wire name IS the CRDT element tag and the TipTap node name.
+        assert!(serde_json::to_string(&doc)
+            .unwrap()
+            .contains(r#""kind":"dataset-view""#));
+    }
+
+    #[test]
+    fn a_dataset_view_block_writes_back_the_markdown_it_came_from() {
+        // md → blocks → md → blocks, and the two trees are one tree. `gw_api::export`'s
+        // renderer interpolates a destination with no escaping, so this is the agreement
+        // that decides whether a page holding a dataset view can ever be exported again.
+        let md = dataset_view_markdown("Laborwerte");
+        let doc = markdown_to_blocks(&md);
+        let block = &doc.content[0];
+        let dest = dataset_view_destination(
+            block
+                .attrs
+                .get("dataset_doc")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            block.attrs.get("view").and_then(|v| v.as_str()).unwrap(),
+        )
+        .expect("the ids this block carries are writable");
+        let label = block
+            .attrs
+            .get("label")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let written = format!("![{label}]({dest})\n");
+        assert_eq!(written, md, "the export is not the markdown that was read");
+        assert_eq!(
+            json(&markdown_to_blocks(&written)),
+            json(&doc),
+            "the re-import is a different document"
+        );
+    }
+
+    #[test]
+    fn a_dataset_view_with_no_label_keeps_the_empty_label_it_was_given() {
+        // Written even when empty, for [`crate::BlockKind::TaskItem`]'s `checked` reason: an
+        // empty label and no label are the same thing to a reader and two documents to the
+        // exporter's comparison — and the editor's schema fills a missing one with `''`.
+        let doc = markdown_to_blocks(&dataset_view_markdown(""));
+        let block = &doc.content[0];
+        assert_eq!(block.kind, BlockKind::DatasetView);
+        assert!(block.attrs.contains_key("label"), "the label key vanished");
+        assert_eq!(block.attrs.get("label").unwrap(), "");
+        assert_eq!(block.attrs.len(), 3);
+        assert_eq!(
+            json(&markdown_to_blocks(&dataset_view_markdown(""))),
+            json(&doc),
+            "an empty label did not round-trip"
+        );
+    }
+
+    #[test]
+    fn a_dataset_view_destination_that_is_not_two_ids_stays_an_ordinary_image() {
+        // The same load-bearing degradation as [`document_reference`]'s: `datensatz:foo#bar`
+        // is a string anybody with write access could have typed into an image destination,
+        // and a reader that accepted it would make that page re-import as a different tree —
+        // a page nobody edited becoming permanently unexportable.
+        for dest in [
+            "datensatz:foo#bar",
+            &format!("datensatz:{DATASET_DOC}"),
+            "datensatz:",
+            &format!("datensatz:#{DATASET_VIEW}"),
+            &format!("datensatz:{DATASET_DOC}#"),
+            &format!("datensatz:{DATASET_DOC}#abschnitt"),
+            &format!("datensatz:/darm/labor#{DATASET_VIEW}"),
+            &format!("datensatz:{DATASET_DOC}#{DATASET_VIEW}#{DATASET_VIEW}"),
+        ] {
+            let doc = markdown_to_blocks(&format!("![a]({dest})\n"));
+            assert!(
+                doc.content.iter().all(|b| b.kind != BlockKind::DatasetView),
+                "{dest:?} became a dataset view"
+            );
+            assert_eq!(doc.plain_text(), "a", "{dest:?} lost its description too");
+        }
+    }
+
+    #[test]
+    fn a_dataset_view_below_the_top_level_degrades_to_its_label() {
+        // The editor's schema admits it in `doc` and nowhere else, so a dataset view read
+        // back inside a list item or a table cell is a tree TipTap deletes on open — and the
+        // deletion broadcasts. The importer never writes one there; the label survives as text.
+        for md in [
+            &format!("- ![a](datensatz:{DATASET_DOC}#{DATASET_VIEW})\n"),
+            &format!("> ![a](datensatz:{DATASET_DOC}#{DATASET_VIEW})\n"),
+            &format!("| Kopf |\n|---|\n| ![a](datensatz:{DATASET_DOC}#{DATASET_VIEW}) |\n"),
+            &format!("siehe ![a](datensatz:{DATASET_DOC}#{DATASET_VIEW}) hier\n"),
+        ] {
+            let doc = markdown_to_blocks(md);
+            let mut kinds = Vec::new();
+            fn walk(b: &Block, out: &mut Vec<BlockKind>) {
+                out.push(b.kind);
+                for c in &b.content {
+                    walk(c, out);
+                }
+            }
+            walk(&doc, &mut kinds);
+            assert!(
+                !kinds.contains(&BlockKind::DatasetView),
+                "{md:?} placed a dataset view where the editor cannot hold one"
+            );
+            assert!(
+                doc.plain_text().contains('a'),
+                "{md:?} lost the label as well: {:?}",
+                doc.plain_text()
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_halves_of_the_dataset_view_syntax_are_one_rule() {
+        // The writer asks the reader rather than restating its rules: both ids are arbitrary
+        // strings that reached `documents.body` over the collaboration socket, and nothing
+        // escapes them on the way into the file.
+        assert_eq!(
+            dataset_view_destination(DATASET_DOC, DATASET_VIEW).as_deref(),
+            Some(&*format!("datensatz:{DATASET_DOC}#{DATASET_VIEW}"))
+        );
+        // Both required: a view-less dataset view is not a thing.
+        assert_eq!(dataset_view_destination("", DATASET_VIEW), None);
+        assert_eq!(dataset_view_destination(DATASET_DOC, ""), None);
+        assert_eq!(dataset_view_destination("foo", "bar"), None);
+        // And nothing that would not read back unchanged is ever written.
+        assert_eq!(dataset_view_destination("x) [a](b", DATASET_VIEW), None);
+        assert_eq!(
+            dataset_view_destination(&format!("{DATASET_DOC}#x"), DATASET_VIEW),
+            None
+        );
     }
 
     // --- a heading's stable id, which is what a section embed anchors to --------------------
