@@ -137,6 +137,19 @@ describe('cardAttrs and columnAttrs', () => {
     expect(out).not.toContain('data-esc="a"b"');
   });
 
+  it('cardAttrs cannot make a read-only card draggable or hide its read-only mark', () => {
+    const out = html(
+      { cardAttrs: () => ({ draggable: 'true', 'data-readonly': 'false', 'data-card': 'other' }) },
+      [card('k1', 'a')],
+      false
+    );
+    expect(out).not.toContain('draggable');
+    expect(out).toContain('data-card="k1"');
+    expect(out).not.toContain('data-card="other"');
+    expect(out).not.toContain('data-readonly="false"');
+    expect(out).toContain('data-readonly');
+  });
+
   it('spreads columnAttrs onto the column div, escaping the value', () => {
     const out = html({ columnAttrs: (col: BoardColumn) => ({ 'data-spalte': String(col.id), 'data-esc': 'x"y' }) });
     expect(out).toContain('data-spalte="a"');

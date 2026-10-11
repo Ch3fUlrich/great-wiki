@@ -66,7 +66,7 @@
 <section class="board" data-board aria-label="Board">
   {#each columns as col (String(col.id))}
     {@const cards = groups.get(col.id) ?? []}
-    <div class="spalte" role="group" aria-label={col.label} data-column={col.id ?? 'none'} {...(columnAttrs?.(col) ?? {})} ondragover={(event: DragEvent) => event.preventDefault()} ondrop={(event: DragEvent) => onDrop(event, col.id)}>
+    <div class="spalte" role="group" aria-label={col.label} {...(columnAttrs?.(col) ?? {})} data-column={col.id ?? 'none'} ondragover={(event: DragEvent) => event.preventDefault()} ondrop={(event: DragEvent) => onDrop(event, col.id)}>
       {#if columnHead}
         {@render columnHead(col, cards)}
       {:else}
@@ -82,10 +82,10 @@
             {@const movable = source.canMove(c)}
             <li
               class="karte"
+              {...(cardAttrs?.(c) ?? {})}
               data-card={c.id}
               data-readonly={!movable || undefined}
               draggable={movable ? "true" : undefined}
-              {...(cardAttrs?.(c) ?? {})}
               ondragstart={(event: DragEvent) => onDragStart(event, c)}
             >
               {#if cardSnippet}
