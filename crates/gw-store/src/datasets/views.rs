@@ -7,7 +7,7 @@
 //! by `FieldKey` and must be fields of this dataset; they are only ever JSON, never SQL.
 
 use super::query::Filter;
-use super::{clean_label, is_computed_kind, Gate, SchemaOutcome};
+use super::{clean_label, is_computed_kind, Gate, SchemaOutcome, MAX_LABEL_CHARS};
 use crate::Store;
 use anyhow::Result;
 use gw_auth::Principal;
@@ -82,6 +82,81 @@ impl BoardConfig {
     }
 }
 
+/// Most fields one form may ask for.
+const MAX_FORM_FIELDS: usize = 100;
+
+/// Config of a `form` view (M8c C5): the fields it asks for, in the order it asks, and an
+/// optional heading. Unknown members are refused, like the other kinds.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FormConfig {
+    pub(super) fields: Vec<FormField>,
+    #[allow(dead_code)] // the form's own heading; the row does not carry it
+    title: Option<String>,
+}
+
+/// One question of a form. `label` overrides the column's label for the form only; `required`
+/// is a promise the submit path enforces, not a hint.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FormField {
+    pub(super) key: FieldKey,
+    label: Option<String>,
+    #[serde(default)]
+    pub(super) required: bool,
+}
+
+impl FormConfig {
+    /// A saved config, parsed the way [`validate`] parsed it when it was saved.
+    pub(super) fn parse(config: &Value) -> Result<Self, String> {
+        serde_json::from_value(config.clone())
+            .map_err(|e| format!("not a valid form view config: {e}"))
+    }
+
+    /// The subset a submit may name: the keys this form holds.
+    pub(super) fn holds(&self, key: &str) -> bool {
+        self.fields.iter().any(|f| f.key.as_str() == key)
+    }
+}
+
+/// A form asks for stored, visible columns and nothing else: a computed one is answered by the
+/// dataset, not by whoever submits, and a field the caller may not see is not a field they may
+/// be asked about.
+fn validate_form(config: &Value, known: &HashMap<String, String>) -> Result<(), String> {
+    let parsed = FormConfig::parse(config)?;
+    if parsed.fields.is_empty() {
+        return Err("a form has at least one field".into());
+    }
+    if parsed.fields.len() > MAX_FORM_FIELDS {
+        return Err(format!("a form has at most {MAX_FORM_FIELDS} fields"));
+    }
+    let mut seen = HashSet::new();
+    for f in &parsed.fields {
+        let key = f.key.as_str();
+        if !seen.insert(key.to_string()) {
+            return Err(format!("the form field {key:?} is asked for twice"));
+        }
+        if !known.contains_key(key) {
+            return Err(format!("the dataset has no field {key:?}"));
+        }
+        if is_computed_kind(&known[key]) {
+            return Err("computed fields cannot be on a form".into());
+        }
+        if let Some(label) = &f.label {
+            let trimmed = label.trim();
+            if trimmed.is_empty() {
+                return Err("a form field label is not blank".into());
+            }
+            if trimmed.chars().count() > MAX_LABEL_CHARS {
+                return Err(format!(
+                    "a form field label is at most {MAX_LABEL_CHARS} characters"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl TableConfig {
     /// Every field key the config names, validated: widths are keyed by plain strings (a
     /// JSON object), so they pass through `FieldKey::parse` here.
@@ -101,19 +176,22 @@ impl TableConfig {
 }
 
 /// Check `config` for `kind` against the fields `known` — the dataset's keys this caller may
-/// see, by kind. Table and board are available (ADR 0029); the other kinds are in the schema's
-/// CHECK for later milestones and refused until then. `group_by` has a rule of its own: in a
-/// table it groups rows under a head, and only a stored column can head a group — a formula or
-/// rollup is evaluated per row, not enumerable, and a relation is not groupable yet; in a board
-/// it names the lanes and must be a select field.
+/// see, by kind. Table, board and form are available (ADR 0029, M8c C5); the other kinds are in
+/// the schema's CHECK for later milestones and refused until then. `group_by` has a rule of its
+/// own: in a table it groups rows under a head, and only a stored column can head a group — a
+/// formula or rollup is evaluated per row, not enumerable, and a relation is not groupable yet;
+/// in a board it names the lanes and must be a select field.
 fn validate(kind: &str, config: &Value, known: &HashMap<String, String>) -> Result<(), String> {
-    if kind != "table" && kind != "board" {
+    if kind != "table" && kind != "board" && kind != "form" {
         return Err(format!("the view kind {kind:?} is not available"));
     }
     if config.to_string().len() > MAX_VIEW_CONFIG_BYTES {
         return Err(format!(
             "a view config is at most {MAX_VIEW_CONFIG_BYTES} bytes"
         ));
+    }
+    if kind == "form" {
+        return validate_form(config, known);
     }
     if kind == "board" {
         let parsed: BoardConfig = serde_json::from_value(config.clone())
@@ -148,12 +226,18 @@ fn validate(kind: &str, config: &Value, known: &HashMap<String, String>) -> Resu
 }
 
 /// Drop everything in a saved config that names a field outside `visible`: the columns (a
-/// board's `card_fields` included), a width, and a sort, filter or grouping on it (filtering
-/// a hidden field is refused, not ignored, so a saved one cannot survive for a caller who may
-/// not see the field). A board whose `group_by` is stripped is left without it; that is fine,
-/// because a select field cannot be hidden — only relation and computed ones can.
+/// board's `card_fields` and a form's field entries included), a width, and a sort, filter or
+/// grouping on it (filtering a hidden field is refused, not ignored, so a saved one cannot
+/// survive for a caller who may not see the field). A board whose `group_by` is stripped is left
+/// without it; that is fine, because a select field cannot be hidden — only relation and
+/// computed ones can.
 pub(crate) fn strip_hidden(config: &mut Value, visible: &HashSet<String>) {
-    let shown = |v: &Value| v.as_str().is_some_and(|k| visible.contains(k));
+    // A column entry is a key (`table`, `board`) or an object naming one (`form`); both shapes
+    // are decided by the same visibility.
+    let shown = |v: &Value| match v.get("key").and_then(Value::as_str) {
+        Some(k) => visible.contains(k),
+        None => v.as_str().is_some_and(|k| visible.contains(k)),
+    };
     let Some(obj) = config.as_object_mut() else {
         return;
     };
@@ -201,7 +285,7 @@ impl Store {
     /// from this caller — a relation they may not resolve, a rollup over it, a formula reaching
     /// either. This is the seam the schema and the query use, so a view cannot name a field the
     /// caller could not otherwise see or filter.
-    async fn visible_field_keys(
+    pub(super) async fn visible_field_keys(
         &self,
         principal: &Principal,
         doc_id: &str,
@@ -231,7 +315,7 @@ impl Store {
             .collect())
     }
 
-    async fn views_of(&self, doc_id: &str) -> Result<Vec<DatasetView>> {
+    pub(super) async fn views_of(&self, doc_id: &str) -> Result<Vec<DatasetView>> {
         let rows: Vec<ViewRow> = sqlx::query_as(
             "SELECT id, name, kind, config, position FROM dataset_view \
              WHERE doc_id = ? ORDER BY position, created_at, id",
@@ -1158,5 +1242,231 @@ mod tests {
         );
         assert_eq!(cfg["filters"].as_array().unwrap().len(), 1);
         assert_eq!(cfg["group_by"], json!("status"));
+    }
+
+    // --- form views (M8c C5) ----------------------------------------------------------
+
+    fn form() -> serde_json::Value {
+        json!({"fields": [{"key": "name", "label": "Name", "required": true},
+                          {"key": "alter", "required": false}],
+               "title": "Anmelden"})
+    }
+
+    async fn made_form(store: &Store, who: &Principal, path: &str) -> DatasetView {
+        match store
+            .create_dataset_view(who, path, "Formular", "form", &form())
+            .await
+            .unwrap()
+        {
+            SchemaOutcome::Done(v) => v,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_writer_creates_lists_updates_and_deletes_a_form_view() {
+        let (store, anna, bea, cleo, path) = fixture().await;
+        let v = made_form(&store, &anna, &path).await;
+        assert_eq!((v.name.as_str(), v.kind.as_str()), ("Formular", "form"));
+        assert_eq!(v.config["fields"].as_array().unwrap().len(), 2);
+        let SchemaOutcome::Done(list) = store.dataset_views(&bea, &path).await.unwrap() else {
+            panic!("reader lists")
+        };
+        assert_eq!(list[0].config["fields"][0]["label"], "Name");
+        // The update path re-validates as a form: a board-shaped config is refused and
+        // changes nothing.
+        let bad = store
+            .update_dataset_view(
+                &anna,
+                &path,
+                &v.id,
+                None,
+                Some(&json!({"group_by": "status"})),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(bad, SchemaOutcome::Invalid(_)), "{bad:?}");
+        let out = store
+            .update_dataset_view(
+                &anna,
+                &path,
+                &v.id,
+                Some("Neu"),
+                Some(&json!({"fields": [{"key": "name"}]})),
+            )
+            .await
+            .unwrap();
+        let SchemaOutcome::Done(u) = out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(u.name, "Neu");
+        assert_eq!(u.config, json!({"fields": [{"key": "name"}]}));
+        // A reader may not save, a stranger learns nothing.
+        assert_eq!(
+            store
+                .create_dataset_view(&bea, &path, "X", "form", &form())
+                .await
+                .unwrap(),
+            SchemaOutcome::ReadOnly
+        );
+        assert_eq!(
+            store
+                .create_dataset_view(&cleo, &path, "X", "form", &form())
+                .await
+                .unwrap(),
+            SchemaOutcome::NoDataset
+        );
+        assert_eq!(
+            store
+                .delete_dataset_view(&anna, &path, &v.id)
+                .await
+                .unwrap(),
+            SchemaOutcome::Done(())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_form_config_needs_the_right_fields_and_nothing_else() {
+        let (store, anna, _, _, path) = fixture().await;
+        for cfg in [
+            // A form without a field is not a form.
+            json!({"fields": []}),
+            // The same key twice: one field cannot be asked for twice.
+            json!({"fields": [{"key": "name"}, {"key": "name"}]}),
+            // A field the dataset does not have.
+            json!({"fields": [{"key": "gibtsnicht"}]}),
+            // A hostile key never reaches the database: FieldKey refuses it.
+            json!({"fields": [{"key": "a'; DROP TABLE dataset_row; --"}]}),
+            // A label that is blank or long is a bad label, not a silent default.
+            json!({"fields": [{"key": "name", "label": "  "}]}),
+            json!({"fields": [{"key": "name", "label": "l".repeat(121)}]}),
+            // An unknown member anywhere: in the config, and in a field entry.
+            json!({"fields": [{"key": "name"}], "bogerig": true}),
+            json!({"fields": [{"key": "name", "bogerig": true}]}),
+            // A field entry whose key is missing.
+            json!({"fields": [{"label": "Name"}]}),
+            // Not an object per field at all.
+            json!({"fields": ["name"]}),
+            json!([1]),
+            json!({"unknown": 1}),
+        ] {
+            let out = store
+                .create_dataset_view(&anna, &path, "X", "form", &cfg)
+                .await
+                .unwrap();
+            assert!(matches!(out, SchemaOutcome::Invalid(_)), "{cfg}: {out:?}");
+        }
+        // An unknown field is named in the same words as everywhere else.
+        assert_eq!(
+            store
+                .create_dataset_view(
+                    &anna,
+                    &path,
+                    "X",
+                    "form",
+                    &json!({"fields": [{"key": "weg"}]})
+                )
+                .await
+                .unwrap(),
+            SchemaOutcome::Invalid("the dataset has no field \"weg\"".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_form_holds_no_computed_field() {
+        let (store, anna, bea, source) = hidden_view_fixture().await;
+        for key in ["fr", "cnt"] {
+            assert_eq!(
+                store
+                    .create_dataset_view(
+                        &anna,
+                        &source,
+                        "X",
+                        "form",
+                        &json!({"fields": [{"key": key}]})
+                    )
+                    .await
+                    .unwrap(),
+                SchemaOutcome::Invalid("computed fields cannot be on a form".into()),
+                "{key}"
+            );
+        }
+        // A relation is not computed and may be asked for; hidden to the caller it is absent.
+        assert!(matches!(
+            store
+                .create_dataset_view(
+                    &anna,
+                    &source,
+                    "X",
+                    "form",
+                    &json!({"fields": [{"key": "mit"}]})
+                )
+                .await
+                .unwrap(),
+            SchemaOutcome::Done(_)
+        ));
+        assert_eq!(
+            store
+                .create_dataset_view(
+                    &bea,
+                    &source,
+                    "X",
+                    "form",
+                    &json!({"fields": [{"key": "mit"}]})
+                )
+                .await
+                .unwrap(),
+            SchemaOutcome::Invalid("the dataset has no field \"mit\"".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_strips_hidden_form_fields_from_the_listed_config() {
+        let (store, anna, bea, source) = hidden_view_fixture().await;
+        let cfg = json!({"fields": [{"key": "name"}, {"key": "mit"}, {"key": "alter"}]});
+        let SchemaOutcome::Done(_) = store
+            .create_dataset_view(&anna, &source, "Alle", "form", &cfg)
+            .await
+            .unwrap()
+        else {
+            panic!("anna names the fields she may read")
+        };
+        // The same hidden key in a table config, so both shapes of `fields` are checked here.
+        let SchemaOutcome::Done(_) = store
+            .create_dataset_view(
+                &anna,
+                &source,
+                "T",
+                "table",
+                &json!({"fields": ["name", "mit"]}),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("anna names the fields she may read")
+        };
+        let SchemaOutcome::Done(list) = store.dataset_views(&bea, &source).await.unwrap() else {
+            panic!()
+        };
+        let of = |kind: &str| -> Vec<serde_json::Value> {
+            let v = list.iter().find(|v| v.kind == kind).unwrap();
+            v.config["fields"].as_array().unwrap().clone()
+        };
+        assert_eq!(
+            of("form"),
+            vec![json!({"key": "name"}), json!({"key": "alter"})],
+            "the form entry whose key is hidden goes: {:?}",
+            of("form")
+        );
+        assert_eq!(of("table"), vec![json!("name")]);
+    }
+
+    #[tokio::test]
+    async fn strip_hidden_drops_form_entries_whose_key_is_hidden() {
+        let mut cfg = json!({"fields": [{"key": "name"}, {"key": "mit"}], "title": "T"});
+        let visible: HashSet<String> = ["name".to_string()].into();
+        strip_hidden(&mut cfg, &visible);
+        assert_eq!(cfg["fields"], json!([{"key": "name"}]));
+        assert_eq!(cfg["title"], json!("T"));
     }
 }

@@ -893,3 +893,83 @@ async fn a_board_view_is_saved_and_a_bad_group_by_is_a_400() {
     let (_, ids, _) = view_ids(&store, "schreiber").await;
     assert_eq!(ids.len(), 1, "the refused boards changed nothing");
 }
+
+/// `POST rows` with a `view` submits through that form: the same 201 for a writer, and a 400
+/// for a field outside the form's subset or an unanswered required field. Without `view` the
+/// call is the ordinary row add.
+#[tokio::test]
+async fn a_form_submit_over_http_adds_a_row_and_refuses_the_subset_violation() {
+    let store = with_columns().await;
+    let body = json!({"name": "Formular", "kind": "form",
+                      "config": {"fields": [{"key": "name", "required": true}, {"key": "alter"}]}});
+    let (s, b) = send(&store, Some("schreiber"), "POST", VIEWS, Some(body)).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let form = id_of(&b);
+
+    let (s, b) = send(
+        &store,
+        Some("schreiber"),
+        "POST",
+        ROWS,
+        Some(json!({"values": {"name": "Ada"}, "view": form})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let row: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(row["values"], json!({"name": "Ada"}));
+
+    for (values, why) in [
+        (
+            json!({"name": "Ada", "alter": 36, "nope": 1}),
+            "no field \"nope\"",
+        ),
+        (json!({"alter": 36}), "name is required"),
+        (json!({"name": " "}), "name is required"),
+    ] {
+        let (s, b) = send(
+            &store,
+            Some("schreiber"),
+            "POST",
+            ROWS,
+            Some(json!({"values": values, "view": form})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{values} — {why}: {b}");
+    }
+
+    // A reader may not submit through a form either.
+    let (s, _) = send(
+        &store,
+        Some("leser"),
+        "POST",
+        ROWS,
+        Some(json!({"values": {"name": "Bob"}, "view": form})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // A view id that is not a form of this dataset is a 400.
+    let (s, b) = send(
+        &store,
+        Some("schreiber"),
+        "POST",
+        ROWS,
+        Some(json!({"values": {"name": "Bob"}, "view": "es-gibt-sie-nicht"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+
+    // Without `view` the ordinary add is unchanged, and `values` alone still parses.
+    let (s, b) = send(
+        &store,
+        Some("schreiber"),
+        "POST",
+        ROWS,
+        Some(json!({"values": {"name": "Bob", "alter": 40}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let (s, b) = send(&store, Some("schreiber"), "GET", ROWS, None).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(b.contains("\"total\":2"), "{b}");
+}

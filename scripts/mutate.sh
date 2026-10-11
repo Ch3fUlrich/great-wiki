@@ -2443,6 +2443,25 @@ mutation crates/gw-store/src/datasets.rs killed \
   's/offset\.saturating_add(take)/offset + take/g' \
   'datasets: an offset cursor near usize::MAX overflows the next-page arithmetic'
 
+# --- datasets: the form view and its submit (M8c C5) -----------------------------------------
+#
+# A form is a promise about what may be written, and the promise is the only thing it adds over
+# a row add: the two checks below are therefore the whole of it. Both tests also count the rows
+# after the refusal, so a mutation that let the row through cannot pass by ignoring the answer.
+#
+# (1) The subset check gone. A crafted body then writes any column the dataset has — which is
+# exactly the thing a form was supposed to make impossible, and the reason an out-of-subset key
+# is REFUSED rather than dropped.
+mutation crates/gw-store/src/datasets.rs killed \
+  's/if !form\.holds(key) || !visible\.contains(key\.as_str()) {/if false {/' \
+  'datasets: a form accepts a field outside its subset'
+# (2) The required check gone: the form's one piece of validation the row validator does not
+# do at all (an empty cell is a legal cell for a plain add), and the tests cover it three times
+# over — absent, `null`, and a string of whitespace.
+mutation crates/gw-store/src/datasets.rs killed \
+  's/if !answered {/if false {/' \
+  'datasets: a form does not enforce required'
+
 # HOW LONG THIS IS ALLOWED TO TAKE
 # --------------------------------
 # A gate too slow to run stops being run. This one got there: eighteen mutations, a whole
