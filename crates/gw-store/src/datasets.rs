@@ -160,7 +160,46 @@ impl Store {
         let mut fields = self.fields_of(&doc.id).await?;
         let hidden = self.hidden_field_keys(principal, &doc.id).await?;
         fields.retain(|f| !hidden.contains(f.key.as_str()));
+        self.attach_target_paths(principal, &mut fields).await?;
         Ok(SchemaOutcome::Done(fields))
+    }
+
+    /// Name every visible `relation` column's target by its **current path**, as
+    /// `config.target_path`: the picker that binds a new cell needs a path, and the stored config
+    /// keeps only the doc id. Looked up at serialisation, never stored; omitted when the target
+    /// page is gone or trashed. A column hidden from the caller is not in `fields` at all, and a
+    /// target the caller cannot read stays unnamed — the path would say more than they may know.
+    async fn attach_target_paths(
+        &self,
+        principal: &Principal,
+        fields: &mut [DatasetField],
+    ) -> Result<()> {
+        for f in fields
+            .iter_mut()
+            .filter(|f| f.kind == FieldKind::Relation.as_str())
+        {
+            let Some(target_doc) = f
+                .config
+                .get("target_doc")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if !self.readable_dataset_by_id(principal, &target_doc).await? {
+                continue;
+            }
+            let path: Option<String> = sqlx::query_scalar(
+                "SELECT path FROM documents WHERE id = ? AND deleted_at IS NULL",
+            )
+            .bind(&target_doc)
+            .fetch_optional(&self.pool)
+            .await?;
+            if let (Some(p), Some(map)) = (path, f.config.as_object_mut()) {
+                map.insert("target_path".to_string(), Value::String(p));
+            }
+        }
+        Ok(())
     }
 
     /// Add a column. Needs write. `key` is validated by [`FieldKey::parse`] before it
@@ -265,13 +304,16 @@ impl Store {
             .fetch_one(&mut *tx)
             .await?;
         tx.commit().await?;
-        Ok(SchemaOutcome::Done(DatasetField {
+        let mut field = DatasetField {
             key: key.as_str().to_string(),
             label,
             kind: new.kind.as_str().to_string(),
             config: stored_config,
             position,
-        }))
+        };
+        self.attach_target_paths(principal, std::slice::from_mut(&mut field))
+            .await?;
+        Ok(SchemaOutcome::Done(field))
     }
 
     /// The formula-specific checks taken before a `formula` column is written: the config must
@@ -344,12 +386,17 @@ impl Store {
         if done.rows_affected() == 0 {
             return Ok(SchemaOutcome::NoField);
         }
-        let field = self
+        let Some(mut field) = self
             .fields_of(&doc_id)
             .await?
             .into_iter()
-            .find(|f| f.key == key);
-        Ok(field.map_or(SchemaOutcome::NoField, SchemaOutcome::Done))
+            .find(|f| f.key == key)
+        else {
+            return Ok(SchemaOutcome::NoField);
+        };
+        self.attach_target_paths(principal, std::slice::from_mut(&mut field))
+            .await?;
+        Ok(SchemaOutcome::Done(field))
     }
 
     /// Put the columns in the order given. Needs write. `keys` must be exactly the current
@@ -388,7 +435,9 @@ impl Store {
                 .await?;
         }
         tx.commit().await?;
-        Ok(SchemaOutcome::Done(self.fields_of(&doc_id).await?))
+        let mut fields = self.fields_of(&doc_id).await?;
+        self.attach_target_paths(principal, &mut fields).await?;
+        Ok(SchemaOutcome::Done(fields))
     }
 
     /// Remove a column and its values from every row, in one transaction. Needs write.
@@ -438,7 +487,9 @@ enum Gate {
     ReadOnly,
 }
 
-/// Most rows one dataset may hold (ADR 0029: filters scan, so the table is bounded).
+/// Most rows one dataset may hold (ADR 0029: filters scan, so the table is bounded). Also the
+/// bound of a computed filter or sort: that path looks at no more than this many rows, and the
+/// call is refused rather than quietly answering from a truncation.
 pub const MAX_ROWS: usize = 50_000;
 
 /// One row. `version` starts at 1 and moves on with every change, so an editor holding an
@@ -633,11 +684,33 @@ impl Store {
 
     /// Filtered, sorted, cursor-paged rows. Same access seam and count-after-gate as
     /// [`Store::dataset_rows`]; see `query.rs` for how the SQL is kept free of caller text.
+    ///
+    /// A visible `formula` or `rollup` key may be named by a filter or by the sort. Computed
+    /// values are not stored, so such a query cannot be answered in SQL: the stored filters run
+    /// in SQL first and fetch at most [`MAX_ROWS`] rows — a computed filter or sort looks at no
+    /// more than [`MAX_ROWS`] rows, and if the SQL-matching set is larger the call is refused —
+    /// those rows are then decorated and evaluated exactly as a normal read, behind the same
+    /// access gate (no evaluation for a dataset the caller cannot read), and the computed
+    /// filters, the sort and the paging happen in memory. This path pages by an **offset**
+    /// cursor and is not stable under concurrent inserts; the keyset path for stored keys is
+    /// unchanged.
     pub async fn dataset_rows_query(
         &self,
         principal: &Principal,
         path: &str,
         select: &RowSelect,
+    ) -> Result<RowOutcome<RowPage>> {
+        self.rows_query(principal, path, select, MAX_ROWS).await
+    }
+
+    /// The query itself. `cap` bounds the computed path's scan: [`MAX_ROWS`] for every real
+    /// call, and a seam so a test can reach the bound without planting fifty thousand rows.
+    async fn rows_query(
+        &self,
+        principal: &Principal,
+        path: &str,
+        select: &RowSelect,
+        cap: usize,
     ) -> Result<RowOutcome<RowPage>> {
         let Some(doc) = self.readable_dataset(principal, path).await? else {
             return Ok(RowOutcome::NoDataset);
@@ -649,23 +722,20 @@ impl Store {
         // names no field at all, in the same words as a key that does not exist.
         let hidden = self.hidden_field_keys(principal, &doc.id).await?;
         let kind_of = |key: &FieldKey| fields.iter().find(|f| f.key == key.as_str());
+        let mut stored = Vec::new();
+        let mut computed = Vec::new();
         for f in &select.filters {
-            let (Filter::Eq { key, .. }
-            | Filter::Contains { key, .. }
-            | Filter::IsEmpty { key }
-            | Filter::In { key, .. }) = f;
+            let key = f.key();
             match kind_of(key) {
                 None => return Ok(RowOutcome::Invalid(format!("no field `{}`", key.as_str()))),
                 Some(_) if hidden.contains(key.as_str()) => {
                     return Ok(RowOutcome::Invalid(format!("no field `{}`", key.as_str())))
                 }
-                Some(field) if is_computed_kind(&field.kind) => {
-                    return Ok(RowOutcome::Invalid(computed_refusal(key.as_str())))
-                }
+                Some(field) if is_computed_kind(&field.kind) => computed.push(f.clone()),
                 Some(field) if field.kind == FieldKind::Relation.as_str() => {
                     return Ok(RowOutcome::Invalid(relation_refusal(key.as_str(), &hidden)))
                 }
-                Some(_) => {}
+                Some(_) => stored.push(f.clone()),
             }
         }
         let sort = match &select.sort {
@@ -678,20 +748,23 @@ impl Store {
                     return Ok(RowOutcome::Invalid(format!("no field `{}`", key.as_str())));
                 }
                 if is_computed_kind(&field.kind) {
-                    return Ok(RowOutcome::Invalid(computed_refusal(key.as_str())));
-                }
-                if field.kind == FieldKind::Relation.as_str() {
+                    Some(SortTarget::Computed {
+                        key: key.clone(),
+                        desc: *desc,
+                    })
+                } else if field.kind == FieldKind::Relation.as_str() {
                     return Ok(RowOutcome::Invalid(relation_refusal(key.as_str(), &hidden)));
+                } else {
+                    Some(SortTarget::Stored(Sort {
+                        key: key.clone(),
+                        kind: if field.kind == FieldKind::Number.as_str() {
+                            SortKind::Number
+                        } else {
+                            SortKind::Text
+                        },
+                        desc: *desc,
+                    }))
                 }
-                Some(Sort {
-                    key: key.clone(),
-                    kind: if field.kind == FieldKind::Number.as_str() {
-                        SortKind::Number
-                    } else {
-                        SortKind::Text
-                    },
-                    desc: *desc,
-                })
             }
         };
         let after = match select.after.as_deref().map(Cursor::decode) {
@@ -700,9 +773,29 @@ impl Store {
             Some(Err(m)) => return Ok(RowOutcome::Invalid(m)),
         };
         let limit = select.limit.clamp(1, MAX_PAGE);
+        let on_computed = !computed.is_empty() || matches!(sort, Some(SortTarget::Computed { .. }));
+        if on_computed {
+            return self
+                .computed_page(
+                    principal,
+                    &doc.id,
+                    &fields,
+                    &hidden,
+                    stored,
+                    &computed,
+                    sort.as_ref(),
+                    after,
+                    limit,
+                    cap,
+                )
+                .await;
+        }
         let query = RowQuery {
-            filters: select.filters.clone(),
-            sort,
+            filters: stored,
+            sort: match sort {
+                Some(SortTarget::Stored(s)) => Some(s),
+                _ => None,
+            },
             after,
             limit,
         };
@@ -710,35 +803,7 @@ impl Store {
             Ok(b) => b,
             Err(m) => return Ok(RowOutcome::Invalid(m)),
         };
-        let sql = format!(
-            "SELECT {ROW_COLS}{} FROM dataset_row WHERE {}{}",
-            built.sort_cols_sql, built.where_sql, built.page_sql
-        );
-        let mut q = sqlx::query_as::<
-            _,
-            (
-                String,
-                String,
-                i64,
-                String,
-                String,
-                Option<f64>,
-                Option<String>,
-            ),
-        >(&sql);
-        for b in built
-            .sort_cols_binds
-            .iter()
-            .chain(&built.where_binds)
-            .chain(&built.page_binds)
-        {
-            q = match b {
-                query::Bind::Text(s) => q.bind(s),
-                query::Bind::Real(r) => q.bind(*r),
-                query::Bind::Int(i) => q.bind(*i),
-            };
-        }
-        let mut fetched = q.fetch_all(&self.pool).await?;
+        let mut fetched = self.fetch_built(&built).await?;
         let more = fetched.len() as i64 > limit;
         fetched.truncate(limit as usize);
         let next = match (more, fetched.last()) {
@@ -769,6 +834,149 @@ impl Store {
             .map(|r| computed::with_computed(&fields, r, &today, &hidden))
             .collect();
         Ok(RowOutcome::Done(RowPage { rows, total, next }))
+    }
+
+    /// The page of a query that names a computed field in a filter or in the sort: everything
+    /// the SQL cannot know is done here, over the rows the stored filters leave. See
+    /// [`Store::dataset_rows_query`] for the bound and the cursor's stability.
+    #[allow(clippy::too_many_arguments)]
+    async fn computed_page(
+        &self,
+        principal: &Principal,
+        doc_id: &str,
+        fields: &[DatasetField],
+        hidden: &std::collections::HashSet<String>,
+        stored_filters: Vec<Filter>,
+        computed_filters: &[Filter],
+        sort: Option<&SortTarget>,
+        after: Option<Cursor>,
+        limit: i64,
+        cap: usize,
+    ) -> Result<RowOutcome<RowPage>> {
+        let offset = match &after {
+            None => 0usize,
+            Some(Cursor::Offset(n)) => *n,
+            Some(_) => {
+                return Ok(RowOutcome::Invalid(
+                    "the cursor does not belong to this order".into(),
+                ))
+            }
+        };
+        // (1) the stored filters in SQL, bounded by the scan cap — one row more than the cap
+        // is enough to know the set is too large to look at.
+        let query = RowQuery {
+            filters: stored_filters,
+            sort: None,
+            after: None,
+            limit: cap as i64 + 1,
+        };
+        let built = match query.build(doc_id) {
+            Ok(b) => b,
+            Err(m) => return Ok(RowOutcome::Invalid(m)),
+        };
+        let fetched = self.fetch_built(&built).await?;
+        if fetched.len() > cap {
+            return Ok(RowOutcome::Invalid(
+                "too many rows to filter or sort on a computed field".into(),
+            ));
+        }
+        // (2) the same decoration a normal read gives: files, live relation cells, rollups,
+        // formulas — under this caller's hidden set, so a computed value never answers about
+        // something they may not see.
+        let names = self.attachment_names(doc_id, fields).await?;
+        let today = self.today().await?;
+        let mut rows: Vec<DatasetRow> = fetched
+            .into_iter()
+            .map(|t| row_from((t.0, t.1, t.2, t.3, t.4)))
+            .map(|r| links::resolve_files(r, fields, &names))
+            .collect();
+        self.decorate_rows(principal, doc_id, &mut rows).await?;
+        self.with_rollups(principal, doc_id, &mut rows).await?;
+        let rows: Vec<DatasetRow> = rows
+            .into_iter()
+            .map(|r| computed::with_computed(fields, r, &today, hidden))
+            .collect();
+        // (3) the computed filters, over the evaluated cells.
+        let mut kept: Vec<(usize, DatasetRow)> = rows
+            .into_iter()
+            .enumerate()
+            .filter(|(_, r)| computed_filters.iter().all(|f| computed_matches(f, r)))
+            .collect();
+        // (4) the sort. The fetch order (`created_at, id`) gives every row its position, so a
+        // tie breaks on position and then on id: the order is total.
+        if let Some(target) = sort {
+            let desc = target.desc();
+            kept.sort_by(|a, b| {
+                cmp_order(&sort_cell(target, &a.1), &sort_cell(target, &b.1), desc)
+                    .then_with(|| a.0.cmp(&b.0))
+                    .then_with(|| a.1.id.cmp(&b.1.id))
+            });
+        }
+        // (5) the offset window. `total` counts every filter, stored and computed alike.
+        let total = kept.len() as i64;
+        let take = limit as usize;
+        let page_rows: Vec<DatasetRow> = kept
+            .into_iter()
+            .skip(offset)
+            .take(take)
+            .map(|(_, r)| r)
+            .collect();
+        let next = if offset + take < total as usize {
+            Some(Cursor::Offset(offset + take).encode())
+        } else {
+            None
+        };
+        Ok(RowOutcome::Done(RowPage {
+            rows: page_rows,
+            total,
+            next,
+        }))
+    }
+
+    /// The page and its sort columns for one built query, exactly as `query.rs` assembled them.
+    async fn fetch_built(
+        &self,
+        built: &query::Built,
+    ) -> Result<
+        Vec<(
+            String,
+            String,
+            i64,
+            String,
+            String,
+            Option<f64>,
+            Option<String>,
+        )>,
+    > {
+        let sql = format!(
+            "SELECT {ROW_COLS}{} FROM dataset_row WHERE {}{}",
+            built.sort_cols_sql, built.where_sql, built.page_sql
+        );
+        let mut q = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                i64,
+                String,
+                String,
+                Option<f64>,
+                Option<String>,
+            ),
+        >(&sql);
+        for b in built
+            .sort_cols_binds
+            .iter()
+            .chain(&built.where_binds)
+            .chain(&built.page_binds)
+        {
+            q = match b {
+                query::Bind::Text(s) => q.bind(s),
+                query::Bind::Real(r) => q.bind(*r),
+                query::Bind::Int(i) => q.bind(*i),
+            };
+        }
+        Ok(q.fetch_all(&self.pool).await?)
     }
 
     /// Add a row. Needs write. Values are validated against the schema; a dataset holds at
@@ -1032,15 +1240,10 @@ fn link_config_check(kind: FieldKind, config: &Value) -> Option<String> {
 }
 
 /// Whether a stored field's `kind` is a computed one (formula or rollup): evaluated at read,
-/// never written, filtered or sorted.
+/// never written. A filter or sort naming one is answered in memory, not in SQL.
 fn is_computed_kind(kind: &str) -> bool {
     serde_json::from_value::<FieldKind>(Value::String(kind.to_string()))
         .is_ok_and(|k| k.is_computed())
-}
-
-/// The one refusal a computed field gets when it is named in a filter or a sort.
-fn computed_refusal(key: &str) -> String {
-    format!("computed field `{key}` cannot be filtered or sorted yet")
 }
 
 /// The refusal a relation field gets when it is named in a filter or a sort: `no field` when it is
@@ -1052,6 +1255,123 @@ fn relation_refusal(key: &str, hidden: &std::collections::HashSet<String>) -> St
     } else {
         "relation fields cannot be filtered or sorted yet".to_string()
     }
+}
+
+/// The sort of one query: a stored column keyed by its typed `SortKind`, or a computed column
+/// whose value only exists after evaluation and is ordered by what it answers with.
+enum SortTarget {
+    Stored(Sort),
+    Computed { key: FieldKey, desc: bool },
+}
+
+impl SortTarget {
+    fn desc(&self) -> bool {
+        match self {
+            SortTarget::Stored(s) => s.desc,
+            SortTarget::Computed { desc, .. } => *desc,
+        }
+    }
+}
+
+/// A cell's place in a sort. `Last` — absent, null or an error cell — sorts after every value
+/// in either direction, the way the SQL path puts a missing value last however the order runs.
+enum CellOrder {
+    Number(f64),
+    Text(String),
+    Last,
+}
+
+/// The cell one row presents to the sort. A stored `number` column is read as a number and a
+/// cell that is not one is a hole; a computed column is read as it answers — numbers
+/// numerically, anything else as text, error cells and blanks last.
+fn sort_cell(target: &SortTarget, row: &DatasetRow) -> CellOrder {
+    let cell = row.values.get(sort_key(target));
+    let Some(v) = cell.filter(|v| !v.is_null() && !is_error_cell(v)) else {
+        return CellOrder::Last;
+    };
+    match target {
+        SortTarget::Stored(s) if s.kind == SortKind::Number => {
+            v.as_f64().map_or(CellOrder::Last, CellOrder::Number)
+        }
+        _ => match v {
+            Value::Number(_) => v.as_f64().map_or(CellOrder::Last, CellOrder::Number),
+            other => CellOrder::Text(text_of(other)),
+        },
+    }
+}
+
+fn sort_key(target: &SortTarget) -> &str {
+    match target {
+        SortTarget::Stored(s) => s.key.as_str(),
+        SortTarget::Computed { key, .. } => key.as_str(),
+    }
+}
+
+fn cmp_order(a: &CellOrder, b: &CellOrder, desc: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    let o = |ord: std::cmp::Ordering| if desc { ord.reverse() } else { ord };
+    match (a, b) {
+        (CellOrder::Last, CellOrder::Last) => Equal,
+        (CellOrder::Last, _) => Greater,
+        (_, CellOrder::Last) => Less,
+        (CellOrder::Number(x), CellOrder::Number(y)) => {
+            o(x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal))
+        }
+        (CellOrder::Text(x), CellOrder::Text(y)) => o(x.cmp(y)),
+        (CellOrder::Number(_), CellOrder::Text(_)) => o(Less),
+        (CellOrder::Text(_), CellOrder::Number(_)) => o(Greater),
+    }
+}
+
+/// Whether one row's evaluated cells satisfy a filter that named a computed field. Numbers
+/// compare numerically, strings as text; an error cell matches nothing but `is_empty`'s
+/// verdict that it is not empty.
+fn computed_matches(f: &Filter, row: &DatasetRow) -> bool {
+    let cell = row
+        .values
+        .get(f.key().as_str())
+        .filter(|v| !v.is_null() && !is_error_cell(v));
+    match f {
+        Filter::Eq { value, .. } => cell.is_some_and(|c| json_eq(c, value)),
+        Filter::Contains { value, .. } => {
+            cell.is_some_and(|c| text_of(c).to_lowercase().contains(&value.to_lowercase()))
+        }
+        Filter::IsEmpty { .. } => match row.values.get(f.key().as_str()) {
+            None | Some(Value::Null) => true,
+            Some(v) if is_error_cell(v) => false,
+            Some(Value::String(s)) => s.is_empty(),
+            Some(Value::Array(a)) => a.is_empty(),
+            Some(_) => false,
+        },
+        Filter::In { values, .. } => cell.is_some_and(|c| values.iter().any(|w| json_eq(c, w))),
+    }
+}
+
+/// Equality the way a filter asks it: two numbers as numbers, two strings as text, two bools
+/// as themselves; nothing else equals a filter value.
+fn json_eq(cell: &Value, want: &Value) -> bool {
+    match (cell, want) {
+        (Value::Number(a), Value::Number(b)) => {
+            a.as_f64().zip(b.as_f64()).is_some_and(|(x, y)| x == y)
+        }
+        (Value::String(a), Value::String(b)) => a == b,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// A cell's text, as a `contains` or a text sort sees it: a string as written, anything else
+/// as it is written down.
+fn text_of(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Whether a value is the error cell a formula or an unanswerable rollup leaves behind.
+fn is_error_cell(v: &Value) -> bool {
+    v.is_object() && v.get("error").is_some_and(|e| e.is_string())
 }
 
 #[cfg(test)]
@@ -2452,42 +2772,277 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filtering_or_sorting_a_formula_field_is_refused() {
+    async fn a_visible_formula_can_be_filtered_and_sorted() {
         let (store, anna, _, _, path) = row_fixture().await;
         store
-            .add_dataset_field(&anna, &path, &formula_field("a", "{alter} + 1"))
+            .add_dataset_field(&anna, &path, &formula_field("twice", "{alter} * 2"))
             .await
             .unwrap();
-        let want = "computed field `a` cannot be filtered or sorted yet";
-        let filt = store
-            .dataset_rows_query(
+        for alter in [2, 5, 9] {
+            made(&store, &anna, &path, json!({"name": "n", "alter": alter})).await;
+        }
+        // `eq` on the evaluated value.
+        let p = done(
+            select(
+                &store,
                 &anna,
                 &path,
-                &RowSelect {
+                RowSelect {
                     filters: vec![Filter::Eq {
-                        key: k("a"),
-                        value: json!(5),
+                        key: k("twice"),
+                        value: json!(10),
                     }],
-                    limit: 5,
+                    limit: 50,
                     ..Default::default()
                 },
             )
-            .await
-            .unwrap();
-        assert_eq!(filt, RowOutcome::Invalid(want.into()));
-        let srt = store
-            .dataset_rows_query(
+            .await,
+        );
+        // A formula's answer is a number, so it reads `10.0` rather than the stored `10`.
+        assert_eq!((col(&p, "twice"), p.total), (vec!["10.0".into()], 1));
+        // a `gt`-like set through `in`: numeric membership, no text ordering.
+        let p = done(
+            select(
+                &store,
                 &anna,
                 &path,
-                &RowSelect {
-                    sort: Some((k("a"), false)),
-                    limit: 5,
+                RowSelect {
+                    filters: vec![Filter::In {
+                        key: k("twice"),
+                        values: vec![json!(10), json!(18), json!(99)],
+                    }],
+                    limit: 50,
                     ..Default::default()
                 },
             )
+            .await,
+        );
+        assert_eq!(
+            (col(&p, "twice"), p.total),
+            (vec!["10.0".into(), "18.0".into()], 2)
+        );
+        // The sort compares numbers, not the digits: text order would put 4.0 first.
+        let p = done(
+            select(
+                &store,
+                &anna,
+                &path,
+                RowSelect {
+                    sort: Some((k("twice"), true)),
+                    limit: 50,
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+        assert_eq!(col(&p, "twice"), ["18.0", "10.0", "4.0"]);
+        let p = done(
+            select(
+                &store,
+                &anna,
+                &path,
+                RowSelect {
+                    sort: Some((k("twice"), false)),
+                    limit: 50,
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+        assert_eq!(col(&p, "twice"), ["4.0", "10.0", "18.0"]);
+    }
+
+    #[tokio::test]
+    async fn an_error_cell_matches_no_filter_and_is_never_empty() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        store
+            .add_dataset_field(&anna, &path, &plain_field("zero", FieldKind::Number))
             .await
             .unwrap();
-        assert_eq!(srt, RowOutcome::Invalid(want.into()));
+        store
+            .add_dataset_field(&anna, &path, &formula_field("ratio", "1 / {zero}"))
+            .await
+            .unwrap();
+        let ok = made(&store, &anna, &path, json!({"zero": 1})).await;
+        made(&store, &anna, &path, json!({"zero": 0})).await;
+        let p = |f: Filter| {
+            let (store, anna, path) = (&store, &anna, &path);
+            async move {
+                done(
+                    select(
+                        store,
+                        anna,
+                        path,
+                        RowSelect {
+                            filters: vec![f],
+                            limit: 50,
+                            ..Default::default()
+                        },
+                    )
+                    .await,
+                )
+            }
+        };
+        let page = p(Filter::Eq {
+            key: k("ratio"),
+            value: json!(1),
+        })
+        .await;
+        assert_eq!((page.rows.len(), page.total), (1, 1));
+        assert_eq!(page.rows[0].id, ok.id);
+        let page = p(Filter::Contains {
+            key: k("ratio"),
+            value: "ERR".into(),
+        })
+        .await;
+        assert_eq!(
+            (page.rows.len(), page.total),
+            (0, 0),
+            "an error cell holds no text to find"
+        );
+        let page = p(Filter::IsEmpty { key: k("ratio") }).await;
+        assert_eq!(page.total, 0, "an error cell is not empty either");
+        let page = p(Filter::In {
+            key: k("ratio"),
+            values: vec![json!(1), json!(0)],
+        })
+        .await;
+        assert_eq!(page.total, 1, "the error row is neither 1 nor 0");
+    }
+
+    #[tokio::test]
+    async fn a_stored_filter_and_a_computed_sort_combine() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        store
+            .add_dataset_field(&anna, &path, &formula_field("twice", "{alter} * 2"))
+            .await
+            .unwrap();
+        for (name, alter) in [("Ada", 5), ("Bob", 2), ("Ada", 9)] {
+            made(&store, &anna, &path, json!({"name": name, "alter": alter})).await;
+        }
+        let p = done(
+            select(
+                &store,
+                &anna,
+                &path,
+                RowSelect {
+                    filters: vec![Filter::Eq {
+                        key: k("name"),
+                        value: json!("Ada"),
+                    }],
+                    sort: Some((k("twice"), true)),
+                    limit: 50,
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+        // `total` counts every filter, stored and computed alike; the order is the computed one.
+        assert_eq!(
+            (col(&p, "twice"), p.total),
+            (vec!["18.0".into(), "10.0".into()], 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_offset_cursor_pages_a_computed_query_without_repeats_or_gaps() {
+        use super::Cursor;
+        let (store, anna, _, _, path) = row_fixture().await;
+        store
+            .add_dataset_field(&anna, &path, &formula_field("twice", "{alter} * 2"))
+            .await
+            .unwrap();
+        for alter in 1..=7i64 {
+            made(&store, &anna, &path, json!({"alter": alter})).await;
+        }
+        let mut seen: Vec<String> = Vec::new();
+        let mut after: Option<String> = None;
+        let mut first = true;
+        loop {
+            let p = done(
+                select(
+                    &store,
+                    &anna,
+                    &path,
+                    RowSelect {
+                        sort: Some((k("twice"), true)),
+                        limit: 3,
+                        after: after.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await,
+            );
+            assert_eq!(p.total, 7, "every page counts every matching row");
+            seen.extend(p.rows.iter().map(|r| r.id.clone()));
+            match p.next {
+                Some(n) => {
+                    if first {
+                        // The computed path hands out an offset cursor, not a keyset one.
+                        assert!(matches!(Cursor::decode(&n).unwrap(), Cursor::Offset(3)));
+                        first = false;
+                    }
+                    after = Some(n);
+                }
+                None => break,
+            }
+        }
+        let unique: std::collections::HashSet<_> = seen.iter().collect();
+        assert_eq!(unique.len(), 7, "repeats or gaps across pages: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_computed_query_refuses_when_the_stored_match_outgrows_the_scan_cap() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        store
+            .add_dataset_field(&anna, &path, &formula_field("twice", "{alter} * 2"))
+            .await
+            .unwrap();
+        for alter in [1, 2, 3] {
+            made(&store, &anna, &path, json!({"alter": alter})).await;
+        }
+        let sel = RowSelect {
+            sort: Some((k("twice"), false)),
+            limit: 50,
+            ..Default::default()
+        };
+        // The cap is `MAX_ROWS` for every real call; the seam lets a test reach the bound
+        // without planting fifty thousand rows.
+        let out = store.rows_query(&anna, &path, &sel, 2).await.unwrap();
+        assert_eq!(
+            out,
+            RowOutcome::Invalid("too many rows to filter or sort on a computed field".into())
+        );
+        let out = store.rows_query(&anna, &path, &sel, 3).await.unwrap();
+        assert!(matches!(out, RowOutcome::Done(_)), "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn a_keyset_cursor_is_refused_by_a_computed_query() {
+        use super::Cursor;
+        let (store, anna, _, _, path) = row_fixture().await;
+        store
+            .add_dataset_field(&anna, &path, &formula_field("twice", "{alter} * 2"))
+            .await
+            .unwrap();
+        made(&store, &anna, &path, json!({"alter": 2})).await;
+        // A keyset cursor from a stored-sort page does not belong to the computed path.
+        let out = select(
+            &store,
+            &anna,
+            &path,
+            RowSelect {
+                sort: Some((k("twice"), false)),
+                after: Some(Cursor::of(Some(1.0), None, "row".into()).encode()),
+                limit: 5,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            out,
+            RowOutcome::Invalid("the cursor does not belong to this order".into())
+        );
     }
 
     #[tokio::test]
@@ -3050,6 +3605,81 @@ mod tests {
                 .unwrap();
             assert_eq!(out, SchemaOutcome::Invalid(want), "target {path}");
         }
+    }
+
+    /// A visible `relation` column also names its target by the target page's **current path**
+    /// (`config.target_path`), looked up when the schema is serialised and never stored: the stored
+    /// id is the binding, the path is what a picker needs. A move shows the new path; a trashed
+    /// target hides the whole column, path and all, exactly as an unreadable one does — and a caller
+    /// who never could read it gets no column either.
+    #[tokio::test]
+    async fn a_visible_relation_names_its_target_by_the_path_it_has_now() {
+        let (store, anna, bea, source, target) = relation_fixture().await;
+        store
+            .add_dataset_field(&anna, &source, &relation_field("mit", &target, false))
+            .await
+            .unwrap();
+        async fn mit(store: &Store, who: &Principal, source: &str) -> Option<serde_json::Value> {
+            let SchemaOutcome::Done(fs) = store.dataset_fields(who, source).await.unwrap() else {
+                panic!("no schema")
+            };
+            fs.into_iter().find(|f| f.key == "mit").map(|f| f.config)
+        }
+        let cfg = mit(&store, &anna, &source)
+            .await
+            .expect("anna sees the column");
+        assert_eq!(
+            cfg["target_path"],
+            json!(target),
+            "the caller is told where the target lives"
+        );
+        assert!(
+            cfg.get("target").is_none(),
+            "the path they typed is not stored"
+        );
+        // Nothing of it lands in storage: the config keeps the id alone.
+        let stored: String =
+            sqlx::query_scalar("SELECT config FROM dataset_field WHERE key = 'mit'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert!(
+            !stored.contains("target_path"),
+            "the current path was persisted: {stored}"
+        );
+        // bea may not read the target, so she is not shown the column or its address.
+        assert!(
+            mit(&store, &bea, &source).await.is_none(),
+            "a hidden column names nothing"
+        );
+        // A move: the binding does not change, the answer does.
+        let doc = doc_id_of(&store, &target).await;
+        sqlx::query("UPDATE documents SET path = ? WHERE id = ?")
+            .bind("/geheim/anderer-ort")
+            .bind(&doc)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            mit(&store, &anna, &source).await.unwrap()["target_path"],
+            json!("/geheim/anderer-ort"),
+            "the schema follows the page"
+        );
+        assert_eq!(
+            doc_id_of(&store, "/geheim/anderer-ort").await,
+            doc,
+            "still the same target, bound by id"
+        );
+        // A trashed target is not readable, so the column is gone for its owner too — no path, and
+        // no half-answer that says "there is a target here somewhere".
+        store
+            .trash_document(&anna, "/geheim/anderer-ort")
+            .await
+            .unwrap();
+        assert!(
+            mit(&store, &anna, &source).await.is_none(),
+            "a trashed target hides its column"
+        );
     }
 
     #[tokio::test]
@@ -3776,15 +4406,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filtering_or_sorting_a_rollup_is_refused_as_a_computed_field() {
+    async fn filtering_or_sorting_a_rollup_answers_in_memory_and_a_hidden_one_is_no_field() {
         let (store, anna, bea, source, target) = relation_fixture().await;
         rollup_fixture(&store, &anna, &source, &target).await;
-        let want = "computed field `n` cannot be filtered or sorted yet";
+        let a = valued_row(&store, &target, json!({"amount": 4})).await;
+        let b = valued_row(&store, &target, json!({"amount": 6})).await;
+        let one = made(&store, &anna, &source, json!({"mit": [a.clone()]})).await;
+        let two = made(&store, &anna, &source, json!({"mit": [a, b.clone()]})).await;
+        made(&store, &anna, &source, json!({"mit": []})).await;
+        let p = done(
+            select(
+                &store,
+                &anna,
+                &source,
+                RowSelect {
+                    filters: vec![Filter::Eq {
+                        key: k("n"),
+                        value: json!(2),
+                    }],
+                    limit: 50,
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+        assert_eq!(
+            (p.rows.len(), p.total),
+            (1, 1),
+            "the `count` filter answered"
+        );
+        assert_eq!(p.rows[0].id, two.id);
+        let p = done(
+            select(
+                &store,
+                &anna,
+                &source,
+                RowSelect {
+                    sort: Some((k("n"), true)),
+                    limit: 50,
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+        assert_eq!(col(&p, "n"), ["2", "1", "0"]);
+        assert_eq!(p.rows[1].id, one.id);
+        // Hidden from bea, the same keys are refused as `no field` — in the exact words a key
+        // that does not exist gets, and never by evaluating anything for her.
+        let ghost = select(
+            &store,
+            &bea,
+            &source,
+            RowSelect {
+                filters: vec![Filter::Eq {
+                    key: k("gibtsnicht"),
+                    value: json!(1),
+                }],
+                limit: 5,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(ghost, RowOutcome::Invalid("no field `gibtsnicht`".into()));
         for which in [
             RowSelect {
                 filters: vec![Filter::Eq {
                     key: k("n"),
-                    value: json!(3),
+                    value: json!(1),
                 }],
                 limit: 5,
                 ..Default::default()
@@ -3795,11 +4483,6 @@ mod tests {
                 ..Default::default()
             },
         ] {
-            assert_eq!(
-                select(&store, &anna, &source, which.clone()).await,
-                RowOutcome::Invalid(want.into())
-            );
-            // Hidden, it is refused as the field it is not: the same words as a made-up key.
             assert_eq!(
                 select(&store, &bea, &source, which).await,
                 RowOutcome::Invalid("no field `n`".into())
@@ -3812,7 +4495,8 @@ mod tests {
     /// that rollup, or a formula over a formula over that relation. Naming any of them in a filter
     /// or a sort is refused in the exact words used for a key that does not exist, they are absent
     /// from the schema, and they leave no value in the row. The owner, who can read the target, sees
-    /// all of them and keeps the honest "not yet" refusals; a visible formula still computes.
+    /// all of them: a visible formula or rollup answers a filter from memory, and only a visible
+    /// relation keeps its "not yet" refusal.
     #[tokio::test]
     async fn a_hidden_relation_rollup_or_formula_is_named_as_no_field_everywhere() {
         let (store, anna, bea, source, target) = relation_fixture().await;
@@ -3914,7 +4598,8 @@ mod tests {
             Some(42.0)
         );
 
-        // anna reads the target, so she sees every one of them and keeps her "not yet" refusals.
+        // anna reads the target, so she sees every one of them: the relation keeps its "not yet"
+        // refusal, the formulas and rollups answer from memory.
         let ka = keys(&store, &anna, &source).await;
         for key in ["mit", "n", "over_n", "over_mit", "over_over", "twice"] {
             assert!(has(&ka, key), "`{key}` absent from anna's schema: {ka:?}");
@@ -3941,7 +4626,7 @@ mod tests {
             RowOutcome::Invalid("relation fields cannot be filtered or sorted yet".into()),
             "a visible relation keeps its not-yet refusal for the owner"
         );
-        assert_eq!(
+        let page = done(
             select(
                 &store,
                 &anna,
@@ -3949,15 +4634,21 @@ mod tests {
                 RowSelect {
                     filters: vec![Filter::Eq {
                         key: k("over_n"),
-                        value: json!(1)
+                        value: json!(2),
                     }],
                     limit: 5,
                     ..Default::default()
-                }
+                },
             )
             .await,
-            RowOutcome::Invalid("computed field `over_n` cannot be filtered or sorted yet".into()),
-            "a visible formula keeps its not-yet refusal for the owner"
+        );
+        assert_eq!(
+            (
+                page.total,
+                page.rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>()
+            ),
+            (1, vec![r.id.clone()]),
+            "a visible formula answers in memory for the owner: `n` counts 1, so over_n is 2"
         );
     }
 }
