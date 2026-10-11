@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { Block, EmbeddedPage, Mark, Reference } from '$lib/blocks/render';
   import { slugify } from '$lib/slug';
-  import { codeText, embeddedPage, placedFile, plainText, safeHref } from '$lib/blocks/render';
+  import { codeText, datasetView, embeddedPage, placedFile, plainText, safeHref } from '$lib/blocks/render';
   import { alignOf } from '$lib/blocks/table';
   import {
     attachmentNamed,
@@ -421,6 +421,26 @@
       </figure>
     {/if}
   {/if}
+{:else if block.kind === 'dataset-view'}
+  <!-- A live view of a saved view of a dataset (M8 D1). FRAME ONLY, and that is the whole
+       of what this component may draw: the rows belong to the dataset, are fetched with the
+       reader's own permission when somebody asks for them, and belong to no page quoting
+       them. The editor fetches nothing here (D2 wires the data); drawing a title, a count or
+       a name from the stored ids would be this interface making statements about a page the
+       reader may not read — and ADR 0022's rule is that what they may not read looks
+       identical to what is absent.
+
+       `data-dataset-doc`/`data-view` carry the ids, and that is deliberate on `data-doc`'s
+       and `data-einbettung`'s argument: they are in the page's own data either way, they
+       are neither an address nor a name, and they are what a browser check finds the frame
+       by. A malformed block that names no view draws nothing, as elsewhere. -->
+  {@const ansicht = datasetView(block)}
+  {#if ansicht}
+    <figure class="datensatz" data-dataset-doc={ansicht.datasetDoc} data-view={ansicht.view}>
+      {#if ansicht.label !== ''}<figcaption class="datensatz-kopf">{ansicht.label}</figcaption>{/if}
+      <p class="datensatz-hinweis">Datenansicht wird geladen …</p>
+    </figure>
+  {/if}
 {:else if block.kind === 'text'}
   {@render marked(block.text ?? '', block.marks ?? [])}
 {/if}
@@ -611,6 +631,32 @@
   }
 
   .einbettung-wort {
+    margin: 0;
+    color: var(--ink-muted);
+    font-size: var(--text-sm);
+  }
+
+  /* The dataset-view frame (M8 D1), shaped like `.einbettung` because it is the same kind
+     of thing: a framed reference to content that lives elsewhere and arrives by its own
+     permission. Tokens throughout, so a theme repaints both together. */
+  .datensatz {
+    margin-block: var(--space-4);
+    padding: var(--space-3) var(--space-4);
+    border: 1px solid var(--border);
+    border-inline-start: 3px solid var(--accent);
+    border-radius: var(--radius-sm);
+    background: var(--bg-raised);
+  }
+
+  .datensatz-kopf {
+    margin: 0 0 var(--space-2);
+    color: var(--ink-muted);
+    font-size: var(--text-sm);
+  }
+
+  /* The neutral loading line. Muted and small, because a frame whose data has not arrived
+     is a normal moment on a page, not an error to look at. */
+  .datensatz-hinweis {
     margin: 0;
     color: var(--ink-muted);
     font-size: var(--text-sm);

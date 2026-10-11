@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   codeText,
+  datasetView,
   embedKey,
   embeddedPage,
   outline,
@@ -168,6 +169,85 @@ describe('placedFile', () => {
       attrs: { filename: 'a.png', alt: 'x', href: '/api/attachment/a.png/seite', sha256: 'ab'.repeat(32) }
     });
     expect(Object.keys(placed ?? {}).sort()).toEqual(['alt', 'filename']);
+  });
+});
+
+describe('datasetView', () => {
+  // A live view of a saved view of a dataset (M8 D1). An atom like `attachment` and
+  // `embed`: its whole meaning is the three attributes, and what the view SHOWS is a
+  // permission answer the reader's frame never carries. So this returns ids and the
+  // author's label, and nothing that could be fetched, titled or counted.
+  const DATEN = '0199c0de-0000-7000-8000-000000000003';
+  const ANSICHT = '0199c0de-0000-7000-8000-00000000000d';
+
+  it('reads the dataset, the view and the label the block carries', () => {
+    expect(
+      datasetView({
+        kind: 'dataset-view',
+        attrs: { dataset_doc: DATEN, view: ANSICHT, label: 'Gewichtsverlauf' }
+      })
+    ).toEqual({ datasetDoc: DATEN, view: ANSICHT, label: 'Gewichtsverlauf' });
+  });
+
+  it('reads an empty label as empty rather than as missing', () => {
+    // The importer writes `label` even when it is empty, so the two sides have to agree —
+    // `embeddedPage`'s reason for the same attribute, verbatim.
+    expect(
+      datasetView({ kind: 'dataset-view', attrs: { dataset_doc: DATEN, view: ANSICHT, label: '' } })
+    ).toEqual({ datasetDoc: DATEN, view: ANSICHT, label: '' });
+    expect(
+      datasetView({ kind: 'dataset-view', attrs: { dataset_doc: DATEN, view: ANSICHT } })?.label
+    ).toBe('');
+  });
+
+  it('names no view rather than a partial one when the block does not say', () => {
+    // Both ids are required on the wire — `gw_core::markdown::dataset_view_reference`
+    // refuses a destination with either missing — so a block without them is malformed and
+    // the renderer draws nothing for it, exactly as a placement without a filename does.
+    for (const attrs of [
+      undefined,
+      {},
+      { dataset_doc: DATEN },
+      { view: ANSICHT },
+      { dataset_doc: '', view: ANSICHT },
+      { dataset_doc: DATEN, view: '' },
+      { dataset_doc: 7, view: ANSICHT }
+    ]) {
+      expect(datasetView({ kind: 'dataset-view', attrs }), JSON.stringify(attrs)).toBeNull();
+    }
+  });
+
+  it('carries no title, no count and no address of any kind', () => {
+    // Pins the SHAPE for ADR 0022's reason: what a reader who may not read the dataset
+    // sees must be indistinguishable from what a page without the block shows. A title or
+    // a row count read out of the ids here would be a disclosure made by the interface
+    // that only ever holds the ids themselves.
+    const ref = datasetView({
+      kind: 'dataset-view',
+      attrs: { dataset_doc: DATEN, view: ANSICHT, label: 'x', title: 'Blutwerte', count: 27 }
+    });
+    expect(Object.keys(ref ?? {}).sort()).toEqual(['datasetDoc', 'label', 'view']);
+  });
+
+  it('contributes nothing to plain text, and keeps the order around it', () => {
+    // The byte-for-byte contract with `Block::plain_text`: an atom's attributes never reach
+    // the outline, the anchor ids or the search index. A paragraph before and after must
+    // come out in document order with the ids nowhere in it.
+    const gemischt: Block = {
+      kind: 'doc',
+      content: [
+        { kind: 'paragraph', content: [{ kind: 'text', text: 'Der Verlauf:' }] },
+        {
+          kind: 'dataset-view',
+          attrs: { dataset_doc: DATEN, view: ANSICHT, label: 'Gewichtsverlauf' }
+        },
+        { kind: 'paragraph', content: [{ kind: 'text', text: 'Danach stabil.' }] }
+      ]
+    };
+    expect(plainText(gemischt)).toBe('Der Verlauf: Danach stabil.');
+    expect(plainText(gemischt)).not.toContain(DATEN);
+    expect(plainText(gemischt)).not.toContain(ANSICHT);
+    expect(plainText(gemischt)).not.toContain('Gewichtsverlauf');
   });
 });
 

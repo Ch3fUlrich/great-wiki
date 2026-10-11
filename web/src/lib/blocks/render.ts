@@ -249,6 +249,42 @@ export function placedFile(block: Block): PlacedFile | null {
   return { filename, alt: typeof alt === 'string' ? alt : '' };
 }
 
+/** What a `dataset-view` block says: which dataset page, and which saved view of it. */
+export interface DatasetViewRef {
+  /** The dataset page's document id. Never an address and never a title. */
+  datasetDoc: string;
+  /** The saved view's `dataset_view.id`. */
+  view: string;
+  /** The author's own words. May be empty. */
+  label: string;
+}
+
+/**
+ * The view a `dataset-view` block names, or `null` for a block that names none.
+ *
+ * Both ids are required, because both are always present on the wire:
+ * `gw_core::markdown::dataset_view_reference` refuses a destination with either missing or
+ * not uuid-shaped, so a block the importer agreed to is a block this can read. `null` for a
+ * malformed one rather than a guess, and the renderer draws nothing for it.
+ *
+ * **What this deliberately does not carry**: the dataset's title, a row count, anything
+ * fetched. Those are statements about a page this reader may not be allowed to read, and
+ * ADR 0022's rule is that what they may not read looks identical to what is absent — which
+ * an interface holding only ids makes possible and an interface that resolved a name into
+ * the markup would not.
+ */
+export function datasetView(block: Block): DatasetViewRef | null {
+  const attr = (key: string) => {
+    const value = block.attrs?.[key];
+    return typeof value === 'string' && value !== '' ? value : null;
+  };
+  const datasetDoc = attr('dataset_doc');
+  const view = attr('view');
+  if (datasetDoc === null || view === null) return null;
+  const label = block.attrs?.label;
+  return { datasetDoc, view, label: typeof label === 'string' ? label : '' };
+}
+
 // A byte-for-byte mirror of `Block::plain_text` in crates/gw-core/src/block.rs, down to
 // the rule about where a space goes. A BLOCK boundary is written as a space, or the last
 // word of one block fuses to the first of the next ("MaßEin"). Adjacent inline text leaves

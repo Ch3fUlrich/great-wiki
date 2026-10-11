@@ -973,3 +973,69 @@ describe('an embedded page', () => {
     expect(out).toContain('data-einbettung="javascript:alert(1)"');
   });
 });
+
+describe('a dataset view', () => {
+  // The reader of a page quoting a dataset sees a FRAME and nothing else until D2 wires the
+  // data: the rows belong to the dataset page and arrive by their own permission, so what a
+  // reader who may not read them sees must be indistinguishable from what is absent
+  // (ADR 0022). No title, no count, no dataset name — and no fetch, right up to D2.
+  const DATEN = '0199c0de-0000-7000-8000-000000000003';
+  const ANSICHT = '0199c0de-0000-7000-8000-00000000000d';
+
+  /** A dataset view block naming `DATEN`/`ANSICHT` with the author's `label`. */
+  function datensatz(label: string): Block {
+    return { kind: 'dataset-view', attrs: { dataset_doc: DATEN, view: ANSICHT, label } };
+  }
+
+  it('draws the frame with the author\'s label as caption', () => {
+    const out = html(datensatz('Gewichtsverlauf'));
+    expect(out).toContain('<figure');
+    expect(out).toContain('class="datensatz');
+    expect(out).toContain('<figcaption');
+    expect(out).toContain('Gewichtsverlauf');
+    expect(out).toContain('Datenansicht wird geladen …');
+  });
+
+  it('draws the frame without a caption when the label is empty', () => {
+    // `label: ""` is what the importer writes for an unlabelled view; the frame stays —
+    // the block exists and its data may simply have no author's words on it.
+    const out = html(datensatz(''));
+    expect(out).toContain('class="datensatz');
+    expect(out).toContain('Datenansicht wird geladen …');
+    expect(out).not.toContain('<figcaption');
+  });
+
+  it('carries the two ids as data attributes and no address of any kind', () => {
+    // `data-einbettung`'s argument, unchanged: the ids are in the page's own data either
+    // way, are neither an address nor a name, and are what a browser check finds the frame
+    // by. `src=`/`href=` are asked for so that the frame cannot quietly grow a fetch.
+    const out = html(datensatz('x'));
+    expect(out).toContain(`data-dataset-doc="${DATEN}"`);
+    expect(out).toContain(`data-view="${ANSICHT}"`);
+    expect(out).not.toContain('src=');
+    expect(out).not.toContain('href=');
+    expect(out).not.toContain('<img');
+  });
+
+  it('never shows the dataset or the view id in the visible text', () => {
+    // The ids are database identity; the words a reader sees are the author's label and one
+    // neutral line. Stripping the tags is what tells the two apart here — the attributes
+    // legitimately carry the ids, the text may never repeat them.
+    const visible = html(datensatz('Gewichtsverlauf'))
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/\s+/g, ' ');
+    expect(visible).not.toContain(DATEN);
+    expect(visible).not.toContain(ANSICHT);
+    expect(visible).toContain('Gewichtsverlauf');
+    expect(visible).toContain('Datenansicht wird geladen …');
+  });
+
+  it('draws nothing for a block that names no view', () => {
+    // The `datasetView` accessor returns null for a malformed block and the branch falls
+    // through, exactly as a placement without a filename does: inventing an empty frame
+    // would be this interface drawing a statement the data model never made.
+    for (const attrs of [undefined, {}, { dataset_doc: DATEN }, { view: ANSICHT }]) {
+      expect(html({ kind: 'dataset-view', attrs }).trim(), JSON.stringify(attrs)).toBe('');
+    }
+  });
+});
