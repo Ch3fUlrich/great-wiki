@@ -57,6 +57,31 @@ struct ViewSort {
     desc: bool,
 }
 
+/// Config of a `board` view (ADR 0029): the select column its lanes group by, which fields
+/// the cards show, and which rows reach the board. Unknown members are refused, like tables.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoardConfig {
+    group_by: FieldKey,
+    #[serde(default)]
+    card_fields: Vec<FieldKey>,
+    #[serde(default)]
+    filters: Vec<Filter>,
+    sort: Option<ViewSort>,
+}
+
+impl BoardConfig {
+    /// Every field key the config names. Keys arrive through `FieldKey`, so a hostile string
+    /// never reaches this list unparsed.
+    fn keys(&self) -> Vec<String> {
+        let mut out: Vec<String> = vec![self.group_by.as_str().to_string()];
+        out.extend(self.card_fields.iter().map(|k| k.as_str().to_string()));
+        out.extend(self.sort.iter().map(|s| s.key.as_str().to_string()));
+        out.extend(self.filters.iter().map(|f| f.key().as_str().to_string()));
+        out
+    }
+}
+
 impl TableConfig {
     /// Every field key the config names, validated: widths are keyed by plain strings (a
     /// JSON object), so they pass through `FieldKey::parse` here.
@@ -76,18 +101,32 @@ impl TableConfig {
 }
 
 /// Check `config` for `kind` against the fields `known` — the dataset's keys this caller may
-/// see, by kind. M8a has the table view only; the other kinds are in the schema's CHECK for
-/// later milestones and refused until then. `group_by` has a rule of its own: it groups rows
-/// under a head, and only a stored column can head a group — a formula or rollup is evaluated
-/// per row, not enumerable, and a relation is not groupable yet.
+/// see, by kind. Table and board are available (ADR 0029); the other kinds are in the schema's
+/// CHECK for later milestones and refused until then. `group_by` has a rule of its own: in a
+/// table it groups rows under a head, and only a stored column can head a group — a formula or
+/// rollup is evaluated per row, not enumerable, and a relation is not groupable yet; in a board
+/// it names the lanes and must be a select field.
 fn validate(kind: &str, config: &Value, known: &HashMap<String, String>) -> Result<(), String> {
-    if kind != "table" {
+    if kind != "table" && kind != "board" {
         return Err(format!("the view kind {kind:?} is not available"));
     }
     if config.to_string().len() > MAX_VIEW_CONFIG_BYTES {
         return Err(format!(
             "a view config is at most {MAX_VIEW_CONFIG_BYTES} bytes"
         ));
+    }
+    if kind == "board" {
+        let parsed: BoardConfig = serde_json::from_value(config.clone())
+            .map_err(|e| format!("not a valid board view config: {e}"))?;
+        for key in parsed.keys() {
+            if !known.contains_key(&key) {
+                return Err(format!("the dataset has no field {key:?}"));
+            }
+        }
+        if known[parsed.group_by.as_str()] != FieldKind::Select.as_str() {
+            return Err("group_by must be a select field of the dataset".into());
+        }
+        return Ok(());
     }
     let parsed: TableConfig = serde_json::from_value(config.clone())
         .map_err(|e| format!("not a valid table view config: {e}"))?;
@@ -108,15 +147,20 @@ fn validate(kind: &str, config: &Value, known: &HashMap<String, String>) -> Resu
     Ok(())
 }
 
-/// Drop everything in a table config that names a field outside `visible`: the column, a
-/// width, and a sort, filter or grouping on it (filtering a hidden field is refused, not
-/// ignored, so a saved one cannot survive for a caller who may not see the field).
+/// Drop everything in a saved config that names a field outside `visible`: the columns (a
+/// board's `card_fields` included), a width, and a sort, filter or grouping on it (filtering
+/// a hidden field is refused, not ignored, so a saved one cannot survive for a caller who may
+/// not see the field). A board whose `group_by` is stripped is left without it; that is fine,
+/// because a select field cannot be hidden — only relation and computed ones can.
 pub(crate) fn strip_hidden(config: &mut Value, visible: &HashSet<String>) {
     let shown = |v: &Value| v.as_str().is_some_and(|k| visible.contains(k));
     let Some(obj) = config.as_object_mut() else {
         return;
     };
     if let Some(Value::Array(fields)) = obj.get_mut("fields") {
+        fields.retain(shown);
+    }
+    if let Some(Value::Array(fields)) = obj.get_mut("card_fields") {
         fields.retain(shown);
     }
     if let Some(Value::Object(widths)) = obj.get_mut("widths") {
@@ -400,6 +444,22 @@ mod tests {
             };
             store.add_dataset_field(&anna, &path, &f).await.unwrap();
         }
+        store
+            .add_dataset_field(
+                &anna,
+                &path,
+                &NewField {
+                    key: "status".into(),
+                    label: "Status".into(),
+                    kind: FieldKind::Select,
+                    config: json!({"options": [
+                        {"id": "offen", "label": "Offen"},
+                        {"id": "fertig", "label": "Fertig"}
+                    ]}),
+                },
+            )
+            .await
+            .unwrap();
         (store, anna, bea, cleo, path)
     }
 
@@ -894,5 +954,188 @@ mod tests {
         );
         assert_eq!(c["filters"][0]["key"], json!("name"));
         assert_eq!(c["widths"], json!({"name": 200}));
+    }
+
+    fn board() -> serde_json::Value {
+        json!({"group_by": "status", "card_fields": ["name", "alter"],
+               "filters": [{"op": "is_empty", "key": "name"}],
+               "sort": {"key": "alter", "desc": true}})
+    }
+
+    async fn made_board(store: &Store, who: &Principal, path: &str) -> DatasetView {
+        match store
+            .create_dataset_view(who, path, "Brett", "board", &board())
+            .await
+            .unwrap()
+        {
+            SchemaOutcome::Done(v) => v,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_writer_creates_lists_updates_and_deletes_a_board_view() {
+        let (store, anna, bea, _, path) = fixture().await;
+        let v = made_board(&store, &anna, &path).await;
+        assert_eq!((v.name.as_str(), v.kind.as_str()), ("Brett", "board"));
+        assert_eq!(v.config["group_by"], json!("status"));
+        let SchemaOutcome::Done(list) = store.dataset_views(&bea, &path).await.unwrap() else {
+            panic!("reader lists")
+        };
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].config["card_fields"], json!(["name", "alter"]));
+        let out = store
+            .update_dataset_view(
+                &anna,
+                &path,
+                &v.id,
+                Some("Neu"),
+                Some(&json!({"group_by": "status"})),
+            )
+            .await
+            .unwrap();
+        let SchemaOutcome::Done(u) = out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(u.name, "Neu");
+        assert_eq!(u.config, json!({"group_by": "status"}));
+        assert_eq!(
+            store
+                .delete_dataset_view(&anna, &path, &v.id)
+                .await
+                .unwrap(),
+            SchemaOutcome::Done(())
+        );
+        assert_eq!(
+            store
+                .delete_dataset_view(&anna, &path, &v.id)
+                .await
+                .unwrap(),
+            SchemaOutcome::NoField
+        );
+    }
+
+    #[tokio::test]
+    async fn a_board_groups_only_under_a_select_field() {
+        let (store, anna, _, _, path) = fixture().await;
+        for key in ["name", "alter"] {
+            assert_eq!(
+                store
+                    .create_dataset_view(&anna, &path, "X", "board", &json!({"group_by": key}))
+                    .await
+                    .unwrap(),
+                SchemaOutcome::Invalid("group_by must be a select field of the dataset".into()),
+                "{key}"
+            );
+        }
+        // group_by is required: a board without one is not a board config.
+        let out = store
+            .create_dataset_view(
+                &anna,
+                &path,
+                "X",
+                "board",
+                &json!({"card_fields": ["name"]}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&out, SchemaOutcome::Invalid(m) if m.contains("not a valid board view config")),
+            "{out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_board_naming_a_missing_field_a_hostile_key_or_an_unknown_member_is_refused() {
+        let (store, anna, _, _, path) = fixture().await;
+        for key in ["gibtsnicht", "a') OR 1=1 --"] {
+            let want = if key == "gibtsnicht" {
+                format!("the dataset has no field {key:?}")
+            } else {
+                String::new()
+            };
+            for cfg in [
+                json!({"group_by": key}),
+                json!({"group_by": "status", "card_fields": [key]}),
+                json!({"group_by": "status", "filters": [{"op": "is_empty", "key": key}]}),
+                json!({"group_by": "status", "sort": {"key": key}}),
+            ] {
+                let out = store
+                    .create_dataset_view(&anna, &path, "X", "board", &cfg)
+                    .await
+                    .unwrap();
+                if want.is_empty() {
+                    assert!(matches!(out, SchemaOutcome::Invalid(_)), "{cfg}: {out:?}");
+                } else {
+                    assert_eq!(out, SchemaOutcome::Invalid(want.clone()), "{cfg}");
+                }
+            }
+        }
+        for cfg in [
+            json!({"group_by": "status", "bogerig": true}),
+            json!({"fields": ["name"]}),
+            json!([1]),
+        ] {
+            let out = store
+                .create_dataset_view(&anna, &path, "X", "board", &cfg)
+                .await
+                .unwrap();
+            assert!(matches!(out, SchemaOutcome::Invalid(_)), "{cfg}: {out:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn board_writes_need_write_and_a_stranger_gets_nodataset() {
+        let (store, anna, bea, cleo, path) = fixture().await;
+        made_board(&store, &anna, &path).await;
+        let cfg = board();
+        assert_eq!(
+            store
+                .create_dataset_view(&bea, &path, "X", "board", &cfg)
+                .await
+                .unwrap(),
+            SchemaOutcome::ReadOnly
+        );
+        assert_eq!(
+            store
+                .create_dataset_view(&cleo, &path, "X", "board", &cfg)
+                .await
+                .unwrap(),
+            SchemaOutcome::NoDataset
+        );
+        assert_eq!(
+            store.dataset_views(&cleo, &path).await.unwrap(),
+            SchemaOutcome::NoDataset
+        );
+    }
+
+    #[tokio::test]
+    async fn kinds_outside_table_and_board_are_still_refused() {
+        let (store, anna, _, _, path) = fixture().await;
+        for kind in ["calendar", "gantt", "nonsense"] {
+            assert_eq!(
+                store
+                    .create_dataset_view(&anna, &path, "X", kind, &json!({"group_by": "status"}))
+                    .await
+                    .unwrap(),
+                SchemaOutcome::Invalid(format!("the view kind {kind:?} is not available")),
+                "{kind}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_strips_hidden_card_fields_from_a_board_config() {
+        let (_, _, _, _, _) = fixture().await;
+        let mut cfg = board();
+        let visible: HashSet<String> = ["name".to_string(), "status".to_string()].into();
+        strip_hidden(&mut cfg, &visible);
+        assert_eq!(cfg["card_fields"], json!(["name"]));
+        assert!(
+            cfg.get("sort").is_none(),
+            "a sort on a hidden field is dropped: {cfg}"
+        );
+        assert_eq!(cfg["filters"].as_array().unwrap().len(), 1);
+        assert_eq!(cfg["group_by"], json!("status"));
     }
 }

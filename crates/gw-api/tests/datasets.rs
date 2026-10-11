@@ -861,3 +861,35 @@ async fn a_view_naming_a_missing_field_or_a_hostile_key_is_a_400() {
     let (_, ids, _) = view_ids(&store, "schreiber").await;
     assert!(ids.is_empty());
 }
+
+#[tokio::test]
+async fn a_board_view_is_saved_and_a_bad_group_by_is_a_400() {
+    let store = with_columns().await;
+    let (s, b) = send(
+        &store,
+        Some("schreiber"),
+        "POST",
+        SCHEMA,
+        Some(json!({"key": "status", "label": "Status", "kind": "select",
+                    "config": {"options": [{"id": "offen", "label": "Offen"},
+                                           {"id": "fertig", "label": "Fertig"}]}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let body = json!({"name": "Brett", "kind": "board",
+                      "config": {"group_by": "status", "card_fields": ["name"]}});
+    let (s, b) = send(&store, Some("schreiber"), "POST", VIEWS, Some(body)).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    assert!(b.contains("\"board\""), "{b}");
+    for cfg in [
+        json!({"group_by": "name"}),
+        json!({"group_by": "gibtsnicht"}),
+        json!({"card_fields": ["name"]}),
+    ] {
+        let body = json!({"name": "Falsch", "kind": "board", "config": cfg});
+        let (s, b) = send(&store, Some("schreiber"), "POST", VIEWS, Some(body)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{cfg}: {b}");
+    }
+    let (_, ids, _) = view_ids(&store, "schreiber").await;
+    assert_eq!(ids.len(), 1, "the refused boards changed nothing");
+}
