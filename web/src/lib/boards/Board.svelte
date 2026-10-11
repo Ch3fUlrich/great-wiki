@@ -13,7 +13,10 @@
     card: cardSnippet,
     actions,
     columnHead,
-    empty
+    empty,
+    cardAttrs,
+    columnAttrs,
+    emptyColumn
   }: {
     source: RowSource;
     hooks?: { onMoved?(c: BoardCard): void; onStale?(cur: BoardCard | null): void };
@@ -21,6 +24,9 @@
     actions?: Snippet<[BoardCard, BoardColumn[]]>;
     columnHead?: Snippet<[BoardColumn, BoardCard[]]>;
     empty?: Snippet;
+    cardAttrs?: (card: BoardCard) => Record<string, string>;
+    columnAttrs?: (column: BoardColumn) => Record<string, string>;
+    emptyColumn?: Snippet<[BoardColumn]>;
   } = $props();
 
   // svelte-ignore state_referenced_locally -- the board is built once from the source it is given
@@ -60,40 +66,49 @@
 <section class="board" data-board aria-label="Board">
   {#each columns as col (String(col.id))}
     {@const cards = groups.get(col.id) ?? []}
-    <div class="spalte" role="group" aria-label={col.label} data-column={col.id ?? 'none'} ondragover={(event: DragEvent) => event.preventDefault()} ondrop={(event: DragEvent) => onDrop(event, col.id)}>
+    <div class="spalte" role="group" aria-label={col.label} data-column={col.id ?? 'none'} {...(columnAttrs?.(col) ?? {})} ondragover={(event: DragEvent) => event.preventDefault()} ondrop={(event: DragEvent) => onDrop(event, col.id)}>
       {#if columnHead}
         {@render columnHead(col, cards)}
       {:else}
         <h3>{col.label}</h3>
       {/if}
-      {#each cards as c (c.id)}
-        {@const movable = source.canMove(c)}
-        <article
-          class="karte"
-          data-card={c.id}
-          data-readonly={!movable || undefined}
-          draggable={movable ? "true" : undefined}
-          ondragstart={(event: DragEvent) => onDragStart(event, c)}
-        >
-          {#if cardSnippet}
-            {@render cardSnippet(c)}
-          {:else}
-            <p class="titel">{c.title}</p>
-          {/if}
-          {#if actions}
-            {@render actions(c, columns)}
-          {:else if movable}
-            <select
-              aria-label="Verschieben nach"
-              onchange={(event: Event) => void move(c, (event.target as HTMLSelectElement).value === 'none' ? null : (event.target as HTMLSelectElement).value)}
+      {#if cards.length === 0}
+        {#if emptyColumn}
+          {@render emptyColumn(col)}
+        {/if}
+      {:else}
+        <ul class="karten">
+          {#each cards as c (c.id)}
+            {@const movable = source.canMove(c)}
+            <li
+              class="karte"
+              data-card={c.id}
+              data-readonly={!movable || undefined}
+              draggable={movable ? "true" : undefined}
+              {...(cardAttrs?.(c) ?? {})}
+              ondragstart={(event: DragEvent) => onDragStart(event, c)}
             >
-              {#each columns as option (String(option.id))}
-                <option value={option.id ?? 'none'} selected={(option.id ?? 'none') === (view.columnOf.get(c.id) ?? 'none')}>{option.label}</option>
-              {/each}
-            </select>
-          {/if}
-        </article>
-      {/each}
+              {#if cardSnippet}
+                {@render cardSnippet(c)}
+              {:else}
+                <p class="titel">{c.title}</p>
+              {/if}
+              {#if actions}
+                {@render actions(c, columns)}
+              {:else if movable}
+                <select
+                  aria-label="Verschieben nach"
+                  onchange={(event: Event) => void move(c, (event.target as HTMLSelectElement).value === 'none' ? null : (event.target as HTMLSelectElement).value)}
+                >
+                  {#each columns as option (String(option.id))}
+                    <option value={option.id ?? 'none'} selected={(option.id ?? 'none') === (view.columnOf.get(c.id) ?? 'none')}>{option.label}</option>
+                  {/each}
+                </select>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      {/if}
     </div>
   {/each}
   {#if empty && !hasCards}
@@ -112,6 +127,14 @@
     }
     .spalte {
       flex: 1 0 12rem;
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-2);
+    }
+    .karten {
+      list-style: none;
+      margin: 0;
+      padding: 0;
       display: flex;
       flex-direction: column;
       gap: var(--space-2);

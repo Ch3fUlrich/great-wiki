@@ -106,3 +106,57 @@ describe('the empty snippet', () => {
     expect(html(leere, [card('k1', 'a')])).not.toContain('data-leer');
   });
 });
+
+describe('cards as a list', () => {
+  it('renders each card as an <li> inside a per-column <ul class="karten">', () => {
+    const out = html({}, [card('k1', 'a'), card('k2', 'a')]);
+    expect(out).toMatch(/<ul class="karten[^"]*"/);
+    expect(out).toMatch(/<li[^>]*data-card="k1"/);
+    expect(out).toMatch(/<li[^>]*data-card="k2"/);
+    expect(out).not.toContain('<article');
+  });
+
+  it('renders no <ul> in a column that holds no card', () => {
+    const out = html({}, [card('k1', 'a')]);
+    const a = out.indexOf('data-column="a"');
+    const b = out.indexOf('data-column="b"');
+    const n = out.indexOf('data-column="none"');
+    expect(out.slice(a, b)).toMatch(/<ul class="karten/);
+    expect(out.slice(b, n)).not.toMatch(/<ul class="karten/);
+  });
+});
+
+describe('cardAttrs and columnAttrs', () => {
+  it('spreads cardAttrs onto the <li>, escaping the value', () => {
+    const out = html(
+      { cardAttrs: (c: BoardCard) => ({ 'data-status': String(c.column), 'data-esc': 'a"b' }) },
+      [card('k1', 'a')]
+    );
+    expect(out).toContain('data-status="a"');
+    expect(out).toContain('data-esc="a&quot;b"');
+    expect(out).not.toContain('data-esc="a"b"');
+  });
+
+  it('spreads columnAttrs onto the column div, escaping the value', () => {
+    const out = html({ columnAttrs: (col: BoardColumn) => ({ 'data-spalte': String(col.id), 'data-esc': 'x"y' }) });
+    expect(out).toContain('data-spalte="a"');
+    expect(out).toContain('data-esc="x&quot;y"');
+    expect(out).not.toContain('data-esc="x"y"');
+  });
+});
+
+describe('the emptyColumn snippet', () => {
+  it('renders only in a column with zero cards', () => {
+    const out = html({ emptyColumn: snippet('<p data-leer-spalte>Nichts hier.</p>') }, [card('k1', 'a')]);
+    const a = out.indexOf('data-column="a"');
+    const b = out.indexOf('data-column="b"');
+    const n = out.indexOf('data-column="none"');
+    expect(out.slice(a, b)).not.toContain('data-leer-spalte');
+    expect(out.slice(b, n)).toContain('data-leer-spalte');
+    expect(out.match(/data-leer-spalte/g)).toHaveLength(2);
+  });
+
+  it('renders nothing in an empty column by default', () => {
+    expect(html({}, [card('k1', 'a')])).not.toContain('Nichts hier');
+  });
+});
