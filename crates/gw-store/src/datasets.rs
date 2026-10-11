@@ -921,8 +921,10 @@ impl Store {
             .take(take)
             .map(|(_, r)| r)
             .collect();
-        let next = if offset + take < total as usize {
-            Some(Cursor::Offset(offset + take).encode())
+        // The offset comes from the client: add with saturation, so `usize::MAX` is an empty
+        // last page rather than an overflow (a panic here, a wrapped cursor in release).
+        let next = if offset.saturating_add(take) < total as usize {
+            Some(Cursor::Offset(offset.saturating_add(take)).encode())
         } else {
             None
         };
@@ -2989,6 +2991,38 @@ mod tests {
         }
         let unique: std::collections::HashSet<_> = seen.iter().collect();
         assert_eq!(unique.len(), 7, "repeats or gaps across pages: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_hostile_offset_cursor_is_an_empty_last_page_not_a_panic() {
+        use super::Cursor;
+        let (store, anna, _, _, path) = row_fixture().await;
+        store
+            .add_dataset_field(&anna, &path, &formula_field("twice", "{alter} * 2"))
+            .await
+            .unwrap();
+        for alter in 1..=3i64 {
+            made(&store, &anna, &path, json!({"alter": alter})).await;
+        }
+        for offset in [usize::MAX, usize::MAX - 1, 4] {
+            let p = done(
+                select(
+                    &store,
+                    &anna,
+                    &path,
+                    RowSelect {
+                        sort: Some((k("twice"), false)),
+                        limit: 2,
+                        after: Some(Cursor::Offset(offset).encode()),
+                        ..Default::default()
+                    },
+                )
+                .await,
+            );
+            assert!(p.rows.is_empty(), "offset {offset} listed rows");
+            assert_eq!(p.next, None, "offset {offset} handed out a next cursor");
+            assert_eq!(p.total, 3);
+        }
     }
 
     #[tokio::test]

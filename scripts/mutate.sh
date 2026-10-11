@@ -2435,6 +2435,14 @@ mutation crates/gw-store/src/datasets.rs killed \
   's/^        fields\.retain(|f| !hidden\.contains(f\.key\.as_str()));$//' \
   'datasets: hidden computed fields stay in the schema instead of being omitted'
 
+# --- datasets: computed-field paging (M8b B6 fix) -------------------------------------------
+#
+# The offset in a computed query's cursor is client text. Added without saturation, `usize::MAX`
+# overflows: a panic (a 500) under test, a wrapped and bogus next cursor in release.
+mutation crates/gw-store/src/datasets.rs killed \
+  's/offset\.saturating_add(take)/offset + take/g' \
+  'datasets: an offset cursor near usize::MAX overflows the next-page arithmetic'
+
 # HOW LONG THIS IS ALLOWED TO TAKE
 # --------------------------------
 # A gate too slow to run stops being run. This one got there: eighteen mutations, a whole
