@@ -39,6 +39,8 @@ describe('rowLabel', () => {
     expect(rowLabel(row('1', { name: 'Ada', alter: 36 }))).toBe('Ada');
     expect(rowLabel(row('1', { name: '  ', note: 'Hi' }))).toBe('Hi');
     expect(rowLabel(row('1', { alter: 0 }))).toBe('0');
+    // key-sorted maps put the number first; the text still names the row
+    expect(rowLabel(row('1', { alter: 7, name: 'Zenta' }))).toBe('Zenta');
     expect(rowLabel(row('1', { ok: true, tags: ['x'] }))).toBe('1');
     expect(rowLabel(row('1', {}))).toBe('1');
   });

@@ -30,11 +30,13 @@ export function relationConfig(config: unknown): RelationConfig | null {
 
 /** A target row's own name: its first non-empty string or number value, else its id. */
 export function rowLabel(row: Row): string {
-  for (const v of Object.values(row.values ?? {})) {
-    if (typeof v === 'string' && v.trim() !== '') return v;
-    if (typeof v === 'number') return String(v);
-  }
-  return row.id;
+  // Strings win over numbers whatever the key order (the API's value maps are key-sorted, so
+  // `alter` comes before `name`): a number names a row only when no text does.
+  const values = Object.values(row.values ?? {});
+  const text = values.find((v): v is string => typeof v === 'string' && v.trim() !== '');
+  if (text !== undefined) return text;
+  const num = values.find((v): v is number => typeof v === 'number');
+  return num !== undefined ? String(num) : row.id;
 }
 
 /** `rowId -> label` for one page of target rows — the shape a relation column's cells want. */
