@@ -1,0 +1,45 @@
+/**
+ * The saved views of a dataset page (M8c C4), as the page reads them: the list from
+ * `GET /api/datasets/views/{path}`, which address selects one, and which field a board
+ * view groups its cards by. Pure — no fetch, no DOM.
+ */
+
+/** Mirrors one entry of the API's `{views: [...]}`: `config` is per-kind and stays unknown here. */
+export interface DatasetView {
+  id: string;
+  name: string;
+  kind: string;
+  config: unknown;
+  position: number;
+}
+
+export const VIEW_PARAM = 'view';
+
+/** A board asks for all its cards in one read — it groups them, a page of them is no board. */
+export const BOARD_ROW_LIMIT = 500;
+
+const strip = (path: string) => path.replace(/^\/+/, '');
+
+export const viewsApiPath = (path: string) => `/api/datasets/views/${strip(path)}`;
+
+/**
+ * The address of one view: `?view=ID`, or the bare path for the table. The table's href is
+ * `'?'`, not `''`: an empty relative reference keeps the CURRENT query (RFC 3986 §5.4), so
+ * `''` could never leave an active view. The same convention as `withoutFilterHref`.
+ */
+export function viewHref(id: string | null): string {
+  return id ? `?${VIEW_PARAM}=${encodeURIComponent(id)}` : '?';
+}
+
+/** The view the address names; an unknown id is `null`, which is the table. */
+export function pickView(views: DatasetView[], id: string | null): DatasetView | null {
+  if (!id) return null;
+  return views.find((v) => v.id === id) ?? null;
+}
+
+/** The field a picked board view groups by; `null` for a table view, a broken config, or no view. */
+export function boardGroupKey(view: DatasetView | null): string | null {
+  if (!view || view.kind !== 'board') return null;
+  const raw = (view.config as { group_by?: unknown } | null)?.group_by;
+  return typeof raw === 'string' && raw !== '' ? raw : null;
+}

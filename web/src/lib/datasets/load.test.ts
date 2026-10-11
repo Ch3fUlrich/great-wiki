@@ -87,3 +87,79 @@ describe('loadDataset', () => {
     expect(out.labels).toEqual({});
   });
 });
+
+/**
+ * The saved views (M8c C4). A FAKE THAT ANSWERS PER ENDPOINT WITH A FRESH RESPONSE — the
+ * original `fakeFetch` hands one shared Response to every non-schema URL and its body can
+ * only be read once, which the views read now competes with for the rows page.
+ */
+describe('loadDataset views', () => {
+  const BOARD_VIEWS = {
+    views: [{ id: 'b1', name: 'Status', kind: 'board', config: { group_by: 'status' }, position: 0 }]
+  };
+  const BOARD_FIELDS = {
+    fields: [
+      { key: 'name', label: 'Name', kind: 'text', config: {}, position: 0 },
+      { key: 'status', label: 'Status', kind: 'select', config: { options: [{ id: 'offen', label: 'Offen' }] }, position: 1 }
+    ]
+  };
+
+  function viewsFetch(over: { views?: Response; fields?: unknown; rows?: unknown } = {}) {
+    const seen: string[] = [];
+    const f = vi.fn(async (url: string | URL | Request) => {
+      const u = String(url);
+      seen.push(u);
+      if (u.includes('/schema/')) return json(over.fields ?? BOARD_FIELDS);
+      if (u.includes('/views/')) return over.views ?? json(BOARD_VIEWS);
+      return json(over.rows ?? { rows: [], total: 0 });
+    }) as unknown as typeof fetch;
+    return { f, seen };
+  }
+
+  it('lists the saved views and picks the one the address names', async () => {
+    const { f, seen } = viewsFetch();
+    const out = await loadDataset(f, '/d', new URLSearchParams('view=b1'), null);
+    expect(seen.some((u) => u.includes('/views/d'))).toBe(true);
+    expect(out.views).toEqual(BOARD_VIEWS.views);
+    expect(out.view?.id).toBe('b1');
+    expect(out.error).toBeNull();
+  });
+
+  it('a views list that cannot be read leaves the page working with no views', async () => {
+    const { f, seen } = viewsFetch({ views: json({ error: 'x' }, 404) });
+    const out = await loadDataset(f, '/d', new URLSearchParams(), null);
+    expect(seen.some((u) => u.includes('/views/d'))).toBe(true);
+    expect(out.views).toEqual([]);
+    expect(out.view).toBeNull();
+    expect(out.error).toBeNull();
+  });
+
+  it('an unknown view id falls back to the table', async () => {
+    const { f, seen } = viewsFetch();
+    const out = await loadDataset(f, '/d', new URLSearchParams('view=nope&sort=name'), null);
+    expect(out.view).toBeNull();
+    const rowsUrl = seen.find((u) => u.includes('/rows/'))!;
+    expect(rowsUrl).toContain('sort=name');
+    expect(rowsUrl).not.toContain('limit=');
+  });
+
+  it('a board view asks all its cards at once and ignores the address sort and filter', async () => {
+    const { f, seen } = viewsFetch();
+    const out = await loadDataset(f, '/d', new URLSearchParams('view=b1&sort=name&desc=1&f=name:x'), null);
+    const rowsUrl = seen.find((u) => u.includes('/rows/'))!;
+    expect(rowsUrl).toContain('limit=500');
+    expect(rowsUrl).not.toContain('sort=');
+    expect(rowsUrl).not.toContain('filter=');
+    expect(out.sort).toBeNull();
+    expect(out.filter).toBeNull();
+    expect(out.view?.kind).toBe('board');
+  });
+
+  it('the views list on a page without ?view comes from the same read that answered the rows', async () => {
+    const { f, seen } = viewsFetch();
+    const out = await loadDataset(f, '/d', new URLSearchParams(), null);
+    expect(out.views).toEqual(BOARD_VIEWS.views);
+    expect(out.error).toBeNull();
+    expect(seen.filter((u) => u.includes('/views/'))).toHaveLength(1);
+  });
+});

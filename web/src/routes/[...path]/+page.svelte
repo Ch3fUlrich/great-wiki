@@ -5,6 +5,9 @@
   import BlockView from '$lib/components/BlockView.svelte';
   import TaskBoard from '$lib/boards/TaskBoard.svelte';
   import TableView from '$lib/datasets/TableView.svelte';
+  import ViewBar from '$lib/datasets/ViewBar.svelte';
+  import BoardView from '$lib/datasets/BoardView.svelte';
+  import { boardGroupKey } from '$lib/datasets/views';
   import Breadcrumb from '$lib/components/Breadcrumb.svelte';
   import PageAttachments from '$lib/components/PageAttachments.svelte';
   import PageMeta from '$lib/components/PageMeta.svelte';
@@ -392,19 +395,33 @@
       </article>
     {/if}
 
-    <!-- A dataset page (ADR 0029) is its description above and its table here. The load
-         states a failed read in `dataset.error`; the table is never drawn empty for one. -->
+    <!-- A dataset page (ADR 0029) is its description above, its saved views here, and then
+         the one view the address picked: a board when the picked view says board, the table
+         otherwise. The load states a failed read in `dataset.error`; neither rendering ever
+         draws an empty body for one. -->
     {#if data.dataset}
-      <TableView
-        path={data.doc.path}
-        fields={data.dataset.fields}
-        page={data.dataset.page}
-        error={data.dataset.error}
-        sort={data.dataset.sort}
-        filter={data.dataset.filter}
-        labels={data.dataset.labels}
-        mayWrite={data.doc.may_write === true}
-      />
+      <ViewBar views={data.dataset.views} active={data.dataset.view?.id ?? null} />
+      {#if boardGroupKey(data.dataset.view) !== null}
+        <BoardView
+          path={data.doc.path}
+          fields={data.dataset.fields}
+          page={data.dataset.page}
+          view={data.dataset.view}
+          error={data.dataset.error}
+          mayWrite={data.doc.may_write === true}
+        />
+      {:else}
+        <TableView
+          path={data.doc.path}
+          fields={data.dataset.fields}
+          page={data.dataset.page}
+          error={data.dataset.error}
+          sort={data.dataset.sort}
+          filter={data.dataset.filter}
+          labels={data.dataset.labels}
+          mayWrite={data.doc.may_write === true}
+        />
+      {/if}
     {/if}
 
     <!-- D-12's second placement: this page's own board, when this page is a project's home.
