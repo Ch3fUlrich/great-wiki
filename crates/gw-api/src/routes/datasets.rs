@@ -6,7 +6,8 @@
 //! - `GET|POST|PATCH|PUT|DELETE /api/datasets/schema/{path}` - list, add, relabel, reorder and
 //!   delete columns. Reading needs read; every change needs write.
 //!
-//! - `POST|GET|PATCH|DELETE /api/datasets/rows/{path}` - add a row (`{values}`, 201), read one
+//! - `POST|GET|PATCH|DELETE /api/datasets/rows/{path}` - add a row (`{values}`, or
+//!   `{values, view}` to submit through a form view; 201), read one
 //!   (`?id=`), change cells (`{id, version, values}`; a stale `version` answers 409 with
 //!   `{error, current}`), delete (`{id}`). Reading needs read; every change needs write.
 //!   An unreadable dataset is the same bare 404 as an absent one.
@@ -70,6 +71,10 @@ type Values = serde_json::Map<String, serde_json::Value>;
 #[serde(deny_unknown_fields)]
 pub struct NewRow {
     pub values: Values,
+    /// A form view's id: the row is submitted THROUGH that form, so the store refuses a field
+    /// the form does not hold and an unanswered required field. Without it, the ordinary add.
+    #[serde(default)]
+    pub view: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,11 +230,18 @@ async fn add_row(
     Json(body): Json<NewRow>,
 ) -> Result<(StatusCode, Json<DatasetRow>), RowFail> {
     let principal = state.principal(&jar).await;
-    let out = state
-        .store
-        .create_dataset_row(&principal, &full(&path), &body.values)
-        .await
-        .map_err(|e| RowFail::Api(ApiError::Internal(e)))?;
+    let out = match &body.view {
+        Some(view) => state
+            .store
+            .create_dataset_row_via_form(&principal, &full(&path), view, &body.values)
+            .await
+            .map_err(|e| RowFail::Api(ApiError::Internal(e)))?,
+        None => state
+            .store
+            .create_dataset_row(&principal, &full(&path), &body.values)
+            .await
+            .map_err(|e| RowFail::Api(ApiError::Internal(e)))?,
+    };
     row_answer(out, principal.is_authenticated()).map(|r| (StatusCode::CREATED, Json(r)))
 }
 

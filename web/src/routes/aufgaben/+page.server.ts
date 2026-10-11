@@ -19,7 +19,7 @@ import type { Actions, PageServerLoad } from './$types';
  * **One query with a filter, and that is the whole of D-12's cost being paid.** The decision
  * put a board here *and* on every project's home page, and said in the same breath what that
  * costs: two places that must agree. They agree by construction — one endpoint
- * (`GET /api/board`), one component (`$lib/components/Board.svelte`), and one form action for
+ * (`GET /api/board`), one component (`$lib/boards/TaskBoard.svelte`), and one form action for
  * a move, which the embedded board posts to from the page it is embedded in. A second
  * retrieval path would be a second answer to "which tasks exist", and because every card is a
  * disclosure surface, a second answer is also a second chance to leak one.

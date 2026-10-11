@@ -8,10 +8,11 @@
   belonging to no project would then have nowhere to appear at all, which is exactly how a
   to-do goes missing — the failure D-6 exists to prevent).
 
-  **The cost D-12 named is two places that must agree**, and it is paid in one place: the
-  board itself is `$lib/components/Board.svelte`, mounted here and in `[...path]/+page.svelte`
-  with different props and no different rules. Everything this page adds is the frame around
-  it — a heading, a lede, and the project filter.
+  **The cost D-12 named is two places that must agree**, and it is paid in one place: one
+  endpoint (`GET /api/board`) and one rendering, `$lib/boards/TaskBoard.svelte`, mounted here
+  and on a project's home page — the same markup, the same rules, the same words, over the
+  generic Board (M8c C3). Everything this page adds is the frame around it — a
+  heading, a lede, and the project filter.
 
   **Nothing on this page needs a script.** The filter is a plain GET form, so choosing a
   project is a navigation; a move is a POST to a form action. A control that only works once
@@ -19,7 +20,7 @@
   `[...path]/+page.svelte` records about its own edit link.
 -->
 <script lang="ts">
-  import Board from '$lib/components/Board.svelte';
+  import TaskBoard from '$lib/boards/TaskBoard.svelte';
 
   let { data } = $props();
 
@@ -70,7 +71,7 @@
     </p>
   {/if}
 
-  <Board
+  <TaskBoard
     board={data.board}
     me={data.me}
     now={data.now}

@@ -1033,6 +1033,66 @@ impl Store {
         Ok(RowOutcome::Done(row))
     }
 
+    /// Add a row **through a form view** (M8c C5). The gate and the row validator are exactly
+    /// [`Store::create_dataset_row`]'s — the call ends there, unchanged — and a form adds the
+    /// promises its fields are, asked BEFORE anything is written: a key outside the form's
+    /// subset is refused rather than ignored (so a crafted body cannot write a column nobody
+    /// agreed to ask for), and a required field must be answered. There is no anonymous form:
+    /// submitting needs write on the dataset, and a caller who may not see a column may not
+    /// submit it either.
+    pub async fn create_dataset_row_via_form(
+        &self,
+        principal: &Principal,
+        path: &str,
+        view_id: &str,
+        values: &serde_json::Map<String, Value>,
+    ) -> Result<RowOutcome<DatasetRow>> {
+        let doc_id = match self.writable_dataset(principal, path).await? {
+            Gate::Open(id) => id,
+            Gate::NoDataset => return Ok(RowOutcome::NoDataset),
+            Gate::ReadOnly => return Ok(RowOutcome::ReadOnly),
+        };
+        // A view is addressed by id inside THIS dataset only; another dataset's id, an unknown
+        // id, and a non-form are refusals in words that do not map the dataset's views.
+        let Some(view) = self
+            .views_of(&doc_id)
+            .await?
+            .into_iter()
+            .find(|v| v.id == view_id)
+        else {
+            return Ok(RowOutcome::Invalid("no such form".into()));
+        };
+        if view.kind != "form" {
+            return Ok(RowOutcome::Invalid("not a form".into()));
+        }
+        let Ok(form) = views::FormConfig::parse(&view.config) else {
+            return Ok(RowOutcome::Invalid("not a form".into()));
+        };
+        let visible = self.visible_field_keys(principal, &doc_id).await?;
+        for key in values.keys() {
+            if !form.holds(key) || !visible.contains(key.as_str()) {
+                return Ok(RowOutcome::Invalid(format!(
+                    "the form has no field {key:?}"
+                )));
+            }
+        }
+        for field in &form.fields {
+            if !field.required {
+                continue;
+            }
+            let key = field.key.as_str();
+            let answered = match values.get(key) {
+                None | Some(Value::Null) => false,
+                Some(Value::String(s)) => !s.trim().is_empty(),
+                Some(_) => true,
+            };
+            if !answered {
+                return Ok(RowOutcome::Invalid(format!("{key} is required")));
+            }
+        }
+        self.create_dataset_row(principal, path, values).await
+    }
+
     /// Change cells of a row. Needs write. `patch` is merged over the stored values (`null`
     /// clears a cell). `version` must be the row's current one, else the call answers
     /// [`RowOutcome::Stale`] with the row as it is, and nothing is written.
@@ -2152,6 +2212,249 @@ mod tests {
             store.dataset_row(&anna, &path, "fremd").await.unwrap(),
             RowOutcome::NoRow
         );
+    }
+
+    // --- a row submitted through a form view (M8c C5) -----------------------------------
+
+    /// Save a form view and return its id.
+    async fn form_view(
+        store: &Store,
+        who: &Principal,
+        path: &str,
+        cfg: serde_json::Value,
+    ) -> String {
+        match store
+            .create_dataset_view(who, path, "Formular", "form", &cfg)
+            .await
+            .unwrap()
+        {
+            SchemaOutcome::Done(v) => v.id,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    async fn table_view(store: &Store, who: &Principal, path: &str) -> String {
+        match store
+            .create_dataset_view(who, path, "Alle", "table", &json!({"fields": ["name"]}))
+            .await
+            .unwrap()
+        {
+            SchemaOutcome::Done(v) => v.id,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    async fn rows_in(store: &Store, path: &str) -> i64 {
+        let doc = doc_id_of(store, path).await;
+        sqlx::query_scalar("SELECT COUNT(*) FROM dataset_row WHERE doc_id = ?")
+            .bind(&doc)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn submitted(
+        store: &Store,
+        who: &Principal,
+        path: &str,
+        view: &str,
+        v: &serde_json::Value,
+    ) -> RowOutcome<DatasetRow> {
+        store
+            .create_dataset_row_via_form(who, path, view, &vals(v.clone()))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_form_submit_by_a_writer_adds_exactly_the_submitted_cells() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        let id = form_view(
+            &store,
+            &anna,
+            &path,
+            json!({"fields": [{"key": "name", "required": true}, {"key": "alter"}]}),
+        )
+        .await;
+        let RowOutcome::Done(r) =
+            submitted(&store, &anna, &path, &id, &json!({"name": "Ada"})).await
+        else {
+            panic!("submit")
+        };
+        assert_eq!(
+            r.values,
+            json!({"name": "Ada"}),
+            "an optional field stays absent"
+        );
+        assert_eq!(r.version, 1);
+        assert_eq!(rows_in(&store, &path).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_form_refuses_a_field_outside_its_subset_and_adds_no_row() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        // The form asks for `name` only: `alter` is a real column of this dataset the form
+        // does not hold, and `nope` is no column at all. Both are the same refusal.
+        let id = form_view(&store, &anna, &path, json!({"fields": [{"key": "name"}]})).await;
+        for (v, key) in [
+            (json!({"name": "Ada", "alter": 36}), "alter"),
+            (json!({"nope": 1}), "nope"),
+        ] {
+            assert_eq!(
+                submitted(&store, &anna, &path, &id, &v).await,
+                RowOutcome::Invalid(format!("the form has no field {key:?}")),
+                "{v}"
+            );
+        }
+        assert_eq!(rows_in(&store, &path).await, 0, "a refusal writes nothing");
+    }
+
+    /// A column the caller may not see is not one they may submit, even when the form holds it:
+    /// saved by a writer who reads the target, submitted by one who does not.
+    #[tokio::test]
+    async fn a_form_submit_refuses_a_field_hidden_from_the_caller_as_absent() {
+        let (store, anna, _, source, target) = relation_fixture().await;
+        store
+            .add_dataset_field(&anna, &source, &nf("name", FieldKind::Text))
+            .await
+            .unwrap();
+        store
+            .add_dataset_field(&anna, &source, &relation_field("mit", &target, false))
+            .await
+            .unwrap();
+        let id = form_view(
+            &store,
+            &anna,
+            &source,
+            json!({"fields": [{"key": "name"}, {"key": "mit"}]}),
+        )
+        .await;
+        let blind = Principal::test("blind", &[], &[]);
+        store
+            .add_grant(
+                "/raum",
+                Subject::Principal(blind.id.clone()),
+                Permission::Write,
+            )
+            .await
+            .unwrap();
+        let live = target_row(&store, &target).await;
+        assert_eq!(
+            submitted(&store, &blind, &source, &id, &json!({"mit": live})).await,
+            RowOutcome::Invalid("the form has no field \"mit\"".into())
+        );
+        assert_eq!(rows_in(&store, &source).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_form_enforces_its_required_fields() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        let id = form_view(
+            &store,
+            &anna,
+            &path,
+            json!({"fields": [{"key": "name", "required": true}, {"key": "alter"}]}),
+        )
+        .await;
+        for v in [
+            json!({"alter": 36}),               // missing
+            json!({"name": null, "alter": 36}), // present but empty
+            json!({"name": "  "}),              // whitespace is not an answer
+            json!({"name": "\t"}),
+        ] {
+            assert_eq!(
+                submitted(&store, &anna, &path, &id, &v).await,
+                RowOutcome::Invalid("name is required".into()),
+                "{v}"
+            );
+        }
+        assert_eq!(rows_in(&store, &path).await, 0);
+        // An optional field may be left out.
+        assert!(matches!(
+            submitted(&store, &anna, &path, &id, &json!({"name": "Ada"})).await,
+            RowOutcome::Done(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_form_submit_needs_write_and_the_uniform_absence_otherwise() {
+        let (store, anna, bea, cleo, path) = row_fixture().await;
+        let id = form_view(&store, &anna, &path, json!({"fields": [{"key": "name"}]})).await;
+        // The gate is the one a row add uses: no anonymous submit, no reader submit.
+        assert_eq!(
+            submitted(&store, &bea, &path, &id, &json!({"name": "x"})).await,
+            RowOutcome::ReadOnly
+        );
+        for who in [&cleo, &Principal::anonymous()] {
+            assert_eq!(
+                submitted(&store, who, &path, &id, &json!({"name": "x"})).await,
+                RowOutcome::NoDataset
+            );
+        }
+        assert_eq!(rows_in(&store, &path).await, 0);
+    }
+
+    #[tokio::test]
+    async fn only_a_form_of_this_dataset_accepts_a_submit() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        let form = form_view(&store, &anna, &path, json!({"fields": [{"key": "name"}]})).await;
+        let table = table_view(&store, &anna, &path).await;
+        // A second dataset under a title that does not collide with the fixture's own.
+        let out = store
+            .create_dataset_for(
+                &anna,
+                &CreateRequest {
+                    parent: Some("/raum".into()),
+                    title: "Zweite".into(),
+                    slug: None,
+                    template: None,
+                },
+                false,
+                "d",
+            )
+            .await
+            .unwrap();
+        let CreateOutcome::Created { path: other, .. } = out else {
+            panic!("{out:?}")
+        };
+        store
+            .add_dataset_field(&anna, &other, &nf("name", FieldKind::Text))
+            .await
+            .unwrap();
+        let foreign = form_view(&store, &anna, &other, json!({"fields": [{"key": "name"}]})).await;
+        for id in [foreign, "es-gibt-sie-nicht".into()] {
+            assert_eq!(
+                submitted(&store, &anna, &path, &id, &json!({"name": "x"})).await,
+                RowOutcome::Invalid("no such form".into()),
+                "another dataset's form is not reachable"
+            );
+        }
+        // A view of this dataset that is not a form refuses in its own words.
+        assert_eq!(
+            submitted(&store, &anna, &path, &table, &json!({"name": "x"})).await,
+            RowOutcome::Invalid("not a form".into())
+        );
+        assert_eq!(rows_in(&store, &path).await, 0);
+        assert_eq!(rows_in(&store, &other).await, 0);
+        // The form of this dataset itself does accept: the refusals above are not a blanket no.
+        assert!(matches!(
+            submitted(&store, &anna, &path, &form, &json!({"name": "Ada"})).await,
+            RowOutcome::Done(_)
+        ));
+        assert_eq!(rows_in(&store, &path).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_hostile_key_in_a_form_submit_is_refused_and_the_rows_survive() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        made(&store, &anna, &path, json!({"name": "Ada"})).await;
+        let id = form_view(&store, &anna, &path, json!({"fields": [{"key": "name"}]})).await;
+        for key in ["a'; DROP TABLE dataset_row; --", "name\") OR 1=1", ""] {
+            let v = json!({ key: "x" });
+            let out = submitted(&store, &anna, &path, &id, &v).await;
+            assert!(matches!(out, RowOutcome::Invalid(_)), "{key}: {out:?}");
+        }
+        assert_eq!(rows_in(&store, &path).await, 1);
     }
 
     #[tokio::test]

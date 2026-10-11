@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
-import Board from './Board.svelte';
+import Board from './TaskBoard.svelte';
 import { ANONYMOUS, type Me } from '$lib/api';
 import { BOARD_NOTICE_ID, type BoardNotice, type BoardResponse, type BoardTask } from '$lib/board';
 import type { Project } from '$lib/projects';

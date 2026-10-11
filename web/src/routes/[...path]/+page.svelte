@@ -3,8 +3,13 @@
   import Comments from '$lib/components/Comments.svelte';
   import Backlinks from '$lib/components/Backlinks.svelte';
   import BlockView from '$lib/components/BlockView.svelte';
-  import Board from '$lib/components/Board.svelte';
+  import TaskBoard from '$lib/boards/TaskBoard.svelte';
   import TableView from '$lib/datasets/TableView.svelte';
+  import ViewBar from '$lib/datasets/ViewBar.svelte';
+  import BoardView from '$lib/datasets/BoardView.svelte';
+  import FormView from '$lib/datasets/FormView.svelte';
+  import { boardGroupKey } from '$lib/datasets/views';
+  import { formKeyOf } from '$lib/datasets/form';
   import Breadcrumb from '$lib/components/Breadcrumb.svelte';
   import PageAttachments from '$lib/components/PageAttachments.svelte';
   import PageMeta from '$lib/components/PageMeta.svelte';
@@ -161,6 +166,9 @@
   // already in the payload — computing these server-side would ship the same titles twice.
   const crumbs = $derived(breadcrumb(data.tree, data.doc));
   const subpages = $derived(childrenOf(data.tree, data.doc.path));
+
+  /** The picked view when it is a form: the branch below hands the narrowed view to FormView. */
+  const formularAnsicht = $derived(data.dataset && formKeyOf(data.dataset.view) !== null ? data.dataset.view : null);
 </script>
 
 <svelte:head><title>{data.doc.title} — great-wiki</title></svelte:head>
@@ -392,19 +400,40 @@
       </article>
     {/if}
 
-    <!-- A dataset page (ADR 0029) is its description above and its table here. The load
-         states a failed read in `dataset.error`; the table is never drawn empty for one. -->
+    <!-- A dataset page (ADR 0029) is its description above, its saved views here, and then
+         the one view the address picked: a board when the picked view says board, the table
+         otherwise. The load states a failed read in `dataset.error`; neither rendering ever
+         draws an empty body for one. -->
     {#if data.dataset}
-      <TableView
-        path={data.doc.path}
-        fields={data.dataset.fields}
-        page={data.dataset.page}
-        error={data.dataset.error}
-        sort={data.dataset.sort}
-        filter={data.dataset.filter}
-        labels={data.dataset.labels}
-        mayWrite={data.doc.may_write === true}
-      />
+      <ViewBar views={data.dataset.views} active={data.dataset.view?.id ?? null} />
+      {#if formularAnsicht !== null}
+        <FormView
+          path={data.doc.path}
+          fields={data.dataset.fields}
+          view={formularAnsicht}
+          mayWrite={data.doc.may_write === true}
+        />
+      {:else if boardGroupKey(data.dataset.view) !== null}
+        <BoardView
+          path={data.doc.path}
+          fields={data.dataset.fields}
+          page={data.dataset.page}
+          view={data.dataset.view}
+          error={data.dataset.error}
+          mayWrite={data.doc.may_write === true}
+        />
+      {:else}
+        <TableView
+          path={data.doc.path}
+          fields={data.dataset.fields}
+          page={data.dataset.page}
+          error={data.dataset.error}
+          sort={data.dataset.sort}
+          filter={data.dataset.filter}
+          labels={data.dataset.labels}
+          mayWrite={data.doc.may_write === true}
+        />
+      {/if}
     {/if}
 
     <!-- D-12's second placement: this page's own board, when this page is a project's home.
@@ -419,7 +448,7 @@
          page in this wiki is nobody's home, and furniture on all of them is not a cost D-12
          asked anybody to pay. -->
     {#if data.board}
-      <Board
+      <TaskBoard
         board={data.board}
         me={data.me}
         now={data.now}
