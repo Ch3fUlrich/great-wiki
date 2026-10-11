@@ -2409,6 +2409,32 @@ mutation crates/gw-store/src/datasets/rollup.rs killed \
   's/^                values.remove(&col.key);$/                values.insert(col.key.clone(), json!(0));/' \
   'datasets: a hidden rollup reads as zero instead of being omitted'
 
+# --- datasets: the one hidden-field set, everywhere (spec §2, M8b B5b) -----------------------
+#
+# "Hidden for this caller" is now ONE function, `hidden_field_keys`, read by the schema, the row,
+# the filter/sort refusal and the saved views. It hides a relation whose target cannot be read, a
+# rollup over it, and — transitively, through other formulas and rollups — a formula that reaches
+# any of them. The three mutations each break one of those consumers; the tests that notice are
+# `a_hidden_relation_rollup_or_formula_is_named_as_no_field_everywhere` (schema, row, filter and
+# sort compared for equality against the refusal a truly absent key gets) and the two view tests.
+#
+# (1) The hidden check lifted out of the query refusal: a hidden field named in a filter or sort
+# then falls through to the "computed ... yet" refusal instead of the "no field" that does not
+# admit it exists — the difference ADR 0022 is all about.
+mutation crates/gw-store/src/datasets.rs killed \
+  's/hidden\.contains(key\.as_str())/false/g' \
+  'datasets: a hidden field named in a query is no longer refused as no field'
+# (2) The transitive step removed: the fixpoint never runs, so a formula over a hidden rollup (or
+# over a formula over a hidden relation) stays visible and leaks the shape of the hidden chain.
+mutation crates/gw-store/src/datasets/relation.rs killed \
+  's/for _ in 0\.\.fields\.len() {/for _ in 0..0 {/' \
+  'datasets: hidden fields are not propagated transitively to formulas'
+# (3) The schema omission removed: hidden columns stay in the schema for a caller who may not see
+# them, which is exactly what the schema is not allowed to disclose.
+mutation crates/gw-store/src/datasets.rs killed \
+  's/^        fields\.retain(|f| !hidden\.contains(f\.key\.as_str()));$//' \
+  'datasets: hidden computed fields stay in the schema instead of being omitted'
+
 # HOW LONG THIS IS ALLOWED TO TAKE
 # --------------------------------
 # A gate too slow to run stops being run. This one got there: eighteen mutations, a whole

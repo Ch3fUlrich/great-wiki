@@ -24,10 +24,11 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use serde_json::{json, Map, Value};
 
-use super::{DatasetField, DatasetRow};
+use super::DatasetRow;
 use crate::Store;
 use gw_auth::Principal;
 use gw_core::dataset::FieldKind;
+use gw_core::formula;
 
 /// The one refusal for a cross-target row, an unreadable target and a deleted one alike. See the
 /// module header and ADR 0022: distinguishing them would make a row write an oracle.
@@ -129,42 +130,81 @@ impl Store {
         Ok(cols)
     }
 
-    /// Drop from the schema every relation column whose target this caller may not read. Such a
-    /// column is absent, not shown-as-empty: an empty column would announce that a relation points
-    /// somewhere the caller cannot see (mutation test: replacing this omission with a leak).
-    pub(super) async fn filter_fields(
-        &self,
-        principal: &Principal,
-        doc_id: &str,
-        fields: &mut Vec<DatasetField>,
-    ) -> Result<()> {
-        if !fields
-            .iter()
-            .any(|f| f.kind == FieldKind::Relation.as_str())
-        {
-            return Ok(());
-        }
-        let cols = self.relation_cols(principal, doc_id).await?;
-        fields.retain(|f| {
-            f.kind != FieldKind::Relation.as_str()
-                || cols.iter().any(|c| c.key == f.key && c.visible)
-        });
-        Ok(())
-    }
-
-    /// The relation keys hidden from this caller — the ones a filter or sort may not name, answered
-    /// exactly as if the column did not exist.
-    pub(super) async fn hidden_relation_keys(
+    /// The one definition of "hidden for this caller", computed once per call and read by every
+    /// door that decides visibility — the schema, the row and the query. A field is hidden when:
+    ///
+    /// * (a) it is a `relation` whose target dataset the caller may not read, or
+    /// * (b) it is a `rollup` over such a relation, or
+    /// * (c) it is a `formula` whose dependency chain — transitive, through other formulas and
+    ///   rollups, read off the field keys named by `field_refs` of its stored `expr` — reaches a
+    ///   hidden field.
+    ///
+    /// A hidden column is ABSENT, never shown-as-empty: an empty column or a `0` would announce
+    /// that something reaches a dataset the caller cannot see (ADR 0022). Formulas are resolved to a
+    /// fixpoint; a cycle is refused when the column is saved so none is expected, and the loop is
+    /// bounded by the field count regardless.
+    pub(super) async fn hidden_field_keys(
         &self,
         principal: &Principal,
         doc_id: &str,
     ) -> Result<HashSet<String>> {
         let cols = self.relation_cols(principal, doc_id).await?;
-        Ok(cols
-            .into_iter()
+        let mut hidden: HashSet<String> = cols
+            .iter()
             .filter(|c| !c.visible)
-            .map(|c| c.key)
-            .collect())
+            .map(|c| c.key.clone())
+            .collect();
+        // (b) A rollup over a relation this caller may not follow. A rollup whose stored config no
+        // longer names an existing relation is a hole rather than a secret — it is not caller-
+        // dependent, so it stays out of this set and simply reads as no value for everyone.
+        let rollups: Vec<(String, String)> = sqlx::query_as(
+            "SELECT key, config FROM dataset_field WHERE doc_id = ?1 AND kind = 'rollup'",
+        )
+        .bind(doc_id)
+        .fetch_all(&self.pool)
+        .await?;
+        for (key, config) in rollups {
+            let relation = serde_json::from_str::<Value>(&config).ok().and_then(|v| {
+                v.get("relation")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+            if let Some(rel) = relation {
+                if cols.iter().any(|c| c.key == rel && !c.visible) {
+                    hidden.insert(key);
+                }
+            }
+        }
+        let fields = self.fields_of(doc_id).await?;
+        let mut deps: Vec<(String, Vec<String>)> = Vec::new();
+        for f in &fields {
+            if f.kind != FieldKind::Formula.as_str() {
+                continue;
+            }
+            let reads = f
+                .config
+                .get("expr")
+                .and_then(Value::as_str)
+                .and_then(|src| formula::parse(src, &|_| true).ok())
+                .map(|expr| formula::field_refs(&expr))
+                .unwrap_or_default();
+            deps.push((f.key.clone(), reads));
+        }
+        for _ in 0..fields.len() {
+            let mut grew = false;
+            for (key, reads) in &deps {
+                if !hidden.contains(key.as_str())
+                    && reads.iter().any(|d| hidden.contains(d.as_str()))
+                {
+                    hidden.insert(key.clone());
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        Ok(hidden)
     }
 
     /// Rewrite each row's relation cells to what a reader sees: a hidden column's key is removed,

@@ -158,8 +158,8 @@ impl Store {
             return Ok(SchemaOutcome::NoDataset);
         };
         let mut fields = self.fields_of(&doc.id).await?;
-        self.filter_fields(principal, &doc.id, &mut fields).await?;
-        self.filter_rollups(principal, &doc.id, &mut fields).await?;
+        let hidden = self.hidden_field_keys(principal, &doc.id).await?;
+        fields.retain(|f| !hidden.contains(f.key.as_str()));
         Ok(SchemaOutcome::Done(fields))
     }
 
@@ -578,7 +578,8 @@ impl Store {
             .await?;
         self.with_rollups(principal, &doc.id, std::slice::from_mut(&mut row))
             .await?;
-        let row = computed::with_computed(&fields, row, &today);
+        let hidden = self.hidden_field_keys(principal, &doc.id).await?;
+        let row = computed::with_computed(&fields, row, &today, &hidden);
         Ok(RowOutcome::Done(row))
     }
 
@@ -618,9 +619,10 @@ impl Store {
             .collect();
         self.decorate_rows(principal, &doc.id, &mut rows).await?;
         self.with_rollups(principal, &doc.id, &mut rows).await?;
+        let hidden = self.hidden_field_keys(principal, &doc.id).await?;
         let rows: Vec<DatasetRow> = rows
             .into_iter()
-            .map(|r| computed::with_computed(&fields, r, &today))
+            .map(|r| computed::with_computed(&fields, r, &today, &hidden))
             .collect();
         Ok(RowOutcome::Done(RowPage {
             rows,
@@ -643,9 +645,9 @@ impl Store {
         // Every named field must exist in this dataset's schema; the sort kind comes from it.
         let fields = self.fields_of(&doc.id).await?;
         // A relation column the caller may not resolve (its target is unreadable) is a key they
-        // never see, and so is a rollup over it: naming either names no field at all.
-        let mut hidden = self.hidden_relation_keys(principal, &doc.id).await?;
-        hidden.extend(self.hidden_rollup_keys(principal, &doc.id).await?);
+        // never see; so is a rollup over it and so is a formula reaching either. Naming any of them
+        // names no field at all, in the same words as a key that does not exist.
+        let hidden = self.hidden_field_keys(principal, &doc.id).await?;
         let kind_of = |key: &FieldKey| fields.iter().find(|f| f.key == key.as_str());
         for f in &select.filters {
             let (Filter::Eq { key, .. }
@@ -764,7 +766,7 @@ impl Store {
         self.with_rollups(principal, &doc.id, &mut rows).await?;
         let rows: Vec<DatasetRow> = rows
             .into_iter()
-            .map(|r| computed::with_computed(&fields, r, &today))
+            .map(|r| computed::with_computed(&fields, r, &today, &hidden))
             .collect();
         Ok(RowOutcome::Done(RowPage { rows, total, next }))
     }
@@ -3803,5 +3805,159 @@ mod tests {
                 RowOutcome::Invalid("no field `n`".into())
             );
         }
+    }
+
+    /// The single hidden-field definition, checked at every door. A caller who may read the source
+    /// but not the relation's target sees none of: the relation, a rollup over it, a formula over
+    /// that rollup, or a formula over a formula over that relation. Naming any of them in a filter
+    /// or a sort is refused in the exact words used for a key that does not exist, they are absent
+    /// from the schema, and they leave no value in the row. The owner, who can read the target, sees
+    /// all of them and keeps the honest "not yet" refusals; a visible formula still computes.
+    #[tokio::test]
+    async fn a_hidden_relation_rollup_or_formula_is_named_as_no_field_everywhere() {
+        let (store, anna, bea, source, target) = relation_fixture().await;
+        rollup_fixture(&store, &anna, &source, &target).await;
+        // A formula over a hidden rollup (`n`), a formula over the hidden relation (`mit`), and a
+        // formula over that formula — the chain that only the transitive step can catch.
+        for (key, expr) in [
+            ("over_n", "{n} + 1"),
+            ("over_mit", "{mit} * 2"),
+            ("over_over", "{over_mit} + 1"),
+        ] {
+            let SchemaOutcome::Done(_) = store
+                .add_dataset_field(&anna, &source, &formula_field(key, expr))
+                .await
+                .unwrap()
+            else {
+                panic!("a formula over a visible-to-anna field lands")
+            };
+        }
+        // A visible formula over a visible field, to prove the hidden set does not swallow it.
+        store
+            .add_dataset_field(&anna, &source, &plain_field("alter", FieldKind::Number))
+            .await
+            .unwrap();
+        store
+            .add_dataset_field(&anna, &source, &formula_field("twice", "{alter} * 2"))
+            .await
+            .unwrap();
+        let one = valued_row(&store, &target, json!({"amount": 7})).await;
+        let r = made(&store, &anna, &source, json!({"mit": [one], "alter": 21})).await;
+
+        // The same wording a truly absent key gets — captured once and compared for equality.
+        let ghost = select(
+            &store,
+            &bea,
+            &source,
+            RowSelect {
+                filters: vec![Filter::Eq {
+                    key: k("gibtsnicht"),
+                    value: json!(1),
+                }],
+                limit: 5,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(ghost, RowOutcome::Invalid("no field `gibtsnicht`".into()));
+
+        for key in ["mit", "n", "over_n", "over_mit", "over_over"] {
+            let want = format!("no field `{key}`");
+            assert_eq!(
+                want,
+                "no field `gibtsnicht`".replace("gibtsnicht", key),
+                "the shape matches the ghost refusal"
+            );
+            assert_eq!(
+                select(
+                    &store,
+                    &bea,
+                    &source,
+                    RowSelect {
+                        filters: vec![Filter::Eq {
+                            key: k(key),
+                            value: json!(1)
+                        }],
+                        limit: 5,
+                        ..Default::default()
+                    }
+                )
+                .await,
+                RowOutcome::Invalid(want.clone()),
+                "bea filters the hidden `{key}`"
+            );
+            assert_eq!(
+                select(
+                    &store,
+                    &bea,
+                    &source,
+                    RowSelect {
+                        sort: Some((k(key), false)),
+                        limit: 5,
+                        ..Default::default()
+                    }
+                )
+                .await,
+                RowOutcome::Invalid(want),
+                "bea sorts the hidden `{key}`"
+            );
+            let ks = keys(&store, &bea, &source).await;
+            assert!(!has(&ks, key), "`{key}` in bea's schema: {ks:?}");
+            let row = read(&store, &bea, &source, &r.id).await;
+            assert!(row.get(key).is_none(), "`{key}` in bea's row: {row}");
+        }
+
+        // The visible formula is untouched: present in the schema and computed for both callers.
+        assert!(has(&keys(&store, &bea, &source).await, "twice"));
+        assert_eq!(
+            read(&store, &bea, &source, &r.id).await["twice"].as_f64(),
+            Some(42.0)
+        );
+
+        // anna reads the target, so she sees every one of them and keeps her "not yet" refusals.
+        let ka = keys(&store, &anna, &source).await;
+        for key in ["mit", "n", "over_n", "over_mit", "over_over", "twice"] {
+            assert!(has(&ka, key), "`{key}` absent from anna's schema: {ka:?}");
+        }
+        let va = read(&store, &anna, &source, &r.id).await;
+        assert_eq!(
+            va["n"].as_i64(),
+            Some(1),
+            "anna aggregates the readable target"
+        );
+        assert_eq!(va["twice"].as_f64(), Some(42.0));
+        assert_eq!(
+            select(
+                &store,
+                &anna,
+                &source,
+                RowSelect {
+                    sort: Some((k("mit"), false)),
+                    limit: 5,
+                    ..Default::default()
+                }
+            )
+            .await,
+            RowOutcome::Invalid("relation fields cannot be filtered or sorted yet".into()),
+            "a visible relation keeps its not-yet refusal for the owner"
+        );
+        assert_eq!(
+            select(
+                &store,
+                &anna,
+                &source,
+                RowSelect {
+                    filters: vec![Filter::Eq {
+                        key: k("over_n"),
+                        value: json!(1)
+                    }],
+                    limit: 5,
+                    ..Default::default()
+                }
+            )
+            .await,
+            RowOutcome::Invalid("computed field `over_n` cannot be filtered or sorted yet".into()),
+            "a visible formula keeps its not-yet refusal for the owner"
+        );
     }
 }

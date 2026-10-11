@@ -37,14 +37,18 @@ fn compute(expr: &Expr, values: &Map<String, Value>, today: &str) -> Value {
 
 /// The row as a reader sees it: its stored values plus one entry per formula field, evaluated in
 /// the order the dependencies ask for. `today` is the caller's clock, fetched once per call.
+/// `hidden` is the caller's hidden-field set: a formula in it is a column this caller never sees,
+/// so it is not evaluated and leaves no value behind — a visible formula is never computed from a
+/// hidden field, because reaching one would have made it hidden too.
 pub(super) fn with_computed(
     fields: &[DatasetField],
     mut row: DatasetRow,
     today: &str,
+    hidden: &HashSet<String>,
 ) -> DatasetRow {
     let formulas: Vec<&DatasetField> = fields
         .iter()
-        .filter(|f| f.kind == FieldKind::Formula.as_str())
+        .filter(|f| f.kind == FieldKind::Formula.as_str() && !hidden.contains(f.key.as_str()))
         .collect();
     if formulas.is_empty() {
         return row;

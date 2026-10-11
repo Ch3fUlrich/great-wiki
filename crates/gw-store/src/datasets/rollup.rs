@@ -23,7 +23,7 @@ use anyhow::Result;
 use serde_json::{json, Number, Value};
 
 use super::computed::error_cell;
-use super::{is_computed_kind, DatasetField, DatasetRow};
+use super::{is_computed_kind, DatasetRow};
 use crate::Store;
 use gw_auth::Principal;
 use gw_core::dataset::FieldKind;
@@ -373,40 +373,6 @@ impl Store {
             cols.push(col);
         }
         Ok(cols)
-    }
-
-    /// Drop from the schema every rollup whose relation the caller may not follow. Absent, not
-    /// shown-as-empty: a column that reads zero would announce that something is being counted
-    /// somewhere the caller cannot see.
-    pub(super) async fn filter_rollups(
-        &self,
-        principal: &Principal,
-        doc_id: &str,
-        fields: &mut Vec<DatasetField>,
-    ) -> Result<()> {
-        if !fields.iter().any(|f| f.kind == FieldKind::Rollup.as_str()) {
-            return Ok(());
-        }
-        let cols = self.rollup_cols(principal, doc_id).await?;
-        fields.retain(|f| {
-            f.kind != FieldKind::Rollup.as_str() || cols.iter().any(|c| c.key == f.key && c.visible)
-        });
-        Ok(())
-    }
-
-    /// The rollup keys hidden from this caller — the ones a filter or sort may not name, answered
-    /// exactly as if the column did not exist.
-    pub(super) async fn hidden_rollup_keys(
-        &self,
-        principal: &Principal,
-        doc_id: &str,
-    ) -> Result<HashSet<String>> {
-        let cols = self.rollup_cols(principal, doc_id).await?;
-        Ok(cols
-            .into_iter()
-            .filter(|c| !c.visible)
-            .map(|c| c.key)
-            .collect())
     }
 
     /// Fill in each row's rollup cells: every column this caller may read gets its aggregate, every
