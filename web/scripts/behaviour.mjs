@@ -4732,6 +4732,164 @@ await check('W5 a formula that divides by zero shows its #ERR(reason) as cell te
   assert(body.includes('#ERR('), 'a divide-by-zero formula shows no #ERR(reason) text');
 });
 
+// ---------------------------------------------------------------------------------------
+// Group X - dataset board and form (ADR 0029, M8c)
+// ---------------------------------------------------------------------------------------
+//
+// The two saved views the table already stores rows for: a BOARD the editor drags cards
+// across, and a FORM that adds exactly one row through the view's own subset of fields.
+// The plan called this group G; W was already taken by the table work and the letters are
+// claimed in file order, so the board/form checks land here as X.
+//
+// Everything is set up through the API like tabelleSetup does for the table: the `stand`
+// select column, the 'Tafel' board view and the 'Formular' form view are created only when
+// they are absent, so each check can call xSetup and stay independent.
+
+async function xSetup(page) {
+  await tabelleSetup(page);
+
+  const schema = await (await page.request.get(BASE + '/api/datasets/schema' + TABELLE)).json();
+  if (!schema.fields.some((f) => f.key === 'stand')) {
+    const r = await page.request.post(BASE + '/api/datasets/schema' + TABELLE, {
+      data: {
+        key: 'stand',
+        label: 'Stand',
+        kind: 'select',
+        config: { options: [{ id: 'offen', label: 'Offen' }, { id: 'fertig', label: 'Fertig' }] }
+      }
+    });
+    assert(r.status() === 201 || r.status() === 200, `adding the stand column answered ${r.status()}`);
+  }
+
+  const listing = await (await page.request.get(BASE + '/api/datasets/views' + TABELLE)).json();
+  const blueprints = [
+    ['Tafel', { name: 'Tafel', kind: 'board', config: { group_by: 'stand' } }],
+    [
+      'Formular',
+      {
+        name: 'Formular',
+        kind: 'form',
+        config: {
+          title: 'Neue Person',
+          fields: [
+            { key: 'name', label: 'Wie heißt die Person?', required: true },
+            { key: 'alter' }
+          ]
+        }
+      }
+    ]
+  ];
+  const ids = {};
+  for (const [name, body] of blueprints) {
+    let view = listing.views.find((v) => v.name === name);
+    if (!view) {
+      const r = await page.request.post(BASE + '/api/datasets/views' + TABELLE, { data: body });
+      assert(r.status() === 201, `creating the ${name} view answered ${r.status()}`);
+      view = await r.json();
+    }
+    ids[name] = view.id;
+  }
+
+  const rows = await (await page.request.get(BASE + '/api/datasets/rows' + TABELLE)).json();
+  const clara = rows.rows.find((r) => r.values.name === 'Clara');
+  assert(clara, 'Clara is not in the rows');
+  if (!clara.values.stand) {
+    const r = await page.request.patch(BASE + '/api/datasets/rows' + TABELLE, {
+      data: { id: clara.id, version: clara.version, values: { stand: 'offen' } }
+    });
+    assert(r.status() === 200, `setting Clara's stand answered ${r.status()}`);
+  }
+  return { boardId: ids['Tafel'], formId: ids['Formular'] };
+}
+
+await check('X1 an editor sees the dataset as a board, drags a card to another column and the move survives a reload; a guest gets the same 404', async (page) => {
+  const { boardId } = await xSetup(page);
+  await page.goto(BASE + TABELLE + '?view=' + boardId, { waitUntil: 'networkidle' });
+  const board = page.locator('[data-board]');
+  await board.waitFor({ state: 'visible', timeout: 10_000 });
+  for (const column of ['offen', 'fertig', 'none']) {
+    await page.locator(`[data-column="${column}"]`).waitFor({ state: 'visible', timeout: 10_000 });
+  }
+
+  // Cards are text: the markup-looking name is shown, never applied.
+  const clara = page.locator('[data-column="offen"] li[data-card]', { hasText: 'Clara' });
+  await clara.waitFor({ state: 'visible', timeout: 10_000 });
+  assert((await board.innerText()).includes('<b>Berta</b>'), 'the markup-looking card is not shown as text');
+  assert((await board.locator('b').count()) === 0, 'a card was rendered as markup');
+
+  // One drag is one row PATCH (DatasetRowSource.move); wait for the answer, not a toast.
+  await clara.dragTo(page.locator('[data-column="fertig"]'));
+  await page
+    .locator('[data-column="fertig"] li[data-card]', { hasText: 'Clara' })
+    .waitFor({ state: 'visible', timeout: 10_000 });
+
+  // Stored, not just drawn: the reload re-reads the rows server-side.
+  await page.reload({ waitUntil: 'networkidle' });
+  await page
+    .locator('[data-column="fertig"] li[data-card]', { hasText: 'Clara' })
+    .waitFor({ state: 'visible', timeout: 10_000 });
+  const rows = await (await page.request.get(BASE + '/api/datasets/rows' + TABELLE)).json();
+  const stored = rows.rows.find((r) => r.values.name === 'Clara');
+  assert(stored?.values.stand === 'fertig', `the API row says stand=${stored?.values.stand}`);
+
+  // Guest half: the board address is still the dataset page — a guest gets W2's 404.
+  assert(ANON, 'SHOT_BASE_ANON is unset — the anonymous half must never be skipped');
+  const guest = await page.request.get(ANON + TABELLE + '?view=' + boardId, { maxRedirects: 0 });
+  assert(guest.status() === 404, `the board answered a guest ${guest.status()}`);
+});
+
+await check('X2 an editor submits the form view; a missing required field is refused inline; a field outside the form is refused by the API; a guest cannot submit', async (page) => {
+  const { formId } = await xSetup(page);
+  await page.goto(BASE + TABELLE + '?view=' + formId, { waitUntil: 'networkidle' });
+  const form = page.locator('form.datensatz-formular');
+  await form.waitFor({ state: 'visible', timeout: 10_000 });
+  await form.getByLabel('Wie heißt die Person?').waitFor({ state: 'visible', timeout: 10_000 });
+  await form.getByLabel('Alter').waitFor({ state: 'visible', timeout: 10_000 });
+
+  const rowCount = async () => (await (await page.request.get(BASE + '/api/datasets/rows' + TABELLE)).json()).rows.length;
+
+  // The view's own question, not the column label. Requiredness is checked here first (form.ts).
+  const before = await rowCount();
+  await form.getByRole('button', { name: 'Absenden' }).click();
+  const inline = form.locator('#name-fehler');
+  await inline.waitFor({ state: 'visible', timeout: 10_000 });
+  assert((await inline.innerText()).includes('Pflichtfeld'), 'the inline error does not name the missing field');
+  assert((await rowCount()) === before, 'a refused submit added a row');
+
+  // A complete submit is one new row.
+  await form.getByLabel('Wie heißt die Person?').fill('Emil');
+  await form.getByLabel('Alter').fill('5');
+  await form.getByRole('button', { name: 'Absenden' }).click();
+  await form.locator('p.form-status', { hasText: 'Gespeichert.' }).waitFor({ state: 'visible', timeout: 10_000 });
+  const afterEmil = await (await page.request.get(BASE + '/api/datasets/rows' + TABELLE)).json();
+  assert(afterEmil.rows.some((r) => r.values.name === 'Emil'), 'the submitted row is not stored');
+
+  // A crafted body naming a column the form never asked for is refused by the SERVER.
+  const outside = await page.request.post(BASE + '/api/datasets/rows' + TABELLE, {
+    data: { values: { name: 'X', stand: 'offen' }, view: formId }
+  });
+  assert(outside.status() >= 400 && outside.status() < 500, `a field outside the form answered ${outside.status()}`);
+  const afterX = await (await page.request.get(BASE + '/api/datasets/rows' + TABELLE)).json();
+  assert(!afterX.rows.some((r) => r.values.name === 'X'), 'the refused row was written anyway');
+
+  // A view id that is not this dataset's form is refused too, without mapping the views.
+  const ghost = await page.request.post(BASE + '/api/datasets/rows' + TABELLE, {
+    data: { values: { name: 'Y' }, view: 'does-not-exist' }
+  });
+  assert(ghost.status() >= 400 && ghost.status() < 500, `an unknown view id answered ${ghost.status()}`);
+  const afterY = await (await page.request.get(BASE + '/api/datasets/rows' + TABELLE)).json();
+  assert(!afterY.rows.some((r) => r.values.name === 'Y'), 'the unknown-view row was written anyway');
+
+  // Guest half: no anonymous form — refused (404 like the page, or 401/403), never written.
+  assert(ANON, 'SHOT_BASE_ANON is unset — the anonymous half must never be skipped');
+  const guest = await page.request.post(ANON + '/api/datasets/rows' + TABELLE, {
+    data: { values: { name: 'G' }, view: formId }
+  });
+  assert(guest.status() < 200 || guest.status() >= 300, `a guest submit answered ${guest.status()}`);
+  const final = await (await page.request.get(BASE + '/api/datasets/rows' + TABELLE)).json();
+  assert(!final.rows.some((r) => r.values.name === 'G'), 'the guest row exists');
+});
+
 await browser.close();
 
 // ---------------------------------------------------------------------------------------
