@@ -2365,6 +2365,26 @@ mutation crates/gw-store/src/datasets/links.rs killed \
   's/SELECT 1 FROM attachments WHERE id = ?1 AND doc_id = ?2/SELECT 1 FROM attachments WHERE id = ?1/' \
   'datasets: person and file cells - a file may name another page'"'"'s attachment'
 
+# --- datasets: relation fields (ADR 0022, ADR 0029, M8b B4) ----------------------------------
+#
+# A relation column reaches into ANOTHER dataset, so every door onto it asks the target's
+# access, not the source's. (1) The write path: a caller who cannot read the target must be
+# refused, in the same words as a bad id. Without it a writer probes which rows exist in a
+# dataset they may not read.
+mutation crates/gw-store/src/datasets/relation.rs killed \
+  's/^            if !col.visible {$/            if false {/' \
+  'datasets: relation write without a read check on the target dataset'
+# (2) The omission. A column the caller cannot see is ABSENT; an empty array in its place
+# announces that a relation exists and points somewhere hidden.
+mutation crates/gw-store/src/datasets/relation.rs killed \
+  's/^                    values.remove(&col.key);$/                    values.insert(col.key.clone(), Value::Array(Vec::new()));/' \
+  'datasets: a hidden relation is shown as an empty array instead of omitted'
+# (3) A cell may name only rows of ITS target; another dataset's row id is a way to read
+# across datasets one hop at a time.
+mutation crates/gw-store/src/datasets/relation.rs killed \
+  's/if !self.row_is_in(target_doc, id).await? {/if false {/' \
+  'datasets: relation cell accepts a row of another dataset'
+
 # HOW LONG THIS IS ALLOWED TO TAKE
 # --------------------------------
 # A gate too slow to run stops being run. This one got there: eighteen mutations, a whole

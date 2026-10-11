@@ -56,9 +56,10 @@ pub struct FieldSpec<'a> {
 
 /// Validate one value; returns the normalised form to store. `null` clears a cell.
 ///
-/// `person` and `file` are checked for SHAPE only — that an id is a non-empty, bounded string
-/// and that an array is deduped. Whether the id names an account that may see this page, or a
-/// file that is on it, is the store's question and is asked there.
+/// `person`, `file` and `relation` are checked for SHAPE only — that an id is a non-empty,
+/// bounded string and that an array is deduped. Whether the id names an account that may see
+/// this page, a file that is on it, or a row that lives in the dataset this column points at,
+/// is the store's question and is asked there.
 pub fn validate_value(kind: FieldKind, config: &Value, json: &Value) -> Result<Value, FieldError> {
     if kind.is_computed() {
         return Err(FieldError::Computed(kind.as_str()));
@@ -139,7 +140,23 @@ pub fn validate_value(kind: FieldKind, config: &Value, json: &Value) -> Result<V
             check_id(string(json)?)?;
             Ok(json.clone())
         }
-        FieldKind::Relation => Err(FieldError::NeedsStore(kind.as_str())),
+        // A relation cell is one row id, or a list of them: the same shape a person cell takes.
+        // Which dataset those ids belong to, and whether the caller may see it, is the store's
+        // question (`datasets/relation.rs`), asked of the column's `target_doc`.
+        FieldKind::Relation => {
+            let multiple = config
+                .get("multiple")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if multiple {
+                let ids = dedupe(strings(json)?);
+                check_ids(&ids)?;
+                Ok(ids.into())
+            } else {
+                check_id(string(json)?)?;
+                Ok(json.clone())
+            }
+        }
         FieldKind::Rollup | FieldKind::Formula => unreachable!("computed kinds returned above"),
     }
 }
@@ -402,10 +419,38 @@ mod tests {
     }
 
     #[test]
-    fn relation_is_the_last_needs_store_kind_and_computed_ones_are_refused() {
+    fn relation_cells_are_checked_for_shape_only_and_computed_kinds_are_refused() {
+        // A single cell is one id; a multi cell is a deduped list. Which dataset the id names is
+        // not core's question, so `target_doc` is irrelevant to the shape check.
         assert_eq!(
-            v(FieldKind::Relation, json!({}), json!("x")),
-            Err(FieldError::NeedsStore("relation"))
+            v(FieldKind::Relation, json!({}), json!("r-1")),
+            Ok(json!("r-1"))
+        );
+        assert_eq!(
+            v(FieldKind::Relation, json!({}), Value::Null),
+            Ok(Value::Null)
+        );
+        for bad in ["", &"x".repeat(MAX_ID_LEN + 1)] {
+            assert_eq!(
+                v(FieldKind::Relation, json!({}), json!(bad)),
+                Err(FieldError::BadId)
+            );
+        }
+        assert_eq!(
+            v(
+                FieldKind::Relation,
+                json!({"multiple": true}),
+                json!(["b", "a", "b"])
+            ),
+            Ok(json!(["b", "a"]))
+        );
+        assert_eq!(
+            v(FieldKind::Relation, json!({"multiple": true}), json!([])),
+            Ok(json!([]))
+        );
+        assert_eq!(
+            v(FieldKind::Relation, json!({}), json!(["a"])),
+            Err(FieldError::WrongType("a string"))
         );
         for k in [FieldKind::Rollup, FieldKind::Formula] {
             assert_eq!(

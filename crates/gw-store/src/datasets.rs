@@ -15,6 +15,7 @@ use serde_json::Value;
 mod computed;
 mod links;
 mod query;
+mod relation;
 mod views;
 pub use query::{Cursor, Filter, RowQuery, Sort, SortKind};
 pub use views::{DatasetView, MAX_VIEWS};
@@ -101,6 +102,16 @@ impl Store {
         Ok(found.filter(|d| d.doc_type == DocumentType::Dataset.as_str()))
     }
 
+    /// Whether `principal` may read the dataset page with id `doc_id` — [`Store::readable_dataset`]
+    /// reached by id, for a relation's `target_doc` which is stored as an id so it survives a move.
+    /// Absent, not-a-dataset and unreadable are one `false`.
+    async fn readable_dataset_by_id(&self, principal: &Principal, doc_id: &str) -> Result<bool> {
+        let found = self
+            .document_for_id(principal, doc_id, Action::Read)
+            .await?;
+        Ok(found.is_some_and(|d| d.doc_type == DocumentType::Dataset.as_str()))
+    }
+
     /// The dataset page at `path` if `principal` may read it **and** write it. Every schema
     /// change goes through here; the write check is the line a mutation test removes.
     async fn writable_dataset(&self, principal: &Principal, path: &str) -> Result<Gate> {
@@ -134,7 +145,8 @@ impl Store {
             .collect())
     }
 
-    /// The schema of the dataset at `path`, for anybody who may read it.
+    /// The schema of the dataset at `path`, for anybody who may read it. A `relation` column whose
+    /// target the caller may not read is absent from the list, not shown empty.
     pub async fn dataset_fields(
         &self,
         principal: &Principal,
@@ -143,13 +155,17 @@ impl Store {
         let Some(doc) = self.readable_dataset(principal, path).await? else {
             return Ok(SchemaOutcome::NoDataset);
         };
-        Ok(SchemaOutcome::Done(self.fields_of(&doc.id).await?))
+        let mut fields = self.fields_of(&doc.id).await?;
+        self.filter_fields(principal, &doc.id, &mut fields).await?;
+        Ok(SchemaOutcome::Done(fields))
     }
 
     /// Add a column. Needs write. `key` is validated by [`FieldKey::parse`] before it
     /// reaches SQL; `kind` is fixed for the life of the field. Every stored kind and `formula`
-    /// are offered; `relation` and `rollup` wait for a later milestone. A `person` column may
-    /// say `{"multiple": true}`, a `file` column takes no config.
+    /// are offered; only `rollup` waits for a later milestone. A `person` column may
+    /// say `{"multiple": true}`, a `file` column takes no config, and a `relation` column says
+    /// `{"target": "<dataset path>", "multiple": bool}` — its target resolved to a doc id under
+    /// the caller's own read access here, and stored by id so a rename cannot break the column.
     pub async fn add_dataset_field(
         &self,
         principal: &Principal,
@@ -165,7 +181,7 @@ impl Store {
             Ok(k) => k,
             Err(e) => return Ok(SchemaOutcome::Invalid(e.to_string())),
         };
-        if matches!(new.kind, FieldKind::Relation | FieldKind::Rollup) {
+        if new.kind == FieldKind::Rollup {
             return Ok(SchemaOutcome::Invalid(format!(
                 "field kind `{}` is not available yet",
                 new.kind.as_str()
@@ -175,8 +191,8 @@ impl Store {
             Ok(l) => l,
             Err(m) => return Ok(SchemaOutcome::Invalid(m)),
         };
-        let config = new.config.to_string();
-        if !new.config.is_object() || config.len() > MAX_CONFIG_BYTES {
+        let caller_config = new.config.to_string();
+        if !new.config.is_object() || caller_config.len() > MAX_CONFIG_BYTES {
             return Ok(SchemaOutcome::Invalid(format!(
                 "field config must be an object of at most {MAX_CONFIG_BYTES} bytes"
             )));
@@ -184,6 +200,17 @@ impl Store {
         if let Some(msg) = link_config_check(new.kind, &new.config) {
             return Ok(SchemaOutcome::Invalid(msg));
         }
+        // A relation names its target by path; only the caller who can read that page may bind a
+        // column to it, so the path is resolved to a doc id here and the path itself is discarded.
+        let stored_config = if new.kind == FieldKind::Relation {
+            match self.resolve_target(principal, &new.config).await? {
+                Ok(cfg) => cfg,
+                Err(m) => return Ok(SchemaOutcome::Invalid(m)),
+            }
+        } else {
+            new.config.clone()
+        };
+        let config = stored_config.to_string();
         if new.kind == FieldKind::Formula {
             if let Some(msg) = self
                 .formula_check(&doc_id, key.as_str(), &new.config)
@@ -235,7 +262,7 @@ impl Store {
             key: key.as_str().to_string(),
             label,
             kind: new.kind.as_str().to_string(),
-            config: new.config.clone(),
+            config: stored_config,
             position,
         }))
     }
@@ -538,11 +565,11 @@ impl Store {
         let fields = self.fields_of(&doc.id).await?;
         let names = self.attachment_names(&doc.id, &fields).await?;
         let today = self.today().await?;
-        Ok(RowOutcome::Done(computed::with_computed(
-            &fields,
-            links::resolve_files(row, &fields, &names),
-            &today,
-        )))
+        let mut row =
+            computed::with_computed(&fields, links::resolve_files(row, &fields, &names), &today);
+        self.decorate_rows(principal, &doc.id, std::slice::from_mut(&mut row))
+            .await?;
+        Ok(RowOutcome::Done(row))
     }
 
     /// A page of rows of the dataset at `path`, with the dataset's row count, for anybody who
@@ -574,12 +601,13 @@ impl Store {
         let fields = self.fields_of(&doc.id).await?;
         let names = self.attachment_names(&doc.id, &fields).await?;
         let today = self.today().await?;
-        let rows = tuples
+        let mut rows: Vec<DatasetRow> = tuples
             .into_iter()
             .map(row_from)
             .map(|r| links::resolve_files(r, &fields, &names))
             .map(|r| computed::with_computed(&fields, r, &today))
             .collect();
+        self.decorate_rows(principal, &doc.id, &mut rows).await?;
         Ok(RowOutcome::Done(RowPage {
             rows,
             total,
@@ -600,6 +628,9 @@ impl Store {
         };
         // Every named field must exist in this dataset's schema; the sort kind comes from it.
         let fields = self.fields_of(&doc.id).await?;
+        // A relation column the caller may not resolve (its target is unreadable) is a key they
+        // never see, so naming it in a filter names no field at all.
+        let hidden = self.hidden_relation_keys(principal, &doc.id).await?;
         let kind_of = |key: &FieldKey| fields.iter().find(|f| f.key == key.as_str());
         for f in &select.filters {
             let (Filter::Eq { key, .. }
@@ -610,6 +641,9 @@ impl Store {
                 None => return Ok(RowOutcome::Invalid(format!("no field `{}`", key.as_str()))),
                 Some(field) if is_computed_kind(&field.kind) => {
                     return Ok(RowOutcome::Invalid(computed_refusal(key.as_str())))
+                }
+                Some(field) if field.kind == FieldKind::Relation.as_str() => {
+                    return Ok(RowOutcome::Invalid(relation_refusal(key.as_str(), &hidden)))
                 }
                 Some(_) => {}
             }
@@ -622,6 +656,9 @@ impl Store {
                 };
                 if is_computed_kind(&field.kind) {
                     return Ok(RowOutcome::Invalid(computed_refusal(key.as_str())));
+                }
+                if field.kind == FieldKind::Relation.as_str() {
+                    return Ok(RowOutcome::Invalid(relation_refusal(key.as_str(), &hidden)));
                 }
                 Some(Sort {
                     key: key.clone(),
@@ -697,16 +734,14 @@ impl Store {
         let total = c.fetch_one(&self.pool).await?;
         let names = self.attachment_names(&doc.id, &fields).await?;
         let today = self.today().await?;
-        Ok(RowOutcome::Done(RowPage {
-            rows: fetched
-                .into_iter()
-                .map(|t| row_from((t.0, t.1, t.2, t.3, t.4)))
-                .map(|r| links::resolve_files(r, &fields, &names))
-                .map(|r| computed::with_computed(&fields, r, &today))
-                .collect(),
-            total,
-            next,
-        }))
+        let mut rows: Vec<DatasetRow> = fetched
+            .into_iter()
+            .map(|t| row_from((t.0, t.1, t.2, t.3, t.4)))
+            .map(|r| links::resolve_files(r, &fields, &names))
+            .map(|r| computed::with_computed(&fields, r, &today))
+            .collect();
+        self.decorate_rows(principal, &doc.id, &mut rows).await?;
+        Ok(RowOutcome::Done(RowPage { rows, total, next }))
     }
 
     /// Add a row. Needs write. Values are validated against the schema; a dataset holds at
@@ -727,6 +762,12 @@ impl Store {
             Err(m) => return Ok(RowOutcome::Invalid(m)),
         };
         clean.retain(|_, v| !v.is_null());
+        // Every relation cell is checked against the target and the caller's read access BEFORE the
+        // transaction opens (the pool is one connection); only the edge writes happen inside it.
+        let edges = match self.plan_write(principal, &doc_id, &clean).await? {
+            Ok(w) => w,
+            Err(m) => return Ok(RowOutcome::Invalid(m)),
+        };
         let id = uuid::Uuid::now_v7().to_string();
         let mut tx = self.pool.begin().await?;
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dataset_row WHERE doc_id = ?")
@@ -744,6 +785,7 @@ impl Store {
             .bind(Value::Object(clean).to_string())
             .execute(&mut *tx)
             .await?;
+        self.rewrite_edges(&mut tx, &id, &edges).await?;
         tx.commit().await?;
         let row = self
             .fetch_row(&doc_id, &id)
@@ -780,6 +822,12 @@ impl Store {
         if current.version != version {
             return Ok(RowOutcome::Stale(current));
         }
+        // Checked against target and access before the transaction, from the patch as it stands
+        // (a `null` clears the cell and its edges, `[]` clears a multi cell).
+        let edges = match self.plan_write(principal, &doc_id, &patch).await? {
+            Ok(w) => w,
+            Err(m) => return Ok(RowOutcome::Invalid(m)),
+        };
         let mut merged = current.values.as_object().cloned().unwrap_or_default();
         for (k, v) in patch {
             if v.is_null() {
@@ -794,7 +842,10 @@ impl Store {
                 "row is larger than {MAX_ROW_BYTES} bytes"
             )));
         }
-        // The version in the WHERE is the lock: two editors holding version N, one wins.
+        // The row write and its edge rewrite share one transaction, so a cell and the edges that
+        // back it can never disagree. The version in the WHERE is the lock: two editors holding
+        // version N, one wins and the other is rolled back and told.
+        let mut tx = self.pool.begin().await?;
         let done = sqlx::query(
             "UPDATE dataset_row SET \"values\" = ?, version = version + 1, \
              updated_at = datetime('now') WHERE doc_id = ? AND id = ? AND version = ?",
@@ -803,14 +854,20 @@ impl Store {
         .bind(&doc_id)
         .bind(row_id)
         .bind(version)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if done.rows_affected() == 0 {
+            tx.rollback().await?;
+            let Some(now) = self.fetch_row(&doc_id, row_id).await? else {
+                return Ok(RowOutcome::NoRow);
+            };
+            return Ok(RowOutcome::Stale(now));
+        }
+        self.rewrite_edges(&mut tx, row_id, &edges).await?;
+        tx.commit().await?;
         let Some(now) = self.fetch_row(&doc_id, row_id).await? else {
             return Ok(RowOutcome::NoRow);
         };
-        if done.rows_affected() == 0 {
-            return Ok(RowOutcome::Stale(now));
-        }
         self.emit_row_event(principal, &doc_id, EventKind::DatasetRowUpdated, row_id)
             .await;
         Ok(RowOutcome::Done(now))
@@ -925,6 +982,23 @@ fn link_config_check(kind: FieldKind, config: &Value) -> Option<String> {
         }
         FieldKind::File if map.is_empty() => {}
         FieldKind::File => return Some("a file's config is {}".into()),
+        FieldKind::Relation
+            if map
+                .get("target")
+                .and_then(Value::as_str)
+                .is_some_and(|t| !t.is_empty())
+                && map.len() <= 2
+                && map.iter().all(|(k, v)| match k.as_str() {
+                    "target" => true,
+                    "multiple" => v.is_boolean(),
+                    _ => false,
+                }) => {}
+        FieldKind::Relation => {
+            return Some(
+                "a relation's config is {\"target\": \"<dataset path>\", \"multiple\": true|false}"
+                    .into(),
+            )
+        }
         _ => {}
     }
     None
@@ -940,6 +1014,17 @@ fn is_computed_kind(kind: &str) -> bool {
 /// The one refusal a computed field gets when it is named in a filter or a sort.
 fn computed_refusal(key: &str) -> String {
     format!("computed field `{key}` cannot be filtered or sorted yet")
+}
+
+/// The refusal a relation field gets when it is named in a filter or a sort: `no field` when it is
+/// hidden from this caller (their read of the target went, so the column is not one they have), and
+/// otherwise the honest "not yet" — a relation cannot be filtered or sorted on in this milestone.
+fn relation_refusal(key: &str, hidden: &std::collections::HashSet<String>) -> String {
+    if hidden.contains(key) {
+        format!("no field `{key}`")
+    } else {
+        "relation fields cannot be filtered or sorted yet".to_string()
+    }
 }
 
 #[cfg(test)]
@@ -1228,8 +1313,8 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(dup, SchemaOutcome::Conflict(_)), "{dup:?}");
-        // Rollup and relation are not offered yet; `formula` with an empty config is refused by
-        // its own shape check, and `person`/`file` are accepted since M8b.
+        // Rollup is not offered yet; a relation without a target and `formula` with an empty config
+        // are refused by their own shape check, and `person`/`file` are accepted since M8b.
         for kind in [FieldKind::Rollup, FieldKind::Relation] {
             let out = store
                 .add_dataset_field(&anna, &path, &nf("x", kind))
@@ -1618,10 +1703,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relation_is_the_last_kind_that_cannot_be_written() {
+    async fn a_relation_column_planted_without_a_target_refuses_every_write() {
         let (store, anna, _, _, path) = row_fixture().await;
         let doc = doc_id_of(&store, &path).await;
-        // A relation column cannot be added through the API, so plant one underneath.
+        // A relation column that names no target can only be planted underneath the API, which
+        // always resolves one. Writing through it is refused rather than left to point nowhere.
         add_field(&store, &doc, "mit", "relation").await.unwrap();
         assert!(matches!(
             store
@@ -2716,7 +2802,8 @@ mod tests {
             );
             assert!(!has(&keys(&store, &anna, &path).await, &mistyped.key));
         }
-        // Relation and rollup wait for their own milestone.
+        // A relation with no target and a rollup are both refused: the first by its own shape
+        // check, the second because it still waits for its milestone.
         for kind in [FieldKind::Relation, FieldKind::Rollup] {
             let out = store
                 .add_dataset_field(&anna, &path, &nf("later", kind))
@@ -2811,6 +2898,412 @@ mod tests {
         assert_eq!(
             read(&store, &anna, &path, &r.id).await["dok"],
             json!({"id": id, "missing": true})
+        );
+    }
+
+    // --- relation fields (M8b B4) ----------------------------------------------------
+
+    /// The write-path refusal, spelled out here rather than imported: an unreadable target, a
+    /// deleted one and an id that belongs to another dataset are one sentence (ADR 0022), and a
+    /// test that renames that sentence quietly is exactly what should break.
+    const NO_RELATION: &str = "relation target is not available";
+
+    fn relation_field(key: &str, target: &str, multiple: bool) -> NewField {
+        NewField {
+            key: key.into(),
+            label: key.to_uppercase(),
+            kind: FieldKind::Relation,
+            config: json!({ "target": target, "multiple": multiple }),
+        }
+    }
+
+    /// Two datasets one writer (`anna`) may change: `source` under `/raum`, which the reader
+    /// `bea` may see, and a `target` under `/geheim`, which she may not. A relation on the source
+    /// points at the target, so the very same column is visible to `anna` and invisible to `bea`
+    /// for exactly one reason — the target.
+    async fn relation_fixture() -> (Store, Principal, Principal, String, String) {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        room(&store, "raum").await;
+        room(&store, "geheim").await;
+        let anna = Principal::test("anna", &[], &[]);
+        let bea = Principal::test("bea", &[], &[]);
+        for (slug, who, perm) in [
+            ("/raum", &anna, Permission::Write),
+            ("/geheim", &anna, Permission::Write),
+            ("/raum", &bea, Permission::Read),
+        ] {
+            store
+                .add_grant(slug, Subject::Principal(who.id.clone()), perm)
+                .await
+                .unwrap();
+        }
+        let source = created_dataset(&store, &anna, "/raum", "d").await;
+        let target = created_dataset(&store, &anna, "/geheim", "z").await;
+        (store, anna, bea, source, target)
+    }
+
+    async fn created_dataset(store: &Store, who: &Principal, parent: &str, slug: &str) -> String {
+        let out = store
+            .create_dataset_for(who, &dreq(Some(parent), None), false, slug)
+            .await
+            .unwrap();
+        let CreateOutcome::Created { path, .. } = out else {
+            panic!("{out:?}")
+        };
+        path
+    }
+
+    /// A row of the target dataset, laid straight into storage: the id a source cell points at.
+    async fn target_row(store: &Store, target: &str) -> String {
+        let doc = doc_id_of(store, target).await;
+        let id = uuid::Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO dataset_row (id, doc_id, \"values\") VALUES (?, ?, '{}')")
+            .bind(&id)
+            .bind(&doc)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    /// The stored id of a column, for addressing the edge table directly.
+    async fn field_id(store: &Store, path: &str, key: &str) -> String {
+        sqlx::query_scalar("SELECT id FROM dataset_field WHERE doc_id = ?1 AND key = ?2")
+            .bind(doc_id_of(store, path).await)
+            .bind(key)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_relation_column_needs_write_on_the_source_and_read_on_its_target() {
+        let (store, anna, bea, source, target) = relation_fixture().await;
+        // A writer who can read the target: the column lands, and keeps the target by id, not path.
+        let SchemaOutcome::Done(f) = store
+            .add_dataset_field(&anna, &source, &relation_field("mit", &target, false))
+            .await
+            .unwrap()
+        else {
+            panic!("anna may point at a target she can read")
+        };
+        assert!(f.config.get("target_doc").is_some());
+        assert!(
+            f.config.get("target").is_none(),
+            "the caller's path is resolved away, never stored"
+        );
+        // A reader of the source may not change its schema, however valid the target.
+        assert_eq!(
+            store
+                .add_dataset_field(&bea, &source, &relation_field("x", &target, false))
+                .await
+                .unwrap(),
+            SchemaOutcome::ReadOnly
+        );
+        // A writer of the source who cannot read the target: an unreadable dataset, an absent path
+        // and a plain page are one answer, so binding a column is not a way to survey what is there.
+        let blind = Principal::test("blind", &[], &[]);
+        store
+            .add_grant(
+                "/raum",
+                Subject::Principal(blind.id.clone()),
+                Permission::Write,
+            )
+            .await
+            .unwrap();
+        for (path, want) in [
+            (target.as_str(), format!("no dataset at {target}")),
+            ("/geheim/nichts", "no dataset at /geheim/nichts".to_string()),
+            ("/geheim", "no dataset at /geheim".to_string()),
+        ] {
+            let out = store
+                .add_dataset_field(&blind, &source, &relation_field("c", path, false))
+                .await
+                .unwrap();
+            assert_eq!(out, SchemaOutcome::Invalid(want), "target {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_relation_cell_must_name_a_row_of_its_own_target() {
+        let (store, anna, _, source, target) = relation_fixture().await;
+        store
+            .add_dataset_field(&anna, &source, &relation_field("mit", &target, false))
+            .await
+            .unwrap();
+        let live = target_row(&store, &target).await;
+        let ok = made(&store, &anna, &source, json!({"mit": live.clone()})).await;
+        assert_eq!(
+            read(&store, &anna, &source, &ok.id).await["mit"],
+            json!(live)
+        );
+        // A row of the source dataset is not a row of the target; that and a made-up id are refused
+        // in the same words, so a cell cannot confirm which dataset some row id belongs to.
+        let foreign = made(&store, &anna, &source, json!({})).await;
+        for id in [foreign.id.clone(), "es-gibt-sie-nicht".into()] {
+            assert_eq!(
+                store
+                    .create_dataset_row(&anna, &source, &vals(json!({"mit": id})))
+                    .await
+                    .unwrap(),
+                RowOutcome::Invalid(NO_RELATION.into()),
+                "one answer for a foreign row and a stranger"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn naming_a_relation_you_cannot_see_is_the_same_refusal_as_a_bad_target() {
+        let (store, anna, _, source, target) = relation_fixture().await;
+        store
+            .add_dataset_field(&anna, &source, &relation_field("mit", &target, false))
+            .await
+            .unwrap();
+        // A writer of the source whose read of the target has gone (never granted here).
+        let blind = Principal::test("blind", &[], &[]);
+        store
+            .add_grant(
+                "/raum",
+                Subject::Principal(blind.id.clone()),
+                Permission::Write,
+            )
+            .await
+            .unwrap();
+        let live = target_row(&store, &target).await;
+        assert_eq!(
+            store
+                .create_dataset_row(&blind, &source, &vals(json!({"mit": live.clone()})))
+                .await
+                .unwrap(),
+            RowOutcome::Invalid(NO_RELATION.into())
+        );
+        // The column reads back as absent for this writer, exactly as for a plain reader.
+        assert!(!has(&keys(&store, &blind, &source).await, "mit"));
+        // anna, who can see the target, writes the cell; blind may still clear it — removing a
+        // name asks nothing of the target it drops.
+        let r = made(&store, &anna, &source, json!({"mit": live.clone()})).await;
+        assert!(
+            matches!(
+                store
+                    .update_dataset_row(
+                        &blind,
+                        &source,
+                        &r.id,
+                        1,
+                        &vals(json!({"mit": Value::Null}))
+                    )
+                    .await
+                    .unwrap(),
+                RowOutcome::Done(_)
+            ),
+            "a clear is allowed even when the target is now blind to the writer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relation_and_its_cells_vanish_for_a_reader_who_cannot_see_the_target() {
+        let (store, anna, bea, source, target) = relation_fixture().await;
+        store
+            .add_dataset_field(&anna, &source, &relation_field("mit", &target, true))
+            .await
+            .unwrap();
+        let one = target_row(&store, &target).await;
+        let two = target_row(&store, &target).await;
+        let r = made(
+            &store,
+            &anna,
+            &source,
+            json!({"mit": [one.clone(), two.clone()]}),
+        )
+        .await;
+        assert!(has(&keys(&store, &anna, &source).await, "mit"));
+        assert_eq!(
+            read(&store, &anna, &source, &r.id).await["mit"],
+            json!([one, two])
+        );
+        // The reader of the source who cannot read the target: the column is not in the schema and
+        // its key is not in the row — not null, not empty, simply gone. An empty column would
+        // announce that a relation reaches somewhere she may not see.
+        assert!(!has(&keys(&store, &bea, &source).await, "mit"));
+        let blind_read = read(&store, &bea, &source, &r.id).await;
+        assert!(blind_read.get("mit").is_none(), "{blind_read}");
+        let RowOutcome::Done(page) = store.dataset_rows(&bea, &source, 10, 0).await.unwrap() else {
+            panic!("bea may read the source")
+        };
+        assert!(page.rows[0].values.get("mit").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_deleted_target_row_leaves_no_dangling_id_in_the_source() {
+        let (store, anna, _, source, target) = relation_fixture().await;
+        store
+            .add_dataset_field(&anna, &source, &relation_field("mit", &target, true))
+            .await
+            .unwrap();
+        let keep = target_row(&store, &target).await;
+        let gone = target_row(&store, &target).await;
+        let r = made(
+            &store,
+            &anna,
+            &source,
+            json!({"mit": [keep.clone(), gone.clone()]}),
+        )
+        .await;
+        // The target row is removed; its edge must go with it, and the id with the edge.
+        sqlx::query("DELETE FROM dataset_row WHERE id = ?")
+            .bind(&gone)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let edges: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM dataset_relation WHERE target_row_id = ?")
+                .bind(&gone)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(edges, 0, "the edge went with its target");
+        assert_eq!(
+            read(&store, &anna, &source, &r.id).await["mit"],
+            json!([keep])
+        );
+    }
+
+    #[tokio::test]
+    async fn rewriting_a_cell_moves_the_edge_and_leaves_no_stale_one() {
+        let (store, anna, _, source, target) = relation_fixture().await;
+        store
+            .add_dataset_field(&anna, &source, &relation_field("mit", &target, true))
+            .await
+            .unwrap();
+        let fid = field_id(&store, &source, "mit").await;
+        let a = target_row(&store, &target).await;
+        let b = target_row(&store, &target).await;
+        let r = made(&store, &anna, &source, json!({"mit": [a.clone()]})).await;
+        assert_eq!(
+            store.rows_pointing_at(&fid, &a).await.unwrap(),
+            vec![r.id.clone()]
+        );
+        // Re-point at b: the a-edge is gone, a b-edge is there, and the cell reads back as b alone.
+        let RowOutcome::Done(u) = store
+            .update_dataset_row(&anna, &source, &r.id, 1, &vals(json!({"mit": [b.clone()]})))
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(u.version, 2);
+        assert!(
+            store.rows_pointing_at(&fid, &a).await.unwrap().is_empty(),
+            "no stale edge behind"
+        );
+        assert_eq!(
+            store.rows_pointing_at(&fid, &b).await.unwrap(),
+            vec![r.id.clone()]
+        );
+        assert_eq!(read(&store, &anna, &source, &r.id).await["mit"], json!([b]));
+    }
+
+    #[tokio::test]
+    async fn clearing_a_relation_drops_its_edges_whether_by_null_or_empty_list() {
+        let (store, anna, _, source, target) = relation_fixture().await;
+        store
+            .add_dataset_field(&anna, &source, &relation_field("mit", &target, true))
+            .await
+            .unwrap();
+        let fid = field_id(&store, &source, "mit").await;
+        let a = target_row(&store, &target).await;
+        let r = made(&store, &anna, &source, json!({"mit": [a.clone()]})).await;
+        assert_eq!(
+            store.rows_pointing_at(&fid, &a).await.unwrap(),
+            vec![r.id.clone()]
+        );
+        // `[]` is a clear: stored empty, and every edge for the cell goes.
+        let RowOutcome::Done(u) = store
+            .update_dataset_row(&anna, &source, &r.id, 1, &vals(json!({"mit": []})))
+            .await
+            .unwrap()
+        else {
+            panic!("an empty list is a clear, and a clear always writes")
+        };
+        assert_eq!(
+            u.values["mit"],
+            json!([]),
+            "an empty list is stored as empty"
+        );
+        assert!(store.rows_pointing_at(&fid, &a).await.unwrap().is_empty());
+        assert_eq!(read(&store, &anna, &source, &r.id).await["mit"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_multi_relation_cell_dedupes_and_a_single_one_refuses_a_list() {
+        let (store, anna, _, source, target) = relation_fixture().await;
+        store
+            .add_dataset_field(&anna, &source, &relation_field("mit", &target, true))
+            .await
+            .unwrap();
+        let a = target_row(&store, &target).await;
+        let b = target_row(&store, &target).await;
+        let r = made(
+            &store,
+            &anna,
+            &source,
+            json!({"mit": [a.clone(), b.clone(), a.clone()]}),
+        )
+        .await;
+        assert_eq!(
+            read(&store, &anna, &source, &r.id).await["mit"],
+            json!([a.clone(), b]),
+            "duplicated, order kept"
+        );
+        // A single column never takes a list: core refuses the shape before the store is asked.
+        store
+            .add_dataset_field(&anna, &source, &relation_field("eins", &target, false))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .create_dataset_row(&anna, &source, &vals(json!({"eins": [a]})))
+                .await
+                .unwrap(),
+            RowOutcome::Invalid(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_reverse_lookup_reads_off_the_target_index_not_a_scan() {
+        let (store, anna, _, source, target) = relation_fixture().await;
+        store
+            .add_dataset_field(&anna, &source, &relation_field("mit", &target, true))
+            .await
+            .unwrap();
+        let fid = field_id(&store, &source, "mit").await;
+        let a = target_row(&store, &target).await;
+        let r = made(&store, &anna, &source, json!({"mit": [a.clone()]})).await;
+        assert_eq!(
+            store.rows_pointing_at(&fid, &a).await.unwrap(),
+            vec![r.id.clone()]
+        );
+        // The very statement `rows_pointing_at` runs (one shared `const`, so the plan under test
+        // cannot drift from the query in use) must be a SEARCH on the target index.
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::relation::POINTS_AT_SQL
+        ))
+        .bind(&a)
+        .bind(&fid)
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+        let text = plan
+            .iter()
+            .map(|(_, _, _, step)| step.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("dataset_relation_by_target"), "{text}");
+        assert!(text.contains("SEARCH"), "{text}");
+        assert!(
+            !text.contains("SCAN dataset_relation"),
+            "a scan of the edge table: {text}"
         );
     }
 }
