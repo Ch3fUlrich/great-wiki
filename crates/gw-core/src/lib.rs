@@ -8,6 +8,7 @@ pub mod block;
 pub mod dataset;
 pub mod diff;
 pub mod document;
+pub mod formula;
 pub mod frontmatter;
 pub mod markdown;
 pub mod slug;
