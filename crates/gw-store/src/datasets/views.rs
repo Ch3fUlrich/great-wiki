@@ -1046,6 +1046,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn updating_a_board_re_validates_it_as_a_board() {
+        let (store, anna, _, _, path) = fixture().await;
+        let v = made_board(&store, &anna, &path).await;
+        // The update path validates against the STORED kind: a text column cannot become
+        // the lanes of an existing board, and a table-shaped config is not a board config.
+        for cfg in [json!({"group_by": "name"}), json!({"fields": ["name"]})] {
+            let out = store
+                .update_dataset_view(&anna, &path, &v.id, None, Some(&cfg))
+                .await
+                .unwrap();
+            assert!(matches!(out, SchemaOutcome::Invalid(_)), "{cfg}: {out:?}");
+        }
+        let list = match store.dataset_views(&anna, &path).await.unwrap() {
+            SchemaOutcome::Done(l) => l,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(list[0].config["group_by"], "status");
+        assert_eq!(list[0].kind, "board");
+    }
+
+    #[tokio::test]
     async fn a_board_naming_a_missing_field_a_hostile_key_or_an_unknown_member_is_refused() {
         let (store, anna, _, _, path) = fixture().await;
         for key in ["gibtsnicht", "a') OR 1=1 --"] {
