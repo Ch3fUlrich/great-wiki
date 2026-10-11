@@ -7,7 +7,9 @@
   import TableView from '$lib/datasets/TableView.svelte';
   import ViewBar from '$lib/datasets/ViewBar.svelte';
   import BoardView from '$lib/datasets/BoardView.svelte';
+  import FormView from '$lib/datasets/FormView.svelte';
   import { boardGroupKey } from '$lib/datasets/views';
+  import { formKeyOf } from '$lib/datasets/form';
   import Breadcrumb from '$lib/components/Breadcrumb.svelte';
   import PageAttachments from '$lib/components/PageAttachments.svelte';
   import PageMeta from '$lib/components/PageMeta.svelte';
@@ -164,6 +166,9 @@
   // already in the payload — computing these server-side would ship the same titles twice.
   const crumbs = $derived(breadcrumb(data.tree, data.doc));
   const subpages = $derived(childrenOf(data.tree, data.doc.path));
+
+  /** The picked view when it is a form: the branch below hands the narrowed view to FormView. */
+  const formularAnsicht = $derived(data.dataset && formKeyOf(data.dataset.view) !== null ? data.dataset.view : null);
 </script>
 
 <svelte:head><title>{data.doc.title} — great-wiki</title></svelte:head>
@@ -401,7 +406,14 @@
          draws an empty body for one. -->
     {#if data.dataset}
       <ViewBar views={data.dataset.views} active={data.dataset.view?.id ?? null} />
-      {#if boardGroupKey(data.dataset.view) !== null}
+      {#if formularAnsicht !== null}
+        <FormView
+          path={data.doc.path}
+          fields={data.dataset.fields}
+          view={formularAnsicht}
+          mayWrite={data.doc.may_write === true}
+        />
+      {:else if boardGroupKey(data.dataset.view) !== null}
         <BoardView
           path={data.doc.path}
           fields={data.dataset.fields}
