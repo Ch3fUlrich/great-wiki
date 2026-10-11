@@ -73,13 +73,11 @@
     {#each items as item (item.field.key)}
       {@const key = item.field.key}
       <label>
-        {item.label}{#if item.required}<span aria-hidden="true"> *</span>{/if}
-        <!-- svelte-ignore a11y_role_supports_aria_props -- the group carries the required flag for the whole control; the star is the visible half -->
+        {item.label}{#if item.required}<span aria-hidden="true">*</span><span class="nur-lesen"> (Pflichtfeld)</span>{/if}
         <span
           class="feld"
           role="group"
           aria-label={item.label}
-          aria-required={item.required ? 'true' : undefined}
           aria-describedby={errors[key] ? `${key}-fehler` : undefined}
         >
           {#if item.field.kind === 'bool'}
@@ -116,6 +114,14 @@
     .datensatz-formular label {
       display: grid;
       gap: var(--space-1);
+    }
+    .nur-lesen {
+      position: absolute;
+      inline-size: 1px;
+      block-size: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
     }
     .feld {
       display: grid;

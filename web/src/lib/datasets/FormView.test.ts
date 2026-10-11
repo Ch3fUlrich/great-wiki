@@ -40,9 +40,9 @@ describe('FormView', () => {
     expect(out).not.toContain('Rechnung');
   });
 
-  it('marks a required field visibly and in ARIA', () => {
+  it('marks a required field visibly and for a screen reader, once', () => {
     const out = html();
-    expect(out.match(/aria-required="true"/g)?.length).toBe(1);
+    expect(out.match(/\(Pflichtfeld\)/g)?.length).toBe(1);
     expect(out).toContain('<span aria-hidden="true">*</span>');
   });
 
