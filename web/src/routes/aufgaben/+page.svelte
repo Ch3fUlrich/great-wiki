@@ -9,10 +9,9 @@
   to-do goes missing — the failure D-6 exists to prevent).
 
   **The cost D-12 named is two places that must agree**, and it is paid in one place: one
-  endpoint (`GET /api/board`) and one rendering, mounted here as `$lib/boards/TaskBoard.svelte`
-  and on a project's home page as `$lib/components/Board.svelte` — the same markup, the same
-  rules, the same words, while the embedded placement still names the file this one was copied
-  off (M8c C3b puts both on `TaskBoard`). Everything this page adds is the frame around it — a
+  endpoint (`GET /api/board`) and one rendering, `$lib/boards/TaskBoard.svelte`, mounted here
+  and on a project's home page — the same markup, the same rules, the same words, over the
+  generic Board (M8c C3). Everything this page adds is the frame around it — a
   heading, a lede, and the project filter.
 
   **Nothing on this page needs a script.** The filter is a plain GET form, so choosing a

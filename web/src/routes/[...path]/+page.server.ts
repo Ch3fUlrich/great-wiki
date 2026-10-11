@@ -151,7 +151,7 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
   // of what D-12 permitted. It put a board here as well as at `/aufgaben` because a
   // project's own page is where you look when you are thinking about that project, and it
   // named the cost in the same breath: two places that must agree. They agree by being one
-  // query and one component (`$lib/components/Board.svelte`), and a move made here posts to
+  // query and one component (`$lib/boards/TaskBoard.svelte`), and a move made here posts to
   // `/aufgaben?/verschieben` like every other one. A second retrieval path would be a second
   // answer to "which tasks exist", and because every card is a disclosure surface, a second
   // answer is also a second chance to leak one.

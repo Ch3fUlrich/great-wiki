@@ -3,7 +3,7 @@
   import Comments from '$lib/components/Comments.svelte';
   import Backlinks from '$lib/components/Backlinks.svelte';
   import BlockView from '$lib/components/BlockView.svelte';
-  import Board from '$lib/components/Board.svelte';
+  import TaskBoard from '$lib/boards/TaskBoard.svelte';
   import TableView from '$lib/datasets/TableView.svelte';
   import Breadcrumb from '$lib/components/Breadcrumb.svelte';
   import PageAttachments from '$lib/components/PageAttachments.svelte';
@@ -419,7 +419,7 @@
          page in this wiki is nobody's home, and furniture on all of them is not a cost D-12
          asked anybody to pay. -->
     {#if data.board}
-      <Board
+      <TaskBoard
         board={data.board}
         me={data.me}
         now={data.now}

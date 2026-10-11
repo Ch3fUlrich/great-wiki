@@ -1,9 +1,8 @@
 <!--
   The task board, rendered on the generic Board (M8c C3a-2).
 
-  `$lib/components/Board.svelte` is the same rendering before this file existed, and it is
-  still what a project's home page mounts; this one is re-founded on `boards/Board.svelte` fed
-  through `TaskRowSource`, so a task board and a dataset board share one column, card and drag
+  This replaced the task-only `components/Board.svelte` (M8c C3b): it is founded on
+  `boards/Board.svelte` fed through `TaskRowSource`, so a task board and a dataset board share one column, card and drag
   machine. What stays **here** is everything a task board says — the heading and its level, the
   notice a move answers in, the words on a card, and the form a move actually is. Those are the
   interface's contract, not the grid's, and `TaskBoard.test.ts` is the old `Board.test.ts`
