@@ -4818,10 +4818,24 @@ await check('X1 an editor sees the dataset as a board, drags a card to another c
   assert((await board.locator('b').count()) === 0, 'a card was rendered as markup');
 
   // One drag is one row PATCH (DatasetRowSource.move); wait for the answer, not a toast.
-  await clara.dragTo(page.locator('[data-column="fertig"]'));
-  await page
-    .locator('[data-column="fertig"] li[data-card]', { hasText: 'Clara' })
-    .waitFor({ state: 'visible', timeout: 10_000 });
+  // The three DOM drag events with one shared DataTransfer: the handlers under test are the
+  // board's own (dragstart stores the card id, drop moves it). Playwright's native dragTo did
+  // not start a drag from a card whose middle is a <select>, and a drag that never starts
+  // says nothing about the board, so the events are sent directly.
+  const dt = await page.evaluateHandle(() => new DataTransfer());
+  const fertig = page.locator('[data-column="fertig"]');
+  await clara.dispatchEvent('dragstart', { dataTransfer: dt });
+  await fertig.dispatchEvent('dragover', { dataTransfer: dt });
+  await fertig.dispatchEvent('drop', { dataTransfer: dt });
+  const arrived = page.locator('[data-column="fertig"] li[data-card]', { hasText: 'Clara' });
+  try {
+    await arrived.waitFor({ state: 'visible', timeout: 10_000 });
+  } catch (err) {
+    const note = await page.locator('[data-board-message]').innerText().catch(() => '(no message element)');
+    const now = await (await page.request.get(BASE + '/api/datasets/rows' + TABELLE)).json();
+    const row = now.rows.find((r) => r.values.name === 'Clara');
+    throw new Error(`the dragged card did not arrive; board message "${note}"; API stand=${row?.values.stand}; ${err.message}`);
+  }
 
   // Stored, not just drawn: the reload re-reads the rows server-side.
   await page.reload({ waitUntil: 'networkidle' });
@@ -4838,13 +4852,32 @@ await check('X1 an editor sees the dataset as a board, drags a card to another c
   assert(guest.status() === 404, `the board answered a guest ${guest.status()}`);
 });
 
+await check('X1b the same move through the card\'s "Verschieben nach" select (one code path with the drag) is stored', async (page) => {
+  const { boardId } = await xSetup(page);
+  await page.goto(BASE + TABELLE + '?view=' + boardId, { waitUntil: 'networkidle' });
+  const berta = page.locator('li[data-card]', { hasText: '<b>Berta</b>' });
+  await berta.waitFor({ state: 'visible', timeout: 10_000 });
+  await berta.locator('select[aria-label="Verschieben nach"]').selectOption('offen');
+  const arrived = page.locator('[data-column="offen"] li[data-card]', { hasText: '<b>Berta</b>' });
+  try {
+    await arrived.waitFor({ state: 'visible', timeout: 10_000 });
+  } catch (err) {
+    const note = await page.locator('[data-board-message]').innerText().catch(() => '(no message element)');
+    throw new Error(`the select move did not arrive; board message "${note}"; ${err.message}`);
+  }
+  await page.reload({ waitUntil: 'networkidle' });
+  await page
+    .locator('[data-column="offen"] li[data-card]', { hasText: '<b>Berta</b>' })
+    .waitFor({ state: 'visible', timeout: 10_000 });
+});
+
 await check('X2 an editor submits the form view; a missing required field is refused inline; a field outside the form is refused by the API; a guest cannot submit', async (page) => {
   const { formId } = await xSetup(page);
   await page.goto(BASE + TABELLE + '?view=' + formId, { waitUntil: 'networkidle' });
   const form = page.locator('form.datensatz-formular');
   await form.waitFor({ state: 'visible', timeout: 10_000 });
-  await form.getByLabel('Wie heißt die Person?').waitFor({ state: 'visible', timeout: 10_000 });
-  await form.getByLabel('Alter').waitFor({ state: 'visible', timeout: 10_000 });
+  await form.getByRole('textbox', { name: /Wie heißt die Person\?/ }).waitFor({ state: 'visible', timeout: 10_000 });
+  await form.getByRole('spinbutton', { name: /Alter/ }).waitFor({ state: 'visible', timeout: 10_000 });
 
   const rowCount = async () => (await (await page.request.get(BASE + '/api/datasets/rows' + TABELLE)).json()).rows.length;
 
@@ -4857,8 +4890,8 @@ await check('X2 an editor submits the form view; a missing required field is ref
   assert((await rowCount()) === before, 'a refused submit added a row');
 
   // A complete submit is one new row.
-  await form.getByLabel('Wie heißt die Person?').fill('Emil');
-  await form.getByLabel('Alter').fill('5');
+  await form.getByRole('textbox', { name: /Wie heißt die Person\?/ }).fill('Emil');
+  await form.getByRole('spinbutton', { name: /Alter/ }).fill('5');
   await form.getByRole('button', { name: 'Absenden' }).click();
   await form.locator('p.form-status', { hasText: 'Gespeichert.' }).waitFor({ state: 'visible', timeout: 10_000 });
   const afterEmil = await (await page.request.get(BASE + '/api/datasets/rows' + TABELLE)).json();
