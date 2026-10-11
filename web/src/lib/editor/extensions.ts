@@ -480,12 +480,16 @@ const Embed = Node.create({
  *
  * # Its own group, so it can only stand where the importer will read one back
  *
- * `group: 'dataset-view'` and NOT `'block'`, with `Doc` below widening only the document's
+ * `group: 'datasetView'` and NOT `'block'`, with `Doc` below widening only the document's
  * content expression to admit it — `Attachment`'s and `Embed`'s argument unchanged: the
  * markdown importer reads a dataset view back only at the top level of the document, a
  * `listItem` cannot hold an atom in first position (and `createNodeFromYElement` answers a
  * node ProseMirror cannot build by DELETING the element from the CRDT), and a `tableCell` in
- * markdown is one paragraph and nothing else.
+ * markdown is one paragraph and nothing else. The group is camelCase even though the NODE
+ * name is kebab-case, and that is a hard constraint rather than a style choice: ProseMirror
+ * tokenizes a content expression at every non-word character, so `dataset-view` in `Doc`'s
+ * expression is three tokens and a schema that throws at construction — while the node name
+ * is a plain property lookup and keeps the wire spelling.
  *
  * # `atom`, `draggable`, and no marks
  *
@@ -496,7 +500,7 @@ const Embed = Node.create({
  */
 const DatasetView = Node.create({
   name: 'dataset-view',
-  group: 'dataset-view',
+  group: 'datasetView',
   atom: true,
   draggable: true,
   marks: '',
@@ -544,7 +548,7 @@ const DatasetView = Node.create({
  * `@tiptap/starter-kit`'s own dependency, pinned by it to the same exact 3.30.0 (checked in
  * `package-lock.json`), exactly as the six marks imported above do.
  */
-const Doc = Document.extend({ content: '(block|attachment|embed|dataset-view)+' });
+const Doc = Document.extend({ content: '(block|attachment|embed|datasetView)+' });
 
 /**
  * The Yjs fragment the document lives in.

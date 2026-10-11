@@ -520,7 +520,7 @@ describe('the editor schema', () => {
     // `createNodeFromYElement` answers a node ProseMirror cannot build by DELETING the
     // element from the CRDT.
     expect(editorSchema.nodes.embed.spec.group).toBe('embed');
-    expect(editorSchema.nodes.doc.spec.content).toBe('(block|attachment|embed|dataset-view)+');
+    expect(editorSchema.nodes.doc.spec.content).toBe('(block|attachment|embed|datasetView)+');
     expect(() =>
       PmNode.fromJSON(editorSchema, {
         type: 'doc',
