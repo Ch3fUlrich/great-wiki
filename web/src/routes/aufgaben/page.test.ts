@@ -8,7 +8,7 @@ import type { Project } from '$lib/projects';
 /**
  * The global board's page, rendered exactly as the server renders it.
  *
- * The board itself is proved in `$lib/components/Board.test.ts` — it is the SAME component
+ * The board itself is proved in `$lib/boards/TaskBoard.test.ts` — it is the SAME component
  * the embedded board uses, which is how D-12's two placements are kept from disagreeing. What
  * is proved here is the frame this page puts around it: the project filter, which is a plain
  * GET form and therefore works before hydration, and the two things this page must not do —

@@ -411,7 +411,7 @@ describe('offering the editor', () => {
 /**
  * D-12's second placement, on the page itself.
  *
- * The board is proved in `$lib/components/Board.test.ts` — it is the SAME component
+ * The board is proved in `$lib/boards/TaskBoard.test.ts` — it is the SAME component
  * `/aufgaben` renders, which is how the two are kept from disagreeing. What is proved here
  * is where it sits and when it appears at all: only on a page the endpoint named as a
  * project's home, above the subpage list, and never as furniture on the pages that are

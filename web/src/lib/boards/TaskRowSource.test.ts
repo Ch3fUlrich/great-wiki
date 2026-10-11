@@ -4,7 +4,7 @@ import type { BoardResponse, BoardTask, TaskStatus } from '$lib/board';
 import type { Project } from '$lib/projects';
 import { TaskRowSource } from './TaskRowSource';
 
-// Copied from web/src/lib/components/Board.test.ts so this source is fed the same wire shape.
+// Copied from web/src/lib/boards/TaskBoard.test.ts so this source is fed the same wire shape.
 function task(over: Partial<BoardTask> = {}): BoardTask {
   return {
     id: 't1',
