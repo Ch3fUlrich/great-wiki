@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 mod computed;
+mod links;
 mod query;
 mod views;
 pub use query::{Cursor, Filter, RowQuery, Sort, SortKind};
@@ -146,8 +147,9 @@ impl Store {
     }
 
     /// Add a column. Needs write. `key` is validated by [`FieldKey::parse`] before it
-    /// reaches SQL; `kind` is fixed for the life of the field. The stored kinds and `formula`
-    /// are offered; `person`, `file`, `relation` and `rollup` wait for a later milestone.
+    /// reaches SQL; `kind` is fixed for the life of the field. Every stored kind and `formula`
+    /// are offered; `relation` and `rollup` wait for a later milestone. A `person` column may
+    /// say `{"multiple": true}`, a `file` column takes no config.
     pub async fn add_dataset_field(
         &self,
         principal: &Principal,
@@ -163,10 +165,7 @@ impl Store {
             Ok(k) => k,
             Err(e) => return Ok(SchemaOutcome::Invalid(e.to_string())),
         };
-        if matches!(
-            new.kind,
-            FieldKind::Person | FieldKind::File | FieldKind::Relation | FieldKind::Rollup
-        ) {
+        if matches!(new.kind, FieldKind::Relation | FieldKind::Rollup) {
             return Ok(SchemaOutcome::Invalid(format!(
                 "field kind `{}` is not available yet",
                 new.kind.as_str()
@@ -181,6 +180,9 @@ impl Store {
             return Ok(SchemaOutcome::Invalid(format!(
                 "field config must be an object of at most {MAX_CONFIG_BYTES} bytes"
             )));
+        }
+        if let Some(msg) = link_config_check(new.kind, &new.config) {
+            return Ok(SchemaOutcome::Invalid(msg));
         }
         if new.kind == FieldKind::Formula {
             if let Some(msg) = self
@@ -459,11 +461,13 @@ fn row_from(t: RowTuple) -> DatasetRow {
 const ROW_COLS: &str = "id, \"values\", version, created_at, updated_at";
 
 impl Store {
-    /// Validate `patch` against the dataset's current schema. Unknown keys, wrong types and
-    /// the kinds that need the store (person, file, relation: M8b) are refused; `null` stays
-    /// as `null` so an update can clear a cell.
+    /// Validate `patch` against the dataset's current schema. Unknown keys and wrong types are
+    /// refused by core; the two kinds whose value names something outside the row — a `person`
+    /// who must be able to read this page, a `file` that must be on it — are refused here, where
+    /// the store can ask. `null` stays as `null` so an update can clear a cell.
     async fn checked_values(
         &self,
+        path: &str,
         doc_id: &str,
         patch: &serde_json::Map<String, Value>,
     ) -> Result<std::result::Result<serde_json::Map<String, Value>, String>> {
@@ -484,7 +488,18 @@ impl Store {
                 config,
             })
             .collect();
-        Ok(validate_row(&specs, patch).map_err(|e| e.to_string()))
+        let clean = match validate_row(&specs, patch) {
+            Ok(clean) => clean,
+            Err(e) => return Ok(Err(e.to_string())),
+        };
+        let kinds: Vec<(&str, FieldKind)> = parsed
+            .iter()
+            .map(|(key, kind, _)| (key.as_str(), *kind))
+            .collect();
+        if let Some(reason) = self.link_refusal(path, doc_id, &kinds, &clean).await? {
+            return Ok(Err(reason));
+        }
+        Ok(Ok(clean))
     }
 
     /// SQLite's current date, for `today()` in a formula: fetched once per read call, never per
@@ -506,8 +521,8 @@ impl Store {
         Ok(t.map(row_from))
     }
 
-    /// One row of the dataset at `path`, for anybody who may read it, with its computed fields
-    /// filled in.
+    /// One row of the dataset at `path`, for anybody who may read it, with its file cells
+    /// resolved and its computed fields filled in.
     pub async fn dataset_row(
         &self,
         principal: &Principal,
@@ -521,9 +536,12 @@ impl Store {
             return Ok(RowOutcome::NoRow);
         };
         let fields = self.fields_of(&doc.id).await?;
+        let names = self.attachment_names(&doc.id, &fields).await?;
         let today = self.today().await?;
         Ok(RowOutcome::Done(computed::with_computed(
-            &fields, row, &today,
+            &fields,
+            links::resolve_files(row, &fields, &names),
+            &today,
         )))
     }
 
@@ -554,10 +572,12 @@ impl Store {
             .fetch_one(&self.pool)
             .await?;
         let fields = self.fields_of(&doc.id).await?;
+        let names = self.attachment_names(&doc.id, &fields).await?;
         let today = self.today().await?;
         let rows = tuples
             .into_iter()
             .map(row_from)
+            .map(|r| links::resolve_files(r, &fields, &names))
             .map(|r| computed::with_computed(&fields, r, &today))
             .collect();
         Ok(RowOutcome::Done(RowPage {
@@ -675,11 +695,13 @@ impl Store {
             };
         }
         let total = c.fetch_one(&self.pool).await?;
+        let names = self.attachment_names(&doc.id, &fields).await?;
         let today = self.today().await?;
         Ok(RowOutcome::Done(RowPage {
             rows: fetched
                 .into_iter()
                 .map(|t| row_from((t.0, t.1, t.2, t.3, t.4)))
+                .map(|r| links::resolve_files(r, &fields, &names))
                 .map(|r| computed::with_computed(&fields, r, &today))
                 .collect(),
             total,
@@ -700,7 +722,7 @@ impl Store {
             Gate::NoDataset => return Ok(RowOutcome::NoDataset),
             Gate::ReadOnly => return Ok(RowOutcome::ReadOnly),
         };
-        let mut clean = match self.checked_values(&doc_id, values).await? {
+        let mut clean = match self.checked_values(path, &doc_id, values).await? {
             Ok(v) => v,
             Err(m) => return Ok(RowOutcome::Invalid(m)),
         };
@@ -748,7 +770,7 @@ impl Store {
             Gate::NoDataset => return Ok(RowOutcome::NoDataset),
             Gate::ReadOnly => return Ok(RowOutcome::ReadOnly),
         };
-        let patch = match self.checked_values(&doc_id, patch).await? {
+        let patch = match self.checked_values(path, &doc_id, patch).await? {
             Ok(v) => v,
             Err(m) => return Ok(RowOutcome::Invalid(m)),
         };
@@ -884,6 +906,28 @@ fn formula_src(config: &Value) -> Result<&str, String> {
         ));
     }
     Ok(src)
+}
+
+/// What the two store-dependent kinds accept as config, or the reason to refuse it. A `person`
+/// column is single unless it says `{"multiple": true}`; a `file` column names one attachment and
+/// so takes no config at all. An unknown member is refused rather than ignored: `{"mutiple":
+/// true}` typed one letter short would otherwise silently leave a column that stores one id, and
+/// the person who typed it would have no way to find out.
+fn link_config_check(kind: FieldKind, config: &Value) -> Option<String> {
+    let Some(map) = config.as_object() else {
+        return None; // the general config check above has already refused this
+    };
+    match kind {
+        FieldKind::Person
+            if map.len() <= 1 && map.iter().all(|(k, v)| k == "multiple" && v.is_boolean()) => {}
+        FieldKind::Person => {
+            return Some("a person's config is {} or {\"multiple\": true|false}".into())
+        }
+        FieldKind::File if map.is_empty() => {}
+        FieldKind::File => return Some("a file's config is {}".into()),
+        _ => {}
+    }
+    None
 }
 
 /// Whether a stored field's `kind` is a computed one (formula or rollup): evaluated at read,
@@ -1184,14 +1228,9 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(dup, SchemaOutcome::Conflict(_)), "{dup:?}");
-        // Computed and store-dependent kinds are not offered in M8a.
-        for kind in [
-            FieldKind::Formula,
-            FieldKind::Rollup,
-            FieldKind::Relation,
-            FieldKind::Person,
-            FieldKind::File,
-        ] {
+        // Rollup and relation are not offered yet; `formula` with an empty config is refused by
+        // its own shape check, and `person`/`file` are accepted since M8b.
+        for kind in [FieldKind::Rollup, FieldKind::Relation] {
             let out = store
                 .add_dataset_field(&anna, &path, &nf("x", kind))
                 .await
@@ -1579,14 +1618,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn needs_store_kinds_are_refused_in_m8a() {
+    async fn relation_is_the_last_kind_that_cannot_be_written() {
         let (store, anna, _, _, path) = row_fixture().await;
         let doc = doc_id_of(&store, &path).await;
-        // A person column cannot be added through the API, so plant one underneath.
-        add_field(&store, &doc, "wer", "person").await.unwrap();
+        // A relation column cannot be added through the API, so plant one underneath.
+        add_field(&store, &doc, "mit", "relation").await.unwrap();
         assert!(matches!(
             store
-                .create_dataset_row(&anna, &path, &vals(json!({"wer": "p1"})))
+                .create_dataset_row(&anna, &path, &vals(json!({"mit": "r1"})))
                 .await
                 .unwrap(),
             RowOutcome::Invalid(_)
@@ -2383,5 +2422,395 @@ mod tests {
             SchemaOutcome::ReadOnly
         );
         assert!(!has(&keys(&store, &anna, &path).await, "a"));
+    }
+
+    // --- person and file fields (M8b B3) ---------------------------------------------
+
+    use crate::{AttachOutcome, BlobOutcome, BlobStore, DetachOutcome};
+
+    /// The two refusals, spelled out rather than imported from `links`: an error message is
+    /// part of the behaviour, and renaming it quietly is exactly what a test should notice.
+    const NO_PERSON: &str = "person is not available for this dataset";
+    const NO_FILE: &str = "file is not an attachment of this dataset";
+
+    fn person_field(key: &str, multiple: bool) -> NewField {
+        NewField {
+            key: key.into(),
+            label: key.to_uppercase(),
+            kind: FieldKind::Person,
+            config: json!({ "multiple": multiple }),
+        }
+    }
+
+    fn file_field(key: &str) -> NewField {
+        NewField {
+            key: key.into(),
+            label: key.to_uppercase(),
+            kind: FieldKind::File,
+            config: json!({}),
+        }
+    }
+
+    /// A text column to patch beside a person, a single-person column, a multi-person one and
+    /// a file column.
+    async fn link_fixture() -> (Store, Principal, Principal, String) {
+        let (store, anna, bea, _cleo, path) = schema_fixture().await;
+        for field in [
+            plain_field("name", FieldKind::Text),
+            person_field("wer", false),
+            person_field("team", true),
+            file_field("dok"),
+        ] {
+            let out = store.add_dataset_field(&anna, &path, &field).await.unwrap();
+            assert!(matches!(out, SchemaOutcome::Done(_)), "{out:?}");
+        }
+        (store, anna, bea, path)
+    }
+
+    /// A real account, because a `person` cell is checked against `principals` and
+    /// [`Principal::test`] names nobody there.
+    async fn account(
+        store: &Store,
+        name: &str,
+        permission: Permission,
+        paths: &[&str],
+    ) -> Principal {
+        let who = store
+            .create_local_principal(name, name, None, "$argon2id$fake")
+            .await
+            .unwrap();
+        for path in paths {
+            store
+                .add_grant(path, Subject::Principal(who.id.clone()), permission)
+                .await
+                .unwrap();
+        }
+        who
+    }
+
+    /// A media mount that lives exactly as long as the test holds it.
+    fn media() -> (tempfile::TempDir, BlobStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::open(dir.path()).unwrap();
+        (dir, blobs)
+    }
+
+    /// Bytes that have arrived and been typed, and the id a `file` cell would name.
+    async fn attach_to(
+        store: &Store,
+        who: &Principal,
+        path: &str,
+        name: &str,
+        blobs: &BlobStore,
+    ) -> String {
+        let mut writer = blobs.writer().unwrap();
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend_from_slice(name.as_bytes());
+        writer.push(&bytes).await.unwrap();
+        let pending = match writer.finish().await.unwrap() {
+            BlobOutcome::Accepted(pending) => pending,
+            other => panic!("these bytes must be acceptable, got {other:?}"),
+        };
+        match store.attach(who, path, name, pending).await.unwrap() {
+            AttachOutcome::Done(_) => {}
+            other => panic!("`{name}` must attach to {path}, got {other:?}"),
+        }
+        sqlx::query_scalar("SELECT id FROM attachments WHERE doc_id = ?1 AND filename = ?2")
+            .bind(doc_id_of(store, path).await)
+            .bind(name)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_person_cell_is_written_only_for_somebody_who_could_read_this_page() {
+        let (store, anna, bea, path) = link_fixture().await;
+        let leser = account(&store, "leser", Permission::Read, &["/raum"]).await;
+        let fremder = account(&store, "fremder", Permission::Read, &[]).await;
+
+        let r = made(&store, &anna, &path, json!({"wer": leser.id.clone()})).await;
+        assert_eq!(r.values["wer"], json!(leser.id));
+
+        // Somebody who may not read this page is refused — and so is an id that names nobody,
+        // in the same words, so a row write is not a way to ask whether an account exists.
+        let unreadable = store
+            .create_dataset_row(&anna, &path, &vals(json!({"wer": fremder.id.clone()})))
+            .await
+            .unwrap();
+        let unknown = store
+            .create_dataset_row(&anna, &path, &vals(json!({"wer": "es-gibt-sie-nicht"})))
+            .await
+            .unwrap();
+        assert_eq!(unreadable, RowOutcome::Invalid(NO_PERSON.into()));
+        assert_eq!(unknown, unreadable, "one answer for two different mistakes");
+        // The same on the update path, with the row left exactly as it was.
+        assert_eq!(
+            store
+                .update_dataset_row(
+                    &anna,
+                    &path,
+                    &r.id,
+                    1,
+                    &vals(json!({"wer": fremder.id.clone()}))
+                )
+                .await
+                .unwrap(),
+            RowOutcome::Invalid(NO_PERSON.into())
+        );
+        assert_eq!(
+            read(&store, &anna, &path, &r.id).await["wer"],
+            json!(leser.id)
+        );
+        // A person who can read the page is accepted on both paths.
+        let chef = account(&store, "chef", Permission::Read, &["/raum"]).await;
+        let RowOutcome::Done(second) = store
+            .create_dataset_row(&anna, &path, &vals(json!({"wer": chef.id.clone()})))
+            .await
+            .unwrap()
+        else {
+            panic!("a reader may be named")
+        };
+        assert_eq!(second.values["wer"], json!(chef.id));
+        // The gate that was there before is still there: naming somebody who may read is not a
+        // way to write a row you may not write.
+        assert_eq!(
+            store
+                .create_dataset_row(&bea, &path, &vals(json!({"wer": leser.id.clone()})))
+                .await
+                .unwrap(),
+            RowOutcome::ReadOnly
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_a_person_asks_nothing_of_the_person_it_drops() {
+        let (store, anna, _, path) = link_fixture().await;
+        let leser = account(&store, "leser", Permission::Read, &["/raum"]).await;
+        let r = made(
+            &store,
+            &anna,
+            &path,
+            json!({"wer": leser.id.clone(), "team": [leser.id.clone()]}),
+        )
+        .await;
+        // Access withdrawn after the write — the stored person can no longer read the page.
+        store
+            .remove_grant(
+                "/raum",
+                &Subject::Principal(leser.id.clone()),
+                Permission::Read,
+            )
+            .await
+            .unwrap();
+
+        // A patch that does not mention the field never re-asks.
+        assert!(matches!(
+            store
+                .update_dataset_row(&anna, &path, &r.id, 1, &vals(json!({"name": "Ada"})))
+                .await
+                .unwrap(),
+            RowOutcome::Done(_)
+        ));
+        // Naming them again is now refused.
+        assert_eq!(
+            store
+                .update_dataset_row(
+                    &anna,
+                    &path,
+                    &r.id,
+                    2,
+                    &vals(json!({"wer": leser.id.clone()}))
+                )
+                .await
+                .unwrap(),
+            RowOutcome::Invalid(NO_PERSON.into())
+        );
+        // Clearing — by `null` and by an empty list — is not: it discloses nothing, and a page
+        // that could not do this could never be tidied up after somebody left.
+        let RowOutcome::Done(cleared) = store
+            .update_dataset_row(
+                &anna,
+                &path,
+                &r.id,
+                2,
+                &vals(json!({"wer": Value::Null, "team": []})),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("a clear must always be allowed")
+        };
+        assert_eq!(cleared.values["wer"], Value::Null);
+        assert_eq!(
+            cleared.values["team"],
+            json!([]),
+            "an empty list is a clear, and is stored as empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_multi_person_cell_dedupes_and_needs_read_of_every_name() {
+        let (store, anna, _, path) = link_fixture().await;
+        let leser = account(&store, "leser", Permission::Read, &["/raum"]).await;
+        let chef = account(&store, "chef", Permission::Read, &["/raum"]).await;
+        let fremder = account(&store, "fremder", Permission::Read, &[]).await;
+
+        let r = made(
+            &store,
+            &anna,
+            &path,
+            json!({"team": [chef.id.clone(), leser.id.clone(), chef.id.clone()]}),
+        )
+        .await;
+        assert_eq!(r.values["team"], json!([chef.id, leser.id]));
+        // One unreadable name poisons the whole cell, in the same uniform words.
+        assert_eq!(
+            store
+                .create_dataset_row(
+                    &anna,
+                    &path,
+                    &vals(json!({"team": [chef.id.clone(), fremder.id.clone()]}))
+                )
+                .await
+                .unwrap(),
+            RowOutcome::Invalid(NO_PERSON.into())
+        );
+        // A single-person column takes one id, never a list.
+        assert!(matches!(
+            store
+                .create_dataset_row(&anna, &path, &vals(json!({"wer": [chef.id.clone()]})))
+                .await
+                .unwrap(),
+            RowOutcome::Invalid(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn person_and_file_columns_take_only_their_own_config() {
+        let (store, anna, _, _, path) = schema_fixture().await;
+        for field in [
+            person_field("wer", false),
+            person_field("team", true),
+            file_field("dok"),
+        ] {
+            let out = store.add_dataset_field(&anna, &path, &field).await.unwrap();
+            assert!(matches!(out, SchemaOutcome::Done(_)), "{out:?}");
+        }
+        // An unknown or mistyped member is refused rather than ignored.
+        for (field, bad) in [
+            (person_field("x", false), json!({"multiple": "yes"})),
+            (person_field("y", false), json!({"many": true})),
+            (file_field("z"), json!({"multiple": true})),
+        ] {
+            let mut mistyped = field;
+            mistyped.config = bad.clone();
+            let out = store
+                .add_dataset_field(&anna, &path, &mistyped)
+                .await
+                .unwrap();
+            assert!(
+                matches!(out, SchemaOutcome::Invalid(_)),
+                "{}: {out:?}",
+                mistyped.key
+            );
+            assert!(!has(&keys(&store, &anna, &path).await, &mistyped.key));
+        }
+        // Relation and rollup wait for their own milestone.
+        for kind in [FieldKind::Relation, FieldKind::Rollup] {
+            let out = store
+                .add_dataset_field(&anna, &path, &nf("later", kind))
+                .await
+                .unwrap();
+            assert!(
+                matches!(out, SchemaOutcome::Invalid(_)),
+                "{kind:?}: {out:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_cell_is_one_of_this_page_s_attachments_and_reads_back_as_a_name() {
+        let (store, anna, _, path) = link_fixture().await;
+        let (_dir, blobs) = media();
+        let CreateOutcome::Created { path: andere, .. } = store
+            .create_dataset_for(
+                &anna,
+                &CreateRequest {
+                    parent: Some("/raum".into()),
+                    title: "Ablage".into(),
+                    slug: None,
+                    template: None,
+                },
+                false,
+                "d",
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("a second dataset")
+        };
+        // A file that sits on another page is not this dataset's to name.
+        let fremder = attach_to(&store, &anna, &andere, "fremd.png", &blobs).await;
+        assert_eq!(
+            store
+                .create_dataset_row(&anna, &path, &vals(json!({"dok": fremder.clone()})))
+                .await
+                .unwrap(),
+            RowOutcome::Invalid(NO_FILE.into())
+        );
+        assert_eq!(
+            store
+                .update_dataset_row(&anna, &path, "nichts", 1, &vals(json!({"dok": fremder})))
+                .await
+                .unwrap(),
+            RowOutcome::Invalid(NO_FILE.into()),
+            "the patch is refused before the row is even looked for"
+        );
+
+        let id = attach_to(&store, &anna, &path, "befund.png", &blobs).await;
+        let on_page = json!({"id": id.clone(), "filename": "befund.png"});
+        let r = made(&store, &anna, &path, json!({"dok": id.clone()})).await;
+        assert_eq!(read(&store, &anna, &path, &r.id).await["dok"], on_page);
+        // The list and the filtered query decorate the same way as the single read.
+        for page in [
+            match store.dataset_rows(&anna, &path, 10, 0).await.unwrap() {
+                RowOutcome::Done(p) => p,
+                other => panic!("{other:?}"),
+            },
+            match store
+                .dataset_rows_query(
+                    &anna,
+                    &path,
+                    &RowSelect {
+                        limit: 10,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+            {
+                RowOutcome::Done(p) => p,
+                other => panic!("{other:?}"),
+            },
+        ] {
+            assert_eq!(page.rows[0].values["dok"], on_page);
+        }
+        // The cell in storage stays the id: a filename is a read-time answer.
+        let raw: String = sqlx::query_scalar("SELECT \"values\" FROM dataset_row WHERE id = ?")
+            .bind(&r.id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert!(raw.contains(&id) && !raw.contains("befund.png"), "{raw}");
+        // A detach is ordinary and must not turn this row into an error.
+        assert!(matches!(
+            store.detach(&anna, &path, "befund.png").await.unwrap(),
+            DetachOutcome::Done(_)
+        ));
+        assert_eq!(
+            read(&store, &anna, &path, &r.id).await["dok"],
+            json!({"id": id, "missing": true})
+        );
     }
 }

@@ -8,8 +8,10 @@ use super::{FieldKey, FieldKind};
 
 /// Largest accepted row, as serialized JSON bytes.
 pub const MAX_ROW_BYTES: usize = 64 * 1024;
-/// Longest tag id accepted.
+/// Longest id accepted, in bytes (a tag, a principal id, an attachment id).
 const MAX_ID_LEN: usize = 128;
+/// Most people one multi-person cell may name.
+pub const MAX_PERSONS: usize = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FieldError {
@@ -25,7 +27,9 @@ pub enum FieldError {
     UnknownOption(String),
     #[error("id is empty or too long")]
     BadId,
-    /// person, file and relation need the store to check what they point at.
+    #[error("a person cell names at most {MAX_PERSONS} people")]
+    TooManyPersons,
+    /// relation values need the store to check what they point at.
     #[error("{0} values need the store to validate")]
     NeedsStore(&'static str),
     #[error("{0} fields are computed and never stored")]
@@ -51,6 +55,10 @@ pub struct FieldSpec<'a> {
 }
 
 /// Validate one value; returns the normalised form to store. `null` clears a cell.
+///
+/// `person` and `file` are checked for SHAPE only — that an id is a non-empty, bounded string
+/// and that an array is deduped. Whether the id names an account that may see this page, or a
+/// file that is on it, is the store's question and is asked there.
 pub fn validate_value(kind: FieldKind, config: &Value, json: &Value) -> Result<Value, FieldError> {
     if kind.is_computed() {
         return Err(FieldError::Computed(kind.as_str()));
@@ -95,9 +103,7 @@ pub fn validate_value(kind: FieldKind, config: &Value, json: &Value) -> Result<V
         }
         FieldKind::Tags => {
             let ids = dedupe(strings(json)?);
-            if ids.iter().any(|t| t.is_empty() || t.len() > MAX_ID_LEN) {
-                return Err(FieldError::BadId);
-            }
+            check_ids(&ids)?;
             Ok(ids.into())
         }
         FieldKind::Url => {
@@ -112,9 +118,28 @@ pub fn validate_value(kind: FieldKind, config: &Value, json: &Value) -> Result<V
                 Err(FieldError::BadUrl)
             }
         }
-        FieldKind::Person | FieldKind::File | FieldKind::Relation => {
-            Err(FieldError::NeedsStore(kind.as_str()))
+        FieldKind::Person => {
+            let multiple = config
+                .get("multiple")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if multiple {
+                let ids = dedupe(strings(json)?);
+                check_ids(&ids)?;
+                if ids.len() > MAX_PERSONS {
+                    return Err(FieldError::TooManyPersons);
+                }
+                Ok(ids.into())
+            } else {
+                check_id(string(json)?)?;
+                Ok(json.clone())
+            }
         }
+        FieldKind::File => {
+            check_id(string(json)?)?;
+            Ok(json.clone())
+        }
+        FieldKind::Relation => Err(FieldError::NeedsStore(kind.as_str())),
         FieldKind::Rollup | FieldKind::Formula => unreachable!("computed kinds returned above"),
     }
 }
@@ -158,6 +183,20 @@ fn strings(v: &Value) -> Result<Vec<String>, FieldError> {
 fn dedupe(ids: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     ids.into_iter().filter(|i| seen.insert(i.clone())).collect()
+}
+
+fn check_id(id: &str) -> Result<(), FieldError> {
+    if id.is_empty() || id.len() > MAX_ID_LEN {
+        return Err(FieldError::BadId);
+    }
+    Ok(())
+}
+
+fn check_ids(ids: &[String]) -> Result<(), FieldError> {
+    for id in ids {
+        check_id(id)?;
+    }
+    Ok(())
 }
 
 fn check_option(config: &Value, id: &str) -> Result<(), FieldError> {
@@ -363,19 +402,78 @@ mod tests {
     }
 
     #[test]
-    fn store_kinds_are_stubs_and_computed_refused() {
-        for k in [FieldKind::Person, FieldKind::File, FieldKind::Relation] {
-            assert_eq!(
-                v(k, json!({}), json!("x")),
-                Err(FieldError::NeedsStore(k.as_str()))
-            );
-        }
+    fn relation_is_the_last_needs_store_kind_and_computed_ones_are_refused() {
+        assert_eq!(
+            v(FieldKind::Relation, json!({}), json!("x")),
+            Err(FieldError::NeedsStore("relation"))
+        );
         for k in [FieldKind::Rollup, FieldKind::Formula] {
             assert_eq!(
                 v(k, json!({}), json!(1)),
                 Err(FieldError::Computed(k.as_str()))
             );
         }
+    }
+
+    #[test]
+    fn person_cells_are_checked_for_shape_only() {
+        assert_eq!(
+            v(FieldKind::Person, json!({}), json!("p-1")),
+            Ok(json!("p-1"))
+        );
+        assert_eq!(
+            v(FieldKind::Person, json!({}), Value::Null),
+            Ok(Value::Null)
+        );
+        for bad in ["", &"x".repeat(MAX_ID_LEN + 1)] {
+            assert_eq!(
+                v(FieldKind::Person, json!({}), json!(bad)),
+                Err(FieldError::BadId)
+            );
+        }
+        assert_eq!(
+            v(FieldKind::Person, json!({}), json!(["p-1"])),
+            Err(FieldError::WrongType("a string"))
+        );
+        assert_eq!(
+            v(FieldKind::Person, json!({"multiple": false}), json!("p-1")),
+            Ok(json!("p-1"))
+        );
+
+        let many = json!({"multiple": true});
+        assert_eq!(
+            v(FieldKind::Person, many.clone(), json!(["a", "b", "a"])),
+            Ok(json!(["a", "b"]))
+        );
+        assert_eq!(v(FieldKind::Person, many.clone(), json!([])), Ok(json!([])));
+        assert!(v(FieldKind::Person, many.clone(), json!(["a", 1])).is_err());
+        let at_the_cap: Vec<String> = (0..MAX_PERSONS).map(|i| format!("p{i}")).collect();
+        assert_eq!(
+            v(FieldKind::Person, many.clone(), json!(at_the_cap)),
+            Ok(at_the_cap.into())
+        );
+        let over: Vec<String> = (0..=MAX_PERSONS).map(|i| format!("p{i}")).collect();
+        assert_eq!(
+            v(FieldKind::Person, many, json!(over)),
+            Err(FieldError::TooManyPersons)
+        );
+    }
+
+    #[test]
+    fn file_cells_are_one_id_and_nothing_else() {
+        assert_eq!(
+            v(FieldKind::File, json!({}), json!("018f-att")),
+            Ok(json!("018f-att"))
+        );
+        assert_eq!(v(FieldKind::File, json!({}), Value::Null), Ok(Value::Null));
+        assert_eq!(
+            v(FieldKind::File, json!({}), json!("")),
+            Err(FieldError::BadId)
+        );
+        assert_eq!(
+            v(FieldKind::File, json!({}), json!(["a"])),
+            Err(FieldError::WrongType("a string"))
+        );
     }
 
     #[test]

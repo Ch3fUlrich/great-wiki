@@ -2343,6 +2343,28 @@ mutation crates/gw-store/src/datasets/views.rs killed \
   's/DELETE FROM dataset_view WHERE id = ? AND doc_id = ?/DELETE FROM dataset_view WHERE id = ?/' \
   'datasets: a view delete is scoped to its own dataset'
 
+# --- datasets: person and file fields (ADR 0009 clause 2, M8b B3) ---------------------------
+#
+# A `person` cell may only name somebody who could read the page it is being named on, and a
+# `file` cell may only name a file that is ON this page. Both are writes, both are asked in
+# `crates/gw-store/src/datasets/links.rs` (the checks need the database, so they cannot live in
+# core), and the two tests that notice are
+# `a_person_cell_is_written_only_for_somebody_who_could_read_this_page` and
+# `a_file_cell_is_one_of_this_page_s_attachments_and_reads_back_as_a_name`.
+#
+# (1) Clause 2 dropped: the person is taken as readable without asking them. A dataset would
+# then record which colleagues can read a page they were never given — the disclosure ADR 0009
+# exists to prevent, and the reason this reuses `assignee_named` rather than the caller's access.
+mutation crates/gw-store/src/datasets/links.rs killed \
+  's/Ok(self.assignee_named(&account, path).await?.is_some())/Ok(true)/' \
+  'datasets: a person cell skips the read check - naming somebody who cannot read the page'
+# (2) The ownership check dropped: the id is looked up without asking which page it belongs to.
+# Naming another page's file then writes that page's filename onto this dataset's rows, which is
+# D-16 undone — access belongs to the page, and a cell is not the page.
+mutation crates/gw-store/src/datasets/links.rs killed \
+  's/SELECT 1 FROM attachments WHERE id = ?1 AND doc_id = ?2/SELECT 1 FROM attachments WHERE id = ?1/' \
+  'datasets: person and file cells - a file may name another page'"'"'s attachment'
+
 # HOW LONG THIS IS ALLOWED TO TAKE
 # --------------------------------
 # A gate too slow to run stops being run. This one got there: eighteen mutations, a whole
@@ -2393,6 +2415,9 @@ probe_for() {
     # own tests, and the filter spares the rest of the crate's 400 unit tests.
     crates/gw-store/src/search.rs) echo "-p gw-store --lib search::" ;;
     crates/gw-store/src/templates.rs) echo "-p gw-store --lib templates::" ;;
+    # Every dataset submodule (links, computed, query, views) is covered by the datasets module's
+    # own tests, so one prefix filter serves them all. A probe that passes falls through.
+    crates/gw-store/src/datasets/*) echo "-p gw-store --lib datasets::" ;;
     crates/gw-store/src/datasets.rs) echo "-p gw-store --lib datasets::" ;;
     crates/gw-api/src/routes/datasets.rs) echo "-p gw-api --test datasets" ;;
     crates/gw-store/src/access_epoch.rs) echo "-p gw-store --lib access_epoch::" ;;
