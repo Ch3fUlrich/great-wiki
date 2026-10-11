@@ -7,6 +7,7 @@
 //! An error is a value the caller renders as a `#ERR(reason)` cell, never a panic and never
 //! markup.
 
+pub mod deps;
 mod eval;
 #[cfg(test)]
 mod hostile_input;

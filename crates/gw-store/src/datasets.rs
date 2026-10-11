@@ -12,6 +12,7 @@ use gw_core::DocumentType;
 use serde::Serialize;
 use serde_json::Value;
 
+mod computed;
 mod query;
 mod views;
 pub use query::{Cursor, Filter, RowQuery, Sort, SortKind};
@@ -33,6 +34,8 @@ pub const MAX_FIELDS: usize = 100;
 pub const MAX_LABEL_CHARS: usize = 120;
 /// Largest `config` JSON a field may carry, in bytes.
 pub const MAX_CONFIG_BYTES: usize = 4096;
+/// Longest formula source a field may carry, in characters.
+pub const MAX_FORMULA_EXPR_CHARS: usize = 1000;
 
 /// One column of a dataset. `key` and `kind` never change after creation.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -143,8 +146,8 @@ impl Store {
     }
 
     /// Add a column. Needs write. `key` is validated by [`FieldKey::parse`] before it
-    /// reaches SQL; `kind` is fixed for the life of the field. M8a offers the stored,
-    /// store-independent kinds only.
+    /// reaches SQL; `kind` is fixed for the life of the field. The stored kinds and `formula`
+    /// are offered; `person`, `file`, `relation` and `rollup` wait for a later milestone.
     pub async fn add_dataset_field(
         &self,
         principal: &Principal,
@@ -162,11 +165,7 @@ impl Store {
         };
         if matches!(
             new.kind,
-            FieldKind::Person
-                | FieldKind::File
-                | FieldKind::Relation
-                | FieldKind::Rollup
-                | FieldKind::Formula
+            FieldKind::Person | FieldKind::File | FieldKind::Relation | FieldKind::Rollup
         ) {
             return Ok(SchemaOutcome::Invalid(format!(
                 "field kind `{}` is not available yet",
@@ -182,6 +181,14 @@ impl Store {
             return Ok(SchemaOutcome::Invalid(format!(
                 "field config must be an object of at most {MAX_CONFIG_BYTES} bytes"
             )));
+        }
+        if new.kind == FieldKind::Formula {
+            if let Some(msg) = self
+                .formula_check(&doc_id, key.as_str(), &new.config)
+                .await?
+            {
+                return Ok(SchemaOutcome::Invalid(msg));
+            }
         }
         let mut tx = self.pool.begin().await?;
         let taken: i64 =
@@ -229,6 +236,49 @@ impl Store {
             config: new.config.clone(),
             position,
         }))
+    }
+
+    /// The formula-specific checks taken before a `formula` column is written: the config must
+    /// be one `expr` string, its `{…}` references must name fields of this dataset (or the new
+    /// column itself, which then fails as a self-cycle), and it must close no cycle with the
+    /// formulas already in the dataset. `Ok(None)` means the column is sound; `Ok(Some(reason))`
+    /// is the message to refuse it with. A formula may read any other kind, rollup included —
+    /// only another formula can be part of a cycle.
+    async fn formula_check(
+        &self,
+        doc_id: &str,
+        new_key: &str,
+        config: &Value,
+    ) -> Result<Option<String>> {
+        let src = match formula_src(config) {
+            Ok(s) => s,
+            Err(m) => return Ok(Some(m)),
+        };
+        let existing = self.fields_of(doc_id).await?;
+        let known = |k: &str| k == new_key || existing.iter().any(|f| f.key == k);
+        let parsed = match gw_core::formula::parse(src, &known) {
+            Ok(p) => p,
+            Err(e) => return Ok(Some(e.to_string())),
+        };
+        // The graph is every formula column plus this one. Stored and rollup columns never
+        // appear as nodes, so an edge to one is ignored: a cycle runs formula to formula only.
+        let mut graph: Vec<(String, Vec<String>)> = existing
+            .iter()
+            .filter(|f| f.kind == FieldKind::Formula.as_str())
+            .map(|f| {
+                let deps = f
+                    .config
+                    .get("expr")
+                    .and_then(Value::as_str)
+                    .and_then(|s| gw_core::formula::parse(s, &|_| true).ok())
+                    .map(|p| gw_core::formula::field_refs(&p))
+                    .unwrap_or_default();
+                (f.key.clone(), deps)
+            })
+            .collect();
+        graph.push((new_key.to_string(), gw_core::formula::field_refs(&parsed)));
+        Ok(gw_core::formula::deps::find_cycle(&graph)
+            .map(|cycle| format!("formula cycle: {}", cycle.join(" -> "))))
     }
 
     /// Change a column's label. Needs write. The key and the kind are not parameters: they
@@ -437,6 +487,14 @@ impl Store {
         Ok(validate_row(&specs, patch).map_err(|e| e.to_string()))
     }
 
+    /// SQLite's current date, for `today()` in a formula: fetched once per read call, never per
+    /// row, so a whole page sees one clock.
+    async fn today(&self) -> Result<String> {
+        Ok(sqlx::query_scalar("SELECT date('now')")
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
     async fn fetch_row(&self, doc_id: &str, row_id: &str) -> Result<Option<DatasetRow>> {
         let t: Option<RowTuple> = sqlx::query_as(&format!(
             "SELECT {ROW_COLS} FROM dataset_row WHERE doc_id = ? AND id = ?"
@@ -448,7 +506,8 @@ impl Store {
         Ok(t.map(row_from))
     }
 
-    /// One row of the dataset at `path`, for anybody who may read it.
+    /// One row of the dataset at `path`, for anybody who may read it, with its computed fields
+    /// filled in.
     pub async fn dataset_row(
         &self,
         principal: &Principal,
@@ -458,10 +517,14 @@ impl Store {
         let Some(doc) = self.readable_dataset(principal, path).await? else {
             return Ok(RowOutcome::NoDataset);
         };
-        Ok(match self.fetch_row(&doc.id, row_id).await? {
-            Some(r) => RowOutcome::Done(r),
-            None => RowOutcome::NoRow,
-        })
+        let Some(row) = self.fetch_row(&doc.id, row_id).await? else {
+            return Ok(RowOutcome::NoRow);
+        };
+        let fields = self.fields_of(&doc.id).await?;
+        let today = self.today().await?;
+        Ok(RowOutcome::Done(computed::with_computed(
+            &fields, row, &today,
+        )))
     }
 
     /// A page of rows of the dataset at `path`, with the dataset's row count, for anybody who
@@ -490,8 +553,15 @@ impl Store {
             .bind(&doc.id)
             .fetch_one(&self.pool)
             .await?;
+        let fields = self.fields_of(&doc.id).await?;
+        let today = self.today().await?;
+        let rows = tuples
+            .into_iter()
+            .map(row_from)
+            .map(|r| computed::with_computed(&fields, r, &today))
+            .collect();
         Ok(RowOutcome::Done(RowPage {
-            rows: tuples.into_iter().map(row_from).collect(),
+            rows,
             total,
             next: None,
         }))
@@ -516,8 +586,12 @@ impl Store {
             | Filter::Contains { key, .. }
             | Filter::IsEmpty { key }
             | Filter::In { key, .. }) = f;
-            if kind_of(key).is_none() {
-                return Ok(RowOutcome::Invalid(format!("no field `{}`", key.as_str())));
+            match kind_of(key) {
+                None => return Ok(RowOutcome::Invalid(format!("no field `{}`", key.as_str()))),
+                Some(field) if is_computed_kind(&field.kind) => {
+                    return Ok(RowOutcome::Invalid(computed_refusal(key.as_str())))
+                }
+                Some(_) => {}
             }
         }
         let sort = match &select.sort {
@@ -526,6 +600,9 @@ impl Store {
                 let Some(field) = kind_of(key) else {
                     return Ok(RowOutcome::Invalid(format!("no field `{}`", key.as_str())));
                 };
+                if is_computed_kind(&field.kind) {
+                    return Ok(RowOutcome::Invalid(computed_refusal(key.as_str())));
+                }
                 Some(Sort {
                     key: key.clone(),
                     kind: if field.kind == FieldKind::Number.as_str() {
@@ -598,10 +675,12 @@ impl Store {
             };
         }
         let total = c.fetch_one(&self.pool).await?;
+        let today = self.today().await?;
         Ok(RowOutcome::Done(RowPage {
             rows: fetched
                 .into_iter()
                 .map(|t| row_from((t.0, t.1, t.2, t.3, t.4)))
+                .map(|r| computed::with_computed(&fields, r, &today))
                 .collect(),
             total,
             next,
@@ -784,6 +863,39 @@ fn clean_label(label: &str) -> Result<String, String> {
         ));
     }
     Ok(label.to_string())
+}
+
+/// A `formula` column's config is exactly `{"expr": "..."}`: one string member, nothing else,
+/// the source bounded. Returns the source text, or the reason the shape is wrong.
+fn formula_src(config: &Value) -> Result<&str, String> {
+    let shape = "a formula's config is exactly {\"expr\": \"...\"}";
+    let Some(map) = config.as_object() else {
+        return Err(shape.into());
+    };
+    if map.len() != 1 {
+        return Err(shape.into());
+    }
+    let Some(Value::String(src)) = map.get("expr") else {
+        return Err(shape.into());
+    };
+    if src.chars().count() > MAX_FORMULA_EXPR_CHARS {
+        return Err(format!(
+            "a formula is at most {MAX_FORMULA_EXPR_CHARS} characters"
+        ));
+    }
+    Ok(src)
+}
+
+/// Whether a stored field's `kind` is a computed one (formula or rollup): evaluated at read,
+/// never written, filtered or sorted.
+fn is_computed_kind(kind: &str) -> bool {
+    serde_json::from_value::<FieldKind>(Value::String(kind.to_string()))
+        .is_ok_and(|k| k.is_computed())
+}
+
+/// The one refusal a computed field gets when it is named in a filter or a sort.
+fn computed_refusal(key: &str) -> String {
+    format!("computed field `{key}` cannot be filtered or sorted yet")
 }
 
 #[cfg(test)]
@@ -1989,5 +2101,287 @@ mod tests {
         assert_eq!(gone, RowOutcome::NoDataset);
         let gone = select(&store, &cleo, "/raum/absent", want).await;
         assert_eq!(gone, RowOutcome::NoDataset);
+    }
+
+    // --- formula fields (M8b) ------------------------------------------------------
+
+    use super::MAX_FORMULA_EXPR_CHARS;
+    use serde_json::Value;
+
+    /// A column planted straight into the table, bypassing `add_dataset_field`: the only way to
+    /// reach a kind the API refuses (a rollup) or to seed half a cycle underneath a write.
+    async fn add_field_with(store: &Store, doc: &str, key: &str, kind: &str, config: Value) {
+        sqlx::query(
+            "INSERT INTO dataset_field (id, doc_id, key, label, kind, config, position) \
+             VALUES (?, ?, ?, ?, ?, ?, 0)",
+        )
+        .bind(format!("{doc}-{key}"))
+        .bind(doc)
+        .bind(key)
+        .bind(key)
+        .bind(kind)
+        .bind(config.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+
+    fn formula_field(key: &str, expr: &str) -> NewField {
+        NewField {
+            key: key.into(),
+            label: key.to_uppercase(),
+            kind: FieldKind::Formula,
+            config: json!({ "expr": expr }),
+        }
+    }
+
+    fn plain_field(key: &str, kind: FieldKind) -> NewField {
+        NewField {
+            key: key.into(),
+            label: key.to_uppercase(),
+            kind,
+            config: json!({}),
+        }
+    }
+
+    async fn read(store: &Store, who: &Principal, path: &str, id: &str) -> Value {
+        let RowOutcome::Done(r) = store.dataset_row(who, path, id).await.unwrap() else {
+            panic!("read")
+        };
+        r.values
+    }
+
+    fn has(keys: &[String], key: &str) -> bool {
+        keys.iter().any(|k| k == key)
+    }
+
+    #[tokio::test]
+    async fn a_formula_over_two_numbers_is_evaluated_when_the_row_is_read() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        store
+            .add_dataset_field(&anna, &path, &formula_field("twice", "{alter} * 2"))
+            .await
+            .unwrap();
+        let r = made(&store, &anna, &path, json!({"name": "Ada", "alter": 21})).await;
+        let v = read(&store, &anna, &path, &r.id).await;
+        assert_eq!(v["twice"].as_f64(), Some(42.0));
+        assert_eq!(v["name"], json!("Ada"));
+        assert_eq!(v["alter"].as_f64(), Some(21.0));
+    }
+
+    #[tokio::test]
+    async fn a_formula_that_divides_by_zero_leaves_an_error_cell_not_a_panic() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        store
+            .add_dataset_field(&anna, &path, &plain_field("zero", FieldKind::Number))
+            .await
+            .unwrap();
+        store
+            .add_dataset_field(&anna, &path, &formula_field("ratio", "1 / {zero}"))
+            .await
+            .unwrap();
+        let r = made(&store, &anna, &path, json!({"zero": 0})).await;
+        let v = read(&store, &anna, &path, &r.id).await;
+        assert_eq!(v["ratio"], json!({ "error": "#ERR(divide by zero)" }));
+    }
+
+    #[tokio::test]
+    async fn a_formula_cannot_read_itself() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        let out = store
+            .add_dataset_field(&anna, &path, &formula_field("loop", "{loop} + 1"))
+            .await
+            .unwrap();
+        assert!(matches!(out, SchemaOutcome::Invalid(_)), "{out:?}");
+        assert!(!has(&keys(&store, &anna, &path).await, "loop"));
+    }
+
+    #[tokio::test]
+    async fn two_formulas_reading_each_other_are_refused_as_a_cycle() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        let doc = doc_id_of(&store, &path).await;
+        // Seed a formula that reads `b`, which does not exist yet, underneath the API.
+        add_field_with(&store, &doc, "a", "formula", json!({ "expr": "{b}" })).await;
+        let out = store
+            .add_dataset_field(&anna, &path, &formula_field("b", "{a}"))
+            .await
+            .unwrap();
+        let SchemaOutcome::Invalid(msg) = out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(msg, "formula cycle: a -> b -> a");
+        let ks = keys(&store, &anna, &path).await;
+        assert!(has(&ks, "a") && !has(&ks, "b"), "{ks:?}");
+    }
+
+    #[tokio::test]
+    async fn a_formula_may_read_a_rollup_column() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        let doc = doc_id_of(&store, &path).await;
+        add_field_with(&store, &doc, "total", "rollup", json!({})).await;
+        let out = store
+            .add_dataset_field(&anna, &path, &formula_field("shown", "{total} + 1"))
+            .await
+            .unwrap();
+        assert!(matches!(out, SchemaOutcome::Done(_)), "{out:?}");
+        // The rollup has no value yet, so it reads as null and the sum is an error cell.
+        let r = made(&store, &anna, &path, json!({"name": "Ada"})).await;
+        let v = read(&store, &anna, &path, &r.id).await;
+        assert!(v["shown"].get("error").is_some(), "{:?}", v["shown"]);
+    }
+
+    #[tokio::test]
+    async fn a_formula_naming_an_unknown_field_is_refused() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        let out = store
+            .add_dataset_field(&anna, &path, &formula_field("calc", "{nope} * 2"))
+            .await
+            .unwrap();
+        assert!(matches!(out, SchemaOutcome::Invalid(_)), "{out:?}");
+        assert!(!has(&keys(&store, &anna, &path).await, "calc"));
+    }
+
+    #[tokio::test]
+    async fn a_formula_reading_another_formula_uses_its_value_in_order() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        store
+            .add_dataset_field(&anna, &path, &formula_field("a", "{alter} + 1"))
+            .await
+            .unwrap();
+        store
+            .add_dataset_field(&anna, &path, &formula_field("b", "{a} * 10"))
+            .await
+            .unwrap();
+        let r = made(&store, &anna, &path, json!({"name": "Ada", "alter": 4})).await;
+        let v = read(&store, &anna, &path, &r.id).await;
+        assert_eq!(v["a"].as_f64(), Some(5.0));
+        assert_eq!(v["b"].as_f64(), Some(50.0));
+    }
+
+    #[tokio::test]
+    async fn a_formula_result_is_never_written_into_the_stored_row() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        store
+            .add_dataset_field(&anna, &path, &formula_field("a", "{alter} + 1"))
+            .await
+            .unwrap();
+        let r = made(&store, &anna, &path, json!({"name": "Ada", "alter": 4})).await;
+        assert_eq!(
+            read(&store, &anna, &path, &r.id).await["a"].as_f64(),
+            Some(5.0)
+        );
+        let raw: String = sqlx::query_scalar("SELECT \"values\" FROM dataset_row WHERE id = ?")
+            .bind(&r.id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert!(raw.contains("alter"), "{raw}");
+        assert!(
+            !raw.contains("\"a\""),
+            "computed key reached storage: {raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_value_cannot_be_written_to_a_formula_field() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        store
+            .add_dataset_field(&anna, &path, &formula_field("a", "{alter} + 1"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .create_dataset_row(&anna, &path, &vals(json!({"a": 5})))
+                .await
+                .unwrap(),
+            RowOutcome::Invalid(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn filtering_or_sorting_a_formula_field_is_refused() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        store
+            .add_dataset_field(&anna, &path, &formula_field("a", "{alter} + 1"))
+            .await
+            .unwrap();
+        let want = "computed field `a` cannot be filtered or sorted yet";
+        let filt = store
+            .dataset_rows_query(
+                &anna,
+                &path,
+                &RowSelect {
+                    filters: vec![Filter::Eq {
+                        key: k("a"),
+                        value: json!(5),
+                    }],
+                    limit: 5,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(filt, RowOutcome::Invalid(want.into()));
+        let srt = store
+            .dataset_rows_query(
+                &anna,
+                &path,
+                &RowSelect {
+                    sort: Some((k("a"), false)),
+                    limit: 5,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(srt, RowOutcome::Invalid(want.into()));
+    }
+
+    #[tokio::test]
+    async fn a_formula_config_must_be_exactly_one_expr_string() {
+        let (store, anna, _, _, path) = row_fixture().await;
+        let bads = [
+            json!({}),                                               // no expr
+            json!({"expr": 1}),                                      // not a string
+            json!({"expr": "{alter}", "extra": 1}),                  // a second member
+            json!({"other": "{alter}"}),                             // the wrong member
+            json!({"expr": "x".repeat(MAX_FORMULA_EXPR_CHARS + 1)}), // too long
+        ];
+        for cfg in bads {
+            let out = store
+                .add_dataset_field(
+                    &anna,
+                    &path,
+                    &NewField {
+                        key: "bad".into(),
+                        label: "B".into(),
+                        kind: FieldKind::Formula,
+                        config: cfg.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(matches!(out, SchemaOutcome::Invalid(_)), "{cfg}: {out:?}");
+        }
+        assert!(matches!(
+            store
+                .add_dataset_field(&anna, &path, &formula_field("ok", "{alter}"))
+                .await
+                .unwrap(),
+            SchemaOutcome::Done(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn adding_a_formula_field_still_needs_write() {
+        let (store, anna, bea, _, path) = row_fixture().await;
+        assert_eq!(
+            store
+                .add_dataset_field(&bea, &path, &formula_field("a", "{alter} + 1"))
+                .await
+                .unwrap(),
+            SchemaOutcome::ReadOnly
+        );
+        assert!(!has(&keys(&store, &anna, &path).await, "a"));
     }
 }
