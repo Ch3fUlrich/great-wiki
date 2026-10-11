@@ -92,7 +92,14 @@ export async function submitForm(
 ): Promise<FormResult> {
   const built = buildFormValues(items, drafts);
   if (!built.ok) return { kind: 'invalid', errors: built.errors };
-  const answer = await send('POST', rowsApiPath(path, {}), { values: built.values, view: viewId });
+  let answer: Awaited<ReturnType<Send>>;
+  try {
+    answer = await send('POST', rowsApiPath(path, {}), { values: built.values, view: viewId });
+  } catch {
+    // A send that throws (not just one that answers 0) is still a failure to SAY, not a crash:
+    // the draft stays and the form shows the same words as for no answer.
+    return { kind: 'failed', message: describeAddFailure(0, null) };
+  }
   if (answer.status === 201) return { kind: 'saved' };
   return { kind: 'failed', message: describeAddFailure(answer.status, answer.message) };
 }

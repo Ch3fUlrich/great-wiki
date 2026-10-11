@@ -118,6 +118,14 @@ describe('submitForm', () => {
     expect(r.kind === 'failed' && r.message).toContain('the form has no field "geheim"');
   });
 
+  it('a send that throws is a failure in words, not a crash', async () => {
+    const send: Send = async () => {
+      throw new Error('network down');
+    };
+    const r = await submitForm(send, '/d', 'v1', items, { name: 'Ada' });
+    expect(r).toEqual({ kind: 'failed', message: expect.stringContaining('keine Antwort') });
+  });
+
   it('no answer is said in words too', async () => {
     const { send } = spy({ status: 0 });
     const r = await submitForm(send, '/d', 'v1', items, { name: 'Ada' });
