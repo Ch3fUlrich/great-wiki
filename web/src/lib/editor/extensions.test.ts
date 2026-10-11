@@ -43,10 +43,10 @@ import {
  * XML element tag `gw-collab` writes (`doc.rs::tag_of` derives the tag from serde), and
  * therefore exactly the node name TipTap will look up in this schema.
  *
- * Seventeen, not the nine the M3 plan's sample lists: the plan predates the table kinds,
+ * Eighteen, not the nine the M3 plan's sample lists: the plan predates the table kinds,
  * `taskList`/`taskItem` arrived with piece 3's checkbox, `attachment` with piece 4's placed
- * files, and `embed` with transclusion. The wire name is `embed` while the Rust variant is
- * `BlockKind::Transclusion`; this list is the WIRE.
+ * files, `embed` with transclusion, and `dataset-view` with M8's dataset views. The wire
+ * name is `embed` while the Rust variant is `BlockKind::Transclusion`; this list is the WIRE.
  */
 const SERVER_KINDS = [
   'doc',
@@ -65,6 +65,7 @@ const SERVER_KINDS = [
   'tableCell',
   'attachment',
   'embed',
+  'dataset-view',
   'text'
 ];
 
@@ -125,6 +126,16 @@ const ONE_PER_KIND = {
         path: null,
         heading: '0199c0de-0000-7000-8000-00000000000a',
         label: 'Dosierung'
+      }
+    },
+    // A live view of a saved view of a dataset, also at the top level and also the only
+    // place the schema admits one. All three attributes set, same reason as the embed.
+    {
+      type: 'dataset-view',
+      attrs: {
+        dataset_doc: '0199c0de-0000-7000-8000-000000000003',
+        view: '0199c0de-0000-7000-8000-00000000000d',
+        label: 'Gewichtsverlauf'
       }
     },
     {
@@ -509,7 +520,7 @@ describe('the editor schema', () => {
     // `createNodeFromYElement` answers a node ProseMirror cannot build by DELETING the
     // element from the CRDT.
     expect(editorSchema.nodes.embed.spec.group).toBe('embed');
-    expect(editorSchema.nodes.doc.spec.content).toBe('(block|attachment|embed)+');
+    expect(editorSchema.nodes.doc.spec.content).toBe('(block|attachment|embed|dataset-view)+');
     expect(() =>
       PmNode.fromJSON(editorSchema, {
         type: 'doc',
@@ -769,5 +780,209 @@ describe('the editor schema', () => {
     ydoc.transact(() => updateYFragment(ydoc, fragment, doc, meta));
     const item = (fragment.get(0) as Y.XmlElement).get(0) as Y.XmlElement;
     expect(item.getAttributes()).toEqual({ checked: false });
+  });
+
+  // --- a live view of a dataset's saved view (M8 D1) -------------------------------------
+  //
+  // The same silent-deletion trap as every atom before it: a tag this schema does not name
+  // makes `createNodeFromYElement` delete the element from the CRDT on open, and an attribute
+  // it does not declare is removed on the first write-back. A dataset view carries no text
+  // and no children, so there is nothing else in the node to notice the loss by — the three
+  // attributes ARE the block.
+
+  const DATASET_DOC = '0199c0de-0000-7000-8000-000000000003';
+  const DATASET_VIEW = '0199c0de-0000-7000-8000-00000000000d';
+
+  /**
+   * A Y.Doc holding a dataset view, built the way `gw-collab::doc.rs::write_children`
+   * builds one: an element tagged `dataset-view` (the serde name, kebab-case on purpose),
+   * its three attrs as XML attributes, no children, and a paragraph after it.
+   */
+  function serverWrittenDatasetView(attrs: Record<string, unknown>): Y.Doc {
+    const ydoc = new Y.Doc();
+    const view = new Y.XmlElement('dataset-view');
+    for (const [key, value] of Object.entries(attrs)) {
+      view.setAttribute(key, value as string);
+    }
+    const after = new Y.XmlElement('paragraph');
+    const leaf = new Y.XmlText();
+    leaf.insert(0, 'Und der Text danach.');
+    after.insert(0, [leaf]);
+    ydoc.getXmlFragment(CONTENT_FIELD).insert(0, [view, after]);
+    return ydoc;
+  }
+
+  function datasetViewParagraphs(label: string) {
+    return {
+      type: 'doc',
+      content: [
+        { type: 'paragraph', content: [{ type: 'text', text: 'Der Verlauf:' }] },
+        {
+          type: 'dataset-view',
+          attrs: { dataset_doc: DATASET_DOC, view: DATASET_VIEW, label }
+        },
+        { type: 'paragraph', content: [{ type: 'text', text: 'Danach stabil.' }] }
+      ]
+    };
+  }
+
+  it('does not delete a dataset view from the CRDT when the editor opens the page', () => {
+    // THE data-loss test for this kind: a Y.Doc whose fragment holds the element the Rust
+    // server wrote must be read back into the node, not dropped. Without `dataset-view` in
+    // this schema, `schema.node('dataset-view', …)` throws and the `catch` runs
+    // `el._item.delete(transaction)` — broadcast to every other editor and snapshotted by
+    // the next sweep, so the frame would simply be gone from everybody's page.
+    const ydoc = serverWrittenDatasetView({
+      dataset_doc: DATASET_DOC,
+      view: DATASET_VIEW,
+      label: 'Gewichtsverlauf'
+    });
+    const fragment = ydoc.getXmlFragment(CONTENT_FIELD);
+
+    const doc = yXmlFragmentToProseMirrorRootNode(fragment, editorSchema);
+
+    expect(fragment.length).toBe(2);
+    expect((fragment.get(0) as Y.XmlElement).nodeName).toBe('dataset-view');
+    expect(doc.childCount).toBe(2);
+    expect(doc.firstChild?.type.name).toBe('dataset-view');
+    expect(doc.firstChild?.attrs).toEqual({
+      dataset_doc: DATASET_DOC,
+      view: DATASET_VIEW,
+      label: 'Gewichtsverlauf'
+    });
+    expect(doc.textBetween(0, doc.content.size, ' ')).toContain('Und der Text danach.');
+  });
+
+  it('keeps a dataset view and all three attributes through a real write-back', () => {
+    // The round trip on the real y-tiptap functions: build the PM doc, write it with
+    // `updateYFragment` (what the collaboration plugin runs on every transaction), read it
+    // back with `yXmlFragmentToProseMirrorRootNode`. The node must still be there, between
+    // its two paragraphs, with identical attributes.
+    const built = PmNode.fromJSON(editorSchema, datasetViewParagraphs('Gewichtsverlauf'));
+    const ydoc = new Y.Doc();
+    const fragment = ydoc.getXmlFragment(CONTENT_FIELD);
+    const { meta } = initProseMirrorDoc(fragment, editorSchema);
+
+    ydoc.transact(() => updateYFragment(ydoc, fragment, built, meta));
+
+    const view = fragment.get(1);
+    if (!(view instanceof Y.XmlElement)) throw new Error('expected a dataset-view element');
+    expect(view.nodeName).toBe('dataset-view');
+    expect(view.getAttributes()).toEqual({
+      dataset_doc: DATASET_DOC,
+      view: DATASET_VIEW,
+      label: 'Gewichtsverlauf'
+    });
+
+    const back = yXmlFragmentToProseMirrorRootNode(fragment, editorSchema);
+    expect(back.childCount).toBe(3);
+    expect(back.child(1).type.name).toBe('dataset-view');
+    expect(back.child(1).attrs).toEqual({
+      dataset_doc: DATASET_DOC,
+      view: DATASET_VIEW,
+      label: 'Gewichtsverlauf'
+    });
+  });
+
+  it('keeps a dataset view with an empty label empty rather than losing the key', () => {
+    // `''` is what `gw_core::markdown` writes for a view nobody labelled, and the server
+    // writes `label` ALWAYS — an empty one and no key at all must not become the same
+    // document. The default is `''`, not `null`, precisely so y-tiptap's null-filtering of
+    // node attributes never strips it from the wire.
+    const built = PmNode.fromJSON(editorSchema, datasetViewParagraphs(''));
+    const ydoc = new Y.Doc();
+    const fragment = ydoc.getXmlFragment(CONTENT_FIELD);
+    const { meta } = initProseMirrorDoc(fragment, editorSchema);
+
+    ydoc.transact(() => updateYFragment(ydoc, fragment, built, meta));
+
+    const view = fragment.get(1);
+    if (!(view instanceof Y.XmlElement)) throw new Error('expected a dataset-view element');
+    expect(view.getAttributes()).toEqual({
+      dataset_doc: DATASET_DOC,
+      view: DATASET_VIEW,
+      label: ''
+    });
+    const back = yXmlFragmentToProseMirrorRootNode(fragment, editorSchema);
+    expect(back.child(1).attrs.label).toBe('');
+  });
+
+  it('survives schema JSON to node and back with all three attributes', () => {
+    // The schema-level check, before anything touches the CRDT: the node is in the schema,
+    // accepts all three attributes including the empty label, and carries them back out.
+    const node = editorSchema.nodes['dataset-view'].create({
+      dataset_doc: DATASET_DOC,
+      view: DATASET_VIEW,
+      label: ''
+    });
+    expect(node.attrs).toEqual({ dataset_doc: DATASET_DOC, view: DATASET_VIEW, label: '' });
+
+    const doc = PmNode.fromJSON(editorSchema, datasetViewParagraphs(''));
+    expect(() => doc.check()).not.toThrow();
+    const json = doc.toJSON();
+    expect(json.content[1]).toEqual({
+      type: 'dataset-view',
+      attrs: { dataset_doc: DATASET_DOC, view: DATASET_VIEW, label: '' }
+    });
+  });
+
+  it('writes a dataset view back under exactly the three attributes the importer states', () => {
+    // The over-declaration half: `gw_core::markdown` writes `dataset_doc`, `view` and
+    // `label` and nothing else, and these blocks are compared whole on export — a fourth
+    // declared attribute would be minted by `computeAttrs` onto every stored view and
+    // refuse the page on the owner's backup path.
+    const ydoc = prosemirrorJSONToYDoc(
+      editorSchema,
+      {
+        type: 'doc',
+        content: [{ type: 'dataset-view', attrs: { dataset_doc: DATASET_DOC, view: DATASET_VIEW, label: 'x' } }]
+      },
+      CONTENT_FIELD
+    );
+    const view = ydoc.getXmlFragment(CONTENT_FIELD).get(0);
+    if (!(view instanceof Y.XmlElement)) throw new Error('expected a dataset-view element');
+    expect(view.nodeName).toBe('dataset-view');
+    expect(view.getAttributes()).toEqual({
+      dataset_doc: DATASET_DOC,
+      view: DATASET_VIEW,
+      label: 'x'
+    });
+  });
+
+  it('admits a dataset view in the document and nowhere the importer would not read one', () => {
+    // Its own group, admitted by `Doc` alone — `attachment`'s assertion style, for the same
+    // reasons: a dataset view is written as an image standing alone in its own paragraph and
+    // the importer only reads one back at the top level. Inside a list item ProseMirror
+    // cannot even build it, and the answer to that is deletion from the CRDT.
+    const top = PmNode.fromJSON(editorSchema, {
+      type: 'doc',
+      content: [{ type: 'dataset-view', attrs: { dataset_doc: DATASET_DOC, view: DATASET_VIEW, label: '' } }]
+    });
+    expect(() => top.check()).not.toThrow();
+
+    for (const nested of [
+      {
+        type: 'bulletList',
+        content: [
+          {
+            type: 'listItem',
+            content: [{ type: 'dataset-view', attrs: { dataset_doc: DATASET_DOC, view: DATASET_VIEW } }]
+          }
+        ]
+      },
+      {
+        type: 'blockquote',
+        content: [{ type: 'dataset-view', attrs: { dataset_doc: DATASET_DOC, view: DATASET_VIEW } }]
+      }
+    ]) {
+      expect(
+        () => PmNode.fromJSON(editorSchema, { type: 'doc', content: [nested] }).check(),
+        `a dataset view inside a ${nested.type} must not be a valid document`
+      ).toThrow();
+    }
+  });
+
+  it('carries no mark, because the CRDT has nowhere to put one on a dataset view', () => {
+    expect(editorSchema.nodes['dataset-view'].spec.marks).toBe('');
   });
 });

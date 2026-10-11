@@ -456,18 +456,95 @@ const Embed = Node.create({
 });
 
 /**
+ * A live view of a saved view of a dataset: `gw_core::BlockKind::DatasetView`.
+ *
+ * # Three attributes, and no fourth
+ *
+ * `dataset_doc`, `view` and `label` — exactly what `gw_core::markdown` writes and exactly
+ * what the export compares. Both hazards the module docs describe apply here, the same way
+ * they do for `Embed` above: an attribute this schema does not declare is deleted from the
+ * Y.Doc on the first edit that touches the node, and a fourth one would be minted onto every
+ * stored block and refuse the page on export.
+ *
+ * All three default to `''` rather than `null`, which is `Embed`'s `label` (and
+ * `Attachment`'s `alt`) extended to the whole node: unlike an embed, whose `heading` and
+ * `path` are genuinely absent for a whole-page reference, the Rust importer ALWAYS writes
+ * `dataset_doc` and `view` — `dataset_view_reference` refuses a destination with either
+ * missing — and writes `label` even when empty. A `null` default would put the key on the
+ * wire only when set, and y-tiptap null-filters node attributes, so a `null`-defaulted
+ * attribute the server wrote would be REMOVED by the editor's next write-back: two values
+ * for one document, and `render_file` refuses the page rather than choosing.
+ *
+ * `rendered: false` on none of them: all three are document content, and the editor shows
+ * which dataset view is placed so the author can see what they inserted.
+ *
+ * # Its own group, so it can only stand where the importer will read one back
+ *
+ * `group: 'dataset-view'` and NOT `'block'`, with `Doc` below widening only the document's
+ * content expression to admit it — `Attachment`'s and `Embed`'s argument unchanged: the
+ * markdown importer reads a dataset view back only at the top level of the document, a
+ * `listItem` cannot hold an atom in first position (and `createNodeFromYElement` answers a
+ * node ProseMirror cannot build by DELETING the element from the CRDT), and a `tableCell` in
+ * markdown is one paragraph and nothing else.
+ *
+ * # `atom`, `draggable`, and no marks
+ *
+ * `atom: true` because it has no content to edit — the rows belong to the dataset, never to
+ * this page, which is what keeps an inaccessible view looking identical to an absent one
+ * (ADR 0022) and keeps `plain_text` from indexing data the reader may not see. `marks: ''`
+ * because `gw-collab` has nowhere to put a mark on an element.
+ */
+const DatasetView = Node.create({
+  name: 'dataset-view',
+  group: 'dataset-view',
+  atom: true,
+  draggable: true,
+  marks: '',
+  addAttributes: () => ({
+    dataset_doc: {
+      default: '',
+      parseHTML: (element: HTMLElement) => element.getAttribute('data-dataset-doc') ?? ''
+    },
+    view: {
+      default: '',
+      parseHTML: (element: HTMLElement) => element.getAttribute('data-view') ?? ''
+    },
+    label: {
+      default: '',
+      parseHTML: (element: HTMLElement) => element.getAttribute('data-label') ?? ''
+    }
+  }),
+  // `data-*` on a `<figure>`, like `Attachment` and `Embed`: the editor has no
+  // permission-checked view of the dataset to draw — that answer belongs to the read-time
+  // endpoint and the reader's renderer — so the editor shows WHICH view is placed, in words.
+  parseHTML: () => [{ tag: 'figure[data-dataset-view]' }],
+  renderHTML: ({ HTMLAttributes }) => [
+    'figure',
+    {
+      'data-dataset-view': '',
+      'data-dataset-doc': HTMLAttributes.dataset_doc,
+      'data-view': HTMLAttributes.view,
+      'data-label': HTMLAttributes.label,
+      class: 'gw-ed-datensatz'
+    },
+    ['figcaption', {}, `▦ ${HTMLAttributes.label || 'Datensatz-Ansicht'}`]
+  ]
+});
+
+/**
  * TipTap's `Document`, widened by exactly one group so a placement has somewhere to go.
  *
  * `content: 'block+'` is the stock expression, and `attachment` is deliberately not in the
  * `block` group — see `Attachment` above for the three ways that would lose or refuse a
- * page. This is the *only* place it is admitted, and `StarterKit.configure({ document: false })`
- * below is what stops the stock one being registered alongside it.
+ * page; `embed` and `dataset-view` are out of it for the identical reasons. This is the
+ * *only* place they are admitted, and `StarterKit.configure({ document: false })` below is
+ * what stops the stock one being registered alongside this.
  *
  * `@tiptap/extension-document` is not named in `package.json`. It arrives as
  * `@tiptap/starter-kit`'s own dependency, pinned by it to the same exact 3.30.0 (checked in
  * `package-lock.json`), exactly as the six marks imported above do.
  */
-const Doc = Document.extend({ content: '(block|attachment|embed)+' });
+const Doc = Document.extend({ content: '(block|attachment|embed|dataset-view)+' });
 
 /**
  * The Yjs fragment the document lives in.
@@ -503,6 +580,7 @@ export const SERVER_BLOCK_KINDS = [
   'tableCell',
   'attachment',
   'embed',
+  'dataset-view',
   'text'
 ] as const satisfies readonly BlockKind[];
 
@@ -596,6 +674,9 @@ export function contentExtensions(): Extensions {
     Attachment,
     // A live view of another page. Its own group too, admitted only by `Doc` above.
     Embed,
+    // A live view of a saved view of a dataset. Its own group too, admitted only by `Doc`
+    // above — see its doc comment.
+    DatasetView,
     // The five marks the server can store, `Strong`/`Em` renamed per the module docs above;
     // `Strike`, `Code` and `Anchor` keep TipTap's own names because those already agree with
     // `MarkKind`'s serde names. `Anchor` is `Link` with its attribute declaration trimmed to

@@ -25,6 +25,11 @@ export type BlockKind =
   // wire name is `embed` while the Rust variant is `BlockKind::Transclusion` — see that
   // enum's doc comment for why the two differ on purpose.
   | 'embed'
+  // A live view of a dataset's saved rows (M8 D1). An atom like `attachment` and `embed`: no
+  // content, and its whole meaning is the three attributes `dataset_doc`, `view` and `label`.
+  // The wire name is kebab-case on purpose, mirroring `gw_core::BlockKind::DatasetView`'s
+  // serde rename.
+  | 'dataset-view'
   | 'text';
 
 // Mirrors `gw_core::MarkKind` — the wire name IS the Yjs attribute key `gw-collab` reads and

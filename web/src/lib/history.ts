@@ -159,6 +159,10 @@ export const BLOCK_LABEL: Record<string, string> = {
   // copy of somebody's words and this is not one — the frame shows whatever the source says
   // NOW, and shows nothing at all to a reader who may not read it.
   embed: 'Einbettung',
+  // A live view of a saved view of a dataset (M8 D1). »Datensatz-Ansicht«: the block shows
+  // a particular saved view of a dataset page, and says nothing about the rows themselves —
+  // which a reader without access never sees anyway.
+  'dataset-view': 'Datensatz-Ansicht',
   text: 'Text'
 };
 
@@ -189,6 +193,11 @@ export const ATTRIBUTE_LABEL: Record<string, string> = {
   path: 'Zieladresse',
   heading: 'Abschnitt',
   label: 'Beschriftung',
+  // The two a dataset view carries besides `label` (above): the dataset page and the one
+  // saved view of it to render. Both are ids, and a changed one is the whole of "this frame
+  // shows something else now".
+  dataset_doc: 'Datensatz',
+  view: 'Ansicht',
   id: 'Ankerkennung',
   marks: 'Formatierung'
 };
