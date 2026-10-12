@@ -56,6 +56,16 @@ describe('ViewBar', () => {
     expect(out).toMatch(/<a [^>]*aria-current="page"[^>]*>Termine<\/a>/);
   });
 
+  it('lists a gallery view by name and links it by id', () => {
+    const out = html(
+      [{ id: 'g1', name: 'Fotos', kind: 'gallery', config: { cover: 'bild' }, position: 0 }],
+      'g1'
+    );
+    expect(out).toMatch(/<a [^>]*href="\?view=g1"/);
+    expect(out).toContain('Fotos');
+    expect(out).toMatch(/<a [^>]*aria-current="page"[^>]*>Fotos<\/a>/);
+  });
+
   it('renders nothing when the dataset has no saved views', () => {
     const out = html([], null);
     expect(out).not.toContain('<nav');
