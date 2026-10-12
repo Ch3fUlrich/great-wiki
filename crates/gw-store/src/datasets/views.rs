@@ -350,7 +350,11 @@ fn validate(kind: &str, config: &Value, known: &HashMap<String, String>) -> Resu
 /// left without it; that is fine, because a select field cannot be hidden — only relation and
 /// computed ones can. A calendar's `date`, `end` and `title` and a gallery's `cover` go the same
 /// way.
-pub(crate) fn strip_hidden(config: &mut Value, visible: &HashSet<String>) {
+///
+/// `kind` is an argument, not something inferred from the shape of `config`: the two kinds that
+/// carry a `title` as a field key are named by the row the config came from. Deciding it by shape
+/// was a guess that a config could lie to.
+pub(crate) fn strip_hidden(kind: &str, config: &mut Value, visible: &HashSet<String>) {
     // A column entry is a key (`table`, `board`) or an object naming one (`form`); both shapes
     // are decided by the same visibility.
     let shown = |v: &Value| match v.get("key").and_then(Value::as_str) {
@@ -378,15 +382,15 @@ pub(crate) fn strip_hidden(config: &mut Value, visible: &HashSet<String>) {
     if obj.get("group_by").is_some_and(|g| !shown(g)) {
         obj.remove("group_by");
     }
-    // `title` names a field only in a calendar's or a gallery's config; a form's `title` is the
-    // form's own heading. A calendar always names `date` and a gallery always names `cover`, so
-    // the presence of either is what tells the shapes apart — read before those members go.
-    let title_is_a_key = obj.contains_key("date") || obj.contains_key("cover");
     for member in ["date", "end", "cover"] {
         if obj.get(member).is_some_and(|d| !shown(d)) {
             obj.remove(member);
         }
     }
+    // A calendar's and a gallery's `title` names a text column and goes with the hidden set; a
+    // form's `title` is the heading the form prints, a string nobody may be denied, and no other
+    // kind has the member at all.
+    let title_is_a_key = matches!(kind, "calendar" | "gallery");
     if title_is_a_key && obj.get("title").is_some_and(|t| !shown(t)) {
         obj.remove("title");
     }
@@ -470,7 +474,7 @@ impl Store {
         let visible = self.visible_field_keys(principal, &doc.id).await?;
         let mut views = self.views_of(&doc.id).await?;
         for v in &mut views {
-            strip_hidden(&mut v.config, &visible);
+            strip_hidden(&v.kind, &mut v.config, &visible);
         }
         Ok(SchemaOutcome::Done(views))
     }
@@ -835,7 +839,7 @@ mod tests {
         let mut cfg = table();
         cfg["group_by"] = json!("alter");
         let visible: std::collections::HashSet<String> = ["name".to_string()].into();
-        strip_hidden(&mut cfg, &visible);
+        strip_hidden("table", &mut cfg, &visible);
         assert_eq!(cfg["fields"], json!(["name"]));
         assert!(cfg.get("sort").is_none());
         assert!(
@@ -1365,7 +1369,7 @@ mod tests {
         let (_, _, _, _, _) = fixture().await;
         let mut cfg = board();
         let visible: HashSet<String> = ["name".to_string(), "status".to_string()].into();
-        strip_hidden(&mut cfg, &visible);
+        strip_hidden("board", &mut cfg, &visible);
         assert_eq!(cfg["card_fields"], json!(["name"]));
         assert!(
             cfg.get("sort").is_none(),
@@ -1596,7 +1600,7 @@ mod tests {
     async fn strip_hidden_drops_form_entries_whose_key_is_hidden() {
         let mut cfg = json!({"fields": [{"key": "name"}, {"key": "mit"}], "title": "T"});
         let visible: HashSet<String> = ["name".to_string()].into();
-        strip_hidden(&mut cfg, &visible);
+        strip_hidden("form", &mut cfg, &visible);
         assert_eq!(cfg["fields"], json!([{"key": "name"}]));
         assert_eq!(cfg["title"], json!("T"));
     }
@@ -1879,7 +1883,7 @@ mod tests {
         let (_, _, _, _, _) = fixture().await;
         let mut cfg = calendar();
         let visible: HashSet<String> = ["name".to_string(), "ende".to_string()].into();
-        strip_hidden(&mut cfg, &visible);
+        strip_hidden("calendar", &mut cfg, &visible);
         assert!(
             cfg.get("date").is_none(),
             "a calendar whose date is hidden loses it: {cfg}"
@@ -1902,12 +1906,61 @@ mod tests {
     async fn strip_hidden_keeps_a_form_title_while_dropping_a_calendar_one() {
         let visible: HashSet<String> = ["name".to_string()].into();
         let mut form_cfg = json!({"fields": [{"key": "name"}], "title": "anmelden"});
-        strip_hidden(&mut form_cfg, &visible);
+        strip_hidden("form", &mut form_cfg, &visible);
         assert_eq!(form_cfg["title"], json!("anmelden"));
         let mut cal_cfg = json!({"date": "start", "title": "name"});
-        strip_hidden(&mut cal_cfg, &visible);
+        strip_hidden("calendar", &mut cal_cfg, &visible);
         assert!(cal_cfg.get("date").is_none());
         assert_eq!(cal_cfg["title"], json!("name"));
+    }
+
+    /// Whether `title` names a field is a fact about the view's KIND, not about the shape of the
+    /// JSON in front of the stripper: a heading that happens to read like a hidden field key
+    /// stays, and a calendar or gallery loses its title with nothing else in the config to
+    /// give it away — including a calendar whose own `date` has just been stripped.
+    #[tokio::test]
+    async fn strip_hidden_decides_a_title_by_the_kind_not_by_the_shape() {
+        let visible: HashSet<String> = ["name".to_string()].into();
+
+        // A form heading that is the name of a hidden field is still a heading.
+        let mut form_cfg = json!({"fields": [{"key": "name"}], "title": "mit"});
+        strip_hidden("form", &mut form_cfg, &visible);
+        assert_eq!(
+            form_cfg["title"],
+            json!("mit"),
+            "a form's title is its own string, never a field key: {form_cfg}"
+        );
+
+        // The shape that used to fool the heuristic: a form's config carrying a `date` member.
+        // Nothing about that JSON says "form" any more than a calendar's does — the kind does.
+        let mut sneaky = json!({"title": "mit", "date": "start"});
+        strip_hidden("form", &mut sneaky, &visible);
+        assert_eq!(sneaky["title"], json!("mit"), "{sneaky}");
+
+        // A calendar and a gallery with no `date`/`cover` member left are still that kind.
+        for kind in ["calendar", "gallery"] {
+            let mut cfg = json!({"title": "mit"});
+            strip_hidden(kind, &mut cfg, &visible);
+            assert!(
+                cfg.get("title").is_none(),
+                "a {kind} whose title names a hidden field loses it: {cfg}"
+            );
+        }
+    }
+
+    /// A calendar whose `date` is hidden loses both: the stripped date must not leave the
+    /// hidden title behind as the config's only surviving key.
+    #[tokio::test]
+    async fn a_calendar_whose_date_is_hidden_still_loses_a_hidden_title() {
+        let visible: HashSet<String> = ["ende".to_string()].into();
+        let mut cfg = calendar();
+        strip_hidden("calendar", &mut cfg, &visible);
+        assert!(cfg.get("date").is_none(), "{cfg}");
+        assert_eq!(cfg["end"], json!("ende"));
+        assert!(
+            cfg.get("title").is_none(),
+            "the date going does not spare the title: {cfg}"
+        );
     }
 
     // --- gallery views (M8d D4a) -----------------------------------------------------
@@ -2231,7 +2284,7 @@ mod tests {
         let (_, _, _, _, _) = fixture().await;
         let mut cfg = gallery();
         let visible: HashSet<String> = ["name".to_string(), "alter".to_string()].into();
-        strip_hidden(&mut cfg, &visible);
+        strip_hidden("gallery", &mut cfg, &visible);
         assert!(
             cfg.get("cover").is_none(),
             "a gallery whose cover is hidden loses it: {cfg}"
@@ -2250,7 +2303,7 @@ mod tests {
         // The same config for a reader who may not see `alter`: its card field and its sort go.
         let mut strict = gallery();
         let visible: HashSet<String> = ["name".to_string(), "bild".to_string()].into();
-        strip_hidden(&mut strict, &visible);
+        strip_hidden("gallery", &mut strict, &visible);
         assert_eq!(strict["cover"], json!("bild"));
         assert!(
             strict.get("sort").is_none(),
@@ -2265,14 +2318,14 @@ mod tests {
     async fn strip_hidden_drops_a_gallery_title_but_keeps_a_form_one() {
         let visible: HashSet<String> = ["name".to_string()].into();
         let mut gal_cfg = json!({"cover": "bild", "title": "mit"});
-        strip_hidden(&mut gal_cfg, &visible);
+        strip_hidden("gallery", &mut gal_cfg, &visible);
         assert!(gal_cfg.get("cover").is_none());
         assert!(
             gal_cfg.get("title").is_none(),
             "a title naming a hidden field goes: {gal_cfg}"
         );
         let mut form_cfg = json!({"fields": [{"key": "name"}], "title": "anmelden"});
-        strip_hidden(&mut form_cfg, &visible);
+        strip_hidden("form", &mut form_cfg, &visible);
         assert_eq!(form_cfg["title"], json!("anmelden"));
     }
 }

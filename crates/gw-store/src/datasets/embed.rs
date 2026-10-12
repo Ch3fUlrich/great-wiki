@@ -87,7 +87,7 @@ impl Store {
             return Ok(EmbedOutcome::ViewMissing);
         };
         let visible = self.visible_field_keys(principal, &doc.id).await?;
-        strip_hidden(&mut v.config, &visible);
+        strip_hidden(&v.kind, &mut v.config, &visible);
         Ok(EmbedOutcome::Ok {
             path: doc.path,
             title: doc.title,
