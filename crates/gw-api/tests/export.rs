@@ -10,7 +10,7 @@
 use gw_api::export::{self, ExportReport, FIDELITY_FILE};
 use gw_api::seed;
 use gw_auth::{Action, Principal};
-use gw_core::{Block, DocumentType, Visibility};
+use gw_core::{Block, BlockKind, DocumentType, Visibility};
 use gw_store::{Author, NewDocument, Store};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1739,4 +1739,129 @@ fn a_heading_with_no_id_whose_words_end_in_an_anchor_is_refused_rather_than_corr
              "content":[{"kind":"text","text":"Dosis {#2}"}]}"#,
     );
     exported(&ordinary, &no_paths());
+}
+
+// --- a dataset view on the page (M8d D1a: the exporter had no arm for it) ----------------
+
+const DATASET_DOC: &str = "0199c0de-0000-7000-8000-000000000002";
+const DATASET_VIEW: &str = "0199c0de-0000-7000-8000-000000000010";
+
+/// A top-level `dataset-view` block with one label, built through serde so every label —
+/// backslash and bracket included — is JSON-escaped exactly once, the way the socket writes it.
+fn dataset_view_body(label: &str) -> Block {
+    body_of(
+        &serde_json::to_string(&serde_json::json!({
+            "kind": "dataset-view",
+            "attrs": {"dataset_doc": DATASET_DOC, "view": DATASET_VIEW, "label": label},
+        }))
+        .unwrap(),
+    )
+}
+
+/// Every label the D1a seat named. A page holding one must export with NO problem and come
+/// back through the comparison as the same tree — a dataset view the exporter refuses is a
+/// page missing from the owner's backup.
+#[test]
+fn a_dataset_view_exports_for_every_shape_its_label_can_take() {
+    for label in ["Laborwerte", "", "a]b)c", "a[b", "a\\b", "*x* _y_", "`z`"] {
+        let body = dataset_view_body(label);
+        // `render_file` IS the round trip: it renders, re-imports, and compares. A label
+        // that escapes wrong or re-imports differently fails here, not later.
+        let file = exported(&body, &no_paths());
+        assert!(
+            file.contains(&format!("](datensatz:{DATASET_DOC}#{DATASET_VIEW})")),
+            "the destination is missing for {label:?}:\n{file}"
+        );
+    }
+}
+
+#[test]
+fn a_dataset_view_written_by_the_exporter_reads_back_as_the_same_block() {
+    for label in ["Laborwerte", "", "a]b)c", "a[b", "a\\b", "*x* _y_", "`z`"] {
+        let file = exported(&dataset_view_body(label), &no_paths());
+        let (_, markdown) = gw_core::split_frontmatter(&file);
+        let back = gw_core::markdown::markdown_to_blocks(markdown);
+        let block = &back.content[0];
+        assert_eq!(block.kind, BlockKind::DatasetView, "{label:?}");
+        assert_eq!(
+            block.attrs.get("label").and_then(|v| v.as_str()),
+            Some(label),
+            "the label did not survive its own markdown: {label:?}\n{file}"
+        );
+    }
+}
+
+#[test]
+fn a_hostile_dataset_doc_is_refused_rather_than_written_into_the_destination() {
+    // The ids reached `documents.body` over the socket unparsed, and the destination is
+    // interpolated with no escaping — the same guard `embed` has, and an escape in the label
+    // is no help there.
+    let body = body_of(
+        &serde_json::to_string(&serde_json::json!({
+            "kind": "dataset-view",
+            "attrs": {"dataset_doc": "x) ![evil](https://e.example/a", "view": DATASET_VIEW, "label": "x"},
+        }))
+        .unwrap(),
+    );
+    let err = export::render_file(&embed_meta(), &body, &no_paths())
+        .expect_err("a destination markdown cannot carry back must be refused");
+    assert!(!err.is_empty());
+    // A dataset view naming no view is the same class of refusal.
+    let no_view = body_of(
+        &serde_json::to_string(&serde_json::json!({
+            "kind": "dataset-view",
+            "attrs": {"dataset_doc": DATASET_DOC, "label": "x"},
+        }))
+        .unwrap(),
+    );
+    assert!(export::render_file(&embed_meta(), &no_view, &no_paths()).is_err());
+}
+
+#[tokio::test]
+async fn a_page_holding_a_dataset_view_is_written_and_seeds_back_identical() {
+    // The gap D1a found, through the real owner's-backup path rather than `render_file`
+    // alone: an unhandled `BlockKind` fell into the "newer than this exporter" arm and the
+    // page was REFUSED from the export — under a FIDELITY file calling the directory faithful.
+    let store = Store::open("sqlite::memory:").await.unwrap();
+    store
+        .create_document(
+            Author::Import,
+            &NewDocument {
+                parent_path: None,
+                doc_type: DocumentType::Page,
+                title: "Verlauf".into(),
+                slug: Some("verlauf".into()),
+                language: "de".into(),
+                visibility: Visibility::Public,
+                body: dataset_view_body("Laborwerte"),
+                sort_key: 0,
+                topics: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+    let report = export_to(&store, &admin(), out.path()).await;
+    assert!(report.is_complete(), "{report}");
+    assert!(report.refused.is_empty(), "{report}");
+    assert!(out.path().join("verlauf.md").exists(), "{report}");
+
+    let reloaded = Store::open("sqlite::memory:").await.unwrap();
+    let reload = seed::run(&reloaded, out.path()).await.unwrap();
+    assert!(reload.is_complete(), "{reload}");
+    let doc = reloaded
+        .document_for(&admin(), "/verlauf", Action::Read)
+        .await
+        .unwrap()
+        .expect("the page came back");
+    let back: Block = serde_json::from_str(&doc.body).unwrap();
+    assert_eq!(back.content.len(), 1, "{:?}", back.content);
+    assert_eq!(back.content[0].kind, BlockKind::DatasetView);
+    assert_eq!(
+        back.content[0].attrs,
+        dataset_view_body("Laborwerte").content[0].attrs,
+        "the re-imported block is not the one that was stored"
+    );
 }

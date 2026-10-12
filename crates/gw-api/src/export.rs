@@ -522,6 +522,13 @@ const TASK_ITEM_ATTRS: [&str; 1] = ["checked"];
 /// same reason: `Renderer::embed` escapes nothing.
 const EMBED_ATTRS: [&str; 3] = ["doc", "heading", "label"];
 
+/// The attributes of a `dataset-view` that markdown states: the two ids of the destination
+/// and the author's words beside it. [`EMBED_ATTRS`]'s argument verbatim — the editor
+/// declares all three, a declared-but-null key must not refuse the page, and an undeclared
+/// fifth key nobody has thought of must not reach the file, because
+/// [`Renderer::dataset_view`] interpolates its destination with no escaping.
+const DATASET_VIEW_ATTRS: [&str; 3] = ["dataset_doc", "view", "label"];
+
 /// A `Block` reduced to what markdown could ever state about it, for [`render_file`]'s
 /// round-trip comparison.
 ///
@@ -629,6 +636,11 @@ fn reduce(block: &mut Block) {
         block
             .attrs
             .retain(|key, value| kept(&EMBED_ATTRS, key, value));
+    }
+    if block.kind == BlockKind::DatasetView {
+        block
+            .attrs
+            .retain(|key, value| kept(&DATASET_VIEW_ATTRS, key, value));
     }
     for mark in &mut block.marks {
         if mark.kind == MarkKind::Link {
@@ -831,6 +843,7 @@ impl Renderer {
             BlockKind::Table => self.table(block),
             BlockKind::Attachment => self.attachment(block),
             BlockKind::Transclusion => self.embed(block),
+            BlockKind::DatasetView => self.dataset_view(block),
             BlockKind::ListItem | BlockKind::TaskItem => {
                 self.problem("a list item is outside any list");
                 self.blocks(&block.content, Nesting::Item)
@@ -1308,6 +1321,29 @@ impl Renderer {
             Some(fallback) => format!("![{label}]({destination} {fallback})"),
             None => format!("![{label}]({destination})"),
         }
+    }
+
+    /// One saved view of one dataset (ADR 0029 §8), written as an image with the
+    /// `datensatz:` scheme. Shaped exactly like [`Self::embed`]: the ids reach the body
+    /// unparsed, the destination interpolates no escaping, so anything
+    /// `dataset_view_destination` would not read back unchanged is a refusal, not a guess.
+    /// The block carries no rows and no path — the reader asks the embed endpoint, under the
+    /// dataset's own permission.
+    fn dataset_view(&mut self, block: &Block) -> String {
+        let attr = |key: &str| block.attrs.get(key).and_then(|v| v.as_str());
+        let Some(destination) = markdown::dataset_view_destination(
+            attr("dataset_doc").unwrap_or_default(),
+            attr("view").unwrap_or_default(),
+        ) else {
+            self.problem(
+                "an embedded dataset view states no pair of ids this format can write — \
+                 the block names one dataset page and one saved view of it, both by id, \
+                 and anything else was not written by this wiki",
+            );
+            return String::new();
+        };
+        let label = self.escape(attr("label").unwrap_or_default());
+        format!("![{label}]({destination})")
     }
 
     fn blockquote(&mut self, block: &Block) -> String {

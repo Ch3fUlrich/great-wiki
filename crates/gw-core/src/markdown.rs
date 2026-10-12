@@ -2697,6 +2697,32 @@ mod tests {
         );
     }
 
+    /// The labels `gw_api::export`'s escaping produces for every shape a stored label can
+    /// take, each decoded back to the words the author wrote. The writer escapes; this is the
+    /// reader's half of the same agreement, and the pair is what decides whether a page
+    /// holding a dataset view survives its own backup.
+    #[test]
+    fn a_dataset_view_label_survives_the_escapes_markdown_needs() {
+        for (raw, written) in [
+            ("Laborwerte", r"Laborwerte".to_string()),
+            ("", String::new()),
+            ("a]b)c", r"a\]b)c".to_string()),
+            ("a[b", r"a\[b".to_string()),
+            (r"a\b", r"a\\b".to_string()),
+            ("*x* _y_", r"\*x\* \_y\_".to_string()),
+            ("`z`", r"\`z\`".to_string()),
+        ] {
+            let doc = markdown_to_blocks(&dataset_view_markdown(&written));
+            let block = &doc.content[0];
+            assert_eq!(block.kind, BlockKind::DatasetView, "{written:?}");
+            assert_eq!(
+                block.attrs.get("label").and_then(|v| v.as_str()),
+                Some(raw),
+                "{written:?} did not decode to {raw:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_dataset_view_destination_that_is_not_two_ids_stays_an_ordinary_image() {
         // The same load-bearing degradation as [`document_reference`]'s: `datensatz:foo#bar`
