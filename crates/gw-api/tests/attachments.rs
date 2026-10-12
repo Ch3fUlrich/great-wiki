@@ -280,6 +280,53 @@ async fn a_list_needs_read_on_the_page_and_says_nothing_about_a_page_it_refuses(
     assert_eq!(status, StatusCode::OK, "and a reader really can read it");
 }
 
+#[tokio::test]
+async fn an_attachment_has_an_id_a_dataset_file_cell_can_hold_and_only_a_reader_sees_it() {
+    // A dataset `file` cell holds the attachment's own id (M8b), and before this the id
+    // reached no client at all: a cover could only be set by SQL. The id is minted on attach,
+    // is not the content address, and travels only in the answers a reader of the page gets.
+    let store = fixture().await;
+    let bytes = png("bild");
+    let digest = {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(&bytes))
+    };
+    let (status, _, body) = as_user(
+        &store,
+        "schreiber",
+        "POST",
+        "/api/attachment/befund.png/raum",
+        bytes,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let created = json(&body);
+    let id = created["id"]
+        .as_str()
+        .expect("the attach answer names the id");
+    assert!(!id.is_empty() && id != digest && !id.contains(&digest[..16]));
+
+    let (_, _, body) = as_user(&store, "leser", "GET", "/api/attachments/raum", Vec::new()).await;
+    assert_eq!(
+        json(&body)["attachments"][0]["id"],
+        id,
+        "the list names the same id"
+    );
+
+    // A caller who may not read the page learns nothing - not an id, not that the page exists.
+    let (status, _, refused) = anonymous(&store, "GET", "/api/attachments/geheim").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        !contains(&refused, id.as_bytes()),
+        "a refusal carries no attachment id"
+    );
+    let (_, _, absent) = anonymous(&store, "GET", "/api/attachments/gibt-es-nicht").await;
+    assert_eq!(
+        refused, absent,
+        "the refusal is the absent page's answer, byte for byte"
+    );
+}
+
 // -------------------------------------------------------------------------------------
 // D-16: a download is authorised against the page it was reached through.
 // -------------------------------------------------------------------------------------
@@ -1021,12 +1068,13 @@ async fn attaching_bytes_that_are_already_stored_answers_exactly_as_a_novel_one(
     assert_eq!(already_status, StatusCode::CREATED);
     assert_eq!(already_status, novel_status, "not even a different status");
 
-    // Everything both answers carry, with only the three fields that are about THIS
-    // attachment rather than about the bytes taken out. They must be the same object — and
+    // Everything both answers carry, with only the four fields that are about THIS
+    // attachment (its own id included: minted per placement, not derived from the bytes)
+    // rather than about the bytes taken out. They must be the same object — and
     // there is nowhere for a "this was already here" field to be added without this failing.
     let strip = |body: &[u8]| {
         let mut value = json(body);
-        for key in ["filename", "href", "uploaded_at"] {
+        for key in ["id", "filename", "href", "uploaded_at"] {
             value.as_object_mut().unwrap().remove(key);
         }
         value

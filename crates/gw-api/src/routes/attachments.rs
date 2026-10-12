@@ -80,6 +80,9 @@ use tower_http::limit::RequestBodyLimitLayer;
 /// and this type is where "must never" is enforced.
 #[derive(Debug, Serialize)]
 pub struct AttachmentView {
+    /// The attachment's own id: what a dataset `file` cell holds. Only a reader of this page
+    /// is ever handed it, and it is not derived from the content.
+    pub id: String,
     pub filename: String,
     /// What the bytes **are**. Never what an upload claimed they were.
     pub media_type: String,
@@ -103,6 +106,7 @@ impl AttachmentView {
             page
         );
         Self {
+            id: attachment.id,
             filename: attachment.filename,
             media_type: attachment.media_type,
             byte_size: attachment.byte_size,

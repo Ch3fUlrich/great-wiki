@@ -75,6 +75,10 @@ pub const MAX_FILENAME_CHARS: usize = 255;
 /// digest lives on [`AttachmentSource`], which never leaves the server.
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 pub struct Attachment {
+    /// The attachment's own id (`attachments.id`), which is what a dataset `file` cell holds. A
+    /// handle on this ONE placement of the bytes on this page, minted on attach: not derived
+    /// from the content, so it says nothing about what else holds the same bytes (D-16).
+    pub id: String,
     /// What the file is called on this page. One path segment; see [`canonical_filename`].
     pub filename: String,
     /// What the bytes are, from [`crate::blobs::sniff`] — never what an upload claimed.
@@ -278,7 +282,7 @@ impl Store {
             "INSERT INTO attachments \
                (id, doc_id, sha256, filename, uploaded_by, uploaded_by_name) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-             RETURNING filename, \
+             RETURNING id, filename, \
                        (SELECT media_type FROM blobs WHERE sha256 = ?3) AS media_type, \
                        (SELECT byte_size FROM blobs WHERE sha256 = ?3) AS byte_size, \
                        uploaded_at, uploaded_by_name",
@@ -333,7 +337,7 @@ impl Store {
             return Ok(None);
         };
         let attachments: Vec<Attachment> = sqlx::query_as(
-            "SELECT a.filename, b.media_type, b.byte_size, a.uploaded_at, a.uploaded_by_name \
+            "SELECT a.id, a.filename, b.media_type, b.byte_size, a.uploaded_at, a.uploaded_by_name \
                FROM attachments a JOIN blobs b ON b.sha256 = a.sha256 \
               WHERE a.doc_id = ?1 ORDER BY a.filename",
         )
@@ -402,7 +406,7 @@ impl Store {
         // apart from it.
         let removed: Option<Attachment> = sqlx::query_as(
             "DELETE FROM attachments WHERE doc_id = ?1 AND filename = ?2 \
-             RETURNING filename, \
+             RETURNING id, filename, \
                        (SELECT media_type FROM blobs WHERE sha256 = attachments.sha256) \
                            AS media_type, \
                        (SELECT byte_size FROM blobs WHERE sha256 = attachments.sha256) \
@@ -1124,6 +1128,7 @@ mod tests {
         // nowhere for a "this was already here" field to be added without this failing —
         // which is the point: the type is the disclosure boundary, not a rule in a handler.
         let blank = |a: &super::Attachment| super::Attachment {
+            id: String::new(),
             filename: String::new(),
             uploaded_at: String::new(),
             ..a.clone()
