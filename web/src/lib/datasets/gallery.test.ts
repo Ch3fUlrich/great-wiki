@@ -42,11 +42,10 @@ describe('coverOf', () => {
     });
   });
 
-  it('a raster type the bytes can really be is an image: tiff, the fifth of the sniff allowlist', () => {
+  it('a tiff is an attachable image no browser draws everywhere: it gets the placeholder, not a broken picture', () => {
     expect(coverOf(row({ bild: fileCell('rntgen.tiff') }), 'bild', LISTING)).toEqual({
-      kind: 'image',
-      src: '/api/attachment/rntgen.tiff/d',
-      filename: 'rntgen.tiff'
+      kind: 'placeholder',
+      reason: 'not-image'
     });
   });
 
@@ -71,11 +70,11 @@ describe('coverOf', () => {
     expect(coverOf(row({}), 'bild', LISTING)).toEqual({ kind: 'placeholder', reason: 'none' });
   });
 
-  it('IMAGE_TYPES is exactly the raster image set of gw_store::blobs::sniff', () => {
-    // The server's own rule (crates/gw-store/src/blobs.rs): png, jpeg, gif, webp, tiff carry
-    // raster signatures; svg is an exception checked BEFORE the image rule, and everything
+  it('IMAGE_TYPES is the raster set every browser draws in an img: png, jpeg, gif, webp', () => {
+    // The server's sniffer (crates/gw-store/src/blobs.rs) also attaches tiff, which Chrome and
+    // Firefox do not draw; svg is an exception checked BEFORE the image rule, and everything
     // else the sniffer knows (pdf, video, audio, zip) is not a picture.
-    expect(IMAGE_TYPES).toEqual(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/tiff']);
+    expect(IMAGE_TYPES).toEqual(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
   });
 });
 

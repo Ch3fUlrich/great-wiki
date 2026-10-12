@@ -15,13 +15,16 @@ import { cellOf } from './table';
 import { rowTitle } from './calendar';
 
 /**
- * The media types a card may carry an `<img>` for: exactly the RASTER image types of
- * `gw_store::blobs::sniff`'s allowlist. Not a copy of everything the server serves inline —
- * `image/svg+xml` is an image by media type and a program by capability (ADR 0014 refuses it
- * inline for that reason), and `application/pdf` is a document, not a cover. If the sniff
- * allowlist ever gains a raster type, this list is checked against it, not assumed.
+ * The media types a card may carry an `<img>` for: the RASTER image types of
+ * `gw_store::blobs::sniff`'s allowlist that every browser draws in an `<img>`. Not a copy of
+ * everything the server serves inline — `image/svg+xml` is an image by media type and a
+ * program by capability (ADR 0014 refuses it inline for that reason), `application/pdf` is a
+ * document, not a cover, and `image/tiff` is an attachable image that Chrome and Firefox do
+ * not draw: a TIFF cover would be a broken picture, so it gets the placeholder, like a file
+ * that is gone. If the sniff allowlist ever gains a raster type, this list is checked
+ * against it, not assumed.
  */
-export const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/tiff'];
+export const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
 
 export interface GalleryConfig {
   cover: string;
