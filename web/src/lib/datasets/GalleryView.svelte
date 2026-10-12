@@ -6,7 +6,7 @@
    *
    * A failed read, a missing page or a config without a cover is STATED in a role=alert, never
    * drawn as an empty gallery. Titles, alts and card fields reach the page as TEXT: nothing
-   * here uses `{@html}`, and a cover is fetched through the `href` the API made (D-16 — no
+   * here parses markup, and a cover is fetched through the `href` the API made (D-16 — no
    * address is assembled here).
    *
    * `path` is carried for the shape of props the page hands every view; a gallery writes
