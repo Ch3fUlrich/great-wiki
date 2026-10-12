@@ -4,6 +4,7 @@
  * its cards by, and which columns a calendar view places its rows by. Pure — no fetch, no DOM.
  */
 import type { CalendarConfig } from './calendar';
+import type { GalleryConfig } from './gallery';
 
 /** Mirrors one entry of the API's `{views: [...]}`: `config` is per-kind and stays unknown here. */
 export interface DatasetView {
@@ -59,4 +60,22 @@ export function calendarConfig(view: DatasetView | null): CalendarConfig | null 
   const date = fieldKey(config?.date);
   if (!date) return null;
   return { date, end: fieldKey(config?.end), title: fieldKey(config?.title) };
+}
+
+/**
+ * The columns a picked gallery view draws by (M8d D4b); `null` for any other kind, a config
+ * with nothing to cover cards with, or no view. `cover` is required; whether the file it names
+ * is a picture at all is `coverOf`'s question, decided from the attachment listing at read
+ * time. A `card_fields` that is not a list, or names nothing usable, is simply no extra lines.
+ */
+export function galleryConfig(view: DatasetView | null): GalleryConfig | null {
+  if (!view || view.kind !== 'gallery') return null;
+  const config = view.config as { cover?: unknown; title?: unknown; card_fields?: unknown } | null;
+  const cover = fieldKey(config?.cover);
+  if (!cover) return null;
+  const rawCards = config?.card_fields;
+  const cardFields = Array.isArray(rawCards)
+    ? rawCards.map(fieldKey).filter((key): key is string => key !== null)
+    : [];
+  return { cover, title: fieldKey(config?.title), card_fields: cardFields };
 }

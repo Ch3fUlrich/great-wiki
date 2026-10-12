@@ -9,9 +9,10 @@
   import ViewBar from '$lib/datasets/ViewBar.svelte';
   import BoardView from '$lib/datasets/BoardView.svelte';
   import CalendarView from '$lib/datasets/CalendarView.svelte';
+  import GalleryView from '$lib/datasets/GalleryView.svelte';
   import FormView from '$lib/datasets/FormView.svelte';
   import { MONTH_PARAM } from '$lib/datasets/calendar';
-  import { boardGroupKey, calendarConfig } from '$lib/datasets/views';
+  import { boardGroupKey, calendarConfig, galleryConfig } from '$lib/datasets/views';
   import { formKeyOf } from '$lib/datasets/form';
   import Breadcrumb from '$lib/components/Breadcrumb.svelte';
   import PageAttachments from '$lib/components/PageAttachments.svelte';
@@ -178,6 +179,11 @@
     data.dataset && calendarConfig(data.dataset.view) !== null ? data.dataset.view : null
   );
   const kalenderMonat = $derived(page.url.searchParams.get(MONTH_PARAM));
+
+  /** The picked view when it is a gallery: its cards are covered by the file the config names. */
+  const gallerieAnsicht = $derived(
+    data.dataset && galleryConfig(data.dataset.view) !== null ? data.dataset.view : null
+  );
 </script>
 
 <svelte:head><title>{data.doc.title} — great-wiki</title></svelte:head>
@@ -411,7 +417,8 @@
 
     <!-- A dataset page (ADR 0029) is its description above, its saved views here, and then
          the one view the address picked: a form when the picked view says form, a board when it
-         says board, a calendar when it says calendar and names a date, the table otherwise. The
+         says board, a calendar when it says calendar and names a date, a gallery when it says
+         gallery and names a cover, the table otherwise. The
          load states a failed read in `dataset.error`; neither rendering ever draws an empty body
          for one. -->
     {#if data.dataset}
@@ -441,6 +448,15 @@
           month={kalenderMonat}
           error={data.dataset.error}
           mayWrite={data.doc.may_write === true}
+        />
+      {:else if gallerieAnsicht !== null}
+        <GalleryView
+          path={data.doc.path}
+          fields={data.dataset.fields}
+          page={data.dataset.page}
+          view={gallerieAnsicht}
+          attachments={data.dataset.attachments}
+          error={data.dataset.error}
         />
       {:else}
         <TableView

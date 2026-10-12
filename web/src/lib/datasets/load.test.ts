@@ -230,3 +230,86 @@ describe('loadDataset calendar view', () => {
     expect(out.error).toBeNull();
   });
 });
+
+/**
+ * A picked GALLERY view is read like a board (M8d D4b) — every row at once, the address's sort
+ * and filter are the table's — AND the page's attachment listing is read beside it, because a
+ * cover is only as good as the listing that says what its file is. A listing that cannot be
+ * read is EMPTY, not an error: every card then states its placeholder rather than the page
+ * failing.
+ */
+describe('loadDataset gallery view', () => {
+  const GALLERY_FIELDS = {
+    fields: [
+      { key: 'name', label: 'Name', kind: 'text', config: {}, position: 0 },
+      { key: 'bild', label: 'Bild', kind: 'file', config: {}, position: 1 }
+    ]
+  };
+  const galleryViews = (config: unknown) => ({
+    views: [{ id: 'g1', name: 'Galerie', kind: 'gallery', config, position: 0 }]
+  });
+  const LISTING = {
+    attachments: [
+      {
+        filename: 'plan.png',
+        media_type: 'image/png',
+        byte_size: 10,
+        uploaded_at: '',
+        uploaded_by_name: '',
+        href: '/api/attachment/plan.png/d'
+      }
+    ],
+    may_write: false
+  };
+
+  function galFetch(
+    config: unknown,
+    over: { attachments?: Response; rows?: unknown } = {}
+  ) {
+    const seen: string[] = [];
+    const f = vi.fn(async (url: string | URL | Request) => {
+      const u = String(url);
+      seen.push(u);
+      if (u.includes('/schema/')) return json(GALLERY_FIELDS);
+      if (u.includes('/views/')) return json(galleryViews(config));
+      if (u.includes('/api/attachments/')) return over.attachments ?? json(LISTING);
+      return json(over.rows ?? { rows: [], total: 0 });
+    }) as unknown as typeof fetch;
+    return { f, seen };
+  }
+
+  it('asks all its rows at once and ignores the address sort and filter', async () => {
+    const { f, seen } = galFetch({ cover: 'bild', title: 'name' });
+    const out = await loadDataset(f, '/d', new URLSearchParams('view=g1&sort=name&desc=1&f=name:x'), null);
+    const rowsUrl = seen.find((u) => u.includes('/rows/'))!;
+    expect(rowsUrl).toContain('limit=500');
+    expect(rowsUrl).not.toContain('sort=');
+    expect(rowsUrl).not.toContain('filter=');
+    expect(out.sort).toBeNull();
+    expect(out.filter).toBeNull();
+    expect(out.view?.kind).toBe('gallery');
+    expect(out.error).toBeNull();
+  });
+
+  it('reads the page\'s attachment listing for a picked gallery and exposes it', async () => {
+    const { f, seen } = galFetch({ cover: 'bild' });
+    const out = await loadDataset(f, '/d', new URLSearchParams('view=g1'), null);
+    expect(seen.some((u) => u.includes('/api/attachments/d'))).toBe(true);
+    expect(out.attachments).toEqual(LISTING.attachments);
+  });
+
+  it('a listing that cannot be read is no list: the page loads and every cover will state its placeholder', async () => {
+    const { f } = galFetch({ cover: 'bild' }, { attachments: json({ error: 'x' }, 500) });
+    const out = await loadDataset(f, '/d', new URLSearchParams('view=g1'), null);
+    expect(out.error).toBeNull();
+    expect(out.page).not.toBeNull();
+    expect(out.attachments).toEqual([]);
+  });
+
+  it('no listing is read when no gallery is picked', async () => {
+    const { f, seen } = galFetch({ cover: 'bild' });
+    const out = await loadDataset(f, '/d', new URLSearchParams(), null);
+    expect(seen.some((u) => u.includes('/api/attachments/'))).toBe(false);
+    expect(out.attachments).toEqual([]);
+  });
+});

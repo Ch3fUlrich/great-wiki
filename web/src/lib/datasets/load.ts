@@ -1,5 +1,7 @@
 import { apiGet } from '$lib/api';
+import { attachmentsApiPath } from '$lib/attachments';
 import { labelMap, relationConfig } from './cells/relation';
+import type { GalleryAttachment } from './gallery';
 import {
   describeRowsFailure,
   fieldsApiPath,
@@ -15,6 +17,7 @@ import {
   BOARD_ROW_LIMIT,
   boardGroupKey,
   calendarConfig,
+  galleryConfig,
   pickView,
   viewsApiPath,
   VIEW_PARAM,
@@ -33,6 +36,13 @@ export interface DatasetLoad {
   views: DatasetView[];
   /** The view the address names, or `null` for the table. An unknown id is `null`. */
   view: DatasetView | null;
+  /**
+   * The page's attachment listing, read only for a picked gallery view (M8d D4b) — it is what
+   * decides whether a cover file is a picture at all. `[]` for any other view, and `[]` when
+   * the listing could not be read: the gallery then states a placeholder on every card rather
+   * than the page failing.
+   */
+  attachments: GalleryAttachment[];
 }
 
 /**
@@ -67,10 +77,12 @@ export async function loadDataset(
   const requested = params.get(VIEW_PARAM);
   const early = requested ? await readViews(fetchFn, path, cookie) : [];
   const view = pickView(early, requested);
-  // A board and a calendar are both drawn from every row at once: a page of a board is no board,
-  // and a page of a calendar is a month with holes in it. Their address carries neither a sort nor
-  // a filter — those are the table's controls, and the rows they picked are not on this page.
-  const whole = boardGroupKey(view) !== null || calendarConfig(view) !== null;
+  // A board, a calendar and a gallery are all drawn from every row at once: a page of a board
+  // is no board, a page of a calendar is a month with holes in it, and a page of a gallery is
+  // half the pictures. Their address carries neither a sort nor a filter — those are the
+  // table's controls, and the rows they picked are not on this page.
+  const whole =
+    boardGroupKey(view) !== null || calendarConfig(view) !== null || galleryConfig(view) !== null;
   const sort = whole ? null : sortFrom(params.get('sort'), params.get('desc'), fields);
   const raw =
     params.get('f') ??
@@ -85,7 +97,12 @@ export async function loadDataset(
     if (!rows.data) return { ...fail(rows.status), fields, sort, filter, views: early, view };
     const labels = await relationLabels(fetchFn, fields, cookie);
     const views = requested ? early : await readViews(fetchFn, path, cookie);
-    return { fields, page: rows.data, error: null, sort, filter, labels, views, view };
+    // A gallery's covers are decided by the page's attachment listing (M8d D4b), and nothing
+    // else on this page asks for it — the ordinary `Anhänge` list is read by the document's
+    // own loader, not by the dataset's.
+    const attachments =
+      galleryConfig(view) !== null ? await readAttachments(fetchFn, path, cookie) : [];
+    return { fields, page: rows.data, error: null, sort, filter, labels, views, view, attachments };
   } catch {
     return { ...fail(0), fields, sort, filter, views: early, view };
   }
@@ -109,6 +126,29 @@ async function readViews(
   }
 }
 
+/**
+ * The page's attachment listing, for a picked gallery's covers (M8d D4b). A listing that
+ * cannot be read is simply NO listing — the gallery then states a placeholder on every card,
+ * which is a smaller claim than the page failing over a picture.
+ */
+async function readAttachments(
+  fetchFn: typeof fetch,
+  path: string,
+  cookie: string | null
+): Promise<GalleryAttachment[]> {
+  try {
+    const res = await apiGet<{ attachments?: GalleryAttachment[] }>(
+      fetchFn,
+      attachmentsApiPath(path),
+      cookie
+    );
+    const list = res.data?.attachments;
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
 function fail(status: number): DatasetLoad {
   return {
     fields: [],
@@ -118,7 +158,8 @@ function fail(status: number): DatasetLoad {
     filter: null,
     labels: {},
     views: [],
-    view: null
+    view: null,
+    attachments: []
   };
 }
 

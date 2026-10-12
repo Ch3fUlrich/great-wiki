@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { boardGroupKey, calendarConfig, pickView, viewHref, viewsApiPath, type DatasetView } from './views';
+import { boardGroupKey, calendarConfig, galleryConfig, pickView, viewHref, viewsApiPath, type DatasetView } from './views';
 
 const view = (over: Partial<DatasetView> = {}): DatasetView => ({
   id: 'v1',
@@ -102,5 +102,47 @@ describe('calendarConfig', () => {
     expect(calendarConfig(cal({ date: null }))).toBeNull();
     expect(calendarConfig(cal(null))).toBeNull();
     expect(calendarConfig(cal('start'))).toBeNull();
+  });
+});
+
+describe('galleryConfig', () => {
+  const gal = (config: unknown): DatasetView => view({ id: 'g1', kind: 'gallery', config });
+
+  it('is the cover, title and card fields of a gallery view', () => {
+    expect(galleryConfig(gal({ cover: 'bild', title: 'name', card_fields: ['ort'] }))).toEqual({
+      cover: 'bild',
+      title: 'name',
+      card_fields: ['ort']
+    });
+  });
+
+  it('leaves the optional members empty when the view does not name them', () => {
+    expect(galleryConfig(gal({ cover: 'bild' }))).toEqual({ cover: 'bild', title: null, card_fields: [] });
+    expect(galleryConfig(gal({ cover: 'bild', title: '', card_fields: [7, '', null] }))).toEqual({
+      cover: 'bild',
+      title: null,
+      card_fields: []
+    });
+    expect(galleryConfig(gal({ cover: 'bild', card_fields: 'ort' }))).toEqual({
+      cover: 'bild',
+      title: null,
+      card_fields: []
+    });
+  });
+
+  it('is null for every other kind, even one that carries a cover', () => {
+    expect(galleryConfig(view({ kind: 'table', config: { cover: 'bild' } }))).toBeNull();
+    expect(galleryConfig(view({ kind: 'calendar', config: { cover: 'bild' } }))).toBeNull();
+    expect(galleryConfig(view({ kind: 'board', config: { cover: 'bild' } }))).toBeNull();
+  });
+
+  it('is null without a cover to draw by', () => {
+    expect(galleryConfig(null)).toBeNull();
+    expect(galleryConfig(gal({}))).toBeNull();
+    expect(galleryConfig(gal({ cover: '' }))).toBeNull();
+    expect(galleryConfig(gal({ cover: 7 }))).toBeNull();
+    expect(galleryConfig(gal({ cover: null }))).toBeNull();
+    expect(galleryConfig(gal(null))).toBeNull();
+    expect(galleryConfig(gal('bild'))).toBeNull();
   });
 });
