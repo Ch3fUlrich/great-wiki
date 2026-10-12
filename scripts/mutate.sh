@@ -2478,7 +2478,7 @@ mutation crates/gw-store/src/datasets.rs killed \
 # stops being the caller's, every dataset becomes readable by id, and `ViewMissing` — the one
 # answer that is only safe behind the gate — is suddenly said to strangers.
 mutation crates/gw-store/src/datasets/embed.rs killed \
-  's/self.document_for_id(principal, dataset_doc, Action::Read)/self.document_for_id(\&Principal::test("wer-auch-immer", \&["admins"], \&[]), dataset_doc, Action::Read)/' \
+  's/.document_for_id(principal, dataset_doc, Action::Read)/.document_for_id(\&Principal::test("wer-auch-immer", \&["admins"], \&[]), dataset_doc, Action::Read)/' \
   'datasets: an embed uses the dataset'"'"'s own permission, never the embedding page'"'"'s'
 
 # HOW LONG THIS IS ALLOWED TO TAKE
