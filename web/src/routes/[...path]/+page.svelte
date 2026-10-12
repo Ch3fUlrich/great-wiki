@@ -1,5 +1,6 @@
 <script lang="ts">
   import { browser } from '$app/environment';
+  import { page } from '$app/state';
   import Comments from '$lib/components/Comments.svelte';
   import Backlinks from '$lib/components/Backlinks.svelte';
   import BlockView from '$lib/components/BlockView.svelte';
@@ -7,8 +8,10 @@
   import TableView from '$lib/datasets/TableView.svelte';
   import ViewBar from '$lib/datasets/ViewBar.svelte';
   import BoardView from '$lib/datasets/BoardView.svelte';
+  import CalendarView from '$lib/datasets/CalendarView.svelte';
   import FormView from '$lib/datasets/FormView.svelte';
-  import { boardGroupKey } from '$lib/datasets/views';
+  import { MONTH_PARAM } from '$lib/datasets/calendar';
+  import { boardGroupKey, calendarConfig } from '$lib/datasets/views';
   import { formKeyOf } from '$lib/datasets/form';
   import Breadcrumb from '$lib/components/Breadcrumb.svelte';
   import PageAttachments from '$lib/components/PageAttachments.svelte';
@@ -169,6 +172,12 @@
 
   /** The picked view when it is a form: the branch below hands the narrowed view to FormView. */
   const formularAnsicht = $derived(data.dataset && formKeyOf(data.dataset.view) !== null ? data.dataset.view : null);
+
+  /** The picked view when it is a calendar, and the month the address asks for beside it. */
+  const kalenderAnsicht = $derived(
+    data.dataset && calendarConfig(data.dataset.view) !== null ? data.dataset.view : null
+  );
+  const kalenderMonat = $derived(page.url.searchParams.get(MONTH_PARAM));
 </script>
 
 <svelte:head><title>{data.doc.title} — great-wiki</title></svelte:head>
@@ -401,9 +410,10 @@
     {/if}
 
     <!-- A dataset page (ADR 0029) is its description above, its saved views here, and then
-         the one view the address picked: a board when the picked view says board, the table
-         otherwise. The load states a failed read in `dataset.error`; neither rendering ever
-         draws an empty body for one. -->
+         the one view the address picked: a form when the picked view says form, a board when it
+         says board, a calendar when it says calendar and names a date, the table otherwise. The
+         load states a failed read in `dataset.error`; neither rendering ever draws an empty body
+         for one. -->
     {#if data.dataset}
       <ViewBar views={data.dataset.views} active={data.dataset.view?.id ?? null} />
       {#if formularAnsicht !== null}
@@ -419,6 +429,16 @@
           fields={data.dataset.fields}
           page={data.dataset.page}
           view={data.dataset.view}
+          error={data.dataset.error}
+          mayWrite={data.doc.may_write === true}
+        />
+      {:else if kalenderAnsicht !== null}
+        <CalendarView
+          path={data.doc.path}
+          fields={data.dataset.fields}
+          page={data.dataset.page}
+          view={kalenderAnsicht}
+          month={kalenderMonat}
           error={data.dataset.error}
           mayWrite={data.doc.may_write === true}
         />

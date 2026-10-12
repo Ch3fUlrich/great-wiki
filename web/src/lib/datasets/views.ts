@@ -1,8 +1,9 @@
 /**
  * The saved views of a dataset page (M8c C4), as the page reads them: the list from
- * `GET /api/datasets/views/{path}`, which address selects one, and which field a board
- * view groups its cards by. Pure — no fetch, no DOM.
+ * `GET /api/datasets/views/{path}`, which address selects one, which field a board view groups
+ * its cards by, and which columns a calendar view places its rows by. Pure — no fetch, no DOM.
  */
+import type { CalendarConfig } from './calendar';
 
 /** Mirrors one entry of the API's `{views: [...]}`: `config` is per-kind and stays unknown here. */
 export interface DatasetView {
@@ -42,4 +43,20 @@ export function boardGroupKey(view: DatasetView | null): string | null {
   if (!view || view.kind !== 'board') return null;
   const raw = (view.config as { group_by?: unknown } | null)?.group_by;
   return typeof raw === 'string' && raw !== '' ? raw : null;
+}
+
+/** A config member that names a field, or nothing at all. */
+const fieldKey = (value: unknown): string | null => (typeof value === 'string' && value !== '' ? value : null);
+
+/**
+ * The columns a picked calendar view places rows by; `null` for any other kind, a config with
+ * nothing to place by, or no view. `end` and `title` are optional; `date` is not, and whether
+ * the keys name real columns is the renderer's question, not this one.
+ */
+export function calendarConfig(view: DatasetView | null): CalendarConfig | null {
+  if (!view || view.kind !== 'calendar') return null;
+  const config = view.config as { date?: unknown; end?: unknown; title?: unknown } | null;
+  const date = fieldKey(config?.date);
+  if (!date) return null;
+  return { date, end: fieldKey(config?.end), title: fieldKey(config?.title) };
 }

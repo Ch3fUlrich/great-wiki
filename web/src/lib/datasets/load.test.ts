@@ -163,3 +163,70 @@ describe('loadDataset views', () => {
     expect(seen.filter((u) => u.includes('/views/'))).toHaveLength(1);
   });
 });
+
+/**
+ * A picked CALENDAR view is read like a board (M8d D3b): a month with holes in it is no
+ * calendar, so it wants every row, and the address's sort and filter are the table's.
+ */
+describe('loadDataset calendar view', () => {
+  const CALENDAR_FIELDS = {
+    fields: [
+      { key: 'name', label: 'Name', kind: 'text', config: {}, position: 0 },
+      { key: 'start', label: 'Start', kind: 'date', config: {}, position: 1 }
+    ]
+  };
+  const calendarViews = (config: unknown) => ({
+    views: [{ id: 'c1', name: 'Termine', kind: 'calendar', config, position: 0 }]
+  });
+
+  function calFetch(config: unknown, rows: unknown = { rows: [], total: 0 }) {
+    const seen: string[] = [];
+    const f = vi.fn(async (url: string | URL | Request) => {
+      const u = String(url);
+      seen.push(u);
+      if (u.includes('/schema/')) return json(CALENDAR_FIELDS);
+      if (u.includes('/views/')) return json(calendarViews(config));
+      return json(rows);
+    }) as unknown as typeof fetch;
+    return { f, seen };
+  }
+
+  it('asks all its rows at once and ignores the address sort and filter', async () => {
+    const { f, seen } = calFetch({ date: 'start', end: 'ende', title: 'name' });
+    const out = await loadDataset(f, '/d', new URLSearchParams('view=c1&sort=name&desc=1&f=name:x'), null);
+    const rowsUrl = seen.find((u) => u.includes('/rows/'))!;
+    expect(rowsUrl).toContain('limit=500');
+    expect(rowsUrl).not.toContain('sort=');
+    expect(rowsUrl).not.toContain('filter=');
+    expect(out.sort).toBeNull();
+    expect(out.filter).toBeNull();
+    expect(out.view?.kind).toBe('calendar');
+    expect(out.error).toBeNull();
+  });
+
+  it('reads the view list BEFORE the rows, because the view decides the request', async () => {
+    const { f, seen } = calFetch({ date: 'start' });
+    await loadDataset(f, '/d', new URLSearchParams('view=c1'), null);
+    expect(seen.findIndex((u) => u.includes('/views/'))).toBeLessThan(
+      seen.findIndex((u) => u.includes('/rows/'))
+    );
+  });
+
+  it('a calendar the dataset cannot place rows by is read as the table', async () => {
+    const { f, seen } = calFetch({});
+    const out = await loadDataset(f, '/d', new URLSearchParams('view=c1&sort=name'), null);
+    expect(out.view?.id).toBe('c1');
+    expect(out.sort).toEqual({ sort: 'name', desc: false });
+    const rowsUrl = seen.find((u) => u.includes('/rows/'))!;
+    expect(rowsUrl).toContain('sort=name');
+    expect(rowsUrl).not.toContain('limit=');
+  });
+
+  it('a month outside the rows read is still the same one read', async () => {
+    const { f, seen } = calFetch({ date: 'start' });
+    const out = await loadDataset(f, '/d', new URLSearchParams('view=c1&month=2026-03'), null);
+    expect(seen.filter((u) => u.includes('/views/'))).toHaveLength(1);
+    expect(seen.filter((u) => u.includes('/rows/'))).toHaveLength(1);
+    expect(out.error).toBeNull();
+  });
+});

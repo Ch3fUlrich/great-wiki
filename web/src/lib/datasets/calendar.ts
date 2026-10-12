@@ -89,20 +89,30 @@ function spanDays(start: string, end: string | null): string[] {
   return days;
 }
 
-/** The row's caption: the titled column, else the first text column, else the row's own id. */
-function titleOf(row: Row, fields: Field[], titleKey: string | null | undefined): string {
-  const text = (key: string | null | undefined): string | null => {
-    if (!key) return null;
-    const value = row.values[key];
-    return typeof value === 'string' && value.trim() !== '' ? value : null;
+/**
+ * The caption of one row: the titled column, else the first text column by position, else the
+ * row's own id. Exported because the undated list beside the month needs the same one the cells
+ * use, and `bucketRows` hands those rows back as they came.
+ */
+export function rowTitle(row: Row, fields: Field[], titleKey: string | null | undefined): string {
+  const value = (key: string): string | null => {
+    const raw = row.values[key];
+    return typeof raw === 'string' && raw.trim() !== '' ? raw : null;
   };
-  const named = text(titleKey);
-  if (named) return named;
+  // Only a key the dataset has as a TEXT column counts as a title: a config naming a column that
+  // is gone, hidden or not text falls through to the fallback rather than printing a value the
+  // schema never offered.
+  const isText = (key: string | null | undefined): key is string =>
+    fields.some((f) => f.key === key && f.kind === 'text');
+  if (isText(titleKey)) {
+    const named = value(titleKey);
+    if (named) return named;
+  }
   const byPosition = [...fields].sort((a, b) => a.position - b.position);
   for (const field of byPosition) {
     if (field.kind !== 'text') continue;
-    const value = text(field.key);
-    if (value) return value;
+    const text = value(field.key);
+    if (text) return text;
   }
   return row.id;
 }
@@ -138,7 +148,11 @@ export function bucketRows(
       continue;
     }
     const end = usableEnd ? dayOf(row.values[usableEnd], toLocalDay) : null;
-    const title = titleOf(row, fields, typeof config.title === 'string' && config.title !== '' ? config.title : null);
+    const title = rowTitle(
+      row,
+      fields,
+      typeof config.title === 'string' && config.title !== '' ? config.title : null
+    );
     spanDays(start, end).forEach((day, index) => {
       const onDay = days.get(day);
       const entry: CalendarEntry = { row, title, continues: index > 0 };

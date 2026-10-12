@@ -5,6 +5,7 @@ import {
   monthHref,
   monthLabel,
   parseMonth,
+  rowTitle,
   shiftMonth,
   type CalendarConfig
 } from './calendar';
@@ -307,5 +308,30 @@ describe('monthHref', () => {
 
   it('still carries a month with no view', () => {
     expect(monthHref(null, '2026-03')).toBe('?month=2026-03');
+  });
+});
+
+describe('rowTitle', () => {
+  it('is the titled column, the first text column, or the row id', () => {
+    const r = row('r1', { start: '2026-03-02', name: 'Tagung', notiz: 'Vorlauf' });
+    expect(rowTitle(r, FIELDS, 'name')).toBe('Tagung');
+    expect(rowTitle(r, FIELDS, null)).toBe('Tagung');
+    expect(rowTitle(r, FIELDS, 'mit'))
+      .toBe('Tagung');
+    expect(rowTitle(row('r2', { start: '2026-03-02', notiz: 'Vorlauf' }), FIELDS, 'name')).toBe('Vorlauf');
+    expect(rowTitle(row('r3', {}), FIELDS, 'name')).toBe('r3');
+    expect(rowTitle(r, [], 'name')).toBe('r1');
+  });
+
+  it('ignores a title naming a column that is not a text column', () => {
+    const r = row('r1', { start: '2026-03-02', name: 'Tagung' });
+    expect(rowTitle(r, FIELDS, 'start')).toBe('Tagung');
+    expect(rowTitle(r, FIELDS, 'name')).toBe('Tagung');
+  });
+
+  it('is the same caption the day cell shows', () => {
+    const rows = [row('r1', { start: '2026-03-02', name: 'Tagung' })];
+    const entry = [...bucketRows(rows, FIELDS, CFG, Berlin).days.values()][0][0];
+    expect(entry.title).toBe(rowTitle(rows[0], FIELDS, CFG.title));
   });
 });

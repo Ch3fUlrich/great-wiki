@@ -11,7 +11,15 @@ import {
   type RowPage,
   type SortState
 } from './table';
-import { BOARD_ROW_LIMIT, boardGroupKey, pickView, viewsApiPath, VIEW_PARAM, type DatasetView } from './views';
+import {
+  BOARD_ROW_LIMIT,
+  boardGroupKey,
+  calendarConfig,
+  pickView,
+  viewsApiPath,
+  VIEW_PARAM,
+  type DatasetView
+} from './views';
 
 export interface DatasetLoad {
   fields: Field[];
@@ -35,10 +43,10 @@ export interface DatasetLoad {
  * an address cannot name a key the API would have to refuse. A failed read is STATED
  * (`error`), never rendered as an empty table.
  *
- * A picked BOARD view changes the rows request — all its cards at once, and the address's
- * sort and filter are the table's, not it — and for that the view list has to be read
- * BEFORE the rows. With no `?view` in the address nothing the list can say changes the
- * request (`pickView` of null is null), so it is read after the rows instead.
+ * A picked BOARD or CALENDAR view changes the rows request — all its rows at once, and the
+ * address's sort and filter are the table's, not it — and for that the view list has to be read
+ * BEFORE the rows. With no `?view` in the address nothing the list can say changes the request
+ * (`pickView` of null is null), so it is read after the rows instead.
  */
 export async function loadDataset(
   fetchFn: typeof fetch,
@@ -59,16 +67,19 @@ export async function loadDataset(
   const requested = params.get(VIEW_PARAM);
   const early = requested ? await readViews(fetchFn, path, cookie) : [];
   const view = pickView(early, requested);
-  const board = boardGroupKey(view) !== null;
-  const sort = board ? null : sortFrom(params.get('sort'), params.get('desc'), fields);
+  // A board and a calendar are both drawn from every row at once: a page of a board is no board,
+  // and a page of a calendar is a month with holes in it. Their address carries neither a sort nor
+  // a filter — those are the table's controls, and the rows they picked are not on this page.
+  const whole = boardGroupKey(view) !== null || calendarConfig(view) !== null;
+  const sort = whole ? null : sortFrom(params.get('sort'), params.get('desc'), fields);
   const raw =
     params.get('f') ??
     (params.get('fk') && params.get('fv') ? `${params.get('fk')}:${params.get('fv')}` : null);
-  const filter = board ? null : filterFrom(raw, fields);
+  const filter = whole ? null : filterFrom(raw, fields);
   try {
     const rows = await apiGet<RowPage>(
       fetchFn,
-      rowsApiPath(path, board ? { limit: BOARD_ROW_LIMIT } : { sort: sort?.sort, desc: sort?.desc, filter }),
+      rowsApiPath(path, whole ? { limit: BOARD_ROW_LIMIT } : { sort: sort?.sort, desc: sort?.desc, filter }),
       cookie
     );
     if (!rows.data) return { ...fail(rows.status), fields, sort, filter, views: early, view };

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { boardGroupKey, pickView, viewHref, viewsApiPath, type DatasetView } from './views';
+import { boardGroupKey, calendarConfig, pickView, viewHref, viewsApiPath, type DatasetView } from './views';
 
 const view = (over: Partial<DatasetView> = {}): DatasetView => ({
   id: 'v1',
@@ -65,5 +65,42 @@ describe('boardGroupKey', () => {
     expect(boardGroupKey(view({ config: { group_by: 7 } }))).toBeNull();
     expect(boardGroupKey(view({ config: null }))).toBeNull();
     expect(boardGroupKey(view({ config: 'x' }))).toBeNull();
+  });
+});
+
+describe('calendarConfig', () => {
+  const cal = (config: unknown): DatasetView => view({ id: 'c1', kind: 'calendar', config });
+
+  it('is the date, end and title of a calendar view', () => {
+    expect(calendarConfig(cal({ date: 'start', end: 'ende', title: 'name' }))).toEqual({
+      date: 'start',
+      end: 'ende',
+      title: 'name'
+    });
+  });
+
+  it('leaves the optional members null when the view does not name them', () => {
+    expect(calendarConfig(cal({ date: 'start' }))).toEqual({ date: 'start', end: null, title: null });
+    expect(calendarConfig(cal({ date: 'start', end: '', title: 7 }))).toEqual({
+      date: 'start',
+      end: null,
+      title: null
+    });
+  });
+
+  it('is null for every other kind, even one that carries a date', () => {
+    expect(calendarConfig(view({ kind: 'table', config: { date: 'start' } }))).toBeNull();
+    expect(calendarConfig(view({ kind: 'form', config: { date: 'start', title: 'Anmelden' } }))).toBeNull();
+    expect(calendarConfig(view({ kind: 'board', config: { date: 'start' } }))).toBeNull();
+  });
+
+  it('is null without a usable date to place rows by', () => {
+    expect(calendarConfig(null)).toBeNull();
+    expect(calendarConfig(cal({}))).toBeNull();
+    expect(calendarConfig(cal({ date: '' }))).toBeNull();
+    expect(calendarConfig(cal({ date: 7 }))).toBeNull();
+    expect(calendarConfig(cal({ date: null }))).toBeNull();
+    expect(calendarConfig(cal(null))).toBeNull();
+    expect(calendarConfig(cal('start'))).toBeNull();
   });
 });
