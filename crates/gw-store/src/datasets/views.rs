@@ -82,6 +82,37 @@ impl BoardConfig {
     }
 }
 
+/// Config of a `calendar` view (ADR 0029, M8d D3a): the date column rows are placed by, an
+/// optional end column for spans, which column titles a row, and which rows reach the calendar.
+/// `date` is required and only ever a date field — a datetime is the same kind with `with_time`,
+/// so it passes where a plain date does. Unknown members are refused, like the other kinds.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CalendarConfig {
+    date: FieldKey,
+    #[serde(default)]
+    end: Option<FieldKey>,
+    /// Left out means "the dataset's first text column", which the web resolves. The store only
+    /// checks the key when the config names one.
+    #[serde(default)]
+    title: Option<FieldKey>,
+    #[serde(default)]
+    filters: Vec<Filter>,
+    sort: Option<ViewSort>,
+}
+
+impl CalendarConfig {
+    /// Every field key the config names, as [`BoardConfig::keys`] does.
+    fn keys(&self) -> Vec<String> {
+        let mut out: Vec<String> = vec![self.date.as_str().to_string()];
+        out.extend(self.end.iter().map(|k| k.as_str().to_string()));
+        out.extend(self.title.iter().map(|k| k.as_str().to_string()));
+        out.extend(self.sort.iter().map(|s| s.key.as_str().to_string()));
+        out.extend(self.filters.iter().map(|f| f.key().as_str().to_string()));
+        out
+    }
+}
+
 /// Most fields one form may ask for.
 const MAX_FORM_FIELDS: usize = 100;
 
@@ -176,13 +207,15 @@ impl TableConfig {
 }
 
 /// Check `config` for `kind` against the fields `known` — the dataset's keys this caller may
-/// see, by kind. Table, board and form are available (ADR 0029, M8c C5); the other kinds are in
-/// the schema's CHECK for later milestones and refused until then. `group_by` has a rule of its
-/// own: in a table it groups rows under a head, and only a stored column can head a group — a
-/// formula or rollup is evaluated per row, not enumerable, and a relation is not groupable yet;
-/// in a board it names the lanes and must be a select field.
+/// see, by kind. Table, board, form and calendar are available (ADR 0029, M8c C5, M8d D3a); the
+/// other kinds are in the schema's CHECK for later milestones and refused until then. `group_by`
+/// has a rule of its own: in a table it groups rows under a head, and only a stored column can
+/// head a group — a formula or rollup is evaluated per row, not enumerable, and a relation is not
+/// groupable yet; in a board it names the lanes and must be a select field. A calendar's `date`
+/// and `end` are subject to the same refusal by being required to be date fields: no computed
+/// column is one.
 fn validate(kind: &str, config: &Value, known: &HashMap<String, String>) -> Result<(), String> {
-    if kind != "table" && kind != "board" && kind != "form" {
+    if kind != "table" && kind != "board" && kind != "form" && kind != "calendar" {
         return Err(format!("the view kind {kind:?} is not available"));
     }
     if config.to_string().len() > MAX_VIEW_CONFIG_BYTES {
@@ -192,6 +225,33 @@ fn validate(kind: &str, config: &Value, known: &HashMap<String, String>) -> Resu
     }
     if kind == "form" {
         return validate_form(config, known);
+    }
+    if kind == "calendar" {
+        let parsed: CalendarConfig = serde_json::from_value(config.clone())
+            .map_err(|e| format!("not a valid calendar view config: {e}"))?;
+        for key in parsed.keys() {
+            if !known.contains_key(&key) {
+                return Err(format!("the dataset has no field {key:?}"));
+            }
+        }
+        let is_date = |key: &FieldKey| known[key.as_str()] == FieldKind::Date.as_str();
+        if !is_date(&parsed.date) {
+            return Err("date must be a date field of the dataset".into());
+        }
+        if let Some(end) = &parsed.end {
+            if !is_date(end) {
+                return Err("end must be a date field of the dataset".into());
+            }
+            if end == &parsed.date {
+                return Err("end must name another field than date".into());
+            }
+        }
+        if let Some(title) = &parsed.title {
+            if known[title.as_str()] != FieldKind::Text.as_str() {
+                return Err("title must be a text field of the dataset".into());
+            }
+        }
+        return Ok(());
     }
     if kind == "board" {
         let parsed: BoardConfig = serde_json::from_value(config.clone())
@@ -226,11 +286,11 @@ fn validate(kind: &str, config: &Value, known: &HashMap<String, String>) -> Resu
 }
 
 /// Drop everything in a saved config that names a field outside `visible`: the columns (a
-/// board's `card_fields` and a form's field entries included), a width, and a sort, filter or
-/// grouping on it (filtering a hidden field is refused, not ignored, so a saved one cannot
-/// survive for a caller who may not see the field). A board whose `group_by` is stripped is left
-/// without it; that is fine, because a select field cannot be hidden — only relation and
-/// computed ones can.
+/// board's or gallery's `card_fields` and a form's field entries included), a width, and a sort,
+/// filter or grouping on it (filtering a hidden field is refused, not ignored, so a saved one
+/// cannot survive for a caller who may not see the field). A board whose `group_by` is stripped is
+/// left without it; that is fine, because a select field cannot be hidden — only relation and
+/// computed ones can. A calendar's `date`, `end` and `title` go the same way.
 pub(crate) fn strip_hidden(config: &mut Value, visible: &HashSet<String>) {
     // A column entry is a key (`table`, `board`) or an object naming one (`form`); both shapes
     // are decided by the same visibility.
@@ -258,6 +318,17 @@ pub(crate) fn strip_hidden(config: &mut Value, visible: &HashSet<String>) {
     }
     if obj.get("group_by").is_some_and(|g| !shown(g)) {
         obj.remove("group_by");
+    }
+    for member in ["date", "end"] {
+        if obj.get(member).is_some_and(|d| !shown(d)) {
+            obj.remove(member);
+        }
+    }
+    // `title` names a field only in a calendar's config; a form's `title` is the form's own
+    // heading, and a calendar always names `date`, so its presence tells the two apart.
+    let title_is_a_key = obj.contains_key("date");
+    if title_is_a_key && obj.get("title").is_some_and(|t| !shown(t)) {
+        obj.remove("title");
     }
     if let Some(Value::Array(filters)) = obj.get_mut("filters") {
         filters.retain(|f| f.get("key").is_some_and(shown));
@@ -1217,7 +1288,7 @@ mod tests {
     #[tokio::test]
     async fn kinds_outside_table_and_board_are_still_refused() {
         let (store, anna, _, _, path) = fixture().await;
-        for kind in ["calendar", "gantt", "nonsense"] {
+        for kind in ["gantt", "nonsense"] {
             assert_eq!(
                 store
                     .create_dataset_view(&anna, &path, "X", kind, &json!({"group_by": "status"}))
@@ -1468,5 +1539,314 @@ mod tests {
         strip_hidden(&mut cfg, &visible);
         assert_eq!(cfg["fields"], json!([{"key": "name"}]));
         assert_eq!(cfg["title"], json!("T"));
+    }
+
+    // --- calendar views (M8d D3a) ----------------------------------------------------
+
+    /// The date columns a calendar places rows by. `zeit` is a datetime: the same kind with
+    /// `with_time`, and a calendar must accept it as readily as a plain date.
+    async fn dated(store: &Store, who: &Principal, path: &str) {
+        for (key, config) in [
+            ("start", json!({})),
+            ("ende", json!({})),
+            ("zeit", json!({"with_time": true})),
+        ] {
+            store
+                .add_dataset_field(
+                    who,
+                    path,
+                    &NewField {
+                        key: key.into(),
+                        label: key.into(),
+                        kind: FieldKind::Date,
+                        config,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    fn calendar() -> serde_json::Value {
+        json!({"date": "start", "end": "ende", "title": "name",
+               "filters": [{"op": "is_empty", "key": "start"}],
+               "sort": {"key": "start", "desc": true}})
+    }
+
+    async fn made_calendar(store: &Store, who: &Principal, path: &str) -> DatasetView {
+        match store
+            .create_dataset_view(who, path, "Kalender", "calendar", &calendar())
+            .await
+            .unwrap()
+        {
+            SchemaOutcome::Done(v) => v,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_writer_creates_lists_updates_and_deletes_a_calendar_view() {
+        let (store, anna, bea, _, path) = fixture().await;
+        dated(&store, &anna, &path).await;
+        let v = made_calendar(&store, &anna, &path).await;
+        assert_eq!((v.name.as_str(), v.kind.as_str()), ("Kalender", "calendar"));
+        assert_eq!(v.config["date"], json!("start"));
+        let SchemaOutcome::Done(list) = store.dataset_views(&bea, &path).await.unwrap() else {
+            panic!("reader lists")
+        };
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].config["end"], json!("ende"));
+        assert_eq!(list[0].config["title"], json!("name"));
+        let out = store
+            .update_dataset_view(
+                &anna,
+                &path,
+                &v.id,
+                Some("Neu"),
+                Some(&json!({"date": "start"})),
+            )
+            .await
+            .unwrap();
+        let SchemaOutcome::Done(u) = out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(u.name, "Neu");
+        assert_eq!(u.config, json!({"date": "start"}));
+        assert_eq!(
+            store
+                .delete_dataset_view(&anna, &path, &v.id)
+                .await
+                .unwrap(),
+            SchemaOutcome::Done(())
+        );
+        assert_eq!(
+            store
+                .delete_dataset_view(&anna, &path, &v.id)
+                .await
+                .unwrap(),
+            SchemaOutcome::NoField
+        );
+    }
+
+    /// `date` is required and must name a date column; `end` must be one too, and a different
+    /// field; `title` must be text. A datetime is the same kind, so `zeit` passes where `start`
+    /// does.
+    #[tokio::test]
+    async fn a_calendar_places_only_date_fields() {
+        let (store, anna, _, _, path) = fixture().await;
+        dated(&store, &anna, &path).await;
+        for (cfg, want) in [
+            (
+                json!({"date": "name"}),
+                "date must be a date field of the dataset",
+            ),
+            (
+                json!({"date": "status"}),
+                "date must be a date field of the dataset",
+            ),
+            (
+                json!({"date": "start", "end": "name"}),
+                "end must be a date field of the dataset",
+            ),
+            (
+                json!({"date": "start", "end": "start"}),
+                "end must name another field than date",
+            ),
+            (
+                json!({"date": "start", "title": "alter"}),
+                "title must be a text field of the dataset",
+            ),
+        ] {
+            assert_eq!(
+                store
+                    .create_dataset_view(&anna, &path, "X", "calendar", &cfg)
+                    .await
+                    .unwrap(),
+                SchemaOutcome::Invalid(want.into()),
+                "{cfg}"
+            );
+        }
+        // date is required: a calendar without one is not a calendar config.
+        let out = store
+            .create_dataset_view(&anna, &path, "X", "calendar", &json!({"title": "name"}))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&out, SchemaOutcome::Invalid(m) if m.contains("not a valid calendar view config")),
+            "{out:?}"
+        );
+        // A datetime is a date field with `with_time`, and so places rows like any other.
+        for key in ["start", "zeit"] {
+            assert!(
+                matches!(
+                    store
+                        .create_dataset_view(&anna, &path, "D", "calendar", &json!({"date": key}))
+                        .await
+                        .unwrap(),
+                    SchemaOutcome::Done(_)
+                ),
+                "{key}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn updating_a_calendar_re_validates_it_as_a_calendar() {
+        let (store, anna, _, _, path) = fixture().await;
+        dated(&store, &anna, &path).await;
+        let v = made_calendar(&store, &anna, &path).await;
+        // The update path validates against the STORED kind: a text column cannot become the
+        // dates of an existing calendar, and a table- or board-shaped config is not a calendar.
+        for cfg in [
+            json!({"date": "name"}),
+            json!({"date": "start", "end": "name"}),
+            json!({"group_by": "status"}),
+            json!({"fields": ["name"]}),
+        ] {
+            let out = store
+                .update_dataset_view(&anna, &path, &v.id, None, Some(&cfg))
+                .await
+                .unwrap();
+            assert!(matches!(out, SchemaOutcome::Invalid(_)), "{cfg}: {out:?}");
+        }
+        let list = match store.dataset_views(&anna, &path).await.unwrap() {
+            SchemaOutcome::Done(l) => l,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(list[0].config["date"], "start");
+        assert_eq!(list[0].kind, "calendar");
+    }
+
+    #[tokio::test]
+    async fn a_calendar_naming_a_missing_field_a_hostile_key_or_an_unknown_member_is_refused() {
+        let (store, anna, _, _, path) = fixture().await;
+        dated(&store, &anna, &path).await;
+        for key in ["gibtsnicht", "a') OR 1=1 --"] {
+            let want = if key == "gibtsnicht" {
+                format!("the dataset has no field {key:?}")
+            } else {
+                String::new()
+            };
+            for cfg in [
+                json!({"date": key}),
+                json!({"date": "start", "end": key}),
+                json!({"date": "start", "title": key}),
+                json!({"date": "start", "filters": [{"op": "is_empty", "key": key}]}),
+                json!({"date": "start", "sort": {"key": key}}),
+            ] {
+                let out = store
+                    .create_dataset_view(&anna, &path, "X", "calendar", &cfg)
+                    .await
+                    .unwrap();
+                if want.is_empty() {
+                    assert!(matches!(out, SchemaOutcome::Invalid(_)), "{cfg}: {out:?}");
+                } else {
+                    assert_eq!(out, SchemaOutcome::Invalid(want.clone()), "{cfg}");
+                }
+            }
+        }
+        for cfg in [
+            json!({"date": "start", "bogerig": true}),
+            json!({"fields": ["name"]}),
+            json!([1]),
+        ] {
+            let out = store
+                .create_dataset_view(&anna, &path, "X", "calendar", &cfg)
+                .await
+                .unwrap();
+            assert!(matches!(out, SchemaOutcome::Invalid(_)), "{cfg}: {out:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn calendar_writes_need_write_and_a_stranger_gets_nodataset() {
+        let (store, anna, bea, cleo, path) = fixture().await;
+        dated(&store, &anna, &path).await;
+        made_calendar(&store, &anna, &path).await;
+        let cfg = calendar();
+        assert_eq!(
+            store
+                .create_dataset_view(&bea, &path, "X", "calendar", &cfg)
+                .await
+                .unwrap(),
+            SchemaOutcome::ReadOnly
+        );
+        assert_eq!(
+            store
+                .update_dataset_view(&bea, &path, "x", Some("X"), None)
+                .await
+                .unwrap(),
+            SchemaOutcome::ReadOnly
+        );
+        assert_eq!(
+            store.delete_dataset_view(&bea, &path, "x").await.unwrap(),
+            SchemaOutcome::ReadOnly
+        );
+        assert_eq!(
+            store
+                .create_dataset_view(&cleo, &path, "X", "calendar", &cfg)
+                .await
+                .unwrap(),
+            SchemaOutcome::NoDataset
+        );
+        assert_eq!(
+            store.dataset_views(&cleo, &path).await.unwrap(),
+            SchemaOutcome::NoDataset
+        );
+    }
+
+    /// A column the caller may not see is not a column their calendar may name, in the exact
+    /// words of a key that does not exist.
+    #[tokio::test]
+    async fn a_calendar_naming_a_hidden_field_is_refused_as_an_unknown_one() {
+        let (store, _, bea, source) = hidden_view_fixture().await;
+        for key in ["mit", "cnt", "fr"] {
+            assert_eq!(
+                store
+                    .create_dataset_view(&bea, &source, "X", "calendar", &json!({"date": key}))
+                    .await
+                    .unwrap(),
+                SchemaOutcome::Invalid(format!("the dataset has no field {key:?}")),
+                "{key}"
+            );
+        }
+    }
+
+    /// A date, an end, a title or a sort over a field the reader may not see is stripped from the
+    /// listed config, and the calendar itself still lists — as a board's `group_by` is.
+    #[tokio::test]
+    async fn listing_strips_hidden_date_fields_from_a_calendar_config() {
+        let (_, _, _, _, _) = fixture().await;
+        let mut cfg = calendar();
+        let visible: HashSet<String> = ["name".to_string(), "ende".to_string()].into();
+        strip_hidden(&mut cfg, &visible);
+        assert!(
+            cfg.get("date").is_none(),
+            "a calendar whose date is hidden loses it: {cfg}"
+        );
+        assert_eq!(cfg["end"], json!("ende"));
+        assert_eq!(cfg["title"], json!("name"));
+        assert!(
+            cfg.get("sort").is_none(),
+            "a sort on a hidden field is dropped: {cfg}"
+        );
+        assert!(
+            cfg["filters"].as_array().unwrap().is_empty(),
+            "the filter on the hidden date goes: {cfg}"
+        );
+    }
+
+    /// `title` is a field key only in a calendar's config: a form's `title` is its heading, and
+    /// stripping by that member must not reach into it.
+    #[tokio::test]
+    async fn strip_hidden_keeps_a_form_title_while_dropping_a_calendar_one() {
+        let visible: HashSet<String> = ["name".to_string()].into();
+        let mut form_cfg = json!({"fields": [{"key": "name"}], "title": "anmelden"});
+        strip_hidden(&mut form_cfg, &visible);
+        assert_eq!(form_cfg["title"], json!("anmelden"));
+        let mut cal_cfg = json!({"date": "start", "title": "name"});
+        strip_hidden(&mut cal_cfg, &visible);
+        assert!(cal_cfg.get("date").is_none());
+        assert_eq!(cal_cfg["title"], json!("name"));
     }
 }

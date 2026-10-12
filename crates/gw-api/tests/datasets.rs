@@ -894,6 +894,34 @@ async fn a_board_view_is_saved_and_a_bad_group_by_is_a_400() {
     assert_eq!(ids.len(), 1, "the refused boards changed nothing");
 }
 
+#[tokio::test]
+async fn a_calendar_view_is_saved_and_a_bad_date_field_is_a_400() {
+    let store = with_columns().await;
+    for key in ["start", "ende"] {
+        let (s, b) = add(&store, "schreiber", key, "date").await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+    }
+    let body = json!({"name": "Kalender", "kind": "calendar",
+                      "config": {"date": "start", "end": "ende", "title": "name"}});
+    let (s, b) = send(&store, Some("schreiber"), "POST", VIEWS, Some(body)).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    assert!(b.contains("\"calendar\""), "{b}");
+    for cfg in [
+        json!({"date": "name"}),
+        json!({"date": "start", "end": "name"}),
+        json!({"date": "start", "end": "start"}),
+        json!({"end": "ende"}),
+        json!({"date": "gibtsnicht"}),
+        json!({"date": "start", "bogerig": true}),
+    ] {
+        let body = json!({"name": "Falsch", "kind": "calendar", "config": cfg});
+        let (s, b) = send(&store, Some("schreiber"), "POST", VIEWS, Some(body)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{cfg}: {b}");
+    }
+    let (_, ids, _) = view_ids(&store, "schreiber").await;
+    assert_eq!(ids.len(), 1, "the refused calendars changed nothing");
+}
+
 /// `POST rows` with a `view` submits through that form: the same 201 for a writer, and a 400
 /// for a field outside the form's subset or an unanswered required field. Without `view` the
 /// call is the ordinary row add.
