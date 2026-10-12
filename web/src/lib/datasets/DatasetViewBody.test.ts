@@ -69,6 +69,18 @@ describe('DatasetViewBody', () => {
     );
   });
 
+  it('an embedded gallery and an embedded calendar carry no edit control even for a writer', () => {
+    // The D2W seat noted that the gallery is handed no `mayWrite`: the cards are read-only by
+    // construction, and this pins it, so a later edit control cannot slip into an embed.
+    for (const dataset of [
+      load(view('gallery', { cover: 'name' })),
+      load(view('calendar', { date: 'wann' }), {})
+    ]) {
+      const out = html({ path: '/d', dataset, mayWrite: true, embedded: true, month: '2026-03' });
+      expect(out).not.toMatch(/<(button|input|select|textarea|form)\b/);
+    }
+  });
+
   it('falls back to the table for no picked view', () => {
     const out = html({ path: '/d', dataset: load(null) });
     expect(out).toContain('aria-label="Tabelle"');
