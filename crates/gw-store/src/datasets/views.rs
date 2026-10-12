@@ -113,6 +113,36 @@ impl CalendarConfig {
     }
 }
 
+/// Config of a `gallery` view (ADR 0029, M8d D4a): the file column its cards are covered by,
+/// which column titles a card, which fields show under it, and which rows reach the gallery.
+/// `cover` is required and only ever a file field; whether that attachment is an image is decided
+/// when the row is read, by its media type, so the config cannot say more than the kind. Unknown
+/// members are refused, like the other kinds.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GalleryConfig {
+    cover: FieldKey,
+    #[serde(default)]
+    title: Option<FieldKey>,
+    #[serde(default)]
+    card_fields: Vec<FieldKey>,
+    #[serde(default)]
+    filters: Vec<Filter>,
+    sort: Option<ViewSort>,
+}
+
+impl GalleryConfig {
+    /// Every field key the config names, as [`BoardConfig::keys`] does.
+    fn keys(&self) -> Vec<String> {
+        let mut out: Vec<String> = vec![self.cover.as_str().to_string()];
+        out.extend(self.title.iter().map(|k| k.as_str().to_string()));
+        out.extend(self.card_fields.iter().map(|k| k.as_str().to_string()));
+        out.extend(self.sort.iter().map(|s| s.key.as_str().to_string()));
+        out.extend(self.filters.iter().map(|f| f.key().as_str().to_string()));
+        out
+    }
+}
+
 /// Most fields one form may ask for.
 const MAX_FORM_FIELDS: usize = 100;
 
@@ -207,15 +237,20 @@ impl TableConfig {
 }
 
 /// Check `config` for `kind` against the fields `known` — the dataset's keys this caller may
-/// see, by kind. Table, board, form and calendar are available (ADR 0029, M8c C5, M8d D3a); the
-/// other kinds are in the schema's CHECK for later milestones and refused until then. `group_by`
-/// has a rule of its own: in a table it groups rows under a head, and only a stored column can
-/// head a group — a formula or rollup is evaluated per row, not enumerable, and a relation is not
-/// groupable yet; in a board it names the lanes and must be a select field. A calendar's `date`
-/// and `end` are subject to the same refusal by being required to be date fields: no computed
-/// column is one.
+/// see, by kind. Table, board, form, calendar and gallery are available (ADR 0029, M8c C5,
+/// M8d D3a/D4a); the other kinds are in the schema's CHECK for later milestones and refused until
+/// then. `group_by` has a rule of its own: in a table it groups rows under a head, and only a
+/// stored column can head a group — a formula or rollup is evaluated per row, not enumerable, and
+/// a relation is not groupable yet; in a board it names the lanes and must be a select field. A
+/// calendar's `date`/`end` and a gallery's `cover` are refused a computed column by the same check
+/// that requires them to be a date, respectively a file, field.
 fn validate(kind: &str, config: &Value, known: &HashMap<String, String>) -> Result<(), String> {
-    if kind != "table" && kind != "board" && kind != "form" && kind != "calendar" {
+    if kind != "table"
+        && kind != "board"
+        && kind != "form"
+        && kind != "calendar"
+        && kind != "gallery"
+    {
         return Err(format!("the view kind {kind:?} is not available"));
     }
     if config.to_string().len() > MAX_VIEW_CONFIG_BYTES {
@@ -225,6 +260,29 @@ fn validate(kind: &str, config: &Value, known: &HashMap<String, String>) -> Resu
     }
     if kind == "form" {
         return validate_form(config, known);
+    }
+    if kind == "gallery" {
+        let parsed: GalleryConfig = serde_json::from_value(config.clone())
+            .map_err(|e| format!("not a valid gallery view config: {e}"))?;
+        for key in parsed.keys() {
+            if !known.contains_key(&key) {
+                return Err(format!("the dataset has no field {key:?}"));
+            }
+        }
+        if known[parsed.cover.as_str()] != FieldKind::File.as_str() {
+            return Err("cover must be a file field of the dataset".into());
+        }
+        if let Some(title) = &parsed.title {
+            if known[title.as_str()] != FieldKind::Text.as_str() {
+                return Err("title must be a text field of the dataset".into());
+            }
+        }
+        for card in &parsed.card_fields {
+            if is_computed_kind(&known[card.as_str()]) {
+                return Err("computed fields cannot be on a gallery".into());
+            }
+        }
+        return Ok(());
     }
     if kind == "calendar" {
         let parsed: CalendarConfig = serde_json::from_value(config.clone())
@@ -290,7 +348,8 @@ fn validate(kind: &str, config: &Value, known: &HashMap<String, String>) -> Resu
 /// filter or grouping on it (filtering a hidden field is refused, not ignored, so a saved one
 /// cannot survive for a caller who may not see the field). A board whose `group_by` is stripped is
 /// left without it; that is fine, because a select field cannot be hidden — only relation and
-/// computed ones can. A calendar's `date`, `end` and `title` go the same way.
+/// computed ones can. A calendar's `date`, `end` and `title` and a gallery's `cover` go the same
+/// way.
 pub(crate) fn strip_hidden(config: &mut Value, visible: &HashSet<String>) {
     // A column entry is a key (`table`, `board`) or an object naming one (`form`); both shapes
     // are decided by the same visibility.
@@ -319,14 +378,15 @@ pub(crate) fn strip_hidden(config: &mut Value, visible: &HashSet<String>) {
     if obj.get("group_by").is_some_and(|g| !shown(g)) {
         obj.remove("group_by");
     }
-    for member in ["date", "end"] {
+    // `title` names a field only in a calendar's or a gallery's config; a form's `title` is the
+    // form's own heading. A calendar always names `date` and a gallery always names `cover`, so
+    // the presence of either is what tells the shapes apart — read before those members go.
+    let title_is_a_key = obj.contains_key("date") || obj.contains_key("cover");
+    for member in ["date", "end", "cover"] {
         if obj.get(member).is_some_and(|d| !shown(d)) {
             obj.remove(member);
         }
     }
-    // `title` names a field only in a calendar's config; a form's `title` is the form's own
-    // heading, and a calendar always names `date`, so its presence tells the two apart.
-    let title_is_a_key = obj.contains_key("date");
     if title_is_a_key && obj.get("title").is_some_and(|t| !shown(t)) {
         obj.remove("title");
     }
@@ -1848,5 +1908,371 @@ mod tests {
         strip_hidden(&mut cal_cfg, &visible);
         assert!(cal_cfg.get("date").is_none());
         assert_eq!(cal_cfg["title"], json!("name"));
+    }
+
+    // --- gallery views (M8d D4a) -----------------------------------------------------
+
+    /// The file columns a gallery covers itself with. Which of them holds an image is decided at
+    /// read time by the attachment's media type, not here.
+    async fn filed(store: &Store, who: &Principal, path: &str) {
+        for key in ["bild", "beleg"] {
+            store
+                .add_dataset_field(
+                    who,
+                    path,
+                    &NewField {
+                        key: key.into(),
+                        label: key.into(),
+                        kind: FieldKind::File,
+                        config: json!({}),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    fn gallery() -> serde_json::Value {
+        json!({"cover": "bild", "title": "name", "card_fields": ["name", "alter"],
+               "filters": [{"op": "is_empty", "key": "bild"}],
+               "sort": {"key": "alter", "desc": true}})
+    }
+
+    async fn made_gallery(store: &Store, who: &Principal, path: &str) -> DatasetView {
+        match store
+            .create_dataset_view(who, path, "Galerie", "gallery", &gallery())
+            .await
+            .unwrap()
+        {
+            SchemaOutcome::Done(v) => v,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_writer_creates_lists_updates_and_deletes_a_gallery_view() {
+        let (store, anna, bea, _, path) = fixture().await;
+        filed(&store, &anna, &path).await;
+        let v = made_gallery(&store, &anna, &path).await;
+        assert_eq!((v.name.as_str(), v.kind.as_str()), ("Galerie", "gallery"));
+        assert_eq!(v.config["cover"], json!("bild"));
+        let SchemaOutcome::Done(list) = store.dataset_views(&bea, &path).await.unwrap() else {
+            panic!("reader lists")
+        };
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].config["card_fields"], json!(["name", "alter"]));
+        let out = store
+            .update_dataset_view(
+                &anna,
+                &path,
+                &v.id,
+                Some("Neu"),
+                Some(&json!({"cover": "beleg"})),
+            )
+            .await
+            .unwrap();
+        let SchemaOutcome::Done(u) = out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(u.name, "Neu");
+        assert_eq!(u.config, json!({"cover": "beleg"}));
+        assert_eq!(
+            store
+                .delete_dataset_view(&anna, &path, &v.id)
+                .await
+                .unwrap(),
+            SchemaOutcome::Done(())
+        );
+        assert_eq!(
+            store
+                .delete_dataset_view(&anna, &path, &v.id)
+                .await
+                .unwrap(),
+            SchemaOutcome::NoField
+        );
+    }
+
+    /// `cover` is required and only ever a file column; `title` only ever a text one;
+    /// `card_fields` may show any stored column, but a computed one is not a column a card holds.
+    #[tokio::test]
+    async fn a_gallery_covers_only_file_fields() {
+        let (store, anna, _, _, path) = fixture().await;
+        filed(&store, &anna, &path).await;
+        for (cfg, want) in [
+            (
+                json!({"cover": "name"}),
+                "cover must be a file field of the dataset",
+            ),
+            (
+                json!({"cover": "status"}),
+                "cover must be a file field of the dataset",
+            ),
+            (
+                json!({"cover": "bild", "title": "alter"}),
+                "title must be a text field of the dataset",
+            ),
+        ] {
+            assert_eq!(
+                store
+                    .create_dataset_view(&anna, &path, "X", "gallery", &cfg)
+                    .await
+                    .unwrap(),
+                SchemaOutcome::Invalid(want.into()),
+                "{cfg}"
+            );
+        }
+        // cover is required: a gallery without one is not a gallery config.
+        let out = store
+            .create_dataset_view(&anna, &path, "X", "gallery", &json!({"title": "name"}))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&out, SchemaOutcome::Invalid(m) if m.contains("not a valid gallery view config")),
+            "{out:?}"
+        );
+        // A computed column answers per row, so no card of it.
+        let (hidden_store, anna2, _, source) = hidden_view_fixture().await;
+        hidden_store
+            .add_dataset_field(
+                &anna2,
+                &source,
+                &NewField {
+                    key: "bild".into(),
+                    label: "Bild".into(),
+                    kind: FieldKind::File,
+                    config: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        for key in ["fr", "cnt"] {
+            assert_eq!(
+                hidden_store
+                    .create_dataset_view(
+                        &anna2,
+                        &source,
+                        "X",
+                        "gallery",
+                        &json!({"cover": "bild", "card_fields": [key]})
+                    )
+                    .await
+                    .unwrap(),
+                SchemaOutcome::Invalid("computed fields cannot be on a gallery".into()),
+                "{key}"
+            );
+        }
+        // A file column may be a card field too; the config does not forbid it.
+        assert!(matches!(
+            store
+                .create_dataset_view(
+                    &anna,
+                    &path,
+                    "X",
+                    "gallery",
+                    &json!({"cover": "bild", "card_fields": ["beleg"]})
+                )
+                .await
+                .unwrap(),
+            SchemaOutcome::Done(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn updating_a_gallery_re_validates_it_as_a_gallery() {
+        let (store, anna, _, _, path) = fixture().await;
+        filed(&store, &anna, &path).await;
+        let v = made_gallery(&store, &anna, &path).await;
+        // The update path validates against the STORED kind: a text column cannot become the
+        // cover of an existing gallery, and a calendar- or table-shaped config is not a gallery.
+        for cfg in [
+            json!({"cover": "name"}),
+            json!({"date": "name"}),
+            json!({"group_by": "status"}),
+            json!({"fields": ["name"]}),
+        ] {
+            let out = store
+                .update_dataset_view(&anna, &path, &v.id, None, Some(&cfg))
+                .await
+                .unwrap();
+            assert!(matches!(out, SchemaOutcome::Invalid(_)), "{cfg}: {out:?}");
+        }
+        let list = match store.dataset_views(&anna, &path).await.unwrap() {
+            SchemaOutcome::Done(l) => l,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(list[0].config["cover"], "bild");
+        assert_eq!(list[0].kind, "gallery");
+    }
+
+    #[tokio::test]
+    async fn a_gallery_naming_a_missing_field_a_hostile_key_or_an_unknown_member_is_refused() {
+        let (store, anna, _, _, path) = fixture().await;
+        filed(&store, &anna, &path).await;
+        for key in ["gibtsnicht", "a') OR 1=1 --"] {
+            let want = if key == "gibtsnicht" {
+                format!("the dataset has no field {key:?}")
+            } else {
+                String::new()
+            };
+            for cfg in [
+                json!({"cover": key}),
+                json!({"cover": "bild", "title": key}),
+                json!({"cover": "bild", "card_fields": [key]}),
+                json!({"cover": "bild", "filters": [{"op": "is_empty", "key": key}]}),
+                json!({"cover": "bild", "sort": {"key": key}}),
+            ] {
+                let out = store
+                    .create_dataset_view(&anna, &path, "X", "gallery", &cfg)
+                    .await
+                    .unwrap();
+                if want.is_empty() {
+                    assert!(matches!(out, SchemaOutcome::Invalid(_)), "{cfg}: {out:?}");
+                } else {
+                    assert_eq!(out, SchemaOutcome::Invalid(want.clone()), "{cfg}");
+                }
+            }
+        }
+        for cfg in [
+            json!({"cover": "bild", "bogerig": true}),
+            json!({"fields": ["name"]}),
+            json!([1]),
+        ] {
+            let out = store
+                .create_dataset_view(&anna, &path, "X", "gallery", &cfg)
+                .await
+                .unwrap();
+            assert!(matches!(out, SchemaOutcome::Invalid(_)), "{cfg}: {out:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn gallery_writes_need_write_and_a_stranger_gets_nodataset() {
+        let (store, anna, bea, cleo, path) = fixture().await;
+        filed(&store, &anna, &path).await;
+        made_gallery(&store, &anna, &path).await;
+        let cfg = gallery();
+        assert_eq!(
+            store
+                .create_dataset_view(&bea, &path, "X", "gallery", &cfg)
+                .await
+                .unwrap(),
+            SchemaOutcome::ReadOnly
+        );
+        assert_eq!(
+            store
+                .update_dataset_view(&bea, &path, "x", Some("X"), None)
+                .await
+                .unwrap(),
+            SchemaOutcome::ReadOnly
+        );
+        assert_eq!(
+            store.delete_dataset_view(&bea, &path, "x").await.unwrap(),
+            SchemaOutcome::ReadOnly
+        );
+        assert_eq!(
+            store
+                .create_dataset_view(&cleo, &path, "X", "gallery", &cfg)
+                .await
+                .unwrap(),
+            SchemaOutcome::NoDataset
+        );
+        assert_eq!(
+            store.dataset_views(&cleo, &path).await.unwrap(),
+            SchemaOutcome::NoDataset
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gallery_naming_a_hidden_field_is_refused_as_an_unknown_one() {
+        let (store, anna, bea, source) = hidden_view_fixture().await;
+        store
+            .add_dataset_field(
+                &anna,
+                &source,
+                &NewField {
+                    key: "bild".into(),
+                    label: "Bild".into(),
+                    kind: FieldKind::File,
+                    config: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        for key in ["mit", "cnt", "fr"] {
+            assert_eq!(
+                store
+                    .create_dataset_view(&bea, &source, "X", "gallery", &json!({"cover": key}))
+                    .await
+                    .unwrap(),
+                SchemaOutcome::Invalid(format!("the dataset has no field {key:?}")),
+                "{key}"
+            );
+            assert_eq!(
+                store
+                    .create_dataset_view(
+                        &bea,
+                        &source,
+                        "X",
+                        "gallery",
+                        &json!({"cover": "bild", "card_fields": [key]})
+                    )
+                    .await
+                    .unwrap(),
+                SchemaOutcome::Invalid(format!("the dataset has no field {key:?}")),
+                "{key} as a card field"
+            );
+        }
+    }
+
+    /// A cover, a title, a card field or a sort over a column the reader may not see is stripped
+    /// from the listed config, and the gallery itself still lists — as a board's `group_by` is.
+    #[tokio::test]
+    async fn listing_strips_hidden_cover_and_card_fields_from_a_gallery_config() {
+        let (_, _, _, _, _) = fixture().await;
+        let mut cfg = gallery();
+        let visible: HashSet<String> = ["name".to_string(), "alter".to_string()].into();
+        strip_hidden(&mut cfg, &visible);
+        assert!(
+            cfg.get("cover").is_none(),
+            "a gallery whose cover is hidden loses it: {cfg}"
+        );
+        assert_eq!(cfg["title"], json!("name"));
+        assert_eq!(cfg["card_fields"], json!(["name", "alter"]));
+        assert_eq!(
+            cfg["sort"]["key"],
+            json!("alter"),
+            "a sort on a field the reader may see stays: {cfg}"
+        );
+        assert!(
+            cfg["filters"].as_array().unwrap().is_empty(),
+            "the filter on the hidden cover goes: {cfg}"
+        );
+        // The same config for a reader who may not see `alter`: its card field and its sort go.
+        let mut strict = gallery();
+        let visible: HashSet<String> = ["name".to_string(), "bild".to_string()].into();
+        strip_hidden(&mut strict, &visible);
+        assert_eq!(strict["cover"], json!("bild"));
+        assert!(
+            strict.get("sort").is_none(),
+            "a sort on a hidden field is dropped: {strict}"
+        );
+        assert_eq!(strict["card_fields"], json!(["name"]));
+    }
+
+    /// A gallery's `title` is a field key and goes with the hidden set; a form's `title` is its
+    /// own heading and stays, whatever the visible set holds.
+    #[tokio::test]
+    async fn strip_hidden_drops_a_gallery_title_but_keeps_a_form_one() {
+        let visible: HashSet<String> = ["name".to_string()].into();
+        let mut gal_cfg = json!({"cover": "bild", "title": "mit"});
+        strip_hidden(&mut gal_cfg, &visible);
+        assert!(gal_cfg.get("cover").is_none());
+        assert!(
+            gal_cfg.get("title").is_none(),
+            "a title naming a hidden field goes: {gal_cfg}"
+        );
+        let mut form_cfg = json!({"fields": [{"key": "name"}], "title": "anmelden"});
+        strip_hidden(&mut form_cfg, &visible);
+        assert_eq!(form_cfg["title"], json!("anmelden"));
     }
 }

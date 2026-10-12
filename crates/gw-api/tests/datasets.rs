@@ -922,6 +922,33 @@ async fn a_calendar_view_is_saved_and_a_bad_date_field_is_a_400() {
     assert_eq!(ids.len(), 1, "the refused calendars changed nothing");
 }
 
+#[tokio::test]
+async fn a_gallery_view_is_saved_and_a_bad_cover_is_a_400() {
+    let store = with_columns().await;
+    for key in ["bild", "beleg"] {
+        let (s, b) = add(&store, "schreiber", key, "file").await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+    }
+    let body = json!({"name": "Galerie", "kind": "gallery",
+                      "config": {"cover": "bild", "title": "name", "card_fields": ["alter"]}});
+    let (s, b) = send(&store, Some("schreiber"), "POST", VIEWS, Some(body)).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    assert!(b.contains("\"gallery\""), "{b}");
+    for cfg in [
+        json!({"cover": "name"}),
+        json!({"cover": "gibtsnicht"}),
+        json!({"title": "name"}),
+        json!({"cover": "bild", "card_fields": ["gibtsnicht"]}),
+        json!({"cover": "bild", "bogerig": true}),
+    ] {
+        let body = json!({"name": "Falsch", "kind": "gallery", "config": cfg});
+        let (s, b) = send(&store, Some("schreiber"), "POST", VIEWS, Some(body)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{cfg}: {b}");
+    }
+    let (_, ids, _) = view_ids(&store, "schreiber").await;
+    assert_eq!(ids.len(), 1, "the refused galleries changed nothing");
+}
+
 /// `POST rows` with a `view` submits through that form: the same 201 for a writer, and a 400
 /// for a field outside the form's subset or an unanswered required field. Without `view` the
 /// call is the ordinary row add.
