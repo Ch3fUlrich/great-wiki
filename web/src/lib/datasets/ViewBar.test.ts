@@ -46,6 +46,16 @@ describe('ViewBar', () => {
     expect(out).not.toContain('<b>x</b>');
   });
 
+  it('lists a calendar view by name and links it by id', () => {
+    const out = html(
+      [{ id: 'c1', name: 'Termine', kind: 'calendar', config: { date: 'start' }, position: 0 }],
+      'c1'
+    );
+    expect(out).toMatch(/<a [^>]*href="\?view=c1"/);
+    expect(out).toContain('Termine');
+    expect(out).toMatch(/<a [^>]*aria-current="page"[^>]*>Termine<\/a>/);
+  });
+
   it('renders nothing when the dataset has no saved views', () => {
     const out = html([], null);
     expect(out).not.toContain('<nav');
