@@ -9,8 +9,12 @@
  *
  * Pure — no fetch, no DOM, no `$lib/api`. Nothing here reaches the network or reads a page:
  * the rows are a separate read (`loadDataset`), made under the caller's own identity, and an
- * interface that decided both would be a second way onto the data.
+ * interface that decided both would be a second way onto the data. {@link resolveEmbed} below
+ * does orchestrate a read, but it is handed the fetch and the loader rather than importing
+ * them, so this module stays free of the server-only API layer and every one of its
+ * decisions can be tested against a stand-in.
  */
+import type { DatasetLoad } from './load';
 import type { DatasetView } from './views';
 
 /**
@@ -89,4 +93,71 @@ export function parseEmbedAnswer(json: unknown): EmbedAnswer {
       position: typeof view.position === 'number' ? view.position : 0
     }
   };
+}
+
+/**
+ * What a `dataset-view` embed shows, as one value the component renders from. `EmbeddedView`
+ * starts at `loading` (which is also all SSR ever emits — the fetch is client-only) and the
+ * effect replaces it once the read settles.
+ */
+export type EmbedState =
+  | { status: 'loading' }
+  | { status: 'unavailable' }
+  | { status: 'view_missing' }
+  /** `ok`, but the view kind is not one that may be embedded (a form, or an unknown kind). */
+  | { status: 'not_embeddable' }
+  /** `ok` and embeddable, with the rows read under the caller's own identity. */
+  | { status: 'ready'; path: string; load: DatasetLoad }
+  /** The request itself failed — a transport error, a non-2xx, a body that is not JSON. */
+  | { status: 'error' };
+
+/** The row read: `loadDataset`'s own shape, injected so this module never imports `$lib/api`. */
+type Loader = (
+  fetchFn: typeof fetch,
+  path: string,
+  params: URLSearchParams,
+  cookie: string | null
+) => Promise<DatasetLoad>;
+
+/**
+ * The client's whole embed read: fetch the answer, decide what it may show, and — only for an
+ * embeddable view the caller is entitled to — load its rows. It returns an {@link EmbedState}
+ * and touches no module-level fetch or API: the caller hands it both, so a test can drive every
+ * branch with a stand-in and the server bundle never reaches here.
+ *
+ * The order is the security rule. The answer's `state` is decided before any rows are asked
+ * for, and the rows are read through `load` under the CALLER's identity — the embed endpoint
+ * deliberately carries none (ADR 0022). A `unavailable` therefore loads nothing and its state
+ * value carries no title, no path and no row: two different reasons for the same refusal
+ * produce a byte-identical result, because there is nothing in it to differ.
+ *
+ * `signal` is the caller's abort: an in-flight read whose props moved on is stopped, and its
+ * rejection is reported as `error` for the component to discard on its own staleness token.
+ */
+export async function resolveEmbed(
+  fetchFn: typeof fetch,
+  datasetDoc: string,
+  view: string,
+  load: Loader,
+  signal?: AbortSignal
+): Promise<EmbedState> {
+  let answer: EmbedAnswer;
+  try {
+    const res = await fetchFn(embedApiPath(datasetDoc, view), { signal });
+    if (!res.ok) return { status: 'error' };
+    answer = parseEmbedAnswer(await res.json());
+  } catch {
+    return { status: 'error' };
+  }
+
+  if (answer.state === 'unavailable') return { status: 'unavailable' };
+  if (answer.state === 'view_missing') return { status: 'view_missing' };
+  if (!embeddable(answer.view.kind)) return { status: 'not_embeddable' };
+
+  try {
+    const loaded = await load(fetchFn, answer.path, new URLSearchParams({ view: answer.view.id }), null);
+    return { status: 'ready', path: answer.path, load: loaded };
+  } catch {
+    return { status: 'error' };
+  }
 }

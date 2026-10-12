@@ -5,15 +5,9 @@
   import Backlinks from '$lib/components/Backlinks.svelte';
   import BlockView from '$lib/components/BlockView.svelte';
   import TaskBoard from '$lib/boards/TaskBoard.svelte';
-  import TableView from '$lib/datasets/TableView.svelte';
   import ViewBar from '$lib/datasets/ViewBar.svelte';
-  import BoardView from '$lib/datasets/BoardView.svelte';
-  import CalendarView from '$lib/datasets/CalendarView.svelte';
-  import GalleryView from '$lib/datasets/GalleryView.svelte';
-  import FormView from '$lib/datasets/FormView.svelte';
+  import DatasetViewBody from '$lib/datasets/DatasetViewBody.svelte';
   import { MONTH_PARAM } from '$lib/datasets/calendar';
-  import { boardGroupKey, calendarConfig, galleryConfig } from '$lib/datasets/views';
-  import { formKeyOf } from '$lib/datasets/form';
   import Breadcrumb from '$lib/components/Breadcrumb.svelte';
   import PageAttachments from '$lib/components/PageAttachments.svelte';
   import PageMeta from '$lib/components/PageMeta.svelte';
@@ -171,19 +165,8 @@
   const crumbs = $derived(breadcrumb(data.tree, data.doc));
   const subpages = $derived(childrenOf(data.tree, data.doc.path));
 
-  /** The picked view when it is a form: the branch below hands the narrowed view to FormView. */
-  const formularAnsicht = $derived(data.dataset && formKeyOf(data.dataset.view) !== null ? data.dataset.view : null);
-
-  /** The picked view when it is a calendar, and the month the address asks for beside it. */
-  const kalenderAnsicht = $derived(
-    data.dataset && calendarConfig(data.dataset.view) !== null ? data.dataset.view : null
-  );
+  /** The month the address names beside a calendar view; handed to the view switch below. */
   const kalenderMonat = $derived(page.url.searchParams.get(MONTH_PARAM));
-
-  /** The picked view when it is a gallery: its cards are covered by the file the config names. */
-  const gallerieAnsicht = $derived(
-    data.dataset && galleryConfig(data.dataset.view) !== null ? data.dataset.view : null
-  );
 </script>
 
 <svelte:head><title>{data.doc.title} — great-wiki</title></svelte:head>
@@ -423,53 +406,12 @@
          for one. -->
     {#if data.dataset}
       <ViewBar views={data.dataset.views} active={data.dataset.view?.id ?? null} />
-      {#if formularAnsicht !== null}
-        <FormView
-          path={data.doc.path}
-          fields={data.dataset.fields}
-          view={formularAnsicht}
-          mayWrite={data.doc.may_write === true}
-        />
-      {:else if boardGroupKey(data.dataset.view) !== null}
-        <BoardView
-          path={data.doc.path}
-          fields={data.dataset.fields}
-          page={data.dataset.page}
-          view={data.dataset.view}
-          error={data.dataset.error}
-          mayWrite={data.doc.may_write === true}
-        />
-      {:else if kalenderAnsicht !== null}
-        <CalendarView
-          path={data.doc.path}
-          fields={data.dataset.fields}
-          page={data.dataset.page}
-          view={kalenderAnsicht}
-          month={kalenderMonat}
-          error={data.dataset.error}
-          mayWrite={data.doc.may_write === true}
-        />
-      {:else if gallerieAnsicht !== null}
-        <GalleryView
-          path={data.doc.path}
-          fields={data.dataset.fields}
-          page={data.dataset.page}
-          view={gallerieAnsicht}
-          attachments={data.dataset.attachments}
-          error={data.dataset.error}
-        />
-      {:else}
-        <TableView
-          path={data.doc.path}
-          fields={data.dataset.fields}
-          page={data.dataset.page}
-          error={data.dataset.error}
-          sort={data.dataset.sort}
-          filter={data.dataset.filter}
-          labels={data.dataset.labels}
-          mayWrite={data.doc.may_write === true}
-        />
-      {/if}
+      <DatasetViewBody
+        path={data.doc.path}
+        dataset={data.dataset}
+        mayWrite={darfSchreiben}
+        month={kalenderMonat}
+      />
     {/if}
 
     <!-- D-12's second placement: this page's own board, when this page is a project's home.

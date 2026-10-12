@@ -31,7 +31,8 @@
     sort = null,
     filter = null,
     mayWrite = false,
-    labels = {}
+    labels = {},
+    embedded = false
   }: {
     path: string;
     fields: Field[];
@@ -41,6 +42,14 @@
     filter?: FilterState | null;
     mayWrite?: boolean;
     labels?: Record<string, Record<string, string>>;
+    /**
+     * Whether this table is drawn INSIDE somebody else's page (M8d D2W). An embed must not
+     * navigate or write: with it the headers are plain text (no sort links), there is no
+     * filter form or chip, no "Mehr laden", and no add-row form. The caller also passes
+     * `mayWrite={false}`; both guards are here so an embed cannot gain a control by an
+     * accident in the caller. Default `false` — the dataset page's own table is unchanged.
+     */
+    embedded?: boolean;
   } = $props();
 
   let more = $state<Row[]>([]);
@@ -90,31 +99,33 @@
   {#if error}
     <p class="tabelle-fehler" role="alert">{error}</p>
   {:else}
-    <form class="filter" method="GET">
-      {#if sort}
-        <input type="hidden" name="sort" value={sort.sort} />
-        <input type="hidden" name="desc" value={sort.desc ? '1' : '0'} />
-      {/if}
-      <label>
-        Spalte
-        <select name="fk">
-          {#each fields as f (f.key)}
-            <option value={f.key} selected={filter?.key === f.key}>{f.label}</option>
-          {/each}
-        </select>
-      </label>
-      <label>
-        enthält
-        <input type="text" name="fv" value={filter?.value ?? ''} />
-      </label>
-      <button type="submit">Filtern</button>
-      {#if filter}
-        <span class="chip filter-chip">
-          {labelOf(filter.key)} enthält „{filter.value}“
-          <a href={withoutFilterHref(sort)} aria-label="Filter entfernen">×</a>
-        </span>
-      {/if}
-    </form>
+    {#if !embedded}
+      <form class="filter" method="GET">
+        {#if sort}
+          <input type="hidden" name="sort" value={sort.sort} />
+          <input type="hidden" name="desc" value={sort.desc ? '1' : '0'} />
+        {/if}
+        <label>
+          Spalte
+          <select name="fk">
+            {#each fields as f (f.key)}
+              <option value={f.key} selected={filter?.key === f.key}>{f.label}</option>
+            {/each}
+          </select>
+        </label>
+        <label>
+          enthält
+          <input type="text" name="fv" value={filter?.value ?? ''} />
+        </label>
+        <button type="submit">Filtern</button>
+        {#if filter}
+          <span class="chip filter-chip">
+            {labelOf(filter.key)} enthält „{filter.value}“
+            <a href={withoutFilterHref(sort)} aria-label="Filter entfernen">×</a>
+          </span>
+        {/if}
+      </form>
+    {/if}
 
     {#if rows.length === 0}
       <p class="leer">{filter ? 'Keine Zeile passt zum Filter.' : 'Noch keine Zeilen.'}</p>
@@ -126,9 +137,13 @@
           <thead>
             <tr>
               {#each fields as f (f.key)}
-                <th scope="col" aria-sort={ariaSort(f.key)}>
-                  <a href={sortHref(sort, f.key, filter)}>{f.label}</a>
-                </th>
+                {#if embedded}
+                  <th scope="col">{f.label}</th>
+                {:else}
+                  <th scope="col" aria-sort={ariaSort(f.key)}>
+                    <a href={sortHref(sort, f.key, filter)}>{f.label}</a>
+                  </th>
+                {/if}
               {/each}
               {#if mayWrite}<th scope="col"><span class="sr-only">Aktionen</span></th>{/if}
             </tr>
@@ -171,7 +186,7 @@
       </div>
     {/if}
 
-    {#if next}
+    {#if next && !embedded}
       <p>
         <a
           class="mehr"
@@ -183,7 +198,7 @@
     {/if}
     {#if loadError}<p class="tabelle-fehler" role="alert">{loadError}</p>{/if}
 
-    {#if mayWrite && addable.length > 0}
+    {#if mayWrite && addable.length > 0 && !embedded}
       <RowEditor {path} {fields} />
     {/if}
   {/if}

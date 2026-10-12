@@ -97,4 +97,34 @@ describe('TableView', () => {
     expect(html({ page: page([]), mayWrite: true })).toContain('Zeile hinzufügen');
     expect(html({ page: page([]), mayWrite: false })).not.toContain('Zeile hinzufügen');
   });
+
+  describe('embedded in somebody else\'s page', () => {
+    it('draws the headers as plain text with no sort links', () => {
+      const out = html({ page: page([]), sort: { sort: 'name', desc: false }, embedded: true });
+      expect(out).toContain('Name');
+      expect(out).not.toContain('<th scope="col"><a');
+      expect(out).not.toContain('aria-sort');
+      expect(out).not.toContain('href="?sort=');
+    });
+
+    it('renders no filter form and no chip', () => {
+      const out = html({ page: page([]), filter: { key: 'name', value: 'Ad' }, embedded: true });
+      expect(out).not.toContain('<form class="filter"');
+      expect(out).not.toContain('Filtern');
+      expect(out).not.toContain('Filter entfernen');
+      expect(out).not.toContain('Name enthält');
+    });
+
+    it('offers no way to load more or add a row, even with a cursor and a writer', () => {
+      const out = html({ page: page([row('1', {})], 'cur'), mayWrite: true, embedded: true });
+      expect(out).not.toContain('Mehr laden');
+      expect(out).not.toContain('Zeile hinzufügen');
+    });
+
+    it('still shows the rows themselves', () => {
+      const out = html({ page: page([row('1', { name: 'Ada' })]), embedded: true });
+      expect(out).toContain('Ada');
+      expect(out).toContain('<td');
+    });
+  });
 });
