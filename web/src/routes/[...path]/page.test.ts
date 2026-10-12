@@ -11,6 +11,8 @@ import type { Reference } from '$lib/blocks/render';
 import type { Attachment } from '$lib/attachments';
 import type { MoveFields, MovePlan } from '$lib/moves';
 import type { EmbedState } from '$lib/datasets/embed';
+import type { DatasetLoad } from '$lib/datasets/load';
+import type { Field } from '$lib/datasets/table';
 
 /**
  * The whole reader page, rendered exactly as the server renders it.
@@ -945,5 +947,72 @@ describe('renaming and moving the page you are reading', () => {
     expect(out).toContain(fehler);
     const themen = out.match(/<nav[^>]*aria-label="Themen dieser Seite"[\s\S]*?<\/nav>/)?.[0];
     expect(themen).not.toContain(fehler);
+  });
+});
+
+/**
+ * A `dataset-view` block quoted on the page, drawn from what the server resolved (M8d D2W).
+ *
+ * The reader page threads `datensaetze` down exactly like `einbettungen`: the permission
+ * question was answered in `+page.server.ts` under the reader's own cookie, and the body
+ * renders from the answer as data. These two tests pin the threading — that a resolved entry
+ * reaches the figure inside the reading surface, and that no entry stays a bare frame.
+ */
+describe('a dataset view quoted on the page', () => {
+  const DATEN = '0199c0de-0000-7000-8000-000000000003';
+  const ANSICHT = '0199c0de-0000-7000-8000-00000000000d';
+
+  const koerper: Block = {
+    kind: 'doc',
+    content: [
+      {
+        kind: 'dataset-view',
+        attrs: { dataset_doc: DATEN, view: ANSICHT, label: 'Gewichtsverlauf' }
+      }
+    ]
+  };
+
+  const brett: EmbedState = {
+    status: 'ready',
+    path: '/raum/tabelle',
+    load: {
+      fields: [
+        { key: 'name', label: 'Name', kind: 'text', config: {}, position: 0 },
+        {
+          key: 'status',
+          label: 'Status',
+          kind: 'select',
+          config: { options: [{ id: 'offen', label: 'Offen' }] },
+          position: 1
+        }
+      ] as Field[],
+      page: {
+        rows: [{ id: '1', values: { name: 'Ada' }, version: 1, created_at: '', updated_at: '' }],
+        total: 1
+      },
+      error: null,
+      sort: null,
+      filter: null,
+      labels: {},
+      views: [],
+      view: { id: ANSICHT, name: 'Alle', kind: 'board', config: { group_by: 'status' }, position: 0 },
+      attachments: []
+    } satisfies DatasetLoad
+  };
+
+  it('draws the resolved board inside the reading surface', () => {
+    const out = html(container, {
+      koerper,
+      datensaetze: { [`${DATEN}/${ANSICHT}`]: brett }
+    });
+    expect(out).toContain('Gewichtsverlauf');
+    expect(out).toContain('data-board');
+  });
+
+  it('leaves an unresolved block a bare frame — label only, no loading line', () => {
+    const out = html(container, { koerper });
+    expect(out).toContain('Gewichtsverlauf');
+    expect(out).not.toContain('data-board');
+    expect(out).not.toContain('Datenansicht wird geladen');
   });
 });

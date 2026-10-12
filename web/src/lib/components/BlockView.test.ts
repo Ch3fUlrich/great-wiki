@@ -9,6 +9,9 @@ import { typesetDocument } from '$lib/server/maths';
 import { highlightDocument } from '$lib/server/highlight';
 import type { Attachment } from '$lib/attachments';
 import type { EmbeddedPage, Reference } from '$lib/blocks/render';
+import type { EmbedState } from '$lib/datasets/embed';
+import type { DatasetLoad } from '$lib/datasets/load';
+import type { Field } from '$lib/datasets/table';
 
 /// The component's markup, without the hydration markers Svelte interleaves — they are an
 /// implementation detail and would make every assertion about structure unreadable.
@@ -18,10 +21,11 @@ function html(
   formeln: Formulas | null = null,
   fences: Fences | null = null,
   verweise: Record<string, Reference> = {},
-  einbettungen: Record<string, EmbeddedPage> = {}
+  einbettungen: Record<string, EmbeddedPage> = {},
+  datensaetze: Record<string, EmbedState> = {}
 ): string {
   return render(BlockView, {
-    props: { block, anhaenge, formeln, fences, verweise, einbettungen }
+    props: { block, anhaenge, formeln, fences, verweise, einbettungen, datensaetze }
   }).body.replace(/<!--.*?-->/g, '');
 }
 
@@ -975,17 +979,51 @@ describe('an embedded page', () => {
 });
 
 describe('a dataset view', () => {
-  // The reader of a page quoting a dataset sees a FRAME and nothing else until D2 wires the
-  // data: the rows belong to the dataset page and arrive by their own permission, so what a
-  // reader who may not read them sees must be indistinguishable from what is absent
-  // (ADR 0022). No title, no count, no dataset name — and no fetch, right up to D2.
+  // The reader of a page quoting a dataset sees a FRAME, its own label, and whatever the
+  // SERVER resolved for them (M8d D2W): the rows belong to the dataset page and arrived by
+  // the reader's own permission, under their own cookie, before this markup existed. There
+  // is no loading line any more — a block with no resolution (nested render, history view,
+  // over the page's cap) shows the label and nothing else, the same nothing an unreadable
+  // dataset shows (ADR 0022).
   const DATEN = '0199c0de-0000-7000-8000-000000000003';
   const ANSICHT = '0199c0de-0000-7000-8000-00000000000d';
+  const SCHLUESSEL = `${DATEN}/${ANSICHT}`;
 
   /** A dataset view block naming `DATEN`/`ANSICHT` with the author's `label`. */
   function datensatz(label: string): Block {
     return { kind: 'dataset-view', attrs: { dataset_doc: DATEN, view: ANSICHT, label } };
   }
+
+  const felder: Field[] = [
+    { key: 'name', label: 'Name', kind: 'text', config: {}, position: 0 },
+    {
+      key: 'status',
+      label: 'Status',
+      kind: 'select',
+      config: { options: [{ id: 'offen', label: 'Offen' }] },
+      position: 1
+    }
+  ];
+
+  /** A resolved board, as `resolveEmbedOnServer` hands it down for this pair. */
+  const brett: EmbedState = {
+    status: 'ready',
+    path: '/raum/tabelle',
+    load: {
+      fields: felder,
+      page: {
+        rows: [{ id: '1', values: { name: 'Ada' }, version: 1, created_at: '', updated_at: '' }],
+        total: 1
+      },
+      error: null,
+      sort: null,
+      filter: null,
+      labels: {},
+      views: [],
+      view: { id: ANSICHT, name: 'Alle', kind: 'board', config: { group_by: 'status' }, position: 0 },
+      attachments: []
+    } satisfies DatasetLoad
+  };
 
   it('draws the frame with the author\'s label as caption', () => {
     const out = html(datensatz('Gewichtsverlauf'));
@@ -993,7 +1031,8 @@ describe('a dataset view', () => {
     expect(out).toContain('class="datensatz');
     expect(out).toContain('<figcaption');
     expect(out).toContain('Gewichtsverlauf');
-    expect(out).toContain('Datenansicht wird geladen …');
+    // The old D1d line is gone: the read settled on the server, there is nothing to load.
+    expect(out).not.toContain('Datenansicht wird geladen');
   });
 
   it('draws the frame without a caption when the label is empty', () => {
@@ -1001,8 +1040,8 @@ describe('a dataset view', () => {
     // the block exists and its data may simply have no author's words on it.
     const out = html(datensatz(''));
     expect(out).toContain('class="datensatz');
-    expect(out).toContain('Datenansicht wird geladen …');
     expect(out).not.toContain('<figcaption');
+    expect(out).not.toContain('Datenansicht wird geladen');
   });
 
   it('carries the two ids as data attributes and no address of any kind', () => {
@@ -1012,22 +1051,62 @@ describe('a dataset view', () => {
     const out = html(datensatz('x'));
     expect(out).toContain(`data-dataset-doc="${DATEN}"`);
     expect(out).toContain(`data-view="${ANSICHT}"`);
-    expect(out).not.toContain('src=');
-    expect(out).not.toContain('href=');
     expect(out).not.toContain('<img');
   });
 
-  it('never shows the dataset or the view id in the visible text', () => {
-    // The ids are database identity; the words a reader sees are the author's label and one
-    // neutral line. Stripping the tags is what tells the two apart here — the attributes
-    // legitimately carry the ids, the text may never repeat them.
+  it('renders the resolved board inside the figure', () => {
+    const out = html(datensatz('Gewichtsverlauf'), [], null, null, {}, {}, {
+      [SCHLUESSEL]: brett
+    });
+    expect(out).toContain('data-board');
+    // Inside THIS figure: the caption precedes the board and nothing follows the figure.
+    const kopf = out.indexOf('Gewichtsverlauf');
+    const brettIndex = out.indexOf('data-board');
+    expect(kopf).toBeGreaterThanOrEqual(0);
+    expect(brettIndex).toBeGreaterThan(kopf);
+    expect(out.indexOf('</figure>')).toBeGreaterThan(brettIndex);
+  });
+
+  it('shows the label only when the page resolved nothing for the block', () => {
     const visible = html(datensatz('Gewichtsverlauf'))
       .replace(/<[^>]*>/g, ' ')
-      .replace(/\s+/g, ' ');
-    expect(visible).not.toContain(DATEN);
-    expect(visible).not.toContain(ANSICHT);
-    expect(visible).toContain('Gewichtsverlauf');
-    expect(visible).toContain('Datenansicht wird geladen …');
+      .replace(/\s+/g, ' ')
+      .trim();
+    expect(visible).toBe('Gewichtsverlauf');
+  });
+
+  it('renders an unavailable entry and no entry IDENTICALLY', () => {
+    // The over-cap block, the nested block and the refused one must not be tellable apart in
+    // the DOM — telling them apart would itself be the disclosure.
+    const ohne = html(datensatz('Gewichtsverlauf'));
+    const verweigert = html(datensatz('Gewichtsverlauf'), [], null, null, {}, {}, {
+      [SCHLUESSEL]: { status: 'unavailable' }
+    });
+    expect(verweigert).toBe(ohne);
+  });
+
+  it('says the view is gone for view_missing', () => {
+    const out = html(datensatz('Gewichtsverlauf'), [], null, null, {}, {}, {
+      [SCHLUESSEL]: { status: 'view_missing' }
+    });
+    expect(out).toContain('Diese Ansicht gibt es nicht mehr.');
+  });
+
+  it('never shows the dataset or the view id in the visible text', () => {
+    // The ids are database identity; the words a reader sees are the author's label and, at
+    // most, the one line a state is allowed to say. Stripping the tags is what tells the two
+    // apart here — the attributes legitimately carry the ids, the text may never repeat them.
+    for (const out of [
+      html(datensatz('Gewichtsverlauf')),
+      html(datensatz('Gewichtsverlauf'), [], null, null, {}, {}, { [SCHLUESSEL]: brett }),
+      html(datensatz('Gewichtsverlauf'), [], null, null, {}, {}, {
+        [SCHLUESSEL]: { status: 'view_missing' }
+      })
+    ]) {
+      const visible = out.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ');
+      expect(visible).not.toContain(DATEN);
+      expect(visible).not.toContain(ANSICHT);
+    }
   });
 
   it('draws nothing for a block that names no view', () => {

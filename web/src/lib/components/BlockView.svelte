@@ -17,8 +17,10 @@
   import Self from './BlockView.svelte';
   import CodeView from './CodeView.svelte';
   import DiagramView from './DiagramView.svelte';
+  import EmbeddedView from '$lib/datasets/EmbeddedView.svelte';
   import MathView from './MathView.svelte';
   import TableView from './TableView.svelte';
+  import type { EmbedState } from '$lib/datasets/embed';
 
   interface Props {
     block: Block;
@@ -115,6 +117,26 @@
      */
     einbettungen?: Record<string, EmbeddedPage>;
     /**
+     * What every `dataset-view` block on this page may show **this reader** — what
+     * `resolveEmbedOnServer` answered in the page load, under the reader's own cookie, keyed
+     * `` `${dataset_doc}/${view}` ``.
+     *
+     * Passed down for `einbettungen`' reason and none of its own: the rows belong to a
+     * DIFFERENT page under a different ACL, so the permission question was settled where the
+     * answer could be trusted, and a component that fetched them would be a second answer
+     * written where nobody can check the first one.
+     *
+     * **A block with no entry here shows its label and nothing else** — which is the same
+     * thing a refusal shows, by construction: the fallback state handed to `EmbeddedView` is
+     * `{ status: 'unavailable' }` itself. Nested renderings, history views and blocks past the
+     * page's cap are all in that one indistinguishable nothing (ADR 0022), and there is no
+     * loading state to wait for: the read settled before this markup existed.
+     *
+     * `{}` by default, and honest for every caller with no page load behind it — the editor
+     * renders this component while TipTap mounts, and so does the history view.
+     */
+    datensaetze?: Record<string, EmbedState>;
+    /**
      * Whether this subtree is being drawn INSIDE an embed's frame.
      *
      * **Depth is one, and this is how.** The blocks handed back for an embed may themselves
@@ -139,6 +161,7 @@
     fences = null,
     verweise = {},
     einbettungen = {},
+    datensaetze = {},
     eingebettet = false,
     quelle = null
   }: Props = $props();
@@ -165,26 +188,26 @@
      markup — which is the containment ADR 0014 already requires for an uploaded SVG. -->
 
 {#if block.kind === 'doc'}
-  {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}
+  {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {datensaetze} {eingebettet} {quelle} />{/each}
 {:else if block.kind === 'paragraph'}
-  <p>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}</p>
+  <p>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {datensaetze} {eingebettet} {quelle} />{/each}</p>
 {:else if block.kind === 'heading'}
   {@const level = Math.min(6, Math.max(1, Number(block.attrs?.level ?? 1)))}
   {@const id = slugify(plainText(block))}
   <svelte:element this={`h${level}`} {id}>
-    {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}
+    {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {datensaetze} {eingebettet} {quelle} />{/each}
   </svelte:element>
 {:else if block.kind === 'bulletList'}
-  <ul>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}</ul>
+  <ul>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {datensaetze} {eingebettet} {quelle} />{/each}</ul>
 {:else if block.kind === 'orderedList'}
-  <ol>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}</ol>
+  <ol>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {datensaetze} {eingebettet} {quelle} />{/each}</ol>
 {:else if block.kind === 'listItem'}
-  <li>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}</li>
+  <li>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {datensaetze} {eingebettet} {quelle} />{/each}</li>
 {:else if block.kind === 'taskList'}
   <!-- A checklist. `data-type` is the attribute TipTap's own `TaskList` puts on its `<ul>`,
        so the editor and the reader can be styled by one rule instead of two that drift. -->
   <ul class="task-list" data-type="taskList">
-    {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}
+    {#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {datensaetze} {eingebettet} {quelle} />{/each}
   </ul>
 {:else if block.kind === 'taskItem'}
   {@const checked = block.attrs?.checked === true}
@@ -206,10 +229,10 @@
        every line beneath it as well. -->
   <li class="task-item" data-type="taskItem" data-checked={checked}>
     <input type="checkbox" {checked} disabled aria-label={plainText(block.content?.[0] ?? block)} />
-    <div>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}</div>
+    <div>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {datensaetze} {eingebettet} {quelle} />{/each}</div>
   </li>
 {:else if block.kind === 'blockquote'}
-  <blockquote>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}</blockquote>
+  <blockquote>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {datensaetze} {eingebettet} {quelle} />{/each}</blockquote>
 {:else if block.kind === 'codeBlock'}
   <!-- `codeText`, never `plainText`: the whitespace IS the content of a fence, and
        `plainText` collapses it — see its own doc comment for why widening THAT is not the
@@ -240,14 +263,14 @@
        no import cycle between the two components. -->
   <TableView {block} child={nested} />
 {:else if block.kind === 'tableRow'}
-  <tr>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}</tr>
+  <tr>{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {datensaetze} {eingebettet} {quelle} />{/each}</tr>
 {:else if block.kind === 'tableHeader'}
   <th scope="col" style:text-align={alignOf(block)}
-    >{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}</th
+    >{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {datensaetze} {eingebettet} {quelle} />{/each}</th
   >
 {:else if block.kind === 'tableCell'}
   <td style:text-align={alignOf(block)}
-    >{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/each}</td
+    >{#each block.content ?? [] as child, i (i)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {datensaetze} {eingebettet} {quelle} />{/each}</td
   >
 {:else if block.kind === 'attachment'}
   <!-- A file placed in the prose (D-15). Three outcomes, and which one applies is decided by
@@ -405,6 +428,7 @@
               fences={null}
               verweise={ziel.references ?? {}}
               einbettungen={{}}
+              datensaetze={{}}
               eingebettet={true}
               quelle={{ path: ziel.path, title: ziel.title }}
             />{/each}
@@ -422,13 +446,17 @@
     {/if}
   {/if}
 {:else if block.kind === 'dataset-view'}
-  <!-- A live view of a saved view of a dataset (M8 D1). FRAME ONLY, and that is the whole
-       of what this component may draw: the rows belong to the dataset, are fetched with the
-       reader's own permission when somebody asks for them, and belong to no page quoting
-       them. The editor fetches nothing here (D2 wires the data); drawing a title, a count or
-       a name from the stored ids would be this interface making statements about a page the
-       reader may not read — and ADR 0022's rule is that what they may not read looks
-       identical to what is absent.
+  <!-- A live view of a saved view of a dataset (M8 D1), drawn from what the SERVER resolved
+       for this reader (M8d D2W): `+page.server.ts` asked the embed endpoint and the row read
+       under the reader's own cookie, and hands the answer down as `datensaetze` — the shape
+       every page embed already uses, because `loadDataset` carries the server-only API base
+       and proxy attestation and can never run in a browser.
+
+       **A block with no entry renders `{ status: 'unavailable' }`** — which draws nothing
+       beyond the frame and the author's label. A nested rendering, a history view, a block
+       past the page's cap and a dataset the reader may not read are one indistinguishable
+       state, and telling them apart is itself the disclosure (ADR 0022). There is no loading
+       line: the read settled before this markup existed.
 
        `data-dataset-doc`/`data-view` carry the ids, and that is deliberate on `data-doc`'s
        and `data-einbettung`'s argument: they are in the page's own data either way, they
@@ -438,14 +466,14 @@
   {#if ansicht}
     <figure class="datensatz" data-dataset-doc={ansicht.datasetDoc} data-view={ansicht.view}>
       {#if ansicht.label !== ''}<figcaption class="datensatz-kopf">{ansicht.label}</figcaption>{/if}
-      <p class="datensatz-hinweis">Datenansicht wird geladen …</p>
+      <EmbeddedView state={datensaetze[`${ansicht.datasetDoc}/${ansicht.view}`] ?? { status: 'unavailable' }} />
     </figure>
   {/if}
 {:else if block.kind === 'text'}
   {@render marked(block.text ?? '', block.marks ?? [])}
 {/if}
 
-{#snippet nested(child: Block)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {eingebettet} {quelle} />{/snippet}
+{#snippet nested(child: Block)}<Self block={child} {anhaenge} {formeln} {fences} {verweise} {einbettungen} {datensaetze} {eingebettet} {quelle} />{/snippet}
 
 <!-- A leaf's `marks`, applied outermost first — the order `gw_core::MARK_ORDER` already
      sorted them into (see `render.ts`'s `Block.marks` doc). Recursing one mark at a time
@@ -650,14 +678,6 @@
 
   .datensatz-kopf {
     margin: 0 0 var(--space-2);
-    color: var(--ink-muted);
-    font-size: var(--text-sm);
-  }
-
-  /* The neutral loading line. Muted and small, because a frame whose data has not arrived
-     is a normal moment on a page, not an error to look at. */
-  .datensatz-hinweis {
-    margin: 0;
     color: var(--ink-muted);
     font-size: var(--text-sm);
   }

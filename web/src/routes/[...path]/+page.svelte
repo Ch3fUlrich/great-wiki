@@ -353,6 +353,7 @@
             fences={data.fences ?? null}
             verweise={data.verweise ?? {}}
             einbettungen={data.einbettungen ?? {}}
+            datensaetze={data.datensaetze ?? {}}
           />
         </article>
       {:then module}
@@ -382,6 +383,7 @@
             fences={data.fences ?? null}
             verweise={data.verweise ?? {}}
             einbettungen={data.einbettungen ?? {}}
+            datensaetze={data.datensaetze ?? {}}
           />
         </article>
       {/await}
@@ -394,6 +396,7 @@
           fences={data.fences ?? null}
           verweise={data.verweise ?? {}}
           einbettungen={data.einbettungen ?? {}}
+          datensaetze={data.datensaetze ?? {}}
         />
       </article>
     {/if}
