@@ -124,10 +124,15 @@ function spyFetch(overrides: Record<string, Answer> = {}, schreiben?: Answer) {
     ...overrides
   };
   const sent: { url: string; method: string; body: string | undefined }[] = [];
+  const calls: { url: string; headers: Record<string, string> }[] = [];
   const fetchFn = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
     const asked = String(url);
     urls.push(asked);
     sent.push({ url: asked, method: init?.method ?? 'GET', body: init?.body as string | undefined });
+    calls.push({
+      url: asked,
+      headers: (init?.headers ?? {}) as Record<string, string>
+    });
     // A write gets its own answer when the test named one. Without that split, a test that
     // wanted a refused PUT would also refuse the GET that reads the current set — and would
     // then be testing a page that could not be read, which is not the case in question.
@@ -139,17 +144,17 @@ function spyFetch(overrides: Record<string, Answer> = {}, schreiben?: Answer) {
       headers: { 'content-type': 'application/json' }
     });
   });
-  return { urls, sent, fetchFn: fetchFn as unknown as typeof fetch };
+  return { urls, sent, calls, fetchFn: fetchFn as unknown as typeof fetch };
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function loadEvent(fetchFn: typeof fetch, query = ''): any {
+function loadEvent(fetchFn: typeof fetch, query = '', cookie: string | null = 'gw_session=abc'): any {
+  const headers: Record<string, string> = {};
+  if (cookie) headers.cookie = cookie;
   return {
     params: { path: 'rundgang/tabellen' },
     fetch: fetchFn,
-    request: new Request('http://wiki.test/rundgang/tabellen', {
-      headers: { cookie: 'gw_session=abc' }
-    }),
+    request: new Request('http://wiki.test/rundgang/tabellen', { headers }),
     url: new URL(`http://wiki.test/rundgang/tabellen${query}`)
   };
 }
@@ -163,6 +168,7 @@ interface Loaded {
   now: number;
   seitenThemen: { path: string; name: string; display_path: string }[];
   seitenThemenFehler: string | null;
+  datensaetze: Record<string, { status: string }>;
 }
 
 /**
@@ -201,8 +207,8 @@ async function runAction(
   }
 }
 
-async function runLoad(fetchFn: typeof fetch, query = ''): Promise<Loaded> {
-  return (await load(loadEvent(fetchFn, query))) as unknown as Loaded;
+async function runLoad(fetchFn: typeof fetch, query = '', cookie: string | null = 'gw_session=abc'): Promise<Loaded> {
+  return (await load(loadEvent(fetchFn, query, cookie))) as unknown as Loaded;
 }
 
 describe('the board embedded in a page', () => {
@@ -918,5 +924,239 @@ describe('being refused a page', () => {
     const thrown = await refusal(403);
     expect(thrown.body.message).not.toContain('Tabellen');
     expect(thrown.body.message).not.toContain('/rundgang');
+  });
+});
+
+/**
+ * The `dataset-view` blocks of a page body, resolved **on the server, for the reader**
+ * (M8d D2W).
+ *
+ * A `dataset-view` block names a dataset page and one of its saved views by id, and those
+ * ids say nothing until the embed endpoint has answered under the READER's own permission —
+ * the dataset's ACL decides what may be shown, never the embedding page's. So the loader
+ * asks here, with the reader's cookie, and hands the answer down as data.
+ *
+ * The two rules this suite exists to pin, because they are the failure modes of every other
+ * retrieval path in this codebase: (a) every call carries exactly the reader's cookie and no
+ * other identity, and (b) a refusal arrives as a value that carries nothing — no title, no
+ * path, no count — and is byte-identical however many different reasons produced it
+ * (ADR 0022).
+ */
+describe('dataset-view blocks resolved on the server', () => {
+  /** A `dataset-view` block as the importer stores one. */
+  function datensatzBlock(datasetDoc: string, view: string): Record<string, unknown> {
+    return { kind: 'dataset-view', attrs: { dataset_doc: datasetDoc, view, label: 'Ansicht' } };
+  }
+
+  /** A page body holding exactly these blocks at the top level. */
+  function koerperMit(blocks: Record<string, unknown>[]): string {
+    return JSON.stringify({ kind: 'doc', content: blocks });
+  }
+
+  const UNAVAILABLE = { status: 200, body: { state: 'unavailable' } };
+
+  const OK_BOARD = {
+    state: 'ok',
+    path: '/raum/tabelle',
+    title: 'Tabelle',
+    view: { id: 'v1', name: 'Alle', kind: 'board', config: { group_by: 'status' }, position: 0 }
+  };
+
+  /** The endpoints `loadDataset` asks, answered well enough to complete a ready read. */
+  const ROWS_READY: Record<string, Answer> = {
+    '/api/datasets/schema': { status: 200, body: { fields: [] } },
+    '/api/datasets/rows': { status: 200, body: { rows: [], total: 0 } },
+    '/api/datasets/views': { status: 200, body: { views: [] } }
+  };
+
+  it('resolves every distinct pair into its own entry, keyed by dataset and view', async () => {
+    const { calls, fetchFn } = spyFetch({
+      '/api/documents': {
+        status: 200,
+        body: { ...doc, body: koerperMit([datensatzBlock('d-eins', 'v-eins'), datensatzBlock('d-zwei', 'v-zwei')]) }
+      },
+      '/api/datasets/embed': UNAVAILABLE
+    });
+    const data = await runLoad(fetchFn);
+    expect(Object.keys(data.datensaetze).sort()).toEqual(['d-eins/v-eins', 'd-zwei/v-zwei']);
+    expect(calls.filter((c) => c.url.includes('/api/datasets/embed'))).toHaveLength(2);
+    // The page itself still loaded — a block is never a reason to refuse the body.
+    expect(data.doc.path).toBe('/rundgang/tabellen');
+  });
+
+  it('asks a pair that appears twice only once', async () => {
+    const { calls, fetchFn } = spyFetch({
+      '/api/documents': {
+        status: 200,
+        body: {
+          ...doc,
+          body: koerperMit([
+            datensatzBlock('d1', 'v1'),
+            datensatzBlock('d1', 'v1'),
+            datensatzBlock('d2', 'v2')
+          ])
+        }
+      },
+      '/api/datasets/embed': UNAVAILABLE
+    });
+    const data = await runLoad(fetchFn);
+    const embeds = calls.filter((c) => c.url.includes('/api/datasets/embed'));
+    expect(embeds.filter((c) => c.url.includes('/api/datasets/embed/d1/v1'))).toHaveLength(1);
+    expect(embeds).toHaveLength(2);
+    expect(Object.keys(data.datensaetze)).toHaveLength(2);
+  });
+
+  it('resolves at most eight pairs and gives the ninth no entry', async () => {
+    const blocks = Array.from({ length: 9 }, (_, i) => datensatzBlock(`d${i}`, `v${i}`));
+    const { calls, fetchFn } = spyFetch({
+      '/api/documents': { status: 200, body: { ...doc, body: koerperMit(blocks) } },
+      '/api/datasets/embed': UNAVAILABLE
+    });
+    const data = await runLoad(fetchFn);
+    expect(Object.keys(data.datensaetze)).toHaveLength(8);
+    expect(calls.filter((c) => c.url.includes('/api/datasets/embed'))).toHaveLength(8);
+    // The first eight in document order; the ninth renders as the plain frame.
+    expect(data.datensaetze['d0/v0']).toBeDefined();
+    expect(data.datensaetze['d8/v8']).toBeUndefined();
+  });
+
+  it('yields an error entry for a failing embed call without failing the page load', async () => {
+    const { fetchFn } = spyFetch({
+      '/api/documents': {
+        status: 200,
+        body: { ...doc, body: koerperMit([datensatzBlock('d1', 'v1')]) }
+      },
+      '/api/datasets/embed': { status: 500, body: { error: 'boom' } }
+    });
+    const data = await runLoad(fetchFn);
+    expect(data.doc.path).toBe('/rundgang/tabellen');
+    expect(data.datensaetze['d1/v1']).toEqual({ status: 'error' });
+  });
+
+  it('makes zero embed calls for a page without dataset-view blocks', async () => {
+    const { urls, fetchFn } = spyFetch();
+    const data = await runLoad(fetchFn);
+    expect(urls.filter((u) => u.includes('/api/datasets'))).toHaveLength(0);
+    expect(data.datensaetze).toEqual({});
+  });
+
+  it('asks nothing for a block outside the top level of the body', async () => {
+    // Nested blocks are not collected — they are top-level by construction, and a second
+    // collection path would be a second answer to how many reads a page may cost.
+    const { urls, fetchFn } = spyFetch({
+      '/api/documents': {
+        status: 200,
+        body: {
+          ...doc,
+          body: JSON.stringify({
+            kind: 'doc',
+            content: [{ kind: 'paragraph', content: [datensatzBlock('d1', 'v1')] }]
+          })
+        }
+      },
+      '/api/datasets/embed': UNAVAILABLE
+    });
+    const data = await runLoad(fetchFn);
+    expect(urls.filter((u) => u.includes('/api/datasets/embed'))).toHaveLength(0);
+    expect(data.datensaetze).toEqual({});
+  });
+
+  it('carries exactly the reader’s cookie on every embed and row call, and no other identity', async () => {
+    const { calls, fetchFn } = spyFetch({
+      '/api/documents': {
+        status: 200,
+        body: { ...doc, body: koerperMit([datensatzBlock('d1', 'v1')]) }
+      },
+      '/api/datasets/embed': { status: 200, body: OK_BOARD },
+      ...ROWS_READY
+    });
+    const data = await runLoad(fetchFn);
+    expect(data.datensaetze['d1/v1']?.status).toBe('ready');
+    const datasetCalls = calls.filter((c) => c.url.includes('/api/datasets/'));
+    // The embed answer, then the schema, rows and views reads — all for the same block.
+    expect(datasetCalls.length).toBeGreaterThan(2);
+    for (const call of datasetCalls) {
+      expect(Object.keys(call.headers)).toEqual(['cookie']);
+      expect(call.headers.cookie).toBe('gw_session=abc');
+    }
+  });
+
+  it('sends no cookie and no service credential when the request carried none', async () => {
+    const { calls, fetchFn } = spyFetch({
+      '/api/documents': {
+        status: 200,
+        body: { ...doc, body: koerperMit([datensatzBlock('d1', 'v1')]) }
+      },
+      '/api/datasets/embed': { status: 200, body: OK_BOARD },
+      ...ROWS_READY
+    });
+    await runLoad(fetchFn, '', null);
+    const datasetCalls = calls.filter((c) => c.url.includes('/api/datasets/'));
+    expect(datasetCalls.length).toBeGreaterThan(2);
+    for (const call of datasetCalls) {
+      expect(Object.keys(call.headers)).not.toContain('cookie');
+      expect(Object.keys(call.headers)).not.toContain('authorization');
+      expect(Object.keys(call.headers)).not.toContain('x-gw-proxy');
+    }
+  });
+
+  it('answers an absent dataset and an unreadable one byte-identically, with nothing in them', async () => {
+    // Rule (b): the entry for `unavailable` is EXACTLY `{ status: 'unavailable' }` — no
+    // title, no path, no count, no dataset id — so the two reasons cannot be told apart in
+    // the page data, in the HTML, or in a timing-freeze of the response.
+    const { calls, fetchFn } = spyFetch({
+      '/api/documents': {
+        status: 200,
+        body: {
+          ...doc,
+          body: koerperMit([datensatzBlock('d-fehlt', 'v1'), datensatzBlock('d-geheim', 'v2')])
+        }
+      },
+      '/api/datasets/embed': UNAVAILABLE
+    });
+    const data = await runLoad(fetchFn);
+    const fehlt = JSON.stringify(data.datensaetze['d-fehlt/v1']);
+    const geheim = JSON.stringify(data.datensaetze['d-geheim/v2']);
+    expect(fehlt).toBe('{"status":"unavailable"}');
+    expect(fehlt).toBe(geheim);
+    // And a refusal asked for no rows: nothing beyond the embed call itself.
+    expect(calls.filter((c) => c.url.includes('/api/datasets/schema'))).toHaveLength(0);
+    expect(calls.filter((c) => c.url.includes('/api/datasets/rows'))).toHaveLength(0);
+  });
+
+  it('gives a view_missing entry no title, path or count either', async () => {
+    const { fetchFn } = spyFetch({
+      '/api/documents': {
+        status: 200,
+        body: { ...doc, body: koerperMit([datensatzBlock('d1', 'v1')]) }
+      },
+      '/api/datasets/embed': { status: 200, body: { state: 'view_missing' } },
+      ...ROWS_READY
+    });
+    const data = await runLoad(fetchFn);
+    const entry = JSON.stringify(data.datensaetze['d1/v1']);
+    expect(entry).toBe('{"status":"view_missing"}');
+    expect(entry).not.toContain('Tabelle');
+    expect(entry).not.toContain('/raum');
+    expect(data.datensaetze['d1/v1']).not.toHaveProperty('load');
+  });
+
+  it('still loads the page when the embed endpoint is not there at all', async () => {
+    // The board's and the chips' rule, applied to a quoted view: an addition to a page is
+    // never a precondition for it. A transport failure is an `error` entry, not a 500.
+    const basis = spyFetch({
+      '/api/documents': {
+        status: 200,
+        body: { ...doc, body: koerperMit([datensatzBlock('d1', 'v1')]) }
+      },
+      ...ROWS_READY
+    });
+    const fetchFn = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      if (String(url).includes('/api/datasets/embed')) throw new TypeError('fetch failed');
+      return basis.fetchFn(url as Request, init);
+    }) as unknown as typeof fetch;
+    const data = await runLoad(fetchFn);
+    expect(data.doc.path).toBe('/rundgang/tabellen');
+    expect(data.datensaetze['d1/v1']).toEqual({ status: 'error' });
   });
 });

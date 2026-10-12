@@ -10,6 +10,7 @@ import type { SidebarMode, Topic, TopicSummary } from '$lib/topics';
 import type { Reference } from '$lib/blocks/render';
 import type { Attachment } from '$lib/attachments';
 import type { MoveFields, MovePlan } from '$lib/moves';
+import type { EmbedState } from '$lib/datasets/embed';
 
 /**
  * The whole reader page, rendered exactly as the server renders it.
@@ -134,7 +135,8 @@ function html(
     hochgeladen = null,
     form = null,
     verweise = {},
-    einbettungen = {}
+    einbettungen = {},
+    datensaetze = {}
   }: {
     me?: Me;
     edit?: boolean;
@@ -163,6 +165,7 @@ function html(
     } | null;
     verweise?: Record<string, Reference>;
     einbettungen?: Record<string, EmbeddedPage>;
+    datensaetze?: Record<string, EmbedState>;
   } = {}
 ): string {
   return render(Page, {
@@ -191,6 +194,10 @@ function html(
         // test passes one: a block with no entry renders as the author's own label, which is
         // the same thing an embed of an unreadable page does.
         einbettungen,
+        // What every `dataset-view` block may show this reader, resolved on the server
+        // (M8d D2W). Empty here unless a test passes one: a block with no entry shows its
+        // label and nothing else.
+        datensaetze,
         tree,
         backlinks,
         edit,

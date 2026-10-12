@@ -7,14 +7,16 @@
  * `crates/gw-store/src/datasets/embed.rs` for the server's side and ADR 0022 for why every
  * refusal is the same bytes; this is the reader's half of the same contract.
  *
- * Pure — no fetch, no DOM, no `$lib/api`. Nothing here reaches the network or reads a page:
- * the rows are a separate read (`loadDataset`), made under the caller's own identity, and an
- * interface that decided both would be a second way onto the data. {@link resolveEmbed} below
- * does orchestrate a read, but it is handed the fetch and the loader rather than importing
- * them, so this module stays free of the server-only API layer and every one of its
- * decisions can be tested against a stand-in.
+ * **Server-only since M8d D2W.** The read is made by `+page.server.ts` under the reader's
+ * own cookie — a browser cannot make it, because `apiGet` carries the server-only API base
+ * and the `X-GW-Proxy` attestation from private env. Anything that wants one of these values
+ * in a component imports the *type* only (`import type { EmbedState }`), which leaves no
+ * runtime edge to this module and keeps the whole thing out of the client bundle. `parseEmbedAnswer`,
+ * `embedApiPath` and `embeddable` stay pure and independently testable; `resolveEmbedOnServer`
+ * is the only part that reaches the network.
  */
-import type { DatasetLoad } from './load';
+import { apiGet } from '$lib/api';
+import { loadDataset, type DatasetLoad } from './load';
 import type { DatasetView } from './views';
 
 /**
@@ -96,56 +98,50 @@ export function parseEmbedAnswer(json: unknown): EmbedAnswer {
 }
 
 /**
- * What a `dataset-view` embed shows, as one value the component renders from. `EmbeddedView`
- * starts at `loading` (which is also all SSR ever emits — the fetch is client-only) and the
- * effect replaces it once the read settles.
+ * What a `dataset-view` embed shows, as one value the component renders from. There is no
+ * `loading` state any more (M8d D2W): the read settles before the markup exists, and a
+ * block with no resolution at all is handed `{ status: 'unavailable' }` by the renderer —
+ * the same value a refusal produces, so an unresolved frame cannot be told from an
+ * unreadable one.
  */
 export type EmbedState =
-  | { status: 'loading' }
   | { status: 'unavailable' }
   | { status: 'view_missing' }
   /** `ok`, but the view kind is not one that may be embedded (a form, or an unknown kind). */
   | { status: 'not_embeddable' }
-  /** `ok` and embeddable, with the rows read under the caller's own identity. */
+  /** `ok` and embeddable, with the rows read under the reader's own identity. */
   | { status: 'ready'; path: string; load: DatasetLoad }
   /** The request itself failed — a transport error, a non-2xx, a body that is not JSON. */
   | { status: 'error' };
 
-/** The row read: `loadDataset`'s own shape, injected so this module never imports `$lib/api`. */
-type Loader = (
-  fetchFn: typeof fetch,
-  path: string,
-  params: URLSearchParams,
-  cookie: string | null
-) => Promise<DatasetLoad>;
-
 /**
- * The client's whole embed read: fetch the answer, decide what it may show, and — only for an
- * embeddable view the caller is entitled to — load its rows. It returns an {@link EmbedState}
- * and touches no module-level fetch or API: the caller hands it both, so a test can drive every
- * branch with a stand-in and the server bundle never reaches here.
+ * The server's whole embed read for one block: fetch the answer under the reader's cookie,
+ * decide what it may show, and — only for an embeddable view the reader is entitled to —
+ * load its rows, again under that same cookie. It returns an {@link EmbedState} and never
+ * throws: an embed that cannot be answered is a state the frame draws, never a failed page.
  *
  * The order is the security rule. The answer's `state` is decided before any rows are asked
- * for, and the rows are read through `load` under the CALLER's identity — the embed endpoint
- * deliberately carries none (ADR 0022). A `unavailable` therefore loads nothing and its state
- * value carries no title, no path and no row: two different reasons for the same refusal
- * produce a byte-identical result, because there is nothing in it to differ.
- *
- * `signal` is the caller's abort: an in-flight read whose props moved on is stopped, and its
- * rejection is reported as `error` for the component to discard on its own staleness token.
+ * for, and every call carries exactly the READER's cookie — the dataset's ACL decides what
+ * may be shown, not the embedding page's, and no service credential or page principal
+ * travels on these requests. A `unavailable` therefore loads nothing and its state value
+ * carries no title, no path and no row: two different reasons for the same refusal produce
+ * a byte-identical result, because there is nothing in it to differ.
  */
-export async function resolveEmbed(
+export async function resolveEmbedOnServer(
   fetchFn: typeof fetch,
+  cookie: string | null,
   datasetDoc: string,
-  view: string,
-  load: Loader,
-  signal?: AbortSignal
+  view: string
 ): Promise<EmbedState> {
   let answer: EmbedAnswer;
   try {
-    const res = await fetchFn(embedApiPath(datasetDoc, view), { signal });
-    if (!res.ok) return { status: 'error' };
-    answer = parseEmbedAnswer(await res.json());
+    const { status, data } = await apiGet<unknown>(
+      fetchFn,
+      embedApiPath(datasetDoc, view),
+      cookie
+    );
+    if (status < 200 || status >= 300) return { status: 'error' };
+    answer = parseEmbedAnswer(data);
   } catch {
     return { status: 'error' };
   }
@@ -155,8 +151,13 @@ export async function resolveEmbed(
   if (!embeddable(answer.view.kind)) return { status: 'not_embeddable' };
 
   try {
-    const loaded = await load(fetchFn, answer.path, new URLSearchParams({ view: answer.view.id }), null);
-    return { status: 'ready', path: answer.path, load: loaded };
+    const load = await loadDataset(
+      fetchFn,
+      answer.path,
+      new URLSearchParams({ view: answer.view.id }),
+      cookie
+    );
+    return { status: 'ready', path: answer.path, load };
   } catch {
     return { status: 'error' };
   }

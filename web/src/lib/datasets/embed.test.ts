@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { embedApiPath, embeddable, parseEmbedAnswer } from './embed';
+import { describe, expect, it, vi } from 'vitest';
+import { embedApiPath, embeddable, parseEmbedAnswer, resolveEmbedOnServer } from './embed';
 
 const VIEW = { id: 'v1', name: 'Alle', kind: 'table', config: { fields: ['name'] }, position: 0 };
 
@@ -95,6 +95,151 @@ describe('embeddable', () => {
   it('refuses a form and anything it does not know', () => {
     for (const kind of ['form', 'timeline', '', 'Table', 'boardish']) {
       expect(embeddable(kind)).toBe(false);
+    }
+  });
+});
+
+interface Answer {
+  status: number;
+  body?: unknown;
+}
+
+/**
+ * A server-side `fetch` that answers by endpoint prefix and records the headers of every
+ * call — because the two rules this module exists to keep are (1) nothing is asked until
+ * the embed answer allows it, and (2) every question goes out under exactly the reader's
+ * cookie.
+ */
+function serverFetch(table: Record<string, Answer>) {
+  const calls: { url: string; headers: Record<string, string> }[] = [];
+  const fetchFn = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+    const asked = String(url);
+    calls.push({ url: asked, headers: (init?.headers ?? {}) as Record<string, string> });
+    const key = Object.keys(table).find((prefix) => asked.includes(prefix));
+    const answer = key ? table[key] : { status: 404 };
+    return new Response(answer.body === undefined ? '' : JSON.stringify(answer.body), {
+      status: answer.status,
+      headers: { 'content-type': 'application/json' }
+    });
+  }) as unknown as typeof fetch;
+  return { calls, fetchFn };
+}
+
+const OK_BOARD = {
+  state: 'ok',
+  path: '/raum/tabelle',
+  title: 'Tabelle',
+  view: { id: 'v1', name: 'Alle', kind: 'board', config: { group_by: 'status' }, position: 0 }
+};
+
+/** The row-read endpoints, answered well enough for `loadDataset` to complete. */
+const ROWS_READY: Record<string, Answer> = {
+  '/api/datasets/schema': { status: 200, body: { fields: [] } },
+  '/api/datasets/rows': { status: 200, body: { rows: [], total: 0 } },
+  '/api/datasets/views': { status: 200, body: { views: [] } }
+};
+
+describe('resolveEmbedOnServer', () => {
+  it('maps the uniform refusal to unavailable and asks for no rows', async () => {
+    const { calls, fetchFn } = serverFetch({
+      '/api/datasets/embed': { status: 200, body: { state: 'unavailable' } },
+      ...ROWS_READY
+    });
+    expect(await resolveEmbedOnServer(fetchFn, 'gw_session=abc', 'doc', 'view')).toEqual({
+      status: 'unavailable'
+    });
+    expect(calls.filter((c) => c.url.includes('/api/datasets/schema'))).toHaveLength(0);
+  });
+
+  it('is byte-identical for an absent and an unreadable dataset', async () => {
+    const { fetchFn } = serverFetch({
+      '/api/datasets/embed': { status: 200, body: { state: 'unavailable' } }
+    });
+    const a = await resolveEmbedOnServer(fetchFn, 'gw_session=abc', 'd-fehlt', 'v1');
+    const b = await resolveEmbedOnServer(fetchFn, 'gw_session=abc', 'd-geheim', 'v2');
+    expect(JSON.stringify(a)).toBe('{"status":"unavailable"}');
+    expect(JSON.stringify(a)).toBe(JSON.stringify(b));
+  });
+
+  it('maps view_missing to its own state, with no rows asked', async () => {
+    const { calls, fetchFn } = serverFetch({
+      '/api/datasets/embed': { status: 200, body: { state: 'view_missing' } },
+      ...ROWS_READY
+    });
+    expect(await resolveEmbedOnServer(fetchFn, 'c', 'doc', 'view')).toEqual({
+      status: 'view_missing'
+    });
+    expect(calls.filter((c) => c.url.includes('/api/datasets/rows'))).toHaveLength(0);
+  });
+
+  it('reports a non-OK embed answer as an error, not a refusal', async () => {
+    const { fetchFn } = serverFetch({
+      '/api/datasets/embed': { status: 500, body: { error: 'boom' } }
+    });
+    expect(await resolveEmbedOnServer(fetchFn, 'c', 'doc', 'view')).toEqual({ status: 'error' });
+  });
+
+  it('reports a fetch that throws as an error', async () => {
+    const fetchFn = vi.fn(async () => {
+      throw new TypeError('fetch failed');
+    }) as unknown as typeof fetch;
+    expect(await resolveEmbedOnServer(fetchFn, 'c', 'doc', 'view')).toEqual({ status: 'error' });
+  });
+
+  it('collapses a malformed ok answer to unavailable', async () => {
+    const { fetchFn } = serverFetch({
+      '/api/datasets/embed': { status: 200, body: { state: 'ok', path: 5 } }
+    });
+    expect(await resolveEmbedOnServer(fetchFn, 'c', 'doc', 'view')).toEqual({
+      status: 'unavailable'
+    });
+  });
+
+  it('refuses to load rows for a kind that may not be embedded', async () => {
+    const { calls, fetchFn } = serverFetch({
+      '/api/datasets/embed': { status: 200, body: { ...OK_BOARD, view: { ...OK_BOARD.view, kind: 'form' } } },
+      ...ROWS_READY
+    });
+    expect(await resolveEmbedOnServer(fetchFn, 'c', 'doc', 'view')).toEqual({
+      status: 'not_embeddable'
+    });
+    expect(calls.filter((c) => c.url.includes('/api/datasets/schema'))).toHaveLength(0);
+  });
+
+  it('loads the rows of the resolved path for an embeddable ok answer', async () => {
+    const { calls, fetchFn } = serverFetch({
+      '/api/datasets/embed': { status: 200, body: OK_BOARD },
+      ...ROWS_READY
+    });
+    const out = await resolveEmbedOnServer(fetchFn, 'gw_session=abc', 'doc', 'view');
+    expect(out.status).toBe('ready');
+    if (out.status === 'ready') expect(out.path).toBe('/raum/tabelle');
+    expect(calls.some((c) => c.url.includes('/api/datasets/schema/raum/tabelle'))).toBe(true);
+  });
+
+  it("carries exactly the reader's cookie on every call, and nothing else", async () => {
+    const { calls, fetchFn } = serverFetch({
+      '/api/datasets/embed': { status: 200, body: OK_BOARD },
+      ...ROWS_READY
+    });
+    await resolveEmbedOnServer(fetchFn, 'gw_session=abc', 'doc', 'view');
+    expect(calls.length).toBeGreaterThan(1);
+    for (const call of calls) {
+      expect(call.headers).toEqual({ cookie: 'gw_session=abc' });
+      expect(Object.keys(call.headers)).not.toContain('x-gw-proxy');
+      expect(Object.keys(call.headers)).not.toContain('authorization');
+    }
+  });
+
+  it('sends no cookie at all when the reader came without one', async () => {
+    const { calls, fetchFn } = serverFetch({
+      '/api/datasets/embed': { status: 200, body: OK_BOARD },
+      ...ROWS_READY
+    });
+    await resolveEmbedOnServer(fetchFn, null, 'doc', 'view');
+    expect(calls.length).toBeGreaterThan(1);
+    for (const call of calls) {
+      expect(Object.keys(call.headers)).not.toContain('cookie');
     }
   });
 });

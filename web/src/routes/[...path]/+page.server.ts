@@ -1,6 +1,6 @@
 import { error, fail, redirect } from '@sveltejs/kit';
 import { apiGet, apiSend, apiUpload, parseBody, type Backlink, type DocumentView } from '$lib/api';
-import type { Block } from '$lib/blocks/render';
+import { datasetView, type Block } from '$lib/blocks/render';
 import {
   attachmentApiPath,
   attachmentsApiPath,
@@ -43,6 +43,7 @@ import {
   type MovePlan
 } from '$lib/moves';
 import { loadDataset } from '$lib/datasets/load';
+import { resolveEmbedOnServer, type EmbedState } from '$lib/datasets/embed';
 import type { Actions, PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
@@ -294,6 +295,47 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
     else vorschauFehler = describeMove(answer.status, answer.failure?.message ?? null);
   }
 
+  /**
+   * The page's `dataset-view` blocks, resolved **here, for the reader** (M8d D2W).
+   *
+   * A browser cannot make this read: `loadDataset` goes through `apiGet`, which prepends the
+   * server-only API base and injects the `X-GW-Proxy` attestation from private env, so the
+   * fetch must never be bundled. The embed therefore takes the shape every page embed
+   * already uses — resolved in this load under the reader's own cookie and handed down as
+   * data, exactly like `einbettungen` above. The dataset's ACL decides what a block may show,
+   * by deciding the answer to a request that carries nothing but this reader's identity.
+   *
+   * **Top level only, and at most eight distinct pairs.** A `dataset-view` block is a
+   * top-level block by construction (the importer puts one between paragraphs, never inside
+   * one), and each pair costs an embed call plus — for a ready answer — the dataset's own
+   * reads. The cap bounds what one page can ask of a server that holds its store to a single
+   * connection; blocks past it, and any block this load never resolved, get no entry and
+   * render as the plain frame — the same nothing a refusal renders in, so exceeding the cap
+   * says nothing about what the dataset holds.
+   *
+   * `resolveEmbedOnServer` never throws, so one dead endpoint is an `error` entry in one
+   * frame, never a failed page: the board and the chips' rule again.
+   */
+  const paar: [string, string][] = [];
+  const gesehen = new Set<string>();
+  for (const kind of body.content ?? []) {
+    if (kind.kind !== 'dataset-view') continue;
+    const ref = datasetView(kind);
+    if (!ref) continue;
+    const key = `${ref.datasetDoc}/${ref.view}`;
+    if (gesehen.has(key)) continue;
+    if (gesehen.size >= 8) break;
+    gesehen.add(key);
+    paar.push([ref.datasetDoc, ref.view]);
+  }
+  const aufloesungen = await Promise.all(
+    paar.map(([datasetDoc, view]) => resolveEmbedOnServer(fetch, cookie, datasetDoc, view))
+  );
+  const datensaetze: Record<string, EmbedState> = {};
+  paar.forEach(([datasetDoc, view], i) => {
+    datensaetze[`${datasetDoc}/${view}`] = aufloesungen[i];
+  });
+
   // Read here rather than from `$app/state` in the component, for two reasons: the flag is
   // then part of the page's data and a server-render test can set it, and the component
   // does not have to reach for a SvelteKit runtime that only exists inside a request.
@@ -324,6 +366,15 @@ export const load: PageServerLoad = async ({ params, fetch, request, url }) => {
      * `gw_store::Store::embeds_for` has already applied and which no client may re-apply.
      */
     einbettungen: data.embeds ?? {},
+    /**
+     * What every `dataset-view` block on this page may show **the reader standing here**
+     * (M8d D2W), keyed `` `${dataset_doc}/${view}` `` — the same two ids the block itself
+     * carries, and no entry for a block this load did not resolve. Each value is what the
+     * embed endpoint answered under this cookie and nothing else; a `unavailable` entry is
+     * exactly `{ status: 'unavailable' }`, with no title, path or count to disagree with the
+     * frame it sits in.
+     */
+    datensaetze,
     formeln,
     fences: codeBloecke,
     // The tree is NOT fetched here any more: the shell renders it on every view, so
