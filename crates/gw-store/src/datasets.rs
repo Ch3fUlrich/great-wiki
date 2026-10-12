@@ -13,11 +13,13 @@ use serde::Serialize;
 use serde_json::Value;
 
 mod computed;
+mod embed;
 mod links;
 mod query;
 mod relation;
 mod rollup;
 mod views;
+pub use embed::EmbedOutcome;
 pub use query::{Cursor, Filter, RowQuery, Sort, SortKind};
 pub use views::{DatasetView, MAX_VIEWS};
 

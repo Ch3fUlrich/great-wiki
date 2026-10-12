@@ -2462,6 +2462,25 @@ mutation crates/gw-store/src/datasets.rs killed \
   's/if !answered {/if false {/' \
   'datasets: a form does not enforce required'
 
+# --- datasets: the dataset-view embed (ADR 0022, ADR 0029 §8, M8d D2) --------------------------
+#
+# A `dataset-view` block sits on a page and names a dataset by id. The block's page decides who
+# may see the block; it decides NOTHING about the data behind it, so `Store::dataset_embed` is
+# handed two ids and asks exactly one permission question — the DATASET's own read. The tests
+# that notice are, at the store:
+# `a_reader_of_the_embedding_page_without_dataset_access_sees_no_title_and_no_view`,
+# `absent_not_a_dataset_unreadable_trashed_and_malformed_are_one_answer` and
+# `a_view_that_is_not_one_of_the_datasets_is_view_missing_for_a_reader_only`; and over HTTP, in
+# `crates/gw-api/tests/dataset_embed.rs`: `every_refusal_is_the_same_response_byte_for_byte`,
+# `reading_the_embedding_page_buys_nothing` and `a_field_hidden_from_the_caller_is_stripped_from_the_answered_view`.
+#
+# Handing the caller's own principal to an admin stand-in is the defect stated plainly: the read
+# stops being the caller's, every dataset becomes readable by id, and `ViewMissing` — the one
+# answer that is only safe behind the gate — is suddenly said to strangers.
+mutation crates/gw-store/src/datasets/embed.rs killed \
+  's/self.document_for_id(principal, dataset_doc, Action::Read)/self.document_for_id(\&Principal::test("wer-auch-immer", \&["admins"], \&[]), dataset_doc, Action::Read)/' \
+  'datasets: an embed uses the dataset'"'"'s own permission, never the embedding page'"'"'s'
+
 # HOW LONG THIS IS ALLOWED TO TAKE
 # --------------------------------
 # A gate too slow to run stops being run. This one got there: eighteen mutations, a whole

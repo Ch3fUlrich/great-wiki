@@ -17,6 +17,15 @@
 //!   Reading needs read; every change needs write. A config naming a field the dataset does
 //!   not have is a 400.
 //!
+//! - `GET /api/datasets/embed/{dataset_doc}/{view}` — what one `dataset-view` block may show
+//!   this caller, by id. **Always 200**, with `state` carrying the verdict: `ok` (the dataset's
+//!   path, its title and the saved view, fields hidden from this caller stripped), or
+//!   `view_missing` (only for a caller who may read that dataset), or `unavailable` for
+//!   everything else — absent, a page that is not a dataset, thrown away, not readable, or a
+//!   string that is not an id. Those are deliberately one response (ADR 0022). The permission
+//!   is the DATASET's: the page the block sits on is not part of the request and grants
+//!   nothing, and no answer carries rows or a count (ADR 0029 §8).
+//!
 //! The same door as `POST /api/pages` ([`gw_store::Store::create_dataset_for`]): the store
 //! decides, this file supplies the `path_admin` gate and the server's date.
 
@@ -33,7 +42,8 @@ use axum_extra::extract::CookieJar;
 use gw_core::dataset::FieldKey;
 use gw_core::FieldKind;
 use gw_store::datasets::{
-    DatasetField, DatasetRow, DatasetView, NewField, RowOutcome, RowSelect, SchemaOutcome,
+    DatasetField, DatasetRow, DatasetView, EmbedOutcome, NewField, RowOutcome, RowSelect,
+    SchemaOutcome,
 };
 use gw_store::{CreateOutcome, CreateRequest};
 use serde::{Deserialize, Serialize};
@@ -63,6 +73,7 @@ pub fn routes() -> Router<AppState> {
                 .patch(update_row)
                 .delete(delete_row),
         )
+        .route("/api/datasets/embed/{dataset_doc}/{view}", get(embed))
 }
 
 type Values = serde_json::Map<String, serde_json::Value>;
@@ -565,4 +576,34 @@ async fn delete_view(
         .map_err(ApiError::Internal)?;
     answer(out, principal.is_authenticated())?;
     Ok(StatusCode::OK)
+}
+
+/// The read a `dataset-view` block makes (ADR 0029 §8), answered **200 for every verdict** —
+/// including for a caller with no account at all.
+///
+/// That is the shape ADR 0022 forces, and it is worth being explicit about why a status code
+/// is not the right place to say "no". A 401 would tell a guest that the id they guessed names
+/// something, a 403 would tell a stranger the same, and a 404 would distinguish an absent page
+/// from a page you may not read — which is exactly the question a probe is built to ask. So the
+/// verdict travels in the body, and the body of every refusal is the same three keys-less
+/// bytes: `{"state":"unavailable"}`.
+///
+/// **The embedding page is not a parameter.** The block sits on a page, and that page's
+/// permissions decide who may see the block; they decide nothing about the data behind it, so
+/// this handler receives two ids and asks one permission question — `Store::dataset_embed`'s
+/// read of the dataset, the same accessor every other dataset read ends in. Nothing here
+/// filters afterwards, and nothing here has rows to filter: a caller who wants the data asks
+/// the row endpoint, under their own identity, and gets the same refusal in the same bytes.
+async fn embed(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((dataset_doc, view)): Path<(String, String)>,
+) -> Result<Json<EmbedOutcome>, ApiError> {
+    let principal = state.principal(&jar).await;
+    state
+        .store
+        .dataset_embed(&principal, &dataset_doc, &view)
+        .await
+        .map(Json)
+        .map_err(ApiError::Internal)
 }
