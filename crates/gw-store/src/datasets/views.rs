@@ -1948,6 +1948,37 @@ mod tests {
         }
     }
 
+    /// A computed column is evaluated per row and is no date and no file: a rollup or a formula
+    /// is refused as a calendar's `date`/`end` and as a gallery's `cover`, by the kind rule
+    /// (D3a/D4a seat, LOW: the refusal had no test of its own).
+    #[tokio::test]
+    async fn a_computed_field_is_refused_as_a_calendar_date_or_a_gallery_cover() {
+        let (store, anna, _, source) = hidden_view_fixture().await;
+        for key in ["cnt", "fr"] {
+            for (kind, cfg, want) in [
+                (
+                    "calendar",
+                    json!({"date": key}),
+                    "date must be a date field of the dataset",
+                ),
+                (
+                    "gallery",
+                    json!({"cover": key}),
+                    "cover must be a file field of the dataset",
+                ),
+            ] {
+                assert_eq!(
+                    store
+                        .create_dataset_view(&anna, &source, "X", kind, &cfg)
+                        .await
+                        .unwrap(),
+                    SchemaOutcome::Invalid(want.into()),
+                    "{kind} {cfg}"
+                );
+            }
+        }
+    }
+
     /// A calendar whose `date` is hidden loses both: the stripped date must not leave the
     /// hidden title behind as the config's only surviving key.
     #[tokio::test]
